@@ -1,3 +1,12 @@
+## [2.3.0] - 2026-05-08
+
+* feat(tron): migrate Tron agents from gRPC to HTTP API (#8370)
+* feat: relayer api (#8364)
+* fix(agents): remove rusoto-based AWS region validation for signer config (#8670)
+* fix: process gas estimation for trusted relayer isms (#8457)
+* fix: skip scraper lookup for txHash (#8517)
+* refactor(evm): remove evm tron techstack (#8408)
+
 ## [2.2.0] - 2026-03-09
 
 * chore: migrate spellchecker from codespell to typos (#8214)

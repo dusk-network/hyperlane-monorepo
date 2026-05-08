@@ -1,3 +1,8 @@
+## [2.3.0] - 2026-05-08
+
+* feat(tron): migrate Tron agents from gRPC to HTTP API (#8370)
+* fix(validator): remove rusoto-based AWS region validation (#8669)
+
 ## [2.1.0] - 2026-03-04
 
 * feat(tron): protocol type (#7827)

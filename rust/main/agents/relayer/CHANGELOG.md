@@ -1,3 +1,14 @@
+## [2.3.0] - 2026-05-08
+
+* feat(tron): migrate Tron agents from gRPC to HTTP API (#8370)
+* feat: deploy relay api on testnet (#8685)
+* feat: relayer api (#8364)
+* fix: Ethermint nonce detection and PostSubmitFailure retry latency (#8426)
+* fix: relay api gas payments (#8690)
+* fix: skip scraper lookup for txHash (#8517)
+* fix: support cctp general message passing (#8705)
+* refactor(evm): remove evm tron techstack (#8408)
+
 ## [2.2.0] - 2026-03-09
 
 * chore: migrate spellchecker from codespell to typos (#8214)
