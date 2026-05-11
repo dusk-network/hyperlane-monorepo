@@ -52,6 +52,14 @@ The companion Dusk PR is the source of contract/tooling/security evidence:
 - `dusk-network/hyperlane-dusk#2` tracks the remaining production sign-off
   decisions before upstream PR preparation.
 
+## Upstream Compatibility Review
+
+`docs/dusk-upstream-compatibility-review.md` records the upstream areas checked
+at the current base, including recent rate-limited ISM/hook work, nested
+trusted relayer ISM fixes, relayer API exposure, and Dusk's explicit
+non-support for Routing, Aggregation, CCIP-read, rate-limited hooks, and
+rate-limited ISMs in this branch.
+
 ## Validation Commands
 
 From `rust/main` in this monorepo:
