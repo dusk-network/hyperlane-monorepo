@@ -44,6 +44,8 @@ The companion Dusk PR is the source of contract/tooling/security evidence:
   deviations from Solidity Hyperlane contracts.
 - `GOAL_AUDIT.md` maps the original revival goal to concrete artifacts and
   remaining gates.
+- `dusk-network/hyperlane-dusk#2` tracks the remaining production sign-off
+  decisions before upstream PR preparation.
 
 ## Validation Commands
 
@@ -71,6 +73,8 @@ with exact run IDs and artifact paths.
 - Dusk reviewers must accept or change the production decisions in
   `SECURITY_REVIEW.md`.
 - Dusk must decide production signer custody and CI artifact policy.
+- Dusk must resolve the production sign-off tracker in
+  `dusk-network/hyperlane-dusk#2`.
 - Internal Dusk PRs must be reviewed first.
 - Upstream PR text should explicitly state that Dusk contract ports and E2E
   scripts live in `dusk-network/hyperlane-dusk`, not this monorepo.
