@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use eyre::Result;
+use eyre::{eyre, Result};
 
 use hyperlane_base::{
     db::HyperlaneRocksDB,
@@ -68,6 +68,9 @@ impl AdapterFactory {
             ChainConnectionConf::Tron(connection_conf) => {
                 let adapter = TronAdapter::from_conf(conf, core_metrics, &connection_conf)?;
                 Arc::new(adapter)
+            }
+            ChainConnectionConf::Dusk(_) => {
+                return Err(eyre!("Lander does not support Dusk yet"));
             }
         };
         Ok(adapter)

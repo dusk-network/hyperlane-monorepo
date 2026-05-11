@@ -1462,6 +1462,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake2b_simd"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b79834656f71332577234b50bfc009996f7449e0c056884e6a02492ded0ca2f3"
+dependencies = [
+ "arrayref",
+ "arrayvec",
+ "constant_time_eq 0.4.2",
+]
+
+[[package]]
 name = "blake2s_simd"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1531,6 +1542,19 @@ name = "block-padding"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d696c370c750c948ada61c69a0ee2cbbb9c50b1019ddb86d9317157a99c2cae"
+
+[[package]]
+name = "bls12_381-bls"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4e6b7c24701ff5167f336478ec29dc176455f5396f62b8f0951cc1fdddf249b"
+dependencies = [
+ "dusk-bls12_381",
+ "dusk-bytes",
+ "ff 0.13.0",
+ "rand_core 0.6.4",
+ "zeroize",
+]
 
 [[package]]
 name = "blst"
@@ -2521,6 +2545,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
 
 [[package]]
+name = "constant_time_eq"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
+
+[[package]]
 name = "convert_case"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3425,6 +3455,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "derive-hex"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b6618553c32cd1c1f4fbdb9418cc035f3168422f24406ebb08576f6db5ed6ec"
+dependencies = [
+ "proc-macro2 1.0.93",
+ "quote 1.0.42",
+ "syn 1.0.109",
+]
+
+[[package]]
 name = "derive-new"
 version = "0.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3688,6 +3729,31 @@ name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
+name = "dusk-bls12_381"
+version = "0.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "633aa835dd9e4db7ad5dc94a3f95d44ff5c6856ec3c83c15eb75366cfb5ee68a"
+dependencies = [
+ "blake2b_simd",
+ "dusk-bytes",
+ "ff 0.13.0",
+ "group 0.13.0",
+ "pairing",
+ "rand_core 0.6.4",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "dusk-bytes"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5d209b92f0741edf1d99369bd4c1a1ef2fd0a85e885220f9e3fb0df3c61337f"
+dependencies = [
+ "derive-hex",
+]
 
 [[package]]
 name = "dyn-clone"
@@ -5946,6 +6012,7 @@ dependencies = [
  "hyperlane-aleo",
  "hyperlane-core",
  "hyperlane-cosmos",
+ "hyperlane-dusk",
  "hyperlane-ethereum",
  "hyperlane-fuel",
  "hyperlane-metric",
@@ -6111,6 +6178,41 @@ dependencies = [
  "sha2 0.10.8",
  "sha3 0.10.8",
  "thiserror 1.0.63",
+]
+
+[[package]]
+name = "hyperlane-dusk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bls12_381-bls",
+ "bs58 0.5.1",
+ "derive-new",
+ "dusk-bytes",
+ "eyre",
+ "hex 0.4.3",
+ "hyperlane-core",
+ "hyperlane-dusk-types",
+ "hyperlane-operation-verifier",
+ "num-traits",
+ "reqwest 0.11.27",
+ "rkyv",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.63",
+ "tokio",
+ "tracing",
+ "tracing-futures",
+ "url",
+]
+
+[[package]]
+name = "hyperlane-dusk-types"
+version = "0.1.0"
+dependencies = [
+ "bytecheck",
+ "rkyv",
+ "serde",
 ]
 
 [[package]]
@@ -8103,6 +8205,15 @@ dependencies = [
  "elliptic-curve 0.13.8",
  "primeorder",
  "sha2 0.10.8",
+]
+
+[[package]]
+name = "pairing"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81fec4625e73cf41ef4bb6846cafa6d44736525f442ba45e407c4a000a13996f"
+dependencies = [
+ "group 0.13.0",
 ]
 
 [[package]]

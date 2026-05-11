@@ -708,6 +708,45 @@ pub fn build_aleo_connection_conf(
     }
 }
 
+pub fn build_dusk_connection_conf(
+    rpcs: &[Url],
+    chain: &ValueParser,
+    err: &mut ConfigParsingError,
+    operation_batch: OpSubmissionConfig,
+) -> Option<ChainConnectionConf> {
+    let url = rpcs.first()?.clone();
+    let native_token = parse_native_token(chain, err, 9);
+
+    let chain_id = chain
+        .chain(err)
+        .get_opt_key("chainId")
+        .parse_u64()
+        .unwrap_or(0) as u8;
+
+    let gas_limit = chain
+        .chain(err)
+        .get_opt_key("gasLimit")
+        .parse_u64()
+        .unwrap_or(500_000_000);
+
+    let gas_price = chain
+        .chain(err)
+        .get_opt_key("gasPrice")
+        .parse_u64()
+        .unwrap_or(1);
+
+    Some(ChainConnectionConf::Dusk(
+        hyperlane_dusk::ConnectionConf {
+            url,
+            chain_id,
+            gas_limit,
+            gas_price,
+            native_token,
+            op_submission_config: operation_batch,
+        },
+    ))
+}
+
 pub fn build_connection_conf(
     domain_protocol: HyperlaneDomainProtocol,
     rpcs: &[Url],
@@ -744,6 +783,9 @@ pub fn build_connection_conf(
         HyperlaneDomainProtocol::Tron => {
             build_tron_connection_conf(rpcs, chain, err, operation_batch)
         }
+        HyperlaneDomainProtocol::Dusk => {
+            build_dusk_connection_conf(rpcs, chain, err, operation_batch)
+        }
         #[cfg(feature = "aleo")]
         HyperlaneDomainProtocol::Aleo => {
             build_aleo_connection_conf(rpcs, chain, err, operation_batch)
@@ -758,7 +800,7 @@ pub fn build_connection_conf(
 pub fn is_protocol_supported(protocol: HyperlaneDomainProtocol) -> bool {
     use HyperlaneDomainProtocol::*;
     match protocol {
-        Ethereum | Fuel | Sealevel | Cosmos | CosmosNative | Starknet | Radix | Tron => true,
+        Ethereum | Fuel | Sealevel | Cosmos | CosmosNative | Starknet | Radix | Tron | Dusk => true,
         // Aleo is feature-gated - only supported when the "aleo" feature is enabled
         Aleo => cfg!(feature = "aleo"),
     }

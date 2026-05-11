@@ -372,6 +372,8 @@ pub enum HyperlaneDomainProtocol {
     Aleo,
     /// Tron chain
     Tron,
+    /// Dusk chain
+    Dusk,
 }
 
 impl HyperlaneDomainProtocol {
@@ -696,7 +698,7 @@ impl HyperlaneDomain {
         let protocol = self.domain_protocol();
         match protocol {
             Ethereum | Cosmos | CosmosNative | Starknet | Tron => IndexMode::Block,
-            Fuel | Sealevel | Radix | Aleo => IndexMode::Sequence,
+            Fuel | Sealevel | Radix | Aleo | Dusk => IndexMode::Sequence,
         }
     }
 }

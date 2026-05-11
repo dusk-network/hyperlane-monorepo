@@ -21,7 +21,7 @@ use url::Url;
 use h_cosmos::RawCosmosAmount;
 use hyperlane_core::{
     cfg_unwrap_all, config::*, HyperlaneDomain, HyperlaneDomainProtocol,
-    HyperlaneDomainTechnicalStack, IndexMode, ReorgPeriod, SubmitterType,
+    HyperlaneDomainTechnicalStack, ReorgPeriod, SubmitterType,
 };
 
 use crate::settings::{
@@ -205,16 +205,8 @@ fn parse_chain(
         .get_opt_key("index")
         .get_opt_key("mode")
         .parse_value("Invalid index mode")
-        .unwrap_or_else(|| {
-            domain
-                .as_ref()
-                .and_then(|d| match d.domain_protocol() {
-                    HyperlaneDomainProtocol::Ethereum => Some(IndexMode::Block),
-                    HyperlaneDomainProtocol::Sealevel => Some(IndexMode::Sequence),
-                    _ => None,
-                })
-                .unwrap_or_default()
-        });
+        // Default indexing mode should follow the protocol's expected cursor semantics.
+        .unwrap_or_else(|| domain.as_ref().map(|d| d.index_mode()).unwrap_or_default());
 
     let mailbox = chain
         .chain(&mut err)
@@ -470,6 +462,14 @@ fn parse_signer(signer: ValueParser) -> ConfigResult<SignerConf> {
                 suffix: suffix.to_owned(),
             })
         }};
+        (duskKey) => {{
+            let key = signer
+                .chain(&mut err)
+                .get_key("key")
+                .parse_private_key()
+                .unwrap_or_default();
+            err.into_result(SignerConf::DuskKey { key })
+        }};
     }
 
     match signer_type {
@@ -478,6 +478,7 @@ fn parse_signer(signer: ValueParser) -> ConfigResult<SignerConf> {
         Some("cosmosKey") => parse_signer!(cosmosKey),
         Some("starkKey") => parse_signer!(starkKey),
         Some("radixKey") => parse_signer!(radixKey),
+        Some("duskKey") => parse_signer!(duskKey),
         Some(t) => {
             Err(eyre!("Unknown signer type `{t}`")).into_config_result(|| (&signer.cwp).add("type"))
         }
