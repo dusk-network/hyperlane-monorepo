@@ -1,5 +1,26 @@
 # @hyperlane-xyz/sdk
 
+## 33.2.0
+
+### Minor Changes
+
+- f758a70: Added rate-limited ISM support.
+- b8a600c: Added rate-limited hook support.
+
+### Patch Changes
+
+- 9a1ce26: Cosmos fee estimation clients were cached by reusing Stargate client connections across repeated estimates, with cache eviction on failures.
+- Updated dependencies [9a1ce26]
+  - @hyperlane-xyz/cosmos-sdk@33.2.0
+  - @hyperlane-xyz/deploy-sdk@6.0.2
+  - @hyperlane-xyz/aleo-sdk@33.2.0
+  - @hyperlane-xyz/starknet-core@33.2.0
+  - @hyperlane-xyz/radix-sdk@33.2.0
+  - @hyperlane-xyz/utils@33.2.0
+  - @hyperlane-xyz/core@11.3.1
+  - @hyperlane-xyz/provider-sdk@6.0.2
+  - @hyperlane-xyz/tron-sdk@23.0.7
+
 ## 33.1.1
 
 ### Patch Changes

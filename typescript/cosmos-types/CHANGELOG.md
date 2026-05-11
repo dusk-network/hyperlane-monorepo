@@ -1,5 +1,7 @@
 # @hyperlane-xyz/cosmos-types
 
+## 33.2.0
+
 ## 33.1.1
 
 ## 33.1.0

@@ -1,5 +1,14 @@
 # @hyperlane-xyz/cosmos-sdk
 
+## 33.2.0
+
+### Patch Changes
+
+- 9a1ce26: Cosmos fee estimation clients were cached by reusing Stargate client connections across repeated estimates, with cache eviction on failures.
+  - @hyperlane-xyz/cosmos-types@33.2.0
+  - @hyperlane-xyz/utils@33.2.0
+  - @hyperlane-xyz/provider-sdk@6.0.2
+
 ## 33.1.1
 
 ### Patch Changes
