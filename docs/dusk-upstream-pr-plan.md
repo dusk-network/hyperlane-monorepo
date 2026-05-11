@@ -58,6 +58,7 @@ cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p scrap
 From the companion Dusk repo:
 
 ```bash
+make repro-check
 make all
 cargo test -p hyperlane-dusk-types
 cargo test -p hyperlane-dusk-integration-tests
@@ -79,8 +80,9 @@ with exact run IDs and artifact paths.
   recent Rusk HTTP/RUES/GraphQL route ownership. No `CODEOWNERS`, `OWNERS`, or
   `MAINTAINERS` file was found in this fork or the companion Dusk repo.
 - Dusk must decide CI/repro runner strategy for the private Rusk-dependent
-  companion checks. Current evidence is local and clean-Rusk documented, not
-  automated PR CI.
+  companion checks. The companion repo now has `make repro-check` for the
+  repeatable local non-E2E subset, but current evidence is still local and
+  clean-Rusk documented, not automated PR CI.
 - Internal Dusk PRs must be reviewed first.
 - Upstream PR text should explicitly state that Dusk contract ports and E2E
   scripts live in `dusk-network/hyperlane-dusk`, not this monorepo.
