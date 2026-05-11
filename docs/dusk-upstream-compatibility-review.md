@@ -97,6 +97,33 @@ Supporting them for Dusk would require:
   wrapper plus direct MerkleTreeHook contract reads, matching the E2E-tested
   MessageIdMultisig path.
 
+## Runtime Placeholder Scan
+
+The original revival goal requires no `todo!`, `unimplemented!`, or direct
+`panic!` paths in Dusk runtime agent code.
+
+Commands checked:
+
+```bash
+rg -n "todo!|unimplemented!|panic!" rust/main/chains/hyperlane-dusk -g '!target'
+git diff upstream/main...HEAD -- \
+  rust/main/chains/hyperlane-dusk \
+  rust/main/hyperlane-base/src/settings/chains.rs \
+  rust/main/hyperlane-base/src/settings/parser \
+  rust/main/hyperlane-base/src/settings/signers.rs \
+  rust/main/lander/src/adapter/chains/factory.rs \
+  rust/main/agents/validator/src/reorg_reporter.rs \
+  | rg -n "^\+.*(todo!|unimplemented!|panic!)"
+```
+
+Observed:
+
+- No matches in `rust/main/chains/hyperlane-dusk`.
+- No added placeholder macros in the Dusk diff against `upstream/main`.
+- A broader scan of shared Hyperlane files still finds existing non-Dusk
+  placeholder macros for other chains, for example Fuel and Radix branches.
+  Those are pre-existing upstream behavior and are not Dusk runtime paths.
+
 ## Upstream PR Implication
 
 An upstream Hyperlane PR should describe this as Dusk Rust agent/protocol
