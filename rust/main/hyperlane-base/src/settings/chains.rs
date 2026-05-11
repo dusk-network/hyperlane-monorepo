@@ -36,6 +36,7 @@ use hyperlane_sealevel::{
 };
 use hyperlane_starknet::{self as h_starknet, StarknetProvider};
 use hyperlane_tron::{self as h_tron, TronProvider};
+use hyperlane_dusk as h_dusk;
 
 use crate::{
     metrics::AgentMetricsConf,
@@ -196,6 +197,8 @@ pub enum ChainConnectionConf {
     Aleo(h_aleo::ConnectionConf),
     /// Tron configuration
     Tron(h_tron::ConnectionConf),
+    /// Dusk configuration
+    Dusk(h_dusk::ConnectionConf),
 }
 
 impl ChainConnectionConf {
@@ -210,6 +213,7 @@ impl ChainConnectionConf {
             Self::CosmosNative(_) => HyperlaneDomainProtocol::CosmosNative,
             Self::Radix(_) => HyperlaneDomainProtocol::Radix,
             Self::Tron(_) => HyperlaneDomainProtocol::Tron,
+            Self::Dusk(_) => HyperlaneDomainProtocol::Dusk,
             #[cfg(feature = "aleo")]
             Self::Aleo(_) => HyperlaneDomainProtocol::Aleo,
         }
@@ -320,6 +324,10 @@ impl ChainConf {
                 h_radix::application::RadixApplicationOperationVerifier::new(),
             )
                 as Box<dyn ApplicationOperationVerifier>),
+            ChainConnectionConf::Dusk(_) => Ok(Box::new(
+                h_dusk::DuskApplicationOperationVerifier::new(),
+            )
+                as Box<dyn ApplicationOperationVerifier>),
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(_) => Ok(Box::new(
                 h_aleo::application::AleoApplicationOperationVerifier::new(),
@@ -374,6 +382,10 @@ impl ChainConf {
             }
             ChainConnectionConf::Tron(conf) => {
                 let provider = build_tron_provider(self, conf, metrics, &locator, None)?;
+                Ok(Box::new(provider) as Box<dyn HyperlaneProvider>)
+            }
+            ChainConnectionConf::Dusk(conf) => {
+                let provider = build_dusk_provider(self, conf);
                 Ok(Box::new(provider) as Box<dyn HyperlaneProvider>)
             }
             #[cfg(feature = "aleo")]
@@ -468,6 +480,21 @@ impl ChainConf {
                 let mailbox = h_tron::TronMailbox::new(provider, &locator);
                 Ok(Box::new(mailbox) as Box<dyn Mailbox>)
             }
+            ChainConnectionConf::Dusk(conf) => {
+                let signer = self.dusk_signer().await.context(ctx)?;
+                let provider = Arc::new(build_dusk_provider(self, conf));
+                let rues = provider.rues().clone();
+                let mailbox = h_dusk::DuskMailbox::new(
+                    provider,
+                    rues,
+                    self.addresses.mailbox,
+                    self.addresses.merkle_tree_hook,
+                    self.domain.clone(),
+                    signer,
+                    conf.clone(),
+                );
+                Ok(Box::new(mailbox) as Box<dyn Mailbox>)
+            }
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(conf) => {
                 let signer = self.aleo_signer().await?;
@@ -535,6 +562,20 @@ impl ChainConf {
                 let hook = h_tron::TronMerkleTreeHook::new(provider, &locator);
 
                 Ok(Box::new(hook) as Box<dyn MerkleTreeHook>)
+            }
+            ChainConnectionConf::Dusk(conf) => {
+                let provider = Arc::new(build_dusk_provider(self, conf));
+                let rues = provider.rues().clone();
+                let mailbox = h_dusk::DuskMailbox::new(
+                    provider,
+                    rues,
+                    self.addresses.mailbox,
+                    self.addresses.merkle_tree_hook,
+                    self.domain.clone(),
+                    None,
+                    conf.clone(),
+                );
+                Ok(Box::new(mailbox) as Box<dyn MerkleTreeHook>)
             }
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(conf) => {
@@ -625,6 +666,15 @@ impl ChainConf {
 
                 Ok(Box::new(indexer) as Box<dyn SequenceAwareIndexer<HyperlaneMessage>>)
             }
+            ChainConnectionConf::Dusk(conf) => {
+                let provider = Arc::new(build_dusk_provider(self, conf));
+                let rues = provider.rues().clone();
+                let indexer = h_dusk::DuskMailboxIndexer::new(
+                    rues,
+                    self.addresses.mailbox,
+                );
+                Ok(Box::new(indexer) as Box<dyn SequenceAwareIndexer<HyperlaneMessage>>)
+            }
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(conf) => {
                 let provider = build_aleo_provider(self, conf, metrics, &locator, None)?;
@@ -710,6 +760,15 @@ impl ChainConf {
 
                 Ok(Box::new(indexer) as Box<dyn SequenceAwareIndexer<H256>>)
             }
+            ChainConnectionConf::Dusk(conf) => {
+                let provider = Arc::new(build_dusk_provider(self, conf));
+                let rues = provider.rues().clone();
+                let indexer = h_dusk::DuskDeliveryIndexer::new(
+                    rues,
+                    self.addresses.mailbox,
+                );
+                Ok(Box::new(indexer) as Box<dyn SequenceAwareIndexer<H256>>)
+            }
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(conf) => {
                 let provider = build_aleo_provider(self, conf, metrics, &locator, None)?;
@@ -786,6 +845,15 @@ impl ChainConf {
                 let paymaster =
                     Box::new(h_tron::TronInterchainGasPaymaster::new(provider, &locator));
                 Ok(paymaster as Box<dyn InterchainGasPaymaster>)
+            }
+            ChainConnectionConf::Dusk(conf) => {
+                let provider = Arc::new(build_dusk_provider(self, conf));
+                let igp = h_dusk::DuskInterchainGasPaymaster::new(
+                    provider,
+                    self.addresses.interchain_gas_paymaster,
+                    self.domain.clone(),
+                );
+                Ok(Box::new(igp) as Box<dyn InterchainGasPaymaster>)
             }
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(conf) => {
@@ -866,6 +934,15 @@ impl ChainConf {
                 let provider = build_tron_provider(self, conf, metrics, &locator, None)?;
                 let indexer = Box::new(h_tron::TronInterchainGasPaymaster::new(provider, &locator));
                 Ok(indexer as Box<dyn SequenceAwareIndexer<InterchainGasPayment>>)
+            }
+            ChainConnectionConf::Dusk(conf) => {
+                let provider = Arc::new(build_dusk_provider(self, conf));
+                let rues = provider.rues().clone();
+                let indexer = h_dusk::DuskInterchainGasPaymasterIndexer::new(
+                    rues,
+                    self.addresses.interchain_gas_paymaster,
+                );
+                Ok(Box::new(indexer) as Box<dyn SequenceAwareIndexer<InterchainGasPayment>>)
             }
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(conf) => {
@@ -996,6 +1073,16 @@ impl ChainConf {
                 let indexer = Box::new(h_tron::TronMerkleTreeHookIndexer::new(provider, &locator));
                 Ok(indexer as Box<dyn SequenceAwareIndexer<MerkleTreeInsertion>>)
             }
+            ChainConnectionConf::Dusk(conf) => {
+                let provider = Arc::new(build_dusk_provider(self, conf));
+                let rues = provider.rues().clone();
+                let dispatch_indexer = h_dusk::DuskMailboxIndexer::new(
+                    rues,
+                    self.addresses.mailbox,
+                );
+                let indexer = h_dusk::DuskMerkleTreeHookIndexer::new(dispatch_indexer);
+                Ok(Box::new(indexer) as Box<dyn SequenceAwareIndexer<MerkleTreeInsertion>>)
+            }
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(conf) => {
                 let provider = build_aleo_provider(self, conf, metrics, &locator, None)?;
@@ -1083,6 +1170,20 @@ impl ChainConf {
                 let validator_announce = h_tron::TronValidatorAnnounce::new(provider, &locator);
                 Ok(Box::new(validator_announce) as Box<dyn ValidatorAnnounce>)
             }
+            ChainConnectionConf::Dusk(conf) => {
+                let signer = self.dusk_signer().await.context(ctx)?;
+                let provider = Arc::new(build_dusk_provider(self, conf));
+                let rues = provider.rues().clone();
+                let va = h_dusk::DuskValidatorAnnounce::new(
+                    provider,
+                    rues,
+                    self.addresses.validator_announce,
+                    self.domain.clone(),
+                    signer,
+                    conf.clone(),
+                );
+                Ok(Box::new(va) as Box<dyn ValidatorAnnounce>)
+            }
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(conf) => {
                 let signer = self.aleo_signer().await?;
@@ -1159,6 +1260,17 @@ impl ChainConf {
                 let ism = h_tron::TronInterchainSecurityModule::new(provider, &locator);
                 Ok(Box::new(ism) as Box<dyn InterchainSecurityModule>)
             }
+            ChainConnectionConf::Dusk(conf) => {
+                let provider = Arc::new(build_dusk_provider(self, conf));
+                let rues = provider.rues().clone();
+                let ism = h_dusk::DuskIsm::new(
+                    provider,
+                    rues,
+                    address,
+                    self.domain.clone(),
+                );
+                Ok(Box::new(ism) as Box<dyn InterchainSecurityModule>)
+            }
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(conf) => {
                 let provider = build_aleo_provider(self, conf, metrics, &locator, None)?;
@@ -1222,6 +1334,17 @@ impl ChainConf {
             ChainConnectionConf::Tron(conf) => {
                 let provider = build_tron_provider(self, conf, metrics, &locator, None)?;
                 let ism = h_tron::TronMultisigIsm::new(provider, &locator);
+                Ok(Box::new(ism) as Box<dyn MultisigIsm>)
+            }
+            ChainConnectionConf::Dusk(conf) => {
+                let provider = Arc::new(build_dusk_provider(self, conf));
+                let rues = provider.rues().clone();
+                let ism = h_dusk::DuskMultisigIsm::new(
+                    provider,
+                    rues,
+                    address,
+                    self.domain.clone(),
+                );
                 Ok(Box::new(ism) as Box<dyn MultisigIsm>)
             }
             #[cfg(feature = "aleo")]
@@ -1312,6 +1435,9 @@ impl ChainConf {
                 let ism = h_tron::TronRoutingIsm::new(provider, &locator);
                 Ok(Box::new(ism) as Box<dyn RoutingIsm>)
             }
+            ChainConnectionConf::Dusk(_) => {
+                Err(eyre!("Dusk does not support routing ISM yet")).context(ctx)
+            }
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(conf) => {
                 let provider = build_aleo_provider(self, conf, metrics, &locator, None)?;
@@ -1372,6 +1498,9 @@ impl ChainConf {
                 let ism = h_tron::TronAggregationIsm::new(provider, &locator);
                 Ok(Box::new(ism) as Box<dyn AggregationIsm>)
             }
+            ChainConnectionConf::Dusk(_) => {
+                Err(eyre!("Dusk does not support aggregation ISM yet")).context(ctx)
+            }
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(_) => Err(eyre!("Aleo support missing")).context(ctx),
         }
@@ -1416,6 +1545,9 @@ impl ChainConf {
                 let ism = h_tron::TronCcipReadIsm::new(provider, &locator);
                 Ok(Box::new(ism) as Box<dyn CcipReadIsm>)
             }
+            ChainConnectionConf::Dusk(_) => {
+                Err(eyre!("Dusk does not support CCIP read ISM yet")).context(ctx)
+            }
             #[cfg(feature = "aleo")]
             ChainConnectionConf::Aleo(_) => Err(eyre!("Aleo support missing")).context(ctx),
         }
@@ -1452,6 +1584,9 @@ impl ChainConf {
                     Box::new(conf.build::<h_radix::RadixSigner>().await?)
                 }
                 ChainConnectionConf::Tron(_) => Box::new(conf.build::<h_tron::TronSigner>().await?),
+                ChainConnectionConf::Dusk(_) => {
+                    Box::new(conf.build::<h_dusk::DuskSigner>().await?)
+                }
                 #[cfg(feature = "aleo")]
                 ChainConnectionConf::Aleo(_) => Box::new(conf.build::<h_aleo::AleoSigner>().await?),
             };
@@ -1509,6 +1644,10 @@ impl ChainConf {
     }
 
     async fn tron_signer(&self) -> Result<Option<h_tron::TronSigner>> {
+        self.signer().await
+    }
+
+    async fn dusk_signer(&self) -> Result<Option<h_dusk::DuskSigner>> {
         self.signer().await
     }
 
@@ -1750,4 +1889,12 @@ fn build_tron_provider(
         metrics,
         middleware_metrics.chain.clone(),
     )
+}
+
+fn build_dusk_provider(
+    chain_conf: &ChainConf,
+    connection_conf: &h_dusk::ConnectionConf,
+) -> h_dusk::DuskProvider {
+    let rues = Arc::new(h_dusk::RuesClient::new(connection_conf.url.clone()));
+    h_dusk::DuskProvider::new(chain_conf.domain.clone(), rues)
 }

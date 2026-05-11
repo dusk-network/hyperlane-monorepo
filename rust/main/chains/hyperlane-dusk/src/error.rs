@@ -1,0 +1,41 @@
+use hyperlane_core::{ChainCommunicationError, HyperlaneCustomErrorWrapper, H512};
+
+/// Errors specific to the Dusk chain integration.
+#[derive(Debug, thiserror::Error)]
+pub enum HyperlaneDuskError {
+    /// HTTP error communicating with the RUES endpoint.
+    #[error("RUES HTTP error: {0}")]
+    RuesHttp(#[from] reqwest::Error),
+    /// Non-success response from the RUES endpoint.
+    #[error("RUES error response ({status}): {body}")]
+    RuesResponse {
+        /// HTTP status code.
+        status: u16,
+        /// Response body.
+        body: String,
+    },
+    /// rkyv deserialization error.
+    #[error("rkyv deserialization error: {0}")]
+    RkyvDeserialize(String),
+    /// Transaction not found.
+    #[error("Transaction not found: {0:?}")]
+    TransactionNotFound(H512),
+    /// Block not found.
+    #[error("Block not found at height: {0}")]
+    BlockNotFound(u64),
+    /// Signer is not configured.
+    #[error("Signer unavailable")]
+    SignerUnavailable,
+    /// The configured BLS secret key is invalid.
+    #[error("Invalid BLS secret key: {0}")]
+    InvalidBlsSecretKey(String),
+    /// Generic error.
+    #[error("{0}")]
+    Other(String),
+}
+
+impl From<HyperlaneDuskError> for ChainCommunicationError {
+    fn from(value: HyperlaneDuskError) -> Self {
+        ChainCommunicationError::Other(HyperlaneCustomErrorWrapper::new(Box::new(value)))
+    }
+}

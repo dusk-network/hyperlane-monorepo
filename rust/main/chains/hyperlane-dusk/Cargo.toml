@@ -1,0 +1,37 @@
+[package]
+name = "hyperlane-dusk"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-trait.workspace = true
+bs58.workspace = true
+derive-new.workspace = true
+eyre.workspace = true
+hex.workspace = true
+num-traits.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "process"] }
+tracing.workspace = true
+tracing-futures.workspace = true
+url.workspace = true
+
+# Dusk BLS key material (for deriving the on-chain sender address and account identifier)
+bls12_381-bls = "0.5.1"
+dusk-bytes = "0.1.7"
+
+# Dusk types for message encoding, keccak256, EthAddress, etc.
+# Uses software keccak256 fallback (no `abi` feature).
+# NOTE: dusk-core is NOT a dependency here because it requires nightly Rust.
+# The monorepo uses stable Rust. Transaction construction is stubbed.
+hyperlane-dusk-types = { path = "../../../../../dusk/types", features = ["serde"] }
+
+# rkyv for RUES binary serialization (matching on-chain contract serialization)
+rkyv = { version = "0.7", features = ["validation"] }
+
+# Hyperlane core traits
+hyperlane-core = { path = "../../hyperlane-core", features = ["async"] }
+hyperlane-operation-verifier = { path = "../../applications/hyperlane-operation-verifier" }

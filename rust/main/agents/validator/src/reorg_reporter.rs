@@ -151,7 +151,7 @@ impl LatestCheckpointReorgReporter {
         #[cfg(feature = "aleo")]
         use ChainConnectionConf::Aleo;
         use ChainConnectionConf::{
-            Cosmos, CosmosNative, Ethereum, Fuel, Radix, Sealevel, Starknet, Tron,
+            Cosmos, CosmosNative, Dusk, Ethereum, Fuel, Radix, Sealevel, Starknet, Tron,
         };
 
         let chain_conf = settings
@@ -214,6 +214,7 @@ impl LatestCheckpointReorgReporter {
                     Tron(updated_conn)
                 })
             }
+            Dusk(conn) => vec![(conn.url.clone(), Dusk(conn))],
         };
 
         chain_conn_confs
