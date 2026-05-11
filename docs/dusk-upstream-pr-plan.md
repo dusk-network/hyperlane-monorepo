@@ -7,7 +7,7 @@ remaining production decisions are accepted or changed.
 Current base:
 
 - Upstream Hyperlane `main`: `f758a70630fd72d4749c3afb79454e725b8081a8`
-- Dusk branch head: `f0df7aa522c65c4a7cf94c677c9573bd353c9b72`
+- Rebase/check evidence commit: `f0df7aa522c65c4a7cf94c677c9573bd353c9b72`
 
 ## Proposed Upstream Shape
 
