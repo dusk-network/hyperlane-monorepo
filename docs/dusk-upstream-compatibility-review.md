@@ -11,7 +11,8 @@ preparation remains blocked on the companion Dusk sign-off tracker.
 Current Dusk branch:
 
 - Branch: `feat/dusk-support-v2`
-- Head: `30652aa11d09714d2df2055cb1741482f36ce163`
+- Rebase/check evidence commit:
+  `30652aa11d09714d2df2055cb1741482f36ce163`
 - Upstream base: `f758a70630fd72d4749c3afb79454e725b8081a8`
 - Upstream commit: `feat: rate limit ism support (#8703)`
 
