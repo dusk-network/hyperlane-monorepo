@@ -68,6 +68,11 @@ pub enum SignerConf {
         /// Whether the Starknet signer is legacy
         is_legacy: bool,
     },
+    /// Dusk Specific key
+    DuskKey {
+        /// Private key value
+        key: H256,
+    },
     /// Assume node will sign on RPC calls
     #[default]
     Node,
@@ -125,6 +130,9 @@ impl BuildableWithSignerConf for hyperlane_ethereum::Signers {
             SignerConf::Node => bail!("Node signer"),
             SignerConf::RadixKey { .. } => {
                 bail!("radixKey signer is not supported by Ethereum")
+            }
+            SignerConf::DuskKey { .. } => {
+                bail!("duskKey signer is not supported by Ethereum")
             }
         })
     }
@@ -327,6 +335,27 @@ impl ChainSigner for hyperlane_aleo::AleoSigner {
 
     fn address_h256(&self) -> H256 {
         self.address_h256()
+    }
+}
+
+#[async_trait]
+impl BuildableWithSignerConf for hyperlane_dusk::DuskSigner {
+    async fn build(conf: &SignerConf) -> Result<Self, Report> {
+        if let SignerConf::DuskKey { key } = conf {
+            hyperlane_dusk::DuskSigner::new(*key).map_err(|e| eyre::eyre!(e.to_string()))
+        } else {
+            bail!(format!("{conf:?} key is not supported by dusk"));
+        }
+    }
+}
+
+impl ChainSigner for hyperlane_dusk::DuskSigner {
+    fn address_string(&self) -> String {
+        self.address_string()
+    }
+
+    fn address_h256(&self) -> H256 {
+        self.eth_address()
     }
 }
 
