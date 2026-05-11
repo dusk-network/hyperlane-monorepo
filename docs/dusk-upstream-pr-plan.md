@@ -82,8 +82,10 @@ with exact run IDs and artifact paths.
   `MAINTAINERS` file was found in this fork or the companion Dusk repo.
 - Dusk must decide CI/repro runner strategy for the private Rusk-dependent
   companion checks. The companion repo now has `make repro-check` and
-  `make repro-check-agent` for the repeatable local non-E2E subset, but current
-  evidence is still local and clean-Rusk documented, not automated PR CI.
+  `make repro-check-agent` for the repeatable local non-E2E subset, plus a
+  manual self-hosted workflow template for Dusk-runner reproduction. Dusk still
+  needs to provide the runner and private checkout secret before this can
+  replace local evidence.
 - Internal Dusk PRs must be reviewed first.
 - Upstream PR text should explicitly state that Dusk contract ports and E2E
   scripts live in `dusk-network/hyperlane-dusk`, not this monorepo.
