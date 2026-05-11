@@ -4,6 +4,11 @@ This branch is for internal Dusk review first. Do not open an upstream
 Hyperlane PR until the companion Dusk contract/security PR is reviewed and the
 remaining production decisions are accepted or changed.
 
+Current base:
+
+- Upstream Hyperlane `main`: `f758a70630fd72d4749c3afb79454e725b8081a8`
+- Dusk branch head: `f0df7aa522c65c4a7cf94c677c9573bd353c9b72`
+
 ## Proposed Upstream Shape
 
 1. Agent/protocol support PR against `hyperlane-xyz/hyperlane-monorepo`.
