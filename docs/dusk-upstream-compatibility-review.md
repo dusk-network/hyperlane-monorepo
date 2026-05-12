@@ -15,9 +15,9 @@ Current Dusk branch:
 - Rebase/check evidence: use the live upstream freshness commands below and
   the companion Dusk `make gate-status` report.
 - Dusk signer test cleanup evidence commit:
-  `662d8b850b8903d15e1d7a24cfef1862d9a2f9ea`
-- Upstream base: `f758a70630fd72d4749c3afb79454e725b8081a8`
-- Upstream commit: `feat: rate limit ism support (#8703)`
+  `b989bbcfbb2a427d3a538c5201f5d7214de6ba84`
+- Upstream base: `66e8c1f4644cea0392b33007225e6611b8f06804`
+- Upstream commit: `feat: whitelist moonpay route for fastpath relayer (#8725)`
 
 Verification commands:
 
@@ -30,13 +30,14 @@ cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p scrap
 Observed:
 
 - `upstream/main` and `merge-base HEAD upstream/main` both resolve to
-  `f758a70630fd72d4749c3afb79454e725b8081a8`.
+  `66e8c1f4644cea0392b33007225e6611b8f06804`.
 - The Rust agent check passed after the rebase to that base.
 
 ## Upstream Areas Checked
 
 Recent upstream changes around the current base include:
 
+- `66e8c1f4 feat: whitelist moonpay route for fastpath relayer (#8725)`
 - `f758a7063 feat: rate limit ism support (#8703)`
 - `b8a600cc1 feat: add RateLimitedHook support to warp deploy and apply (#8715)`
 - `33097209a fix: rate limit ism inside aggregation ism (#8709)`
