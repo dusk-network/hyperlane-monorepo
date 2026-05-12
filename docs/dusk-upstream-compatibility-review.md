@@ -11,7 +11,7 @@ preparation remains blocked on the companion Dusk sign-off tracker.
 Current Dusk branch:
 
 - Branch: `feat/dusk-support-v2`
-- Current review head: `ecb11359747dce240a24c50fa229afd4479919b5`
+- Current review head: `60e1254943058f8249e297dc1733e892ec4907fa`
 - Rebase/check evidence commit:
   `30652aa11d09714d2df2055cb1741482f36ce163`
 - Upstream base: `f758a70630fd72d4749c3afb79454e725b8081a8`

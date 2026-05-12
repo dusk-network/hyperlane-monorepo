@@ -7,7 +7,7 @@ remaining production decisions are accepted or changed.
 Current base:
 
 - Current Dusk monorepo branch head:
-  `ecb11359747dce240a24c50fa229afd4479919b5`
+  `60e1254943058f8249e297dc1733e892ec4907fa`
 - Upstream Hyperlane `main`: `f758a70630fd72d4749c3afb79454e725b8081a8`
 - Rebase/check evidence commit: `f0df7aa522c65c4a7cf94c677c9573bd353c9b72`
 
@@ -54,6 +54,8 @@ The companion Dusk PR is the source of contract/tooling/security evidence:
   remaining gates.
 - `dusk-network/hyperlane-dusk#2` tracks the remaining production sign-off
   decisions before upstream PR preparation.
+- Consolidated review entry point for the split decisions:
+  https://github.com/dusk-network/hyperlane-dusk/issues/2#issuecomment-4427052555
 - Split decision issues `dusk-network/hyperlane-dusk#4` through
   `dusk-network/hyperlane-dusk#9` route the remaining contract-policy,
   signer-custody, CI/repro-runner, and soak-acceptance decisions.
