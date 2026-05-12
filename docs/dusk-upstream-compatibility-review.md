@@ -32,8 +32,18 @@ Observed:
 
 - `upstream/main` and `merge-base HEAD upstream/main` both resolve to
   `c6bce706316206ac7b5652155c9ea92e96f78c39`.
-- `git rev-list --left-right --count HEAD...upstream/main` reports `26 0`.
+- `git rev-list --left-right --count HEAD...upstream/main` currently reports
+  `28 0` after the documentation and workflow guard updates.
 - The Rust agent check passed after the rebase to that base.
+
+The Dusk fork now also proposes
+`.github/workflows/dusk-agent-gate.yml` as a narrow PR status check for the
+agent crate. It checks out the companion private Dusk repo for
+`hyperlane-dusk-types`, scans `rust/main/chains/hyperlane-dusk` for runtime
+placeholder macros, preflights private repo access for `DUSK_ORG_READ_TOKEN`,
+and runs `cargo check -p hyperlane-dusk`. The workflow is intended to give the
+monorepo PR a focused status check while the full cross-repo repro and E2E
+evidence remain in `dusk-network/hyperlane-dusk`.
 
 ## Upstream Areas Checked
 

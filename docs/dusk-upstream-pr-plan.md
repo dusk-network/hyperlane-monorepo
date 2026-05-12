@@ -87,6 +87,22 @@ From `rust/main` in this monorepo:
 cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p scraper -p lander
 ```
 
+The fork also includes `.github/workflows/dusk-agent-gate.yml` as a narrow
+pull-request status check for the Dusk agent crate. It checks out this
+monorepo and the companion `dusk-network/hyperlane-dusk` repo in the same
+adjacent layout used locally, scans `rust/main/chains/hyperlane-dusk` for
+runtime placeholder macros, and runs:
+
+```bash
+cargo check -p hyperlane-dusk
+```
+
+The workflow needs `DUSK_ORG_READ_TOKEN` because the companion Dusk repo is
+private. It preflights that private repo access with `gh api` before checkout
+so missing token provisioning fails explicitly. It is an early agent
+compile/status gate, not a replacement for the full local `cargo check`
+command above or the companion Dusk E2E evidence.
+
 From the companion Dusk repo:
 
 ```bash
