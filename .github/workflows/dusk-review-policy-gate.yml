@@ -1,0 +1,40 @@
+name: Dusk Review Policy Gate
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  review-policy-gate:
+    name: Dusk review policy gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check worktree and diff hygiene
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "$(git ls-files --others --exclude-standard)" ]; then
+            git ls-files --others --exclude-standard
+            echo "::error::untracked source paths found"
+            exit 1
+          fi
+
+          base_ref="${GITHUB_BASE_REF:-main}"
+          if git rev-parse --verify "origin/$base_ref" >/dev/null 2>&1; then
+            git diff --check "origin/$base_ref"...HEAD
+          else
+            git diff --check HEAD~1..HEAD
+          fi
