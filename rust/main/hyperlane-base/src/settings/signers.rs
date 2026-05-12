@@ -66,6 +66,7 @@ impl DuskSignerKeyConf {
         match self {
             Self::Inline { key } => Ok(*key),
             Self::File { path } => {
+                Self::validate_key_file(path)?;
                 let key = fs::read_to_string(path)
                     .with_context(|| format!("Failed to read Dusk signer key file `{path}`"))?;
                 Self::parse_key_material(&key)
@@ -78,6 +79,30 @@ impl DuskSignerKeyConf {
                     .with_context(|| format!("Invalid Dusk signer key env var `{var}`"))
             }
         }
+    }
+
+    fn validate_key_file(path: &str) -> Result<(), Report> {
+        let metadata = fs::metadata(path)
+            .with_context(|| format!("Failed to inspect Dusk signer key file `{path}`"))?;
+
+        if !metadata.is_file() {
+            bail!("Dusk signer key file `{path}` must be a regular file");
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = metadata.permissions().mode();
+            if mode & 0o077 != 0 {
+                bail!(
+                    "Dusk signer key file `{path}` permissions must not allow group or world access; found mode {:o}",
+                    mode & 0o777
+                );
+            }
+        }
+
+        Ok(())
     }
 
     fn parse_key_material(key: &str) -> Result<H256, Report> {
@@ -578,6 +603,13 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("create tempdir");
         let key_path = tempdir.path().join("dusk-signer.key");
         std::fs::write(&key_path, format!("{PRIVATE_KEY}\n")).expect("write key file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+                .expect("set key file permissions");
+        }
 
         let signer_config = SignerConf::DuskKey {
             key: DuskSignerKeyConf::File {
@@ -595,6 +627,39 @@ mod tests {
                 &hex::decode("45f325943f47c662afbdfc9bd0b48f38b162441d92363746d8582677d7e4ce4a")
                     .expect("decode expected Dusk address")
             )
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dusk_signer_rejects_loose_key_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::settings::signers::{BuildableWithSignerConf, DuskSignerKeyConf};
+
+        const PRIVATE_KEY: &str =
+            "0x1111111111111111111111111111111111111111111111111111111111111111";
+
+        let tempdir = tempfile::tempdir().expect("create tempdir");
+        let key_path = tempdir.path().join("dusk-signer.key");
+        std::fs::write(&key_path, format!("{PRIVATE_KEY}\n")).expect("write key file");
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644))
+            .expect("set loose key file permissions");
+
+        let signer_config = SignerConf::DuskKey {
+            key: DuskSignerKeyConf::File {
+                path: key_path.to_string_lossy().to_string(),
+            },
+        };
+
+        let err = match hyperlane_dusk::DuskSigner::build(&signer_config).await {
+            Ok(_) => panic!("loose Dusk signer key file permissions must be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("permissions"),
+            "unexpected error: {err:?}"
         );
     }
 }
