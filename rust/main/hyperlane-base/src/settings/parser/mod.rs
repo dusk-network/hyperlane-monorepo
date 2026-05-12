@@ -23,14 +23,14 @@ use hyperlane_core::matching_list::MatchingList;
 use h_cosmos::RawCosmosAmount;
 use hyperlane_core::{
     cfg_unwrap_all, config::*, HyperlaneDomain, HyperlaneDomainProtocol,
-    HyperlaneDomainTechnicalStack, NativeToken, ReorgPeriod, SubmitterType,
+    HyperlaneDomainTechnicalStack, NativeToken, ReorgPeriod, SubmitterType, H256,
 };
 
 use crate::settings::{
     chains::IndexSettings,
     parser::connection_parser::{build_connection_conf, is_protocol_supported},
     trace::TracingConfig,
-    ChainConf, CoreContractAddresses, Settings, SignerConf,
+    ChainConf, CoreContractAddresses, DuskSignerKeyConf, Settings, SignerConf,
 };
 
 pub use super::envs::*;
@@ -570,11 +570,46 @@ fn parse_signer(signer: ValueParser) -> ConfigResult<SignerConf> {
             })
         }};
         (duskKey) => {{
-            let key = signer
+            let inline_key = signer
                 .chain(&mut err)
-                .get_key("key")
+                .get_opt_key("key")
                 .parse_private_key()
-                .unwrap_or_default();
+                .end();
+            let key_file = signer
+                .chain(&mut err)
+                .get_opt_key("keyFile")
+                .parse_string()
+                .map(str::to_owned)
+                .end();
+            let key_env = signer
+                .chain(&mut err)
+                .get_opt_key("keyEnv")
+                .parse_string()
+                .map(str::to_owned)
+                .end();
+
+            let configured_sources = usize::from(inline_key.is_some())
+                + usize::from(key_file.is_some())
+                + usize::from(key_env.is_some());
+            if configured_sources != 1 {
+                err.push(
+                    (&signer.cwp).add("key"),
+                    eyre!("duskKey signer requires exactly one of `key`, `keyFile`, or `keyEnv`"),
+                );
+            }
+
+            let key = if let Some(key) = inline_key {
+                DuskSignerKeyConf::Inline { key }
+            } else if let Some(path) = key_file {
+                DuskSignerKeyConf::File { path }
+            } else if let Some(var) = key_env {
+                DuskSignerKeyConf::Env { var }
+            } else {
+                DuskSignerKeyConf::Inline {
+                    key: H256::default(),
+                }
+            };
+
             err.into_result(SignerConf::DuskKey { key })
         }};
     }
@@ -767,6 +802,7 @@ fn parse_base_and_override_urls(
 #[cfg(test)]
 mod test {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn supports_sequence_h256s() {
@@ -780,5 +816,35 @@ mod test {
         let val: serde_json::Value = serde_json::from_str(json_str).unwrap();
         let value_parser = ValueParser::new(Default::default(), &val);
         parse_matching_list(value_parser).unwrap();
+    }
+
+    #[test]
+    fn parses_dusk_signer_key_file() {
+        let val = json!({
+            "type": "duskKey",
+            "keyfile": "/run/secrets/dusk-signer.key"
+        });
+        let value_parser = ValueParser::new(Default::default(), &val);
+
+        let signer = parse_signer(value_parser).unwrap();
+
+        match signer {
+            SignerConf::DuskKey {
+                key: DuskSignerKeyConf::File { path },
+            } => assert_eq!(path, "/run/secrets/dusk-signer.key"),
+            other => panic!("expected dusk keyFile signer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_dusk_signer_with_multiple_key_sources() {
+        let val = json!({
+            "type": "duskKey",
+            "key": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "keyfile": "/run/secrets/dusk-signer.key"
+        });
+        let value_parser = ValueParser::new(Default::default(), &val);
+
+        assert!(parse_signer(value_parser).is_err());
     }
 }

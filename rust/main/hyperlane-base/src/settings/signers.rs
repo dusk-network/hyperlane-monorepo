@@ -1,3 +1,5 @@
+use std::fmt;
+use std::fs;
 use std::str::FromStr;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -12,7 +14,7 @@ use rusoto_core::Region;
 use rusoto_kms::KmsClient;
 use tracing::instrument;
 
-use hyperlane_core::{AccountAddressType, H256};
+use hyperlane_core::{utils::hex_or_base58_or_bech32_to_h256, AccountAddressType, H256};
 
 use super::aws_credentials::AwsChainCredentialsProvider;
 use crate::types::utils;
@@ -63,6 +65,69 @@ async fn build_aws_signer(id: &str, region: &str) -> Result<AwsSigner, Report> {
         .map_err(|arc_err| eyre::eyre!("{arc_err}"))
 }
 
+/// Dusk signer key material source.
+#[derive(Clone)]
+pub enum DuskSignerKeyConf {
+    /// Inline raw key material. Supported for backwards compatibility and local
+    /// dev only; prefer File or Env for review/CI configs.
+    Inline {
+        /// Private key value
+        key: H256,
+    },
+    /// Path to a file containing hex/base58/bech32 raw key material.
+    File {
+        /// File path
+        path: String,
+    },
+    /// Environment variable containing hex/base58/bech32 raw key material.
+    Env {
+        /// Environment variable name
+        var: String,
+    },
+}
+
+impl fmt::Debug for DuskSignerKeyConf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inline { .. } => f
+                .debug_struct("Inline")
+                .field("key", &"<redacted>")
+                .finish(),
+            Self::File { path } => f.debug_struct("File").field("path", path).finish(),
+            Self::Env { var } => f.debug_struct("Env").field("var", var).finish(),
+        }
+    }
+}
+
+impl DuskSignerKeyConf {
+    fn resolve(&self) -> Result<H256, Report> {
+        match self {
+            Self::Inline { key } => Ok(*key),
+            Self::File { path } => {
+                let key = fs::read_to_string(path)
+                    .with_context(|| format!("Failed to read Dusk signer key file `{path}`"))?;
+                Self::parse_key_material(&key)
+                    .with_context(|| format!("Invalid Dusk signer key file `{path}`"))
+            }
+            Self::Env { var } => {
+                let key = std::env::var(var)
+                    .with_context(|| format!("Dusk signer key env var `{var}` is not set"))?;
+                Self::parse_key_material(&key)
+                    .with_context(|| format!("Invalid Dusk signer key env var `{var}`"))
+            }
+        }
+    }
+
+    fn parse_key_material(key: &str) -> Result<H256, Report> {
+        let key = key.trim();
+        if key.is_empty() {
+            bail!("Dusk signer key material is empty");
+        }
+        hex_or_base58_or_bech32_to_h256(key)
+            .context("Expected a valid Dusk signer key in hex, base58, or bech32")
+    }
+}
+
 /// Signer types
 #[derive(Default, Debug, Clone)]
 pub enum SignerConf {
@@ -106,8 +171,8 @@ pub enum SignerConf {
     },
     /// Dusk Specific key
     DuskKey {
-        /// Private key value
-        key: H256,
+        /// Private key source
+        key: DuskSignerKeyConf,
     },
     /// Assume node will sign on RPC calls
     #[default]
@@ -364,7 +429,8 @@ impl ChainSigner for hyperlane_aleo::AleoSigner {
 impl BuildableWithSignerConf for hyperlane_dusk::DuskSigner {
     async fn build(conf: &SignerConf) -> Result<Self, Report> {
         if let SignerConf::DuskKey { key } = conf {
-            hyperlane_dusk::DuskSigner::new(*key).map_err(|e| eyre::eyre!(e.to_string()))
+            let key = key.resolve()?;
+            hyperlane_dusk::DuskSigner::new(key).map_err(|e| eyre::eyre!(e.to_string()))
         } else {
             bail!(format!("{conf:?} key is not supported by dusk"));
         }
@@ -586,6 +652,36 @@ mod tests {
         assert_eq!(
             "TWfaDp7My62uVWnxPiohWau4HyanfDG31N",
             tron_signer.address_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn dusk_signer_builds_from_key_file() {
+        use crate::settings::signers::{BuildableWithSignerConf, DuskSignerKeyConf};
+
+        const PRIVATE_KEY: &str =
+            "0x1111111111111111111111111111111111111111111111111111111111111111";
+
+        let tempdir = tempfile::tempdir().expect("create tempdir");
+        let key_path = tempdir.path().join("dusk-signer.key");
+        std::fs::write(&key_path, format!("{PRIVATE_KEY}\n")).expect("write key file");
+
+        let signer_config = SignerConf::DuskKey {
+            key: DuskSignerKeyConf::File {
+                path: key_path.to_string_lossy().to_string(),
+            },
+        };
+
+        let signer = hyperlane_dusk::DuskSigner::build(&signer_config)
+            .await
+            .expect("build Dusk signer from key file");
+
+        assert_eq!(
+            signer.address_h256(),
+            H256::from_slice(
+                &hex::decode("45f325943f47c662afbdfc9bd0b48f38b162441d92363746d8582677d7e4ce4a")
+                    .expect("decode expected Dusk address")
+            )
         );
     }
 }

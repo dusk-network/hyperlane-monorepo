@@ -51,7 +51,9 @@ The Dusk Rust agent integration currently supports the pieces used by the
 companion Dusk E2E evidence:
 
 - Dusk chain/protocol parsing.
-- `duskKey` signer construction.
+- `duskKey` signer construction with inline, `keyFile`, or `keyEnv` key
+  sources. Inline key material remains for backwards-compatible local dev
+  only; generated Dusk demo configs use `keyFile`.
 - RUES-backed provider/indexing.
 - Mailbox dispatch/process flow.
 - MerkleTreeHook reads and indexer wrapping.
