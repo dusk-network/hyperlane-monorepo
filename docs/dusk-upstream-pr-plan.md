@@ -102,9 +102,12 @@ with exact run IDs and artifact paths.
 - Dusk must resolve or replace split decision issues #4 through #9 before the
   upstream PR text can accurately describe accepted Dusk production
   assumptions.
-- Dusk agent/runtime review has been requested from `Neotamandua`, based on
-  recent Rusk HTTP/RUES/GraphQL route ownership. No `CODEOWNERS`, `OWNERS`, or
-  `MAINTAINERS` file was found in this fork or the companion Dusk repo.
+- This fork keeps upstream `.github/CODEOWNERS` routing `rust/` to Hyperlane's
+  `@tkporter`; the companion Dusk repo has no `CODEOWNERS`, `OWNERS`, or
+  `MAINTAINERS` file. Internal Dusk agent/runtime review is still requested
+  from `Neotamandua`, based on recent Rusk HTTP/RUES/GraphQL route ownership,
+  because the remaining decisions are Dusk/Rusk-specific and not covered by
+  upstream Hyperlane ownership alone.
 - Dusk must decide CI/repro runner strategy for the private Rusk-dependent
   companion checks. The companion repo now has `make repro-check` and
   `make repro-check-agent` for the repeatable local non-E2E subset, plus a
