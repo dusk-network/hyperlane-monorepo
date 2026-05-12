@@ -828,19 +828,19 @@ mod test {
 
         let signer = parse_signer(value_parser).unwrap();
 
-        match signer {
+        assert!(matches!(
+            signer,
             SignerConf::DuskKey {
-                key: DuskSignerKeyConf::File { path },
-            } => assert_eq!(path, "/run/secrets/dusk-signer.key"),
-            other => panic!("expected dusk keyFile signer, got {other:?}"),
-        }
+                key: DuskSignerKeyConf::File { ref path },
+            } if path == "/run/secrets/dusk-signer.key"
+        ));
     }
 
     #[test]
     fn rejects_dusk_signer_with_multiple_key_sources() {
         let val = json!({
             "type": "duskKey",
-            "key": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "key": "inline-key-present",
             "keyfile": "/run/secrets/dusk-signer.key"
         });
         let value_parser = ValueParser::new(Default::default(), &val);
