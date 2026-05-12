@@ -16,27 +16,30 @@ Current Dusk branch:
   the companion Dusk `make gate-status` report.
 - Dusk signer test cleanup evidence commit:
   `b989bbcfbb2a427d3a538c5201f5d7214de6ba84`
-- Upstream base: `66e8c1f4644cea0392b33007225e6611b8f06804`
-- Upstream commit: `feat: whitelist moonpay route for fastpath relayer (#8725)`
+- Upstream base: `7a362a093d622b69d6c55d47992c9490ec33fb1a`
+- Upstream commit: `feat: temporarily disable relaying to/from krown (#8742)`
 
 Verification commands:
 
 ```bash
 git rev-parse upstream/main
 git merge-base HEAD upstream/main
+git rev-list --left-right --count HEAD...upstream/main
 cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p scraper -p lander
 ```
 
 Observed:
 
 - `upstream/main` and `merge-base HEAD upstream/main` both resolve to
-  `66e8c1f4644cea0392b33007225e6611b8f06804`.
+  `7a362a093d622b69d6c55d47992c9490ec33fb1a`.
+- `git rev-list --left-right --count HEAD...upstream/main` reports `25 0`.
 - The Rust agent check passed after the rebase to that base.
 
 ## Upstream Areas Checked
 
 Recent upstream changes around the current base include:
 
+- `7a362a09 feat: temporarily disable relaying to/from krown (#8742)`
 - `66e8c1f4 feat: whitelist moonpay route for fastpath relayer (#8725)`
 - `f758a7063 feat: rate limit ism support (#8703)`
 - `b8a600cc1 feat: add RateLimitedHook support to warp deploy and apply (#8715)`
@@ -49,9 +52,10 @@ CLI, deploy, and TypeScript relayer metadata changes. The Dusk Rust agent
 branch does not add TypeScript SDK/CLI support and does not claim rate-limited
 ISM or rate-limited hook support for Dusk deployments.
 
-The `66e8c1f4` fastpath relayer whitelist update is also TypeScript
-infra/config-only. It does not change the Rust agent interfaces used by the
-Dusk chain crate, relayer, validator, scraper, or lander integration.
+The `7a362a09` Krown relaying disablement and `66e8c1f4` fastpath relayer
+whitelist update are TypeScript infra/config-only. They do not change the Rust
+agent interfaces used by the Dusk chain crate, relayer, validator, scraper, or
+lander integration.
 
 ## Current Dusk Support
 
