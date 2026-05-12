@@ -53,7 +53,8 @@ companion Dusk E2E evidence:
 - Dusk chain/protocol parsing.
 - `duskKey` signer construction with inline, `keyFile`, or `keyEnv` key
   sources. Inline key material remains for backwards-compatible local dev
-  only; generated Dusk demo configs use `keyFile`.
+  only; generated Dusk demo configs use `keyFile`. On Unix, `keyFile` paths
+  must be regular files with no group/world permissions.
 - RUES-backed provider/indexing.
 - Mailbox dispatch/process flow.
 - MerkleTreeHook reads and indexer wrapping.
