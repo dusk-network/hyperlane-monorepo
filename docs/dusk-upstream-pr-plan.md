@@ -6,10 +6,11 @@ remaining production decisions are accepted or changed.
 
 Current base:
 
-- Current Dusk monorepo branch head:
-  `60e1254943058f8249e297dc1733e892ec4907fa`
+- Current Dusk monorepo branch head: see the GitHub PR header.
 - Upstream Hyperlane `main`: `f758a70630fd72d4749c3afb79454e725b8081a8`
 - Rebase/check evidence commit: `f0df7aa522c65c4a7cf94c677c9573bd353c9b72`
+- Dusk signer test cleanup evidence commit:
+  `662d8b850b8903d15e1d7a24cfef1862d9a2f9ea`
 
 ## Proposed Upstream Shape
 
