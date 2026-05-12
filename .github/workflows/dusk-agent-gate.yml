@@ -1,0 +1,75 @@
+name: Dusk Hyperlane Agent Gate
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      dusk_ref:
+        description: "dusk-network/hyperlane-dusk ref to checkout for shared types"
+        required: true
+        default: "feat/dusk-hardening-v2"
+
+permissions:
+  contents: read
+
+jobs:
+  dusk-agent-check:
+    name: Dusk agent cargo check
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      GH_TOKEN: ${{ secrets.DUSK_ORG_READ_TOKEN || github.token }}
+      DUSK_REF: ${{ inputs.dusk_ref || 'feat/dusk-hardening-v2' }}
+      MONOREPO_DIR: ${{ github.workspace }}/hyperlane/hyperlane-monorepo
+      DUSK_DIR: ${{ github.workspace }}/hyperlane/dusk
+
+    steps:
+      - name: Checkout Hyperlane monorepo
+        uses: actions/checkout@v4
+        with:
+          path: hyperlane/hyperlane-monorepo
+          persist-credentials: false
+
+      - name: Scan Dusk agent runtime placeholders
+        working-directory: ${{ env.MONOREPO_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ! rg -n "todo!|unimplemented!|panic!" rust/main/chains/hyperlane-dusk -g '!target'
+
+      - name: Verify private Dusk checkout access
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api repos/dusk-network/hyperlane-dusk --jq .full_name >/dev/null || {
+            echo "::error::DUSK_ORG_READ_TOKEN must grant read access to dusk-network/hyperlane-dusk for the Dusk agent cargo check"
+            exit 1
+          }
+
+      - name: Checkout Dusk Hyperlane shared types
+        uses: actions/checkout@v4
+        with:
+          repository: dusk-network/hyperlane-dusk
+          ref: ${{ env.DUSK_REF }}
+          path: hyperlane/dusk
+          token: ${{ env.GH_TOKEN }}
+          persist-credentials: false
+
+      - name: Report resolved check refs
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'monorepo_ref=%s\n' "$GITHUB_SHA"
+          git -C "$MONOREPO_DIR" rev-parse HEAD
+          printf 'dusk_ref=%s\n' "$DUSK_REF"
+          git -C "$DUSK_DIR" rev-parse HEAD
+
+      - name: Check Dusk agent crate
+        working-directory: ${{ env.MONOREPO_DIR }}/rust/main
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check -p hyperlane-dusk
