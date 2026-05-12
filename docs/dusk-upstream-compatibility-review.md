@@ -49,6 +49,10 @@ CLI, deploy, and TypeScript relayer metadata changes. The Dusk Rust agent
 branch does not add TypeScript SDK/CLI support and does not claim rate-limited
 ISM or rate-limited hook support for Dusk deployments.
 
+The `66e8c1f4` fastpath relayer whitelist update is also TypeScript
+infra/config-only. It does not change the Rust agent interfaces used by the
+Dusk chain crate, relayer, validator, scraper, or lander integration.
+
 ## Current Dusk Support
 
 The Dusk Rust agent integration currently supports the pieces used by the
