@@ -6,6 +6,8 @@ remaining production decisions are accepted or changed.
 
 Current base:
 
+- Current Dusk monorepo branch head:
+  `ecb11359747dce240a24c50fa229afd4479919b5`
 - Upstream Hyperlane `main`: `f758a70630fd72d4749c3afb79454e725b8081a8`
 - Rebase/check evidence commit: `f0df7aa522c65c4a7cf94c677c9573bd353c9b72`
 
@@ -44,13 +46,17 @@ The companion Dusk PR is the source of contract/tooling/security evidence:
 - `dusk-network/hyperlane-dusk#1`
 - Latest evidence includes clean-Rusk TestMock and MessageIdMultisig E2E,
   dirty redeploy guard, metadata corruption, RPC failures, low signer balance,
-  duplicate relayers, and a 3102-second high-volume restart/backlog soak.
+  duplicate relayers, a 3102-second high-volume restart/backlog soak, and the
+  later 7282-second clean-Rusk soak with 280 completed transfers.
 - `SECURITY_REVIEW.md` records Dusk-specific security assumptions and
   deviations from Solidity Hyperlane contracts.
 - `GOAL_AUDIT.md` maps the original revival goal to concrete artifacts and
   remaining gates.
 - `dusk-network/hyperlane-dusk#2` tracks the remaining production sign-off
   decisions before upstream PR preparation.
+- Split decision issues `dusk-network/hyperlane-dusk#4` through
+  `dusk-network/hyperlane-dusk#9` route the remaining contract-policy,
+  signer-custody, CI/repro-runner, and soak-acceptance decisions.
 
 ## Upstream Compatibility Review
 
@@ -90,6 +96,9 @@ with exact run IDs and artifact paths.
 - Dusk must decide production signer custody and CI artifact policy.
 - Dusk must resolve the production sign-off tracker in
   `dusk-network/hyperlane-dusk#2`.
+- Dusk must resolve or replace split decision issues #4 through #9 before the
+  upstream PR text can accurately describe accepted Dusk production
+  assumptions.
 - Dusk agent/runtime review has been requested from `Neotamandua`, based on
   recent Rusk HTTP/RUES/GraphQL route ownership. No `CODEOWNERS`, `OWNERS`, or
   `MAINTAINERS` file was found in this fork or the companion Dusk repo.
