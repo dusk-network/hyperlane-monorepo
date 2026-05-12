@@ -16,8 +16,8 @@ Current Dusk branch:
   the companion Dusk `make gate-status` report.
 - Dusk signer test cleanup evidence commit:
   `b989bbcfbb2a427d3a538c5201f5d7214de6ba84`
-- Upstream base: `7a362a093d622b69d6c55d47992c9490ec33fb1a`
-- Upstream commit: `feat: temporarily disable relaying to/from krown (#8742)`
+- Upstream base: `c6bce706316206ac7b5652155c9ea92e96f78c39`
+- Upstream commit: `fix: reduce cctp interval to 10 retries (#8744)`
 
 Verification commands:
 
@@ -31,14 +31,15 @@ cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p scrap
 Observed:
 
 - `upstream/main` and `merge-base HEAD upstream/main` both resolve to
-  `7a362a093d622b69d6c55d47992c9490ec33fb1a`.
-- `git rev-list --left-right --count HEAD...upstream/main` reports `25 0`.
+  `c6bce706316206ac7b5652155c9ea92e96f78c39`.
+- `git rev-list --left-right --count HEAD...upstream/main` reports `26 0`.
 - The Rust agent check passed after the rebase to that base.
 
 ## Upstream Areas Checked
 
 Recent upstream changes around the current base include:
 
+- `c6bce706 fix: reduce cctp interval to 10 retries (#8744)`
 - `7a362a09 feat: temporarily disable relaying to/from krown (#8742)`
 - `66e8c1f4 feat: whitelist moonpay route for fastpath relayer (#8725)`
 - `f758a7063 feat: rate limit ism support (#8703)`
@@ -52,10 +53,13 @@ CLI, deploy, and TypeScript relayer metadata changes. The Dusk Rust agent
 branch does not add TypeScript SDK/CLI support and does not claim rate-limited
 ISM or rate-limited hook support for Dusk deployments.
 
-The `7a362a09` Krown relaying disablement and `66e8c1f4` fastpath relayer
-whitelist update are TypeScript infra/config-only. They do not change the Rust
-agent interfaces used by the Dusk chain crate, relayer, validator, scraper, or
-lander integration.
+The `c6bce706` CCTP retry interval change touches Rust relayer CCIP-read
+metadata handling only. Dusk continues to return explicit unsupported errors
+for CCIP-read ISMs, so this does not expand the supported Dusk behavior. The
+`7a362a09` Krown relaying disablement and `66e8c1f4` fastpath relayer whitelist
+update are TypeScript infra/config-only. They do not change the Rust agent
+interfaces used by the Dusk chain crate, relayer, validator, scraper, or lander
+integration.
 
 ## Current Dusk Support
 
