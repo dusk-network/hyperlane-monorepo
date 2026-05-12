@@ -143,6 +143,49 @@ Observed:
   placeholder macros for other chains, for example Fuel and Radix branches.
   Those are pre-existing upstream behavior and are not Dusk runtime paths.
 
+## Fork Dependency Advisory Scope
+
+The Dusk fork currently has open Dependabot alerts, but they are inherited npm
+alerts outside the Dusk Rust integration diff. They are not remediated in this
+branch because doing so would require broad upstream TypeScript/package-lock
+churn unrelated to the internal Dusk agent review.
+
+Commands checked:
+
+```bash
+gh api repos/dusk-network/hyperlane-monorepo/dependabot/alerts --paginate \
+  | jq -s 'add | map(select(.state=="open")) | {total:length, by_ecosystem:(group_by(.dependency.package.ecosystem)|map({ecosystem:.[0].dependency.package.ecosystem,count:length})), by_manifest:(group_by(.dependency.manifest_path)|map({manifest:.[0].dependency.manifest_path,count:length})|sort_by(.manifest)), severities:(group_by(.security_advisory.severity)|map({severity:.[0].security_advisory.severity,count:length}))}'
+gh api repos/dusk-network/hyperlane-monorepo/dependabot/alerts --paginate \
+  | jq -r -s 'add | map(select(.state=="open") | .dependency.manifest_path) | unique[]'
+gh api repos/dusk-network/hyperlane-monorepo/dependabot/alerts --paginate \
+  --jq '.[] | select(.state=="open") | select(.dependency.package.ecosystem != "npm") | [.number,.dependency.package.ecosystem,.dependency.package.name,.dependency.manifest_path] | @tsv'
+git diff --name-status upstream/main...HEAD -- \
+  pnpm-lock.yaml \
+  typescript/github-proxy/package.json \
+  typescript/warp-widget/examples/react-app/package.json \
+  typescript/warp-widget/examples/react-app/pnpm-lock.yaml \
+  typescript/widgets/package.json
+```
+
+Observed on 2026-05-12:
+
+- 173 open alerts, all ecosystem `npm`.
+- Severity counts: 6 critical, 68 high, 79 medium, 20 low.
+- Alert manifests: `pnpm-lock.yaml`, `typescript/github-proxy/package.json`,
+  `typescript/warp-widget/examples/react-app/package.json`,
+  `typescript/warp-widget/examples/react-app/pnpm-lock.yaml`, and
+  `typescript/widgets/package.json`.
+- No open non-npm Dependabot alerts were returned.
+- The Dusk branch diff does not touch any of those npm manifests.
+- The Dusk branch does touch `rust/main/Cargo.lock` for the Dusk Rust agent
+  integration, but the Dependabot API reported no open Cargo/Rust alerts for
+  this monorepo fork.
+
+Upstream PR preparation should re-check this advisory scope. If Hyperlane
+main still has npm advisories then, they should be handled as upstream
+dependency maintenance rather than as Dusk protocol integration changes unless
+Hyperlane reviewers ask for a combined remediation.
+
 ## Upstream PR Implication
 
 An upstream Hyperlane PR should describe this as Dusk Rust agent/protocol
