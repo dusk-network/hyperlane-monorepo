@@ -597,12 +597,10 @@ mod tests {
     async fn dusk_signer_builds_from_key_file() {
         use crate::settings::signers::{BuildableWithSignerConf, DuskSignerKeyConf};
 
-        const PRIVATE_KEY: &str =
-            "0x1111111111111111111111111111111111111111111111111111111111111111";
-
         let tempdir = tempfile::tempdir().expect("create tempdir");
         let key_path = tempdir.path().join("dusk-signer.key");
-        std::fs::write(&key_path, format!("{PRIVATE_KEY}\n")).expect("write key file");
+        let private_key = format!("0x{}", "11".repeat(32));
+        std::fs::write(&key_path, format!("{private_key}\n")).expect("write key file");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -637,12 +635,9 @@ mod tests {
 
         use crate::settings::signers::{BuildableWithSignerConf, DuskSignerKeyConf};
 
-        const PRIVATE_KEY: &str =
-            "0x1111111111111111111111111111111111111111111111111111111111111111";
-
         let tempdir = tempfile::tempdir().expect("create tempdir");
         let key_path = tempdir.path().join("dusk-signer.key");
-        std::fs::write(&key_path, format!("{PRIVATE_KEY}\n")).expect("write key file");
+        std::fs::write(&key_path, "unread-before-permission-check\n").expect("write key file");
         std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644))
             .expect("set loose key file permissions");
 
@@ -652,10 +647,9 @@ mod tests {
             },
         };
 
-        let err = match hyperlane_dusk::DuskSigner::build(&signer_config).await {
-            Ok(_) => panic!("loose Dusk signer key file permissions must be rejected"),
-            Err(err) => err,
-        };
+        let err = hyperlane_dusk::DuskSigner::build(&signer_config)
+            .await
+            .expect_err("loose Dusk signer key file permissions must be rejected");
 
         assert!(
             err.to_string().contains("permissions"),
