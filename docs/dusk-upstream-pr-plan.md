@@ -43,6 +43,13 @@ The current upstream-facing diff is intentionally limited to Rust agent support:
 - `rust/main/agents/validator/src/reorg_reporter.rs`
 - `rust/main/lander/src/adapter/chains/factory.rs`
 
+The Dusk Rust agent crate currently depends on `hyperlane-dusk-types` through
+the adjacent companion Dusk repo path (`../../../../../dusk/types`). That keeps
+Dusk-specific message/metadata/token encoding shared with the Dusk contract
+ports during internal review. An upstream Hyperlane PR should either vendor or
+publish that type crate in the shape Hyperlane maintainers prefer, or replace
+the path dependency before upstream submission.
+
 ## Companion Evidence
 
 The companion Dusk PR is the source of contract/tooling/security evidence:
