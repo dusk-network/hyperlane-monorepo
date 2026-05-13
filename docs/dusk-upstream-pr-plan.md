@@ -7,11 +7,13 @@ remaining production decisions are accepted or changed.
 Current base:
 
 - Current Dusk monorepo branch head: see the GitHub PR header.
-- Upstream Hyperlane `main`: `c6bce706316206ac7b5652155c9ea92e96f78c39`
+- Upstream Hyperlane `main`: `2b7db706023806b36a57e446205ae443537ae9ec`
 - Rebase/check evidence: use the live `git fetch upstream main`,
   `git merge-base HEAD upstream/main`, and
   `git rev-list --left-right --count HEAD...upstream/main` checks recorded in
   the companion Dusk gate reports.
+- Latest targeted validation after rebasing onto that upstream head is recorded
+  on monorepo head `abf2eaa5d7361d37ab19e755b71371e35f92f681`.
 - Dusk signer test cleanup evidence commit:
   `b989bbcfbb2a427d3a538c5201f5d7214de6ba84`
 
