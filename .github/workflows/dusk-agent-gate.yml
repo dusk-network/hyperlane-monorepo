@@ -38,7 +38,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ! rg -n "todo!|unimplemented!|panic!" rust/main/chains/hyperlane-dusk -g '!target'
+          if git grep -n -E 'todo!|unimplemented!|panic!|expect\(' -- rust/main/chains/hyperlane-dusk/src; then
+            echo "::error::Dusk agent runtime panic/placeholder path found"
+            exit 1
+          fi
 
       - name: Verify private Dusk checkout access
         shell: bash
