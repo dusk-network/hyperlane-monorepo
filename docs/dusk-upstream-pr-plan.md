@@ -103,10 +103,11 @@ so missing token provisioning fails explicitly. It is an early agent
 compile/status gate, not a replacement for the full local `cargo check`
 command above or the companion Dusk E2E evidence.
 
-The inherited upstream Rust agent image workflow is guarded to run only when
-`github.repository_owner == 'hyperlane-xyz'`. That avoids a Dusk-fork PR
-failure on Hyperlane-owned GitHub App and image-publishing credentials while
-preserving the release/image workflow for the eventual upstream PR path.
+The inherited upstream Rust agent and monorepo image workflows are guarded to
+run only when `github.repository_owner == 'hyperlane-xyz'`. That avoids
+Dusk-fork PR failures on Hyperlane-owned GitHub App, Depot, and
+image-publishing credentials while preserving the release/image workflows for
+the eventual upstream PR path.
 
 From the companion Dusk repo:
 
