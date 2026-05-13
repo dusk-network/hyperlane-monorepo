@@ -32,8 +32,9 @@ Observed:
 
 - `upstream/main` and `merge-base HEAD upstream/main` both resolve to
   `c6bce706316206ac7b5652155c9ea92e96f78c39`.
-- `git rev-list --left-right --count HEAD...upstream/main` currently reports
-  `31 0` after the documentation and workflow guard updates.
+- `git rev-list --left-right --count HEAD...upstream/main` is reported by the
+  live gate checks instead of being hard-coded here, so docs-only evidence
+  refreshes do not immediately stale this compatibility note.
 - The Rust agent check passed after the rebase to that base.
 
 The Dusk fork now also proposes
