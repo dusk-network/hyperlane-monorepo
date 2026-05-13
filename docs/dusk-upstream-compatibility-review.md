@@ -33,7 +33,7 @@ Observed:
 - `upstream/main` and `merge-base HEAD upstream/main` both resolve to
   `c6bce706316206ac7b5652155c9ea92e96f78c39`.
 - `git rev-list --left-right --count HEAD...upstream/main` currently reports
-  `28 0` after the documentation and workflow guard updates.
+  `31 0` after the documentation and workflow guard updates.
 - The Rust agent check passed after the rebase to that base.
 
 The Dusk fork now also proposes
@@ -44,6 +44,11 @@ placeholder macros, preflights private repo access for `DUSK_ORG_READ_TOKEN`,
 and runs `cargo check -p hyperlane-dusk`. The workflow is intended to give the
 monorepo PR a focused status check while the full cross-repo repro and E2E
 evidence remain in `dusk-network/hyperlane-dusk`.
+
+The inherited upstream `rust-docker.yml` image-publishing workflow now has a
+job-level `github.repository_owner == 'hyperlane-xyz'` guard. This keeps the
+Dusk fork from failing on Hyperlane-owned GitHub App and image-publishing
+credentials, and leaves the workflow active for the later upstream PR path.
 
 ## Upstream Areas Checked
 
