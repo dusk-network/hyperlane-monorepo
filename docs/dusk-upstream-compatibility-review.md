@@ -37,7 +37,8 @@ Observed:
   refreshes do not immediately stale this compatibility note.
 - The Rust agent check passed after the rebase to that base. Latest
   clean-layout validation is recorded in the companion Dusk `TEST_REPORT.md`
-  on monorepo head `48dcc0c87efc12584904d841d5088c1ae4acef20`.
+  for run `1778683232` on monorepo head
+  `9050143c1ef12f76d117ee97effa79da8df3e334`.
 
 The Dusk fork now also proposes
 `.github/workflows/dusk-agent-gate.yml` as a narrow PR status check for the
