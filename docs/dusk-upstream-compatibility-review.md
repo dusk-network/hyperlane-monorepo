@@ -35,9 +35,9 @@ Observed:
 - `git rev-list --left-right --count HEAD...upstream/main` is reported by the
   live gate checks instead of being hard-coded here, so docs-only evidence
   refreshes do not immediately stale this compatibility note.
-- The Rust agent check passed after the rebase to that base. Latest targeted
-  local validation is recorded on monorepo head
-  `abf2eaa5d7361d37ab19e755b71371e35f92f681`.
+- The Rust agent check passed after the rebase to that base. Latest
+  clean-layout validation is recorded in the companion Dusk `TEST_REPORT.md`
+  on monorepo head `48dcc0c87efc12584904d841d5088c1ae4acef20`.
 
 The Dusk fork now also proposes
 `.github/workflows/dusk-agent-gate.yml` as a narrow PR status check for the
