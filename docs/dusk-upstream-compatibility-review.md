@@ -46,10 +46,11 @@ and runs `cargo check -p hyperlane-dusk`. The workflow is intended to give the
 monorepo PR a focused status check while the full cross-repo repro and E2E
 evidence remain in `dusk-network/hyperlane-dusk`.
 
-The inherited upstream `rust-docker.yml` image-publishing workflow now has a
-job-level `github.repository_owner == 'hyperlane-xyz'` guard. This keeps the
-Dusk fork from failing on Hyperlane-owned GitHub App and image-publishing
-credentials, and leaves the workflow active for the later upstream PR path.
+The inherited upstream `rust-docker.yml` and `monorepo-docker.yml`
+image-publishing workflows now have job-level
+`github.repository_owner == 'hyperlane-xyz'` guards. This keeps the Dusk fork
+from failing on Hyperlane-owned GitHub App, Depot, and image-publishing
+credentials, and leaves the workflows active for the later upstream PR path.
 
 ## Upstream Areas Checked
 

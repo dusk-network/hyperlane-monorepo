@@ -30,6 +30,7 @@ concurrency:
 
 jobs:
   build-and-push:
+    if: github.repository_owner == 'hyperlane-xyz'
     runs-on: ubuntu-latest
     permissions:
       contents: read
