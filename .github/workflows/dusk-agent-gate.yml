@@ -28,7 +28,7 @@ jobs:
 
     steps:
       - name: Checkout Hyperlane monorepo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: hyperlane/hyperlane-monorepo
           persist-credentials: false
@@ -53,7 +53,7 @@ jobs:
           }
 
       - name: Checkout Dusk Hyperlane shared types
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: dusk-network/hyperlane-dusk
           ref: ${{ env.DUSK_REF }}
