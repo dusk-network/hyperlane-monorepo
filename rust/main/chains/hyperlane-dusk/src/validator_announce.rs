@@ -6,8 +6,7 @@ use tracing::info;
 
 use hyperlane_core::{
     Announcement, ChainResult, FixedPointNumber, HyperlaneChain, HyperlaneContract,
-    HyperlaneDomain, HyperlaneProvider, SignedType, TxOutcome, ValidatorAnnounce, H256, H512,
-    U256,
+    HyperlaneDomain, HyperlaneProvider, SignedType, TxOutcome, ValidatorAnnounce, H256, H512, U256,
 };
 
 use hyperlane_dusk_types::EthAddress;
@@ -90,10 +89,7 @@ impl ValidatorAnnounce for DuskValidatorAnnounce {
         Ok(locations)
     }
 
-    async fn announce(
-        &self,
-        announcement: SignedType<Announcement>,
-    ) -> ChainResult<TxOutcome> {
+    async fn announce(&self, announcement: SignedType<Announcement>) -> ChainResult<TxOutcome> {
         let signer = self
             .signer
             .as_ref()
@@ -116,18 +112,16 @@ impl ValidatorAnnounce for DuskValidatorAnnounce {
             validator_eth_addr,
             &announcement.value.storage_location,
             &signature,
-        );
+        )?;
 
-        let res = crate::tx_sender::dusk_tx_call(
-            &self.conn,
-            signer,
-            &self.va_id,
-            "announce",
-            &args,
-        )
-        .await?;
+        let res =
+            crate::tx_sender::dusk_tx_call(&self.conn, signer, &self.va_id, "announce", &args)
+                .await?;
 
-        let tx_id = res.get("tx_id").and_then(|v| v.as_str()).unwrap_or_default();
+        let tx_id = res
+            .get("tx_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         let transaction_id =
             crate::tx_sender::dusk_tx_id_to_h512(tx_id).unwrap_or_else(|_| H512::zero());
 

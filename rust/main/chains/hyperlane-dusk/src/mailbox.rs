@@ -144,19 +144,18 @@ impl Mailbox for DuskMailbox {
             "Processing message on Dusk via dusk-tx"
         );
 
-        let args = crate::tx_sender::process_args(&metadata_bytes, &encoded);
+        let args = crate::tx_sender::process_args(&metadata_bytes, &encoded)?;
 
-        let res = crate::tx_sender::dusk_tx_call(
-            &self.conn,
-            signer,
-            &self.mailbox_id,
-            "process",
-            &args,
-        )
-        .await?;
+        let res =
+            crate::tx_sender::dusk_tx_call(&self.conn, signer, &self.mailbox_id, "process", &args)
+                .await?;
 
-        let tx_id = res.get("tx_id").and_then(|v| v.as_str()).unwrap_or_default();
-        let transaction_id = crate::tx_sender::dusk_tx_id_to_h512(tx_id).unwrap_or_else(|_| H512::zero());
+        let tx_id = res
+            .get("tx_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let transaction_id =
+            crate::tx_sender::dusk_tx_id_to_h512(tx_id).unwrap_or_else(|_| H512::zero());
 
         Ok(TxOutcome {
             transaction_id,
@@ -193,12 +192,12 @@ impl Mailbox for DuskMailbox {
     ) -> ChainResult<Vec<u8>> {
         let encoded = Self::encode_message(message);
         let metadata_bytes = metadata.to_owned();
-        Ok(rkyv_serialize(&(metadata_bytes, encoded)))
+        Ok(rkyv_serialize(&(metadata_bytes, encoded))?)
     }
 
     fn delivered_calldata(&self, message_id: H256) -> ChainResult<Option<Vec<u8>>> {
         let id_bytes: [u8; 32] = message_id.into();
-        Ok(Some(rkyv_serialize(&(id_bytes,))))
+        Ok(Some(rkyv_serialize(&(id_bytes,))?))
     }
 }
 
