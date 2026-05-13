@@ -13,8 +13,8 @@ Current base:
   `git rev-list --left-right --count HEAD...upstream/main` checks recorded in
   the companion Dusk gate reports.
 - Latest clean-layout validation after rebasing onto that upstream head is
-  recorded in the companion Dusk `TEST_REPORT.md` on monorepo head
-  `48dcc0c87efc12584904d841d5088c1ae4acef20`.
+  recorded in the companion Dusk `TEST_REPORT.md` for run `1778683232` on
+  monorepo head `9050143c1ef12f76d117ee97effa79da8df3e334`.
 - Dusk signer test cleanup evidence commit:
   `b989bbcfbb2a427d3a538c5201f5d7214de6ba84`
 
