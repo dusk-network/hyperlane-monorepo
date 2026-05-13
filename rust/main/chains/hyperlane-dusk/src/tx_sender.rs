@@ -69,9 +69,14 @@ pub async fn dusk_tx_call(
 
     // Provide the secret key via stdin so it is not exposed in the process list.
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(secret_key_hex.as_bytes()).await.map_err(|e| {
-            HyperlaneDuskError::Other(format!("Failed to write dusk secret key to dusk-tx stdin: {e}"))
-        })?;
+        stdin
+            .write_all(secret_key_hex.as_bytes())
+            .await
+            .map_err(|e| {
+                HyperlaneDuskError::Other(format!(
+                    "Failed to write dusk secret key to dusk-tx stdin: {e}"
+                ))
+            })?;
         stdin.write_all(b"\n").await.map_err(|e| {
             HyperlaneDuskError::Other(format!("Failed to finalize dusk-tx stdin: {e}"))
         })?;
@@ -127,9 +132,7 @@ pub async fn dusk_tx_call(
 /// Convert a 32-byte Dusk transaction ID (hex) into a `H512` by left-padding with zeros.
 pub fn dusk_tx_id_to_h512(tx_id_hex: &str) -> Result<H512, HyperlaneDuskError> {
     let bytes = hex::decode(tx_id_hex).map_err(|e| {
-        HyperlaneDuskError::Other(format!(
-            "Invalid dusk tx_id hex '{tx_id_hex}': {e}"
-        ))
+        HyperlaneDuskError::Other(format!("Invalid dusk tx_id hex '{tx_id_hex}': {e}"))
     })?;
     if bytes.len() != 32 {
         return Err(HyperlaneDuskError::Other(format!(
@@ -143,7 +146,10 @@ pub fn dusk_tx_id_to_h512(tx_id_hex: &str) -> Result<H512, HyperlaneDuskError> {
 }
 
 /// Build rkyv-serialized args for mailbox.process(metadata, encoded_message).
-pub fn process_args(metadata: &[u8], encoded_message: &[u8]) -> Vec<u8> {
+pub fn process_args(
+    metadata: &[u8],
+    encoded_message: &[u8],
+) -> Result<Vec<u8>, HyperlaneDuskError> {
     rkyv_serialize(&(metadata.to_vec(), encoded_message.to_vec()))
 }
 
@@ -152,11 +158,7 @@ pub fn announce_args(
     validator_eth_addr: [u8; 20],
     storage_location: &str,
     signature: &[u8],
-) -> Vec<u8> {
+) -> Result<Vec<u8>, HyperlaneDuskError> {
     let eth_addr = hyperlane_dusk_types::EthAddress(validator_eth_addr);
-    rkyv_serialize(&(
-        eth_addr,
-        String::from(storage_location),
-        signature.to_vec(),
-    ))
+    rkyv_serialize(&(eth_addr, String::from(storage_location), signature.to_vec()))
 }

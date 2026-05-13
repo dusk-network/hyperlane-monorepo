@@ -55,15 +55,14 @@ pub struct GasPriceStats {
 
 impl RuesClient {
     /// Create a new RUES client.
-    pub fn new(url: Url) -> Self {
+    pub fn new(url: Url) -> Result<Self, HyperlaneDuskError> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
-            .build()
-            .expect("Failed to build reqwest client");
+            .build()?;
         // Normalize to avoid footguns around missing/extra trailing slashes.
         let base_url = url.to_string();
         let base_url = base_url.trim_end_matches('/').to_string();
-        Self { client, base_url }
+        Ok(Self { client, base_url })
     }
 
     /// Query a contract method, sending and receiving raw bytes.
@@ -74,10 +73,7 @@ impl RuesClient {
         body: &[u8],
     ) -> Result<Vec<u8>, HyperlaneDuskError> {
         let contract_hex = hex::encode(contract_id);
-        let url = format!(
-            "{}/on/contracts:{}/{}",
-            self.base_url, contract_hex, method
-        );
+        let url = format!("{}/on/contracts:{}/{}", self.base_url, contract_hex, method);
 
         let response = self
             .client
@@ -140,10 +136,9 @@ impl RuesClient {
     where
         I: Serialize<AllocSerializer<256>>,
         O: Archive,
-        O::Archived:
-            Deserialize<O, Infallible> + for<'b> rkyv::CheckBytes<DefaultValidator<'b>>,
+        O::Archived: Deserialize<O, Infallible> + for<'b> rkyv::CheckBytes<DefaultValidator<'b>>,
     {
-        let body = rkyv_serialize(args);
+        let body = rkyv_serialize(args)?;
         let response_bytes = self.contract_query_raw(contract_id, method, &body).await?;
         rkyv_deserialize(&response_bytes)
     }
@@ -213,7 +208,9 @@ impl RuesClient {
         }
 
         serde_json::from_str::<JsonValue>(&body).map_err(|e| {
-            HyperlaneDuskError::Other(format!("Failed to parse GraphQL JSON response: {e}. Body: {body}"))
+            HyperlaneDuskError::Other(format!(
+                "Failed to parse GraphQL JSON response: {e}. Body: {body}"
+            ))
         })
     }
 
@@ -239,7 +236,9 @@ impl RuesClient {
         }
 
         serde_json::from_str::<AccountStatus>(&body).map_err(|e| {
-            HyperlaneDuskError::Other(format!("Failed to parse account status JSON: {e}. Body: {body}"))
+            HyperlaneDuskError::Other(format!(
+                "Failed to parse account status JSON: {e}. Body: {body}"
+            ))
         })
     }
 
@@ -268,7 +267,9 @@ impl RuesClient {
         }
 
         serde_json::from_str::<ContractStatus>(&body).map_err(|e| {
-            HyperlaneDuskError::Other(format!("Failed to parse contract status JSON: {e}. Body: {body}"))
+            HyperlaneDuskError::Other(format!(
+                "Failed to parse contract status JSON: {e}. Body: {body}"
+            ))
         })
     }
 
@@ -297,7 +298,9 @@ impl RuesClient {
         }
 
         serde_json::from_str::<GasPriceStats>(&body).map_err(|e| {
-            HyperlaneDuskError::Other(format!("Failed to parse gas price stats JSON: {e}. Body: {body}"))
+            HyperlaneDuskError::Other(format!(
+                "Failed to parse gas price stats JSON: {e}. Body: {body}"
+            ))
         })
     }
 
@@ -316,15 +319,15 @@ impl RuesClient {
 }
 
 /// Serialize a value using rkyv.
-pub fn rkyv_serialize<T>(value: &T) -> Vec<u8>
+pub fn rkyv_serialize<T>(value: &T) -> Result<Vec<u8>, HyperlaneDuskError>
 where
     T: Serialize<AllocSerializer<256>>,
 {
     let mut serializer = AllocSerializer::<256>::default();
     serializer
         .serialize_value(value)
-        .expect("rkyv serialization should not fail");
-    serializer.into_serializer().into_inner().to_vec()
+        .map_err(|e| HyperlaneDuskError::Other(format!("rkyv serialization error: {e:?}")))?;
+    Ok(serializer.into_serializer().into_inner().to_vec())
 }
 
 /// Deserialize a value from rkyv bytes.
