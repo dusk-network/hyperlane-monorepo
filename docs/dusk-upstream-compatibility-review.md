@@ -49,10 +49,13 @@ monorepo PR a focused status check while the full cross-repo repro and E2E
 evidence remain in `dusk-network/hyperlane-dusk`.
 
 The inherited upstream `rust-docker.yml` and `monorepo-docker.yml`
-image-publishing workflows now have job-level
-`github.repository_owner == 'hyperlane-xyz'` guards. This keeps the Dusk fork
-from failing on Hyperlane-owned GitHub App, Depot, and image-publishing
-credentials, and leaves the workflows active for the later upstream PR path.
+image-publishing workflows have job-level
+`github.repository_owner == 'hyperlane-xyz'` guards. The inherited Depot-backed
+PR jobs in `rust.yml`, `test.yml`, and `rebalancer-e2e-test.yml` use the same
+repository-owner guard so Dusk-fork PRs do not stay queued on Hyperlane-owned
+Depot runner labels. This keeps internal Dusk review focused on the Dusk
+review-policy and Dusk agent gates, and leaves the upstream workflows active
+for the later Hyperlane PR path.
 
 ## Upstream Areas Checked
 

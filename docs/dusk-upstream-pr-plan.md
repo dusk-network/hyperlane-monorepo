@@ -106,10 +106,12 @@ compile/status gate, not a replacement for the full local `cargo check`
 command above or the companion Dusk E2E evidence.
 
 The inherited upstream Rust agent and monorepo image workflows are guarded to
-run only when `github.repository_owner == 'hyperlane-xyz'`. That avoids
-Dusk-fork PR failures on Hyperlane-owned GitHub App, Depot, and
-image-publishing credentials while preserving the release/image workflows for
-the eventual upstream PR path.
+run only when `github.repository_owner == 'hyperlane-xyz'`. The inherited
+Depot-backed PR jobs in `rust.yml`, `test.yml`, and `rebalancer-e2e-test.yml`
+use the same guard so internal Dusk PRs do not stay queued on Hyperlane-owned
+runner labels. That avoids Dusk-fork PR failures or indefinite queued checks on
+Hyperlane-owned GitHub App, Depot, and image-publishing infrastructure while
+preserving the upstream workflows for the eventual Hyperlane PR path.
 
 From the companion Dusk repo:
 
