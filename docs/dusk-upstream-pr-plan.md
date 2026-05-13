@@ -7,7 +7,7 @@ remaining production decisions are accepted or changed.
 Current base:
 
 - Current Dusk monorepo branch head: see the GitHub PR header.
-- Upstream Hyperlane `main`: `215135227a0e47883d3581433a02c68d89986e41`
+- Upstream Hyperlane `main`: `7689ff65f4929a72ad0650a03e8dd7d987f0e802`
 - Rebase/check evidence: use the live `git fetch upstream main`,
   `git merge-base HEAD upstream/main`, and
   `git rev-list --left-right --count HEAD...upstream/main` checks recorded in
@@ -15,6 +15,11 @@ Current base:
 - Latest clean-layout validation after rebasing onto that upstream head is
   recorded in the companion Dusk `TEST_REPORT.md` for run `1778683232` on
   monorepo head `9050143c1ef12f76d117ee97effa79da8df3e334`.
+- The latest upstream move from `215135227a0e47883d3581433a02c68d89986e41`
+  to `7689ff65f4929a72ad0650a03e8dd7d987f0e802` is the npm release commit
+  `chore: release npm packages (#8733)`; it updates TypeScript/Starknet
+  changelogs and package versions and does not touch the Dusk Rust agent,
+  covered Rust settings, or Dusk-fork CI paths.
 - Dusk signer test cleanup evidence commit:
   `b989bbcfbb2a427d3a538c5201f5d7214de6ba84`
 

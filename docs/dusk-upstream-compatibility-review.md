@@ -16,8 +16,8 @@ Current Dusk branch:
   the companion Dusk `make gate-status` report.
 - Dusk signer test cleanup evidence commit:
   `b989bbcfbb2a427d3a538c5201f5d7214de6ba84`
-- Upstream base: `215135227a0e47883d3581433a02c68d89986e41`
-- Upstream commit: `feat(sdk)!: move ICA helpers to subpath export (#8764)`
+- Upstream base: `7689ff65f4929a72ad0650a03e8dd7d987f0e802`
+- Upstream commit: `chore: release npm packages (#8733)`
 
 Verification commands:
 
@@ -31,7 +31,7 @@ cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p scrap
 Observed:
 
 - `upstream/main` and `merge-base HEAD upstream/main` both resolve to
-  `215135227a0e47883d3581433a02c68d89986e41`.
+  `7689ff65f4929a72ad0650a03e8dd7d987f0e802`.
 - `git rev-list --left-right --count HEAD...upstream/main` is reported by the
   live gate checks instead of being hard-coded here, so docs-only evidence
   refreshes do not immediately stale this compatibility note.
@@ -39,6 +39,11 @@ Observed:
   clean-layout validation is recorded in the companion Dusk `TEST_REPORT.md`
   for run `1778683232` on monorepo head
   `9050143c1ef12f76d117ee97effa79da8df3e334`.
+- The upstream move from `215135227a0e47883d3581433a02c68d89986e41` to
+  `7689ff65f4929a72ad0650a03e8dd7d987f0e802` is an npm release commit. It
+  removes consumed changesets and updates TypeScript/Starknet changelogs,
+  package versions, and `typescript/cli/src/version.ts`; it does not touch the
+  Dusk Rust agent crate, shared Rust settings, or Dusk-fork CI paths.
 
 The Dusk fork now also proposes
 `.github/workflows/dusk-agent-gate.yml` as a narrow PR status check for the
@@ -52,16 +57,17 @@ evidence remain in `dusk-network/hyperlane-dusk`.
 The inherited upstream `rust-docker.yml` and `monorepo-docker.yml`
 image-publishing workflows have job-level
 `github.repository_owner == 'hyperlane-xyz'` guards. The inherited Depot-backed
-PR jobs in `rust.yml`, `test.yml`, and `rebalancer-e2e-test.yml` use the same
-repository-owner guard so Dusk-fork PRs do not stay queued on Hyperlane-owned
-Depot runner labels. This keeps internal Dusk review focused on the Dusk
-review-policy and Dusk agent gates, and leaves the upstream workflows active
-for the later Hyperlane PR path.
+PR jobs in `rust.yml`, `test.yml`, `rebalancer-e2e-test.yml`, and
+`rebalancer-sim-test.yml` use the same repository-owner guard so Dusk-fork PRs
+do not stay queued on Hyperlane-owned Depot runner labels. This keeps internal
+Dusk review focused on the Dusk review-policy and Dusk agent gates, and leaves
+the upstream workflows active for the later Hyperlane PR path.
 
 ## Upstream Areas Checked
 
 Recent upstream changes around the current base include:
 
+- `7689ff65 chore: release npm packages (#8733)`
 - `21513522 feat(sdk)!: move ICA helpers to subpath export (#8764)`
 - `2b7db706 feat(infra): add Citrea/Moonpay warp route config getters (#8722)`
 - `c6bce706 fix: reduce cctp interval to 10 retries (#8744)`
