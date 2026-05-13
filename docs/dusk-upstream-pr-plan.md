@@ -7,7 +7,7 @@ remaining production decisions are accepted or changed.
 Current base:
 
 - Current Dusk monorepo branch head: see the GitHub PR header.
-- Upstream Hyperlane `main`: `2b7db706023806b36a57e446205ae443537ae9ec`
+- Upstream Hyperlane `main`: `215135227a0e47883d3581433a02c68d89986e41`
 - Rebase/check evidence: use the live `git fetch upstream main`,
   `git merge-base HEAD upstream/main`, and
   `git rev-list --left-right --count HEAD...upstream/main` checks recorded in

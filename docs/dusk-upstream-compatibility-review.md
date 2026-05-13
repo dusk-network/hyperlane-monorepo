@@ -16,8 +16,8 @@ Current Dusk branch:
   the companion Dusk `make gate-status` report.
 - Dusk signer test cleanup evidence commit:
   `b989bbcfbb2a427d3a538c5201f5d7214de6ba84`
-- Upstream base: `2b7db706023806b36a57e446205ae443537ae9ec`
-- Upstream commit: `feat(infra): add Citrea/Moonpay warp route config getters (#8722)`
+- Upstream base: `215135227a0e47883d3581433a02c68d89986e41`
+- Upstream commit: `feat(sdk)!: move ICA helpers to subpath export (#8764)`
 
 Verification commands:
 
@@ -31,7 +31,7 @@ cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p scrap
 Observed:
 
 - `upstream/main` and `merge-base HEAD upstream/main` both resolve to
-  `2b7db706023806b36a57e446205ae443537ae9ec`.
+  `215135227a0e47883d3581433a02c68d89986e41`.
 - `git rev-list --left-right --count HEAD...upstream/main` is reported by the
   live gate checks instead of being hard-coded here, so docs-only evidence
   refreshes do not immediately stale this compatibility note.
@@ -62,6 +62,7 @@ for the later Hyperlane PR path.
 
 Recent upstream changes around the current base include:
 
+- `21513522 feat(sdk)!: move ICA helpers to subpath export (#8764)`
 - `2b7db706 feat(infra): add Citrea/Moonpay warp route config getters (#8722)`
 - `c6bce706 fix: reduce cctp interval to 10 retries (#8744)`
 - `7a362a09 feat: temporarily disable relaying to/from krown (#8742)`
@@ -77,13 +78,14 @@ CLI, deploy, and TypeScript relayer metadata changes. The Dusk Rust agent
 branch does not add TypeScript SDK/CLI support and does not claim rate-limited
 ISM or rate-limited hook support for Dusk deployments.
 
-The `2b7db706` Citrea/Moonpay getter change, `7a362a09` Krown relaying
-disablement, and `66e8c1f4` fastpath relayer whitelist update are TypeScript
-infra/config-only. They do not change the Rust agent interfaces used by the
-Dusk chain crate, relayer, validator, scraper, or lander integration. The
-`c6bce706` CCTP retry interval change touches Rust relayer CCIP-read metadata
-handling only. Dusk continues to return explicit unsupported errors for
-CCIP-read ISMs, so this does not expand the supported Dusk behavior.
+The `21513522` ICA helper subpath export, `2b7db706` Citrea/Moonpay getter
+change, `7a362a09` Krown relaying disablement, and `66e8c1f4` fastpath relayer
+whitelist update are TypeScript SDK or infra/config-only. They do not change
+the Rust agent interfaces used by the Dusk chain crate, relayer, validator,
+scraper, or lander integration. The `c6bce706` CCTP retry interval change
+touches Rust relayer CCIP-read metadata handling only. Dusk continues to return
+explicit unsupported errors for CCIP-read ISMs, so this does not expand the
+supported Dusk behavior.
 
 ## Current Dusk Support
 
