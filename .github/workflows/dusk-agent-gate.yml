@@ -22,6 +22,7 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       GH_TOKEN: ${{ secrets.DUSK_ORG_READ_TOKEN || github.token }}
+      DUSK_ORG_READ_TOKEN_CONFIGURED: ${{ secrets.DUSK_ORG_READ_TOKEN != '' }}
       DUSK_REF: ${{ inputs.dusk_ref || 'feat/dusk-hardening-v2' }}
       MONOREPO_DIR: ${{ github.workspace }}/hyperlane/hyperlane-monorepo
       DUSK_DIR: ${{ github.workspace }}/hyperlane/dusk
@@ -47,6 +48,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          printf 'dusk_org_read_token_configured=%s\n' "$DUSK_ORG_READ_TOKEN_CONFIGURED"
+          if [ "$DUSK_ORG_READ_TOKEN_CONFIGURED" = "true" ]; then
+            printf 'dusk_agent_gate_token_source=%s\n' 'DUSK_ORG_READ_TOKEN'
+          else
+            printf 'dusk_agent_gate_token_source=%s\n' 'github.token'
+          fi
           gh api repos/dusk-network/hyperlane-dusk --jq .full_name >/dev/null || {
             echo "::error::DUSK_ORG_READ_TOKEN must grant read access to dusk-network/hyperlane-dusk for the Dusk agent cargo check"
             exit 1
