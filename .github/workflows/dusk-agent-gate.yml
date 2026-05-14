@@ -55,7 +55,11 @@ jobs:
             printf 'dusk_agent_gate_token_source=%s\n' 'github.token'
           fi
           gh api repos/dusk-network/hyperlane-dusk --jq .full_name >/dev/null || {
-            echo "::error::DUSK_ORG_READ_TOKEN must grant read access to dusk-network/hyperlane-dusk for the Dusk agent cargo check"
+            if [ "$DUSK_ORG_READ_TOKEN_CONFIGURED" = "true" ]; then
+              echo "::error::DUSK_ORG_READ_TOKEN is configured but does not grant read access to dusk-network/hyperlane-dusk for the Dusk agent cargo check"
+            else
+              echo "::error::DUSK_ORG_READ_TOKEN is not configured or not available to this workflow; the Dusk agent cargo check cannot read dusk-network/hyperlane-dusk"
+            fi
             exit 1
           }
 
