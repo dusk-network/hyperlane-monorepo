@@ -1071,9 +1071,8 @@ impl ChainConf {
             ChainConnectionConf::Dusk(conf) => {
                 let provider = Arc::new(build_dusk_provider(self, conf)?);
                 let rues = provider.rues().clone();
-                let dispatch_indexer =
-                    h_dusk::DuskMailboxIndexer::new(rues, self.addresses.mailbox);
-                let indexer = h_dusk::DuskMerkleTreeHookIndexer::new(dispatch_indexer);
+                let indexer =
+                    h_dusk::DuskMerkleTreeHookIndexer::new(rues, self.addresses.merkle_tree_hook);
                 Ok(Box::new(indexer) as Box<dyn SequenceAwareIndexer<MerkleTreeInsertion>>)
             }
             #[cfg(feature = "aleo")]

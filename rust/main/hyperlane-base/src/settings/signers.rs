@@ -1,5 +1,6 @@
 use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::str::FromStr;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -20,6 +21,7 @@ use super::aws_credentials::AwsChainCredentialsProvider;
 use crate::types::utils;
 
 const AWS_SIGNER_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_DUSK_SIGNER_KEY_FILE_BYTES: u64 = 16 * 1024;
 
 /// Resolve an AWS region string into a `rusoto_core::Region` without relying on
 /// rusoto's `FromStr` allowlist, which rejects regions added after rusoto was
@@ -104,9 +106,7 @@ impl DuskSignerKeyConf {
         match self {
             Self::Inline { key } => Ok(*key),
             Self::File { path } => {
-                Self::validate_key_file(path)?;
-                let key = fs::read_to_string(path)
-                    .with_context(|| format!("Failed to read Dusk signer key file `{path}`"))?;
+                let key = Self::read_key_file(path)?;
                 Self::parse_key_material(&key)
                     .with_context(|| format!("Invalid Dusk signer key file `{path}`"))
             }
@@ -119,12 +119,21 @@ impl DuskSignerKeyConf {
         }
     }
 
-    fn validate_key_file(path: &str) -> Result<(), Report> {
-        let metadata = fs::metadata(path)
+    fn read_key_file(path: &str) -> Result<String, Report> {
+        // Inspect and read through the same open handle. This avoids a path
+        // replacement race between permission validation and key loading.
+        let file = fs::File::open(path)
+            .with_context(|| format!("Failed to open Dusk signer key file `{path}`"))?;
+        let metadata = file
+            .metadata()
             .with_context(|| format!("Failed to inspect Dusk signer key file `{path}`"))?;
 
         if !metadata.is_file() {
             bail!("Dusk signer key file `{path}` must be a regular file");
+        }
+
+        if metadata.len() > MAX_DUSK_SIGNER_KEY_FILE_BYTES {
+            bail!("Dusk signer key file `{path}` exceeds {MAX_DUSK_SIGNER_KEY_FILE_BYTES} bytes");
         }
 
         #[cfg(unix)]
@@ -140,7 +149,15 @@ impl DuskSignerKeyConf {
             }
         }
 
-        Ok(())
+        let mut reader = file.take(MAX_DUSK_SIGNER_KEY_FILE_BYTES + 1);
+        let mut key = String::new();
+        reader
+            .read_to_string(&mut key)
+            .with_context(|| format!("Failed to read Dusk signer key file `{path}`"))?;
+        if key.len() as u64 > MAX_DUSK_SIGNER_KEY_FILE_BYTES {
+            bail!("Dusk signer key file `{path}` exceeds {MAX_DUSK_SIGNER_KEY_FILE_BYTES} bytes");
+        }
+        Ok(key)
     }
 
     fn parse_key_material(key: &str) -> Result<H256, Report> {
@@ -740,6 +757,41 @@ mod tests {
 
         assert!(
             err.to_string().contains("permissions"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dusk_signer_rejects_oversized_key_file() {
+        use crate::settings::signers::{
+            BuildableWithSignerConf, DuskSignerKeyConf, MAX_DUSK_SIGNER_KEY_FILE_BYTES,
+        };
+
+        let tempdir = tempfile::tempdir().expect("create tempdir");
+        let key_path = tempdir.path().join("oversized-dusk-signer.key");
+        std::fs::write(
+            &key_path,
+            vec![b'a'; (MAX_DUSK_SIGNER_KEY_FILE_BYTES + 1) as usize],
+        )
+        .expect("write oversized key file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+                .expect("set key file permissions");
+        }
+
+        let signer_config = SignerConf::DuskKey {
+            key: DuskSignerKeyConf::File {
+                path: key_path.to_string_lossy().to_string(),
+            },
+        };
+        let err = hyperlane_dusk::DuskSigner::build(&signer_config)
+            .await
+            .expect_err("oversized Dusk signer key file must be rejected");
+        assert!(
+            err.to_string().contains("exceeds"),
             "unexpected error: {err:?}"
         );
     }

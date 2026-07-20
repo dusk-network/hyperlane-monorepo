@@ -7,19 +7,22 @@ remaining production decisions are accepted or changed.
 Current base:
 
 - Current Dusk monorepo branch head: see the GitHub PR header.
-- Upstream Hyperlane `main`: `577aa4a82e1082aed35dcde589c9b51bed787478`
+- Upstream Hyperlane `main`: `6c2ca1d5514907f6875b6b6729cbffc31e97c09c`
 - Rebase/check evidence: use the live `git fetch upstream main`,
   `git merge-base HEAD upstream/main`, and
   `git rev-list --left-right --count HEAD...upstream/main` checks recorded in
   the companion Dusk gate reports.
-- The 2026-07-20 reassessment rebased all 47 feature commits from
-  `197b1e0d1a7b7ee5539e9ad38a02a23a7eb0a0b3` onto that upstream head. The two
-  new upstream commits are an npm release and a CCIP-server image-build
-  cleanup; neither touches the covered Dusk paths.
+- The final 2026-07-20 refresh rebased the 50-commit feature series from
+  `577aa4a82e1082aed35dcde589c9b51bed787478` onto that upstream head. The three
+  intervening commits change SVM/warp TypeScript, mainnet infrastructure
+  configuration, and TypeScript SDK warp checks; none touches the Dusk Rust
+  paths. `git range-diff` pairs all 50 commits exactly and the `rust/main` tree
+  remains `18cc899741589bff06b831ff0f2904b7b0997a36` before and after the rebase.
 - Post-rebase validation passes the focused Dusk gate, Dusk crate tests,
   package-scoped formatting, and the expanded affected-package cargo check
-  against companion Dusk head
-  `63bd80803e36bdca883d815eacea74c7575199de`.
+  against companion base-contract head
+  `726040440c904ec6adf6616a1963146ee9693fe4` and stacked dispatch-withdrawal
+  head `6b3a17845a3ff206bd830383d7d353ee94a34667`.
 - Dusk signer test cleanup evidence commit:
   `b989bbcfbb2a427d3a538c5201f5d7214de6ba84`
 
@@ -122,7 +125,11 @@ cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p scrap
 
 The workflow needs `DUSK_ORG_READ_TOKEN` because the companion Dusk repo is
 private. It preflights that private repo access with `gh api` before checkout
-so missing token provisioning fails explicitly. A separate policy-gate step
+so missing token provisioning fails explicitly. Its default companion checkout
+is an exact reviewed Dusk commit rather than a moving branch; the manual
+`workflow_dispatch` input is the only intentional override. This pin is part of
+the contract/agent ABI compatibility record, not merely build reproducibility.
+A separate policy-gate step
 diffs the branch against live Hyperlane upstream and rejects changes outside
 the reviewed Dusk integration allowlist. Together these are the fork-scoped
 validation substitute for Hyperlane-owned infrastructure, not a replacement
@@ -133,6 +140,13 @@ Production indexers now require an archive-enabled Rusk endpoint. Canonical
 topic, in-block ordinal, exact serialized payload, transaction origin, and
 block hash. Missing archive data fails closed; zero provenance is not emitted
 because the scraper can filter it and still advance its cursor.
+
+All sequence indexers are additionally capped at Rusk's consensus-finalized
+height. Merkle insertion records and validator checkpoints come from the
+configured MerkleTreeHook's persisted message/height/root history and exact
+archived event; Mailbox dispatch is not used as a proxy for hook execution.
+The companion contracts carrying this history require a fresh deployment and
+report `state_version() == 1`.
 
 The indexer API also supports canonical transaction-hash lookups. Dusk's
 32-byte transaction ID is represented as a zero-left-padded common `H512`;

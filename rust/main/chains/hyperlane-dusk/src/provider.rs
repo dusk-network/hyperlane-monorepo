@@ -8,6 +8,7 @@ use hyperlane_core::{
     HyperlaneProvider, HyperlaneProviderError, TxnInfo, H256, H512, U256,
 };
 
+use crate::tx_sender::h512_to_dusk_tx_id;
 use crate::{HyperlaneDuskError, RuesClient};
 
 /// Dusk provider implementing `HyperlaneProvider`.
@@ -96,10 +97,9 @@ impl HyperlaneProvider for DuskProvider {
     }
 
     async fn get_txn_by_hash(&self, hash: &H512) -> ChainResult<TxnInfo> {
-        // Dusk transaction IDs are 32 bytes. We embed them into `H512` by
-        // left-padding with zeros, so the ID lives in the lower 32 bytes.
-        let dusk_tx_id = &hash.as_bytes()[32..64];
-        let dusk_tx_hex = hex::encode(dusk_tx_id);
+        // Reject non-canonical H512 values instead of silently aliasing any
+        // upper 32 bytes onto the same Dusk transaction ID.
+        let dusk_tx_hex = h512_to_dusk_tx_id(hash)?;
 
         let query = format!(
             "query {{ tx(hash: \"{dusk_tx_hex}\") {{ gasSpent tx {{ gasLimit gasPrice raw callData {{ contractId }} }} }} }}"

@@ -82,6 +82,14 @@ impl DuskMailboxIndexer {
             .await?;
         Ok(Some(first..=after - 1))
     }
+
+    async fn finalized_dispatch_count(&self, current_count: u32) -> ChainResult<(u32, u32)> {
+        let finalized_tip = self.rues.finalized_block_number().await?;
+        let finalized_count = self
+            .first_dispatch_at_or_after(current_count, u64::from(finalized_tip) + 1)
+            .await?;
+        Ok((finalized_count, finalized_tip))
+    }
 }
 
 // =============================================================================
@@ -105,9 +113,10 @@ impl Indexer<HyperlaneMessage> for DuskMailboxIndexer {
             .rues
             .contract_query(&self.mailbox_id, "nonce", &())
             .await?;
+        let (finalized_nonce, _) = self.finalized_dispatch_count(current_nonce).await?;
 
         for nonce in range {
-            if nonce >= current_nonce {
+            if nonce >= finalized_nonce {
                 break;
             }
             let block_number: u64 = self
@@ -185,8 +194,7 @@ impl Indexer<HyperlaneMessage> for DuskMailboxIndexer {
     }
 
     async fn get_finalized_block_number(&self) -> ChainResult<u32> {
-        // Not used for sequence-based indexing.
-        Ok(0)
+        Ok(self.rues.finalized_block_number().await?)
     }
 
     async fn fetch_logs_by_tx_hash(
@@ -198,6 +206,9 @@ impl Indexer<HyperlaneMessage> for DuskMailboxIndexer {
             return Ok(vec![]);
         };
         ensure_cursor_height(block_height)?;
+        if block_height > self.rues.finalized_block_height().await? {
+            return Ok(vec![]);
+        }
         let count: u32 = self
             .rues
             .contract_query(&self.mailbox_id, "nonce", &())
@@ -222,8 +233,8 @@ impl SequenceAwareIndexer<HyperlaneMessage> for DuskMailboxIndexer {
             .rues
             .contract_query(&self.mailbox_id, "nonce", &())
             .await?;
-        // tip = 0 since we use sequence-based indexing (no block concept)
-        Ok((Some(nonce), 0))
+        let (finalized_nonce, finalized_tip) = self.finalized_dispatch_count(nonce).await?;
+        Ok((Some(finalized_nonce), finalized_tip))
     }
 }
 
@@ -299,6 +310,14 @@ impl DuskDeliveryIndexer {
             .await?;
         Ok(Some(first..=after - 1))
     }
+
+    async fn finalized_process_count(&self, current_count: u32) -> ChainResult<(u32, u32)> {
+        let finalized_tip = self.rues.finalized_block_number().await?;
+        let finalized_count = self
+            .first_process_at_or_after(current_count, u64::from(finalized_tip) + 1)
+            .await?;
+        Ok((finalized_count, finalized_tip))
+    }
 }
 
 #[async_trait]
@@ -318,9 +337,10 @@ impl Indexer<H256> for DuskDeliveryIndexer {
             .rues
             .contract_query(&self.mailbox_id, "processed_count", &())
             .await?;
+        let (finalized_count, _) = self.finalized_process_count(processed_count).await?;
 
         for index in range {
-            if index >= processed_count {
+            if index >= finalized_count {
                 break;
             }
             let message_id: [u8; 32] = self
@@ -374,7 +394,7 @@ impl Indexer<H256> for DuskDeliveryIndexer {
     }
 
     async fn get_finalized_block_number(&self) -> ChainResult<u32> {
-        Ok(0)
+        Ok(self.rues.finalized_block_number().await?)
     }
 
     async fn fetch_logs_by_tx_hash(
@@ -386,6 +406,9 @@ impl Indexer<H256> for DuskDeliveryIndexer {
             return Ok(vec![]);
         };
         ensure_cursor_height(block_height)?;
+        if block_height > self.rues.finalized_block_height().await? {
+            return Ok(vec![]);
+        }
         let count: u32 = self
             .rues
             .contract_query(&self.mailbox_id, "processed_count", &())
@@ -420,6 +443,7 @@ impl SequenceAwareIndexer<H256> for DuskDeliveryIndexer {
             .rues
             .contract_query(&self.mailbox_id, "processed_count", &())
             .await?;
-        Ok((Some(count), 0))
+        let (finalized_count, finalized_tip) = self.finalized_process_count(count).await?;
+        Ok((Some(finalized_count), finalized_tip))
     }
 }

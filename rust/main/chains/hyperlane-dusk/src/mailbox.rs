@@ -63,6 +63,115 @@ impl DuskMailbox {
             &message.body,
         )
     }
+
+    async fn merkle_tree_count(&self) -> ChainResult<u32> {
+        Ok(self
+            .rues
+            .contract_query(&self.merkle_tree_hook_id, "count", &())
+            .await?)
+    }
+
+    async fn merkle_insertion_height(&self, index: u32) -> ChainResult<u64> {
+        Ok(self
+            .rues
+            .contract_query(
+                &self.merkle_tree_hook_id,
+                "inserted_block_height",
+                &(index,),
+            )
+            .await?)
+    }
+
+    async fn first_merkle_insertion_at_or_after(
+        &self,
+        count: u32,
+        block_height: u64,
+    ) -> ChainResult<u32> {
+        let mut low = 0u32;
+        let mut high = count;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.merkle_insertion_height(middle).await? < block_height {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        Ok(low)
+    }
+
+    async fn merkle_count_at_height(&self, count: u32, block_height: u64) -> ChainResult<u32> {
+        self.first_merkle_insertion_at_or_after(count, block_height.saturating_add(1))
+            .await
+    }
+
+    async fn finalized_merkle_view(&self) -> ChainResult<(u32, u64)> {
+        let finalized_height = self.rues.finalized_block_height().await?;
+        let count = self.merkle_tree_count().await?;
+        let finalized_count = self.merkle_count_at_height(count, finalized_height).await?;
+        Ok((finalized_count, finalized_height))
+    }
+
+    async fn merkle_root_at(&self, index: u32) -> ChainResult<H256> {
+        let root: [u8; 32] = self
+            .rues
+            .contract_query(&self.merkle_tree_hook_id, "root_at", &(index,))
+            .await?;
+        Ok(H256::from_slice(&root))
+    }
+
+    async fn finalized_tree(&self) -> ChainResult<IncrementalMerkleAtBlock> {
+        let (count, finalized_height) = self.finalized_merkle_view().await?;
+        let mut tree = IncrementalMerkle::default();
+        for index in 0..count {
+            let message_id: [u8; 32] = self
+                .rues
+                .contract_query(&self.merkle_tree_hook_id, "message_id_at", &(index,))
+                .await?;
+            tree.ingest(H256::from_slice(&message_id));
+        }
+
+        if count > 0 {
+            let expected_root = self.merkle_root_at(count - 1).await?;
+            if tree.root() != expected_root {
+                return Err(HyperlaneDuskError::Other(format!(
+                    "Reconstructed finalized merkle root mismatch: on-chain={expected_root:?} local={:?} count={count}",
+                    tree.root()
+                ))
+                .into());
+            }
+        }
+
+        Ok(IncrementalMerkleAtBlock {
+            tree,
+            block_height: Some(finalized_height),
+        })
+    }
+
+    async fn checkpoint_at_height(&self, block_height: u64) -> ChainResult<CheckpointAtBlock> {
+        let finalized_height = self.rues.finalized_block_height().await?;
+        let effective_height = block_height.min(finalized_height);
+        let current_count = self.merkle_tree_count().await?;
+        let count = self
+            .merkle_count_at_height(current_count, effective_height)
+            .await?;
+        if count == 0 {
+            return Err(HyperlaneDuskError::Other(format!(
+                "MerkleTreeHook has no insertion at or before finalized block {effective_height}"
+            ))
+            .into());
+        }
+        let index = count - 1;
+        Ok(CheckpointAtBlock {
+            checkpoint: Checkpoint {
+                merkle_tree_hook_address: H256::from_slice(&self.merkle_tree_hook_id),
+                mailbox_domain: self.domain.id(),
+                root: self.merkle_root_at(index).await?,
+                index,
+            },
+            block_height: Some(effective_height),
+        })
+    }
 }
 
 impl HyperlaneChain for DuskMailbox {
@@ -232,75 +341,26 @@ impl Mailbox for DuskMailbox {
 #[async_trait]
 impl MerkleTreeHook for DuskMailbox {
     async fn tree(&self, _reorg_period: &ReorgPeriod) -> ChainResult<IncrementalMerkleAtBlock> {
-        // Prefer reading the tree state directly from the MerkleTreeHook
-        // contract (O(1) query). This avoids reconstructing the tree by replaying
-        // all dispatched messages (O(count) queries).
-        let dusk_tree: hyperlane_dusk_types::merkle::IncrementalMerkle = self
-            .rues
-            .contract_query(&self.merkle_tree_hook_id, "tree", &())
-            .await?;
-
-        let mut tree = IncrementalMerkle {
-            count: dusk_tree.count as usize,
-            ..Default::default()
-        };
-        for (i, node) in dusk_tree.branch.iter().enumerate() {
-            tree.branch[i] = H256::from_slice(node);
-        }
-
-        // Sanity-check the loaded tree matches the on-chain root.
-        let onchain_root: [u8; 32] = self
-            .rues
-            .contract_query(&self.merkle_tree_hook_id, "root", &())
-            .await?;
-        let onchain_root = H256::from_slice(&onchain_root);
-        if tree.root() != onchain_root {
-            return Err(HyperlaneDuskError::Other(format!(
-                "Loaded merkle tree root mismatch: on-chain={onchain_root:?} local={:?} count={}",
-                tree.root(),
-                dusk_tree.count
-            ))
-            .into());
-        }
-
-        Ok(IncrementalMerkleAtBlock {
-            tree,
-            block_height: None,
-        })
+        // Rusk does not expose historical contract-state queries. Reconstruct
+        // the one-time validator start tree from hook-owned insertion history,
+        // capped at consensus finality, and verify it against the stored root.
+        self.finalized_tree().await
     }
 
     async fn count(&self, _reorg_period: &ReorgPeriod) -> ChainResult<u32> {
-        let count: u32 = self
-            .rues
-            .contract_query(&self.merkle_tree_hook_id, "count", &())
-            .await?;
-        Ok(count)
+        Ok(self.finalized_merkle_view().await?.0)
     }
 
     async fn latest_checkpoint(
         &self,
         _reorg_period: &ReorgPeriod,
     ) -> ChainResult<CheckpointAtBlock> {
-        let (root, index): ([u8; 32], u32) = self
-            .rues
-            .contract_query(&self.merkle_tree_hook_id, "latest_checkpoint", &())
-            .await?;
-
-        Ok(CheckpointAtBlock {
-            checkpoint: Checkpoint {
-                merkle_tree_hook_address: H256::from_slice(&self.merkle_tree_hook_id),
-                mailbox_domain: self.domain.id(),
-                root: H256::from_slice(&root),
-                index,
-            },
-            block_height: None,
-        })
+        let finalized_height = self.rues.finalized_block_height().await?;
+        self.checkpoint_at_height(finalized_height).await
     }
 
-    async fn latest_checkpoint_at_block(&self, _height: u64) -> ChainResult<CheckpointAtBlock> {
-        // Dusk does not support point-in-time queries.
-        // Return the current checkpoint.
-        self.latest_checkpoint(&ReorgPeriod::None).await
+    async fn latest_checkpoint_at_block(&self, height: u64) -> ChainResult<CheckpointAtBlock> {
+        self.checkpoint_at_height(height).await
     }
 }
 

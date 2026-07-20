@@ -1,26 +1,92 @@
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use tracing::debug;
 
 use hyperlane_core::{
-    ChainResult, HyperlaneMessage, Indexed, Indexer, LogMeta, MerkleTreeInsertion,
-    SequenceAwareIndexer, H512,
+    ChainResult, Indexed, Indexer, LogMeta, MerkleTreeInsertion, SequenceAwareIndexer, H256, H512,
+    U256,
 };
+use hyperlane_dusk_types::events;
 
-use crate::DuskMailboxIndexer;
+use crate::rues::{contract_event_transaction_id, rkyv_serialize, ArchivedContractEvent};
+use crate::tx_sender::{dusk_tx_id_to_h512, h512_to_dusk_tx_id};
+use crate::RuesClient;
 
-/// Dusk MerkleTreeHook indexer — wraps the mailbox dispatch indexer
-/// and converts `HyperlaneMessage` to `MerkleTreeInsertion`.
+/// Dusk MerkleTreeHook indexer anchored to the hook's own state and events.
 #[derive(Debug, Clone)]
 pub struct DuskMerkleTreeHookIndexer {
-    inner: DuskMailboxIndexer,
+    rues: Arc<RuesClient>,
+    hook_id: [u8; 32],
+    hook_address: H256,
 }
 
 impl DuskMerkleTreeHookIndexer {
-    /// Create a new merkle tree hook indexer wrapping a mailbox indexer.
-    pub fn new(inner: DuskMailboxIndexer) -> Self {
-        Self { inner }
+    /// Create an indexer for a deployed MerkleTreeHook contract.
+    pub fn new(rues: Arc<RuesClient>, hook_id: H256) -> Self {
+        Self {
+            rues,
+            hook_id: hook_id.into(),
+            hook_address: hook_id,
+        }
+    }
+
+    async fn insertion_height(&self, sequence: u32) -> ChainResult<u64> {
+        Ok(self
+            .rues
+            .contract_query(&self.hook_id, "inserted_block_height", &(sequence,))
+            .await?)
+    }
+
+    async fn first_insertion_at_or_after(&self, count: u32, block_height: u64) -> ChainResult<u32> {
+        let mut low = 0u32;
+        let mut high = count;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.insertion_height(middle).await? < block_height {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        Ok(low)
+    }
+
+    async fn insertion_ordinal_in_block(
+        &self,
+        sequence: u32,
+        block_height: u64,
+    ) -> ChainResult<usize> {
+        let first = self
+            .first_insertion_at_or_after(sequence + 1, block_height)
+            .await?;
+        Ok((sequence - first) as usize)
+    }
+
+    async fn insertion_range_at_block(
+        &self,
+        count: u32,
+        block_height: u64,
+    ) -> ChainResult<Option<RangeInclusive<u32>>> {
+        let first = self
+            .first_insertion_at_or_after(count, block_height)
+            .await?;
+        if first == count || self.insertion_height(first).await? != block_height {
+            return Ok(None);
+        }
+        let after = self
+            .first_insertion_at_or_after(count, block_height.saturating_add(1))
+            .await?;
+        Ok(Some(first..=after - 1))
+    }
+
+    async fn finalized_insertion_count(&self, current_count: u32) -> ChainResult<(u32, u32)> {
+        let finalized_tip = self.rues.finalized_block_number().await?;
+        let finalized_count = self
+            .first_insertion_at_or_after(current_count, u64::from(finalized_tip) + 1)
+            .await?;
+        Ok((finalized_count, finalized_tip))
     }
 }
 
@@ -30,58 +96,113 @@ impl Indexer<MerkleTreeInsertion> for DuskMerkleTreeHookIndexer {
         &self,
         range: RangeInclusive<u32>,
     ) -> ChainResult<Vec<(Indexed<MerkleTreeInsertion>, LogMeta)>> {
-        let messages = Indexer::<HyperlaneMessage>::fetch_logs_in_range(&self.inner, range).await?;
-        let results = convert_messages(messages)?;
+        let count: u32 = self
+            .rues
+            .contract_query(&self.hook_id, "count", &())
+            .await?;
+        let (finalized_count, _) = self.finalized_insertion_count(count).await?;
+        let mut results = Vec::new();
+        let mut archive_height = None;
+        let mut archive_events = Vec::<ArchivedContractEvent>::new();
+        let mut archive_block_hash = H256::zero();
+        let mut insertion_ordinal = 0usize;
+
+        for index in range {
+            if index >= finalized_count {
+                break;
+            }
+            let message_id: [u8; 32] = self
+                .rues
+                .contract_query(&self.hook_id, "message_id_at", &(index,))
+                .await?;
+            let block_number = self.insertion_height(index).await?;
+            ensure_cursor_height(block_number)?;
+
+            if archive_height != Some(block_number) {
+                archive_events = self.rues.contract_events_at(block_number).await?;
+                archive_block_hash = self.rues.block_hash_at(block_number).await?;
+                insertion_ordinal = self.insertion_ordinal_in_block(index, block_number).await?;
+                archive_height = Some(block_number);
+            }
+
+            let expected_event = rkyv_serialize(&events::InsertedIntoTree { message_id, index })?;
+            let transaction_id = contract_event_transaction_id(
+                &archive_events,
+                &self.hook_id,
+                events::InsertedIntoTree::TOPIC,
+                insertion_ordinal,
+                &expected_event,
+            )?;
+            insertion_ordinal += 1;
+
+            let insertion = MerkleTreeInsertion::new(index, H256::from_slice(&message_id));
+            let indexed = Indexed::from(insertion).with_sequence(index);
+            let meta = LogMeta {
+                address: self.hook_address,
+                block_number,
+                block_hash: archive_block_hash,
+                transaction_id,
+                transaction_index: 0,
+                log_index: U256::from(index),
+            };
+            results.push((indexed, meta));
+        }
+
         debug!(count = results.len(), "Fetched merkle tree insertion logs");
         Ok(results)
     }
 
     async fn get_finalized_block_number(&self) -> ChainResult<u32> {
-        Ok(0)
+        Ok(self.rues.finalized_block_number().await?)
     }
 
     async fn fetch_logs_by_tx_hash(
         &self,
         tx_hash: H512,
     ) -> ChainResult<Vec<(Indexed<MerkleTreeInsertion>, LogMeta)>> {
-        let messages =
-            Indexer::<HyperlaneMessage>::fetch_logs_by_tx_hash(&self.inner, tx_hash).await?;
-        convert_messages(messages)
+        let tx_id = h512_to_dusk_tx_id(&tx_hash)?;
+        let Some(block_height) = self.rues.transaction_block_height(&tx_id).await? else {
+            return Ok(vec![]);
+        };
+        ensure_cursor_height(block_height)?;
+        if block_height > self.rues.finalized_block_height().await? {
+            return Ok(vec![]);
+        }
+        let count: u32 = self
+            .rues
+            .contract_query(&self.hook_id, "count", &())
+            .await?;
+        let Some(range) = self.insertion_range_at_block(count, block_height).await? else {
+            return Ok(vec![]);
+        };
+        let mut logs = self.fetch_logs_in_range(range).await?;
+        logs.retain(|(_, meta)| meta.transaction_id == tx_hash);
+        Ok(logs)
     }
 
     fn parse_tx_hash(&self, tx_hash: &str) -> ChainResult<H512> {
-        Indexer::<HyperlaneMessage>::parse_tx_hash(&self.inner, tx_hash)
+        Ok(dusk_tx_id_to_h512(tx_hash)?)
     }
 }
 
-fn convert_messages(
-    messages: Vec<(Indexed<HyperlaneMessage>, LogMeta)>,
-) -> ChainResult<Vec<(Indexed<MerkleTreeInsertion>, LogMeta)>> {
-    let mut results = Vec::with_capacity(messages.len());
-    for (indexed_msg, meta) in messages {
-        let sequence = indexed_msg.sequence.ok_or_else(|| {
-            crate::HyperlaneDuskError::Other(
-                "Dusk mailbox message is missing its queried sequence".into(),
-            )
-        })?;
-        let msg = indexed_msg.inner();
-        if msg.nonce != sequence {
-            return Err(crate::HyperlaneDuskError::Other(format!(
-                "Dusk mailbox message nonce {} does not match queried sequence {sequence}",
-                msg.nonce
-            ))
-            .into());
-        }
-        let insertion = MerkleTreeInsertion::new(sequence, msg.id());
-        let indexed = Indexed::from(insertion).with_sequence(sequence);
-        results.push((indexed, meta));
+fn ensure_cursor_height(block_height: u64) -> ChainResult<()> {
+    if block_height > u64::from(u32::MAX) {
+        return Err(crate::HyperlaneDuskError::Other(format!(
+            "Dusk block height {block_height} exceeds the shared u32 cursor range"
+        ))
+        .into());
     }
-    Ok(results)
+    Ok(())
 }
 
 #[async_trait]
 impl SequenceAwareIndexer<MerkleTreeInsertion> for DuskMerkleTreeHookIndexer {
     async fn latest_sequence_count_and_tip(&self) -> ChainResult<(Option<u32>, u32)> {
-        SequenceAwareIndexer::<HyperlaneMessage>::latest_sequence_count_and_tip(&self.inner).await
+        let count: u32 = self
+            .rues
+            .contract_query(&self.hook_id, "count", &())
+            .await?;
+        let (finalized_count, finalized_tip) = self.finalized_insertion_count(count).await?;
+        Ok((Some(finalized_count), finalized_tip))
     }
 }

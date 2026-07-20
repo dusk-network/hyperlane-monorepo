@@ -118,6 +118,14 @@ impl DuskInterchainGasPaymasterIndexer {
             .await?;
         Ok(Some(first..=after - 1))
     }
+
+    async fn finalized_payment_count(&self, current_count: u32) -> ChainResult<(u32, u32)> {
+        let finalized_tip = self.rues.finalized_block_number().await?;
+        let finalized_count = self
+            .first_payment_at_or_after(current_count, u64::from(finalized_tip) + 1)
+            .await?;
+        Ok((finalized_count, finalized_tip))
+    }
 }
 
 #[async_trait]
@@ -136,9 +144,10 @@ impl Indexer<InterchainGasPayment> for DuskInterchainGasPaymasterIndexer {
             .rues
             .contract_query(&self.igp_id, "gas_payment_count", &())
             .await?;
+        let (finalized_count, _) = self.finalized_payment_count(payment_count).await?;
 
         for index in range {
-            if index >= payment_count {
+            if index >= finalized_count {
                 break;
             }
 
@@ -196,7 +205,7 @@ impl Indexer<InterchainGasPayment> for DuskInterchainGasPaymasterIndexer {
     }
 
     async fn get_finalized_block_number(&self) -> ChainResult<u32> {
-        Ok(0)
+        Ok(self.rues.finalized_block_number().await?)
     }
 
     async fn fetch_logs_by_tx_hash(
@@ -208,6 +217,9 @@ impl Indexer<InterchainGasPayment> for DuskInterchainGasPaymasterIndexer {
             return Ok(vec![]);
         };
         ensure_cursor_height(block_height)?;
+        if block_height > self.rues.finalized_block_height().await? {
+            return Ok(vec![]);
+        }
         let count: u32 = self
             .rues
             .contract_query(&self.igp_id, "gas_payment_count", &())
@@ -242,6 +254,7 @@ impl SequenceAwareIndexer<InterchainGasPayment> for DuskInterchainGasPaymasterIn
             .rues
             .contract_query(&self.igp_id, "gas_payment_count", &())
             .await?;
-        Ok((Some(count), 0))
+        let (finalized_count, finalized_tip) = self.finalized_payment_count(count).await?;
+        Ok((Some(finalized_count), finalized_tip))
     }
 }

@@ -16,8 +16,8 @@ Current Dusk branch:
   the companion Dusk `make gate-status` report.
 - Dusk signer test cleanup evidence commit:
   `b989bbcfbb2a427d3a538c5201f5d7214de6ba84`
-- Upstream base: `577aa4a82e1082aed35dcde589c9b51bed787478`
-- Upstream commit: `chore: release npm packages (#9070)`
+- Upstream base: `6c2ca1d5514907f6875b6b6729cbffc31e97c09c`
+- Upstream commit: `fix: normalize zero-address hook in warp check (#9065)`
 
 Verification commands:
 
@@ -28,7 +28,27 @@ git rev-list --left-right --count HEAD...upstream/main
 cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p scraper -p lander
 ```
 
-Observed on 2026-07-20:
+Final upstream refresh on 2026-07-20:
+
+- `upstream/main` and `merge-base HEAD upstream/main` both resolve to
+  `6c2ca1d5514907f6875b6b6729cbffc31e97c09c`; the feature branch is 50 commits
+  ahead and zero commits behind before this evidence update.
+- A local backup branch, `backup/feat-dusk-support-v2-pre-6c2ca1d`, preserves
+  the pre-refresh feature head
+  `b68a9aa026daa163145054945558d8683d013dd3`.
+- The three new upstream commits are `f74e4bda6f` (LUMIA infrastructure
+  configuration), `0573f57a72` (SVM warp ALT hardening), and `6c2ca1d551`
+  (TypeScript SDK warp-check normalization). None changes `rust/main`.
+- `git range-diff` pairs all 50 feature commits exactly across the rebase. The
+  `rust/main` tree is byte-identical at
+  `18cc899741589bff06b831ff0f2904b7b0997a36`, so the focused Rust validation
+  and cross-chain E2E exercise the same agent source while the refreshed PR
+  also carries the three upstream-only TypeScript/infrastructure commits.
+- Fork synchronization remains isolated in PR #2. Its head was advanced to
+  the exact upstream commit above; PR #2 is intentionally not merged by this
+  reassessment.
+
+Earlier observation on 2026-07-20:
 
 - `upstream/main` and `merge-base HEAD upstream/main` both resolve to
   `577aa4a82e1082aed35dcde589c9b51bed787478`; the rebased feature branch is 47
@@ -44,8 +64,9 @@ Observed on 2026-07-20:
 - The focused gate command `cargo check -p hyperlane-dusk`, the crate tests,
   and the expanded affected-package command
   `cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p scraper -p lander`
-  all pass against companion Dusk head
-  `63bd80803e36bdca883d815eacea74c7575199de`.
+  all pass against companion base head
+  `726040440c904ec6adf6616a1963146ee9693fe4`; the combined contract/withdrawal
+  gate is `6b3a17845a3ff206bd830383d7d353ee94a34667`.
 - `cargo fmt --package hyperlane-dusk --package hyperlane-base -- --check`
   passes. Workspace-wide
   `cargo fmt --all -- --check` is not used as Dusk PR evidence because Cargo's
@@ -70,7 +91,7 @@ Observed on 2026-07-20:
   and rate-limited ISMs/hooks. A successful compile after the upstream sync is
   compatibility evidence, not a claim that those protocols are implemented.
 - Keep the fork sync as a separate PR (`dusk-network/hyperlane-monorepo#2`) and
-  the 47-commit Dusk feature series in PR #1. This makes upstream provenance
+  the 50-commit Dusk feature series in PR #1. This makes upstream provenance
   visible while avoiding a merge commit inside the feature history.
 
 ## 2026-07-20 Deep-Review Remediation Decisions
@@ -148,6 +169,21 @@ The follow-up raw-artifact triage added these compatibility decisions:
 - Same-block ordinal reconstruction now uses logarithmic boundary searches
   over monotonic contract-record heights rather than scanning the entire prior
   same-block prefix for every record.
+- Sequence state is visible to agents only through the node's consensus-finalized
+  height. Dispatch, delivery, IGP payment, and Merkle insertion indexers stop
+  before unfinalized records, transaction-hash lookups exclude unfinalized
+  transactions, and their reported tips are the actual finalized block.
+- Merkle insertion provenance comes from MerkleTreeHook itself, never from an
+  assumed one-to-one mapping with Mailbox dispatch. The hook persists message
+  ID, insertion height, and post-insertion root; the indexer verifies its exact
+  archived `InsertedIntoTree` event. Validator trees and checkpoints are
+  reconstructed or queried only through that finalized hook-owned history.
+- Transaction success requires an explicit `err: null`. Missing execution
+  status remains an observation failure, non-canonical H512 padding is rejected,
+  and a block hash response must bind to the requested height.
+- Dusk signer files are opened once, must be regular and permission-safe, and
+  are read through a 16 KiB bound. This removes the metadata/read time-of-check
+  gap and prevents unbounded key-file input.
 
 `announce_tokens_needed = 0` remains deliberate. Like Sealevel, Dusk validator
 announcement has no separate contract deposit; the transaction sender still
@@ -156,10 +192,10 @@ submit, and is not a claim that transaction execution itself is free.
 
 Local regression evidence for this follow-up is:
 
-- `cargo test -p hyperlane-dusk`: 12 passed, including bounded helper output,
+- `cargo test -p hyperlane-dusk`: 15 passed, including bounded helper output,
   exact transaction-ID conversion, provider fail-closed parsing, archive-event
   provenance, and malformed-observation retry behavior;
-- `cargo test -p hyperlane-base dusk_`: 6 passed, including Dusk signer,
+- `cargo test -p hyperlane-base dusk_`: 7 passed, including Dusk signer,
   chain-ID, and sequence-only index-mode coverage;
 - `cargo clippy -p hyperlane-dusk --all-targets -- -D warnings`: passed;
 - `cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p
@@ -194,6 +230,9 @@ the upstream workflows active for the later Hyperlane PR path.
 
 Recent upstream changes relevant to the current compatibility boundary include:
 
+- `6c2ca1d551 fix: normalize zero-address hook in warp check (#9065)`
+- `0573f57a72 fix(cli): harden svm warp alt create after review (#9007)`
+- `f74e4bda6f fix(infra): pin LUMIA proxyAdmin owner to on-chain value (#9054)`
 - `577aa4a82e chore: release npm packages (#9070)`
 - `31abc0b089 fix: remove redundant prisma generate from ccip-server build (#9071)`
 - `a7d9af7541 fix(relayer): bound and validate CCIP-read responses (#9047)`
@@ -221,7 +260,8 @@ companion Dusk E2E evidence:
   must be regular files with no group/world permissions.
 - RUES-backed provider/indexing.
 - Mailbox dispatch/process flow.
-- MerkleTreeHook reads and indexer wrapping.
+- Finalized MerkleTreeHook history/checkpoint reads and a dedicated hook-state
+  and hook-event indexer.
 - `InterchainSecurityModule` module-type and dry-run verify calls.
 - `MessageIdMultisigISM` validator/threshold reads for relayer metadata.
 - Relayer, validator, scraper, and lander compile-time integration.
@@ -260,9 +300,13 @@ Supporting them for Dusk would require:
 - If a Dusk deployment config points at Routing, Aggregation, or CCIP-read ISMs,
   the chain builder returns explicit unsupported errors rather than silently
   attempting partial support.
-- Dusk MerkleTreeHook integration is intentionally backed by the Dusk mailbox
-  wrapper plus direct MerkleTreeHook contract reads, matching the E2E-tested
-  MessageIdMultisig path.
+- Dusk MerkleTreeHook integration is intentionally backed by hook-owned message
+  IDs, insertion heights, roots, and archived `InsertedIntoTree` events. The
+  mailbox wrapper implements the shared trait, but a Mailbox dispatch is not
+  accepted as proof that the configured hook ran.
+- The new Merkle history and escrow fields change companion contract storage.
+  This agent head must be paired with freshly deployed `state_version() == 1`
+  contracts; no in-place migration from the older layout is claimed.
 
 ## Runtime Placeholder Scan
 

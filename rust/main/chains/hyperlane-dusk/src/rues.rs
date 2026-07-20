@@ -284,12 +284,32 @@ impl RuesClient {
         &self,
         block_height: u64,
     ) -> Result<H256, HyperlaneDuskError> {
-        let query = format!("query {{ block(height: {block_height}) {{ header {{ hash }} }} }}");
+        let query =
+            format!("query {{ block(height: {block_height}) {{ header {{ height hash }} }} }}");
         let data = self.graphql_query(&query).await?;
-        let hash = data
+        let header = data
             .get("block")
             .and_then(|block| block.get("header"))
-            .and_then(|header| header.get("hash"))
+            .ok_or_else(|| {
+                HyperlaneDuskError::Other(format!(
+                    "GraphQL block response is missing header at height {block_height}: {data}"
+                ))
+            })?;
+        let returned_height = header
+            .get("height")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| {
+                HyperlaneDuskError::Other(format!(
+                    "GraphQL block response is missing numeric header.height at requested height {block_height}: {data}"
+                ))
+            })?;
+        if returned_height != block_height {
+            return Err(HyperlaneDuskError::Other(format!(
+                "GraphQL block lookup requested height {block_height} but returned {returned_height}"
+            )));
+        }
+        let hash = header
+            .get("hash")
             .and_then(JsonValue::as_str)
             .ok_or_else(|| {
                 HyperlaneDuskError::Other(format!(
@@ -297,6 +317,24 @@ impl RuesClient {
                 ))
             })?;
         parse_h256_hex(hash, "block hash")
+    }
+
+    /// Return the latest block height finalized by the node's consensus view.
+    pub(crate) async fn finalized_block_height(&self) -> Result<u64, HyperlaneDuskError> {
+        let data = self
+            .graphql_query("query { lastBlockPair { json } }")
+            .await?;
+        parse_finalized_block_height(&data)
+    }
+
+    /// Return the finalized height in Hyperlane's shared u32 cursor range.
+    pub(crate) async fn finalized_block_number(&self) -> Result<u32, HyperlaneDuskError> {
+        let height = self.finalized_block_height().await?;
+        u32::try_from(height).map_err(|_| {
+            HyperlaneDuskError::Other(format!(
+                "Dusk finalized height {height} exceeds the shared u32 cursor range"
+            ))
+        })
     }
 
     /// Resolve the canonical block height containing a transaction.
@@ -499,8 +537,13 @@ fn parse_confirmed_transaction(
             ))
         })?;
     let error = match transaction.get("err") {
-        Some(JsonValue::Null) | None => None,
+        Some(JsonValue::Null) => None,
         Some(JsonValue::String(error)) => Some(error.clone()),
+        None => {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Ledger transaction {tx_id} is missing err status: {transaction}"
+            )))
+        }
         Some(other) => {
             return Err(HyperlaneDuskError::Other(format!(
                 "Ledger transaction {tx_id} has invalid err field: {other}"
@@ -508,6 +551,43 @@ fn parse_confirmed_transaction(
         }
     };
     Ok(ConfirmedTransaction { gas_spent, error })
+}
+
+fn parse_finalized_block_height(data: &JsonValue) -> Result<u64, HyperlaneDuskError> {
+    let pair = data
+        .get("lastBlockPair")
+        .and_then(|value| value.get("json"))
+        .ok_or_else(|| {
+            HyperlaneDuskError::Other(format!(
+                "Rusk archive response is missing lastBlockPair.json: {data}"
+            ))
+        })?;
+    let latest = pair
+        .get("last_block")
+        .and_then(JsonValue::as_array)
+        .and_then(|value| value.first())
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| {
+            HyperlaneDuskError::Other(format!(
+                "Rusk archive response is missing numeric last_block height: {pair}"
+            ))
+        })?;
+    let finalized = pair
+        .get("last_finalized_block")
+        .and_then(JsonValue::as_array)
+        .and_then(|value| value.first())
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| {
+            HyperlaneDuskError::Other(format!(
+                "Rusk archive response is missing numeric last_finalized_block height: {pair}"
+            ))
+        })?;
+    if finalized > latest {
+        return Err(HyperlaneDuskError::Other(format!(
+            "Rusk finalized height {finalized} exceeds latest height {latest}"
+        )));
+    }
+    Ok(finalized)
 }
 
 pub(crate) fn contract_event_transaction_id(
@@ -731,6 +811,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn confirmed_transaction_requires_explicit_execution_status() {
+        let tx_id = "ab".repeat(32);
+        assert!(
+            parse_confirmed_transaction(&tx_id, &serde_json::json!({"gasSpent": 7}))
+                .unwrap_err()
+                .to_string()
+                .contains("missing err status")
+        );
+        assert_eq!(
+            parse_confirmed_transaction(&tx_id, &serde_json::json!({"gasSpent": 7, "err": null}))
+                .unwrap(),
+            ConfirmedTransaction {
+                gas_spent: 7,
+                error: None,
+            }
+        );
+    }
+
+    #[test]
+    fn finalized_height_is_parsed_fail_closed() {
+        assert_eq!(
+            parse_finalized_block_height(&serde_json::json!({
+                "lastBlockPair": {
+                    "json": {
+                        "last_block": [46, "latest"],
+                        "last_finalized_block": [45, "finalized"]
+                    }
+                }
+            }))
+            .unwrap(),
+            45
+        );
+        assert!(parse_finalized_block_height(&serde_json::json!({
+            "lastBlockPair": {
+                "json": {
+                    "last_block": [45, "latest"],
+                    "last_finalized_block": [46, "finalized"]
+                }
+            }
+        }))
+        .is_err());
+        assert!(parse_finalized_block_height(&serde_json::json!({})).is_err());
+    }
+
     #[tokio::test]
     async fn confirmation_retries_observation_errors_for_the_same_transaction() {
         let url = test_server(vec![
@@ -759,6 +884,19 @@ mod tests {
         let client = RuesClient::new(oversized_response_server()).unwrap();
         let error = client.graphql_query("query { ping }").await.unwrap_err();
         assert!(error.to_string().contains("response exceeds"));
+    }
+
+    #[tokio::test]
+    async fn block_hash_lookup_rejects_a_mismatched_returned_height() {
+        let url = test_server(vec![(
+            200,
+            r#"{"block":{"header":{"height":8,"hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}"#,
+        )]);
+        let client = RuesClient::new(url).unwrap();
+        let error = client.block_hash_at(7).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requested height 7 but returned 8"));
     }
 
     #[test]
