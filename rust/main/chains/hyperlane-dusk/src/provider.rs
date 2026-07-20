@@ -42,9 +42,8 @@ impl HyperlaneChain for DuskProvider {
 #[async_trait]
 impl HyperlaneProvider for DuskProvider {
     async fn get_block_by_height(&self, height: u64) -> ChainResult<BlockInfo> {
-        let query = format!(
-            "query {{ block(height: {height}) {{ header {{ height hash timestamp }} }} }}"
-        );
+        let query =
+            format!("query {{ block(height: {height}) {{ header {{ height hash timestamp }} }} }}");
         let data = self.rues.graphql_query(&query).await?;
 
         let block = data
@@ -58,19 +57,12 @@ impl HyperlaneProvider for DuskProvider {
             .get("header")
             .and_then(|v| v.as_object())
             .ok_or_else(|| {
-                HyperlaneDuskError::Other(format!(
-                    "GraphQL block response missing header: {data}"
-                ))
+                HyperlaneDuskError::Other(format!("GraphQL block response missing header: {data}"))
             })?;
 
-        let hash_hex = header
-            .get("hash")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                HyperlaneDuskError::Other(format!(
-                    "GraphQL block header missing hash: {data}"
-                ))
-            })?;
+        let hash_hex = header.get("hash").and_then(|v| v.as_str()).ok_or_else(|| {
+            HyperlaneDuskError::Other(format!("GraphQL block header missing hash: {data}"))
+        })?;
         let hash_bytes = hex::decode(hash_hex).map_err(|e| {
             HyperlaneDuskError::Other(format!("Invalid hex block hash '{hash_hex}': {e}"))
         })?;
@@ -86,9 +78,7 @@ impl HyperlaneProvider for DuskProvider {
             .get("timestamp")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| {
-                HyperlaneDuskError::Other(format!(
-                    "GraphQL block header missing timestamp: {data}"
-                ))
+                HyperlaneDuskError::Other(format!("GraphQL block header missing timestamp: {data}"))
             })?;
 
         Ok(BlockInfo {
@@ -118,14 +108,9 @@ impl HyperlaneProvider for DuskProvider {
             ));
         }
 
-        let inner_tx = spent
-            .get("tx")
-            .and_then(|v| v.as_object())
-            .ok_or_else(|| {
-                HyperlaneDuskError::Other(format!(
-                    "GraphQL tx response missing tx field: {data}"
-                ))
-            })?;
+        let inner_tx = spent.get("tx").and_then(|v| v.as_object()).ok_or_else(|| {
+            HyperlaneDuskError::Other(format!("GraphQL tx response missing tx field: {data}"))
+        })?;
 
         let gas_limit = inner_tx
             .get("gasLimit")
@@ -177,26 +162,15 @@ impl HyperlaneProvider for DuskProvider {
         // Query VM metadata for the contract owner. This avoids relying on
         // contract-specific methods (many contracts do not expose `owner()`).
         let contract_id: [u8; 32] = (*address).into();
-        match self.rues.contract_owner_raw(&contract_id).await {
-            Ok(_) => Ok(true),
-            Err(crate::HyperlaneDuskError::RuesResponse { status, body })
-                if status == 500 && {
-                    let body_lc = body.to_lowercase();
-                    body.contains("ContractDoesNotExist")
-                        || body_lc.contains("contract does not exist")
-                        || body_lc.contains("contract owner not found")
-                } =>
-            {
-                Ok(false)
-            }
-            Err(err) => Err(err.into()),
-        }
+        let metadata = self.rues.contract_metadata(&contract_id).await?;
+        Ok(!metadata.contract_owner.is_empty())
     }
 
     async fn get_balance(&self, address: String) -> ChainResult<U256> {
         let addr = address.trim();
         let hex_addr = addr.strip_prefix("0x").unwrap_or(addr);
-        let is_hex_contract_id = hex_addr.len() == 64 && hex_addr.chars().all(|c| c.is_ascii_hexdigit());
+        let is_hex_contract_id =
+            hex_addr.len() == 64 && hex_addr.chars().all(|c| c.is_ascii_hexdigit());
 
         if is_hex_contract_id {
             let status = self.rues.contract_status(hex_addr).await?;
@@ -217,18 +191,14 @@ impl HyperlaneProvider for DuskProvider {
             .and_then(|v| v.as_array())
             .and_then(|ary| ary.first())
             .ok_or_else(|| {
-                HyperlaneDuskError::Other(format!(
-                    "GraphQL blocks response missing blocks: {data}"
-                ))
+                HyperlaneDuskError::Other(format!("GraphQL blocks response missing blocks: {data}"))
             })?;
 
         let header = first
             .get("header")
             .and_then(|v| v.as_object())
             .ok_or_else(|| {
-                HyperlaneDuskError::Other(format!(
-                    "GraphQL blocks response missing header: {data}"
-                ))
+                HyperlaneDuskError::Other(format!("GraphQL blocks response missing header: {data}"))
             })?;
 
         let height = header

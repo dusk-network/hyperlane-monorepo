@@ -11,10 +11,6 @@ use url::Url;
 
 use crate::HyperlaneDuskError;
 
-/// HTTP header for the RUES protocol version.
-const RUSK_VERSION_HEADER: &str = "Rusk-Version";
-const RUSK_VERSION_VALUE: &str = "1.0.0-rc.0";
-
 /// RUES (Rusk Unified Event System) HTTP client.
 ///
 /// Communicates with Dusk nodes using the RUES protocol:
@@ -44,6 +40,13 @@ pub struct ContractStatus {
     pub balance: u64,
 }
 
+/// VM metadata returned for a contract.
+#[derive(Debug, Clone, SerdeDeserialize)]
+pub struct ContractMetadata {
+    /// Hex-encoded owner bytes. Empty when the contract does not exist.
+    pub contract_owner: String,
+}
+
 /// Gas price stats returned by Rusk.
 #[derive(Debug, Clone, SerdeDeserialize)]
 pub struct GasPriceStats {
@@ -51,6 +54,15 @@ pub struct GasPriceStats {
     pub max: u64,
     pub median: u64,
     pub min: u64,
+}
+
+/// A transaction that has been included in the Dusk ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmedTransaction {
+    /// Gas actually consumed by execution.
+    pub gas_spent: u64,
+    /// Contract execution error, if execution reverted.
+    pub error: Option<String>,
 }
 
 impl RuesClient {
@@ -95,16 +107,13 @@ impl RuesClient {
         Ok(response.bytes().await?.to_vec())
     }
 
-    /// Query the owner metadata of a contract.
-    ///
-    /// This does **not** invoke contract code; it queries VM metadata.
-    pub async fn contract_owner_raw(
+    /// Query VM metadata for a contract without invoking contract code.
+    pub async fn contract_metadata(
         &self,
         contract_id: &[u8; 32],
-    ) -> Result<Vec<u8>, HyperlaneDuskError> {
+    ) -> Result<ContractMetadata, HyperlaneDuskError> {
         let contract_hex = hex::encode(contract_id);
-        // RUES URI format requires a non-empty topic; "owner" is conventional here.
-        let url = format!("{}/on/contract_owner:{}/owner", self.base_url, contract_hex);
+        let url = format!("{}/on/contract:{}/metadata", self.base_url, contract_hex);
 
         let response = self
             .client
@@ -123,7 +132,12 @@ impl RuesClient {
             });
         }
 
-        Ok(response.bytes().await?.to_vec())
+        let body = response.text().await.unwrap_or_default();
+        serde_json::from_str::<ContractMetadata>(&body).map_err(|error| {
+            HyperlaneDuskError::Other(format!(
+                "Failed to parse contract metadata JSON: {error}. Body: {body}"
+            ))
+        })
     }
 
     /// Query a contract method with typed rkyv serialization/deserialization.
@@ -214,6 +228,59 @@ impl RuesClient {
         })
     }
 
+    /// Wait for a propagated transaction to be included in the ledger.
+    ///
+    /// Propagation only acknowledges admission to the mempool. Hyperlane must not
+    /// report a transaction as executed until Rusk exposes its spent transaction
+    /// record, which also contains the actual gas use and any execution error.
+    pub async fn wait_for_tx(
+        &self,
+        tx_id: &str,
+        timeout: Duration,
+    ) -> Result<ConfirmedTransaction, HyperlaneDuskError> {
+        if tx_id.len() != 64 || !tx_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Invalid Dusk transaction ID '{tx_id}'"
+            )));
+        }
+
+        let query = format!(r#"query {{ tx(hash: \"{tx_id}\") {{ gasSpent err }} }}"#);
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        loop {
+            let data = self.graphql_query(&query).await?;
+            if let Some(tx) = data.get("tx").filter(|tx| !tx.is_null()) {
+                let gas_spent =
+                    tx.get("gasSpent")
+                        .and_then(JsonValue::as_u64)
+                        .ok_or_else(|| {
+                            HyperlaneDuskError::Other(format!(
+                                "Ledger transaction {tx_id} is missing numeric gasSpent: {tx}"
+                            ))
+                        })?;
+                let error = match tx.get("err") {
+                    Some(JsonValue::Null) | None => None,
+                    Some(JsonValue::String(error)) => Some(error.clone()),
+                    Some(other) => {
+                        return Err(HyperlaneDuskError::Other(format!(
+                            "Ledger transaction {tx_id} has invalid err field: {other}"
+                        )))
+                    }
+                };
+                return Ok(ConfirmedTransaction { gas_spent, error });
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return Err(HyperlaneDuskError::Other(format!(
+                    "Timed out after {}s waiting for Dusk transaction {tx_id} to be included",
+                    timeout.as_secs()
+                )));
+            }
+
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
     /// Query a Moonlight account status by bs58-encoded BLS public key.
     pub async fn account_status(&self, bs58_pk: &str) -> Result<AccountStatus, HyperlaneDuskError> {
         let url = format!("{}/on/account:{}/status", self.base_url, bs58_pk);
@@ -247,30 +314,23 @@ impl RuesClient {
         &self,
         contract_id_hex: &str,
     ) -> Result<ContractStatus, HyperlaneDuskError> {
-        let url = format!("{}/on/contract:{}/status", self.base_url, contract_id_hex);
-
-        let response = self
-            .client
-            .post(&url)
-            .headers(self.default_headers())
-            .body(Vec::new())
-            .send()
-            .await?;
-
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(HyperlaneDuskError::RuesResponse {
-                status: status.as_u16(),
-                body,
-            });
-        }
-
-        serde_json::from_str::<ContractStatus>(&body).map_err(|e| {
+        let bytes = hex::decode(contract_id_hex).map_err(|error| {
             HyperlaneDuskError::Other(format!(
-                "Failed to parse contract status JSON: {e}. Body: {body}"
+                "Invalid contract ID hex '{contract_id_hex}': {error}"
             ))
-        })
+        })?;
+        let contract_id: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
+            HyperlaneDuskError::Other(format!("Contract ID must be 32 bytes, got {}", bytes.len()))
+        })?;
+
+        // The transfer contract is reserved contract ID 0x01 followed by zeros.
+        // Querying it directly avoids Rusk's deprecated contract status route.
+        let mut transfer_contract = [0u8; 32];
+        transfer_contract[0] = 1;
+        let balance = self
+            .contract_query(&transfer_contract, "contract_balance", &contract_id)
+            .await?;
+        Ok(ContractStatus { balance })
     }
 
     /// Query node gas price statistics from the mempool.
@@ -309,10 +369,6 @@ impl RuesClient {
         headers.insert(
             CONTENT_TYPE,
             HeaderValue::from_static("application/octet-stream"),
-        );
-        headers.insert(
-            RUSK_VERSION_HEADER,
-            HeaderValue::from_static(RUSK_VERSION_VALUE),
         );
         headers
     }

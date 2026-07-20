@@ -1,18 +1,21 @@
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
-use tracing::info;
+use tracing::{info, warn};
 
 use hyperlane_core::{
     accumulator::incremental::IncrementalMerkle, BatchResult, ChainResult, Checkpoint,
     CheckpointAtBlock, FixedPointNumber, HyperlaneChain, HyperlaneContract, HyperlaneDomain,
     HyperlaneMessage, HyperlaneProvider, IncrementalMerkleAtBlock, Mailbox, MerkleTreeHook,
-    Metadata, QueueOperation, ReorgPeriod, TxCostEstimate, TxOutcome, H256, H512, U256,
+    Metadata, QueueOperation, ReorgPeriod, TxCostEstimate, TxOutcome, H256, U256,
 };
 
 use crate::rues::rkyv_serialize;
 use crate::{ConnectionConf, DuskProvider, DuskSigner, HyperlaneDuskError, RuesClient};
+
+const TX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Dusk Mailbox — implements both `Mailbox` and `MerkleTreeHook` traits.
 #[derive(Debug, Clone)]
@@ -150,17 +153,23 @@ impl Mailbox for DuskMailbox {
             crate::tx_sender::dusk_tx_call(&self.conn, signer, &self.mailbox_id, "process", &args)
                 .await?;
 
-        let tx_id = res
-            .get("tx_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        let transaction_id =
-            crate::tx_sender::dusk_tx_id_to_h512(tx_id).unwrap_or_else(|_| H512::zero());
+        let tx_id = res.get("tx_id").and_then(|v| v.as_str()).ok_or_else(|| {
+            HyperlaneDuskError::Other(format!("dusk-tx response is missing string tx_id: {res}"))
+        })?;
+        let transaction_id = crate::tx_sender::dusk_tx_id_to_h512(tx_id)?;
+        let confirmed = self
+            .rues
+            .wait_for_tx(tx_id, TX_CONFIRMATION_TIMEOUT)
+            .await?;
+        let executed = confirmed.error.is_none();
+        if let Some(error) = &confirmed.error {
+            warn!(tx_id, %error, "Dusk mailbox transaction execution failed");
+        }
 
         Ok(TxOutcome {
             transaction_id,
-            executed: true,
-            gas_used: U256::from(self.conn.gas_limit),
+            executed,
+            gas_used: U256::from(confirmed.gas_spent),
             gas_price: FixedPointNumber::from(self.conn.gas_price),
         })
     }

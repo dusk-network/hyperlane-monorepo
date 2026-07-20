@@ -14,7 +14,7 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "process"] }
+tokio = { workspace = true, features = ["io-util", "macros", "process", "time"] }
 tracing.workspace = true
 tracing-futures.workspace = true
 url.workspace = true
@@ -26,7 +26,8 @@ dusk-bytes = "0.1.7"
 # Dusk types for message encoding, keccak256, EthAddress, etc.
 # Uses software keccak256 fallback (no `abi` feature).
 # NOTE: dusk-core is NOT a dependency here because it requires nightly Rust.
-# The monorepo uses stable Rust. Transaction construction is stubbed.
+# The monorepo uses stable Rust. Transaction construction is delegated to the
+# separately built `dusk-tx` helper.
 hyperlane-dusk-types = { path = "../../../../../dusk/types", features = ["serde"] }
 
 # rkyv for RUES binary serialization (matching on-chain contract serialization)

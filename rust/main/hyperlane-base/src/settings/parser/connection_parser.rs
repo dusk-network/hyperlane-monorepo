@@ -859,16 +859,14 @@ pub fn build_dusk_connection_conf(
         .parse_u64()
         .unwrap_or(1);
 
-    Some(ChainConnectionConf::Dusk(
-        hyperlane_dusk::ConnectionConf {
-            url,
-            chain_id,
-            gas_limit,
-            gas_price,
-            native_token,
-            op_submission_config: operation_batch,
-        },
-    ))
+    Some(ChainConnectionConf::Dusk(hyperlane_dusk::ConnectionConf {
+        url,
+        chain_id,
+        gas_limit,
+        gas_price,
+        native_token,
+        op_submission_config: operation_batch,
+    }))
 }
 
 pub fn build_connection_conf(

@@ -23,7 +23,7 @@ use hyperlane_core::matching_list::MatchingList;
 use h_cosmos::RawCosmosAmount;
 use hyperlane_core::{
     cfg_unwrap_all, config::*, HyperlaneDomain, HyperlaneDomainProtocol,
-    HyperlaneDomainTechnicalStack, NativeToken, ReorgPeriod, SubmitterType, H256,
+    HyperlaneDomainTechnicalStack, IndexMode, NativeToken, ReorgPeriod, SubmitterType, H256,
 };
 
 use crate::settings::{

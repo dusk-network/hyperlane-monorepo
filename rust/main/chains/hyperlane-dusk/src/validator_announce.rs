@@ -1,17 +1,20 @@
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
-use tracing::info;
+use tracing::{info, warn};
 
 use hyperlane_core::{
     Announcement, ChainResult, FixedPointNumber, HyperlaneChain, HyperlaneContract,
-    HyperlaneDomain, HyperlaneProvider, SignedType, TxOutcome, ValidatorAnnounce, H256, H512, U256,
+    HyperlaneDomain, HyperlaneProvider, SignedType, TxOutcome, ValidatorAnnounce, H256, U256,
 };
 
 use hyperlane_dusk_types::EthAddress;
 
 use crate::{ConnectionConf, DuskProvider, DuskSigner, HyperlaneDuskError, RuesClient};
+
+const TX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Dusk ValidatorAnnounce implementation.
 #[derive(Debug, Clone)]
@@ -118,17 +121,23 @@ impl ValidatorAnnounce for DuskValidatorAnnounce {
             crate::tx_sender::dusk_tx_call(&self.conn, signer, &self.va_id, "announce", &args)
                 .await?;
 
-        let tx_id = res
-            .get("tx_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        let transaction_id =
-            crate::tx_sender::dusk_tx_id_to_h512(tx_id).unwrap_or_else(|_| H512::zero());
+        let tx_id = res.get("tx_id").and_then(|v| v.as_str()).ok_or_else(|| {
+            HyperlaneDuskError::Other(format!("dusk-tx response is missing string tx_id: {res}"))
+        })?;
+        let transaction_id = crate::tx_sender::dusk_tx_id_to_h512(tx_id)?;
+        let confirmed = self
+            .rues
+            .wait_for_tx(tx_id, TX_CONFIRMATION_TIMEOUT)
+            .await?;
+        let executed = confirmed.error.is_none();
+        if let Some(error) = &confirmed.error {
+            warn!(tx_id, %error, "Dusk validator announcement execution failed");
+        }
 
         Ok(TxOutcome {
             transaction_id,
-            executed: true,
-            gas_used: U256::from(self.conn.gas_limit),
+            executed,
+            gas_used: U256::from(confirmed.gas_spent),
             gas_price: FixedPointNumber::from(self.conn.gas_price),
         })
     }
