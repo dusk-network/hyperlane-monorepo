@@ -37,9 +37,8 @@ impl DuskSigner {
     /// in the Dusk Mailbox contract.
     pub fn new(key: H256) -> Result<Self, HyperlaneDuskError> {
         let key_bytes: [u8; 32] = key.into();
-        let sk = BlsSecretKey::from_bytes(&key_bytes).map_err(|e| {
-            HyperlaneDuskError::InvalidBlsSecretKey(format!("{e:?}"))
-        })?;
+        let sk = BlsSecretKey::from_bytes(&key_bytes)
+            .map_err(|e| HyperlaneDuskError::InvalidBlsSecretKey(format!("{e:?}")))?;
         let pk = BlsPublicKey::from(&sk);
 
         let pk_bytes = pk.to_bytes();

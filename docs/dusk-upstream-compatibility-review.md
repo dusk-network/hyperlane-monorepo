@@ -1,6 +1,6 @@
 # Dusk Upstream Compatibility Review
 
-Date: 2026-05-13
+Date: 2026-07-20
 
 This note records the upstream Hyperlane areas checked before keeping the Dusk
 integration scoped to internal review. It is not an upstream PR; upstream PR
@@ -16,8 +16,8 @@ Current Dusk branch:
   the companion Dusk `make gate-status` report.
 - Dusk signer test cleanup evidence commit:
   `b989bbcfbb2a427d3a538c5201f5d7214de6ba84`
-- Upstream base: `7689ff65f4929a72ad0650a03e8dd7d987f0e802`
-- Upstream commit: `chore: release npm packages (#8733)`
+- Upstream base: `577aa4a82e1082aed35dcde589c9b51bed787478`
+- Upstream commit: `chore: release npm packages (#9070)`
 
 Verification commands:
 
@@ -28,22 +28,49 @@ git rev-list --left-right --count HEAD...upstream/main
 cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p scraper -p lander
 ```
 
-Observed:
+Observed on 2026-07-20:
 
 - `upstream/main` and `merge-base HEAD upstream/main` both resolve to
-  `7689ff65f4929a72ad0650a03e8dd7d987f0e802`.
-- `git rev-list --left-right --count HEAD...upstream/main` is reported by the
-  live gate checks instead of being hard-coded here, so docs-only evidence
-  refreshes do not immediately stale this compatibility note.
-- The Rust agent check passed after the rebase to that base. Latest
-  clean-layout validation is recorded in the companion Dusk `TEST_REPORT.md`
-  for run `1778683232` on monorepo head
-  `9050143c1ef12f76d117ee97effa79da8df3e334`.
-- The upstream move from `215135227a0e47883d3581433a02c68d89986e41` to
-  `7689ff65f4929a72ad0650a03e8dd7d987f0e802` is an npm release commit. It
-  removes consumed changesets and updates TypeScript/Starknet changelogs,
-  package versions, and `typescript/cli/src/version.ts`; it does not touch the
-  Dusk Rust agent crate, shared Rust settings, or Dusk-fork CI paths.
+  `577aa4a82e1082aed35dcde589c9b51bed787478`; the rebased feature branch is 47
+  commits ahead and zero commits behind that base before this evidence update.
+- A local backup branch,
+  `backup/feat-dusk-support-v2-pre-577aa4a`, preserves the pre-rebase head
+  `a931f75b3d23d2e15e75f2e064470a1a01289abb`.
+- The final upstream delta after the branch's previous base
+  `197b1e0d1a7b7ee5539e9ad38a02a23a7eb0a0b3` consists of
+  `31abc0b089` (CCIP server image build cleanup) and `577aa4a82e` (npm release).
+  Neither changes the Dusk Rust agent crate, shared Rust settings, or Dusk-fork
+  CI paths.
+- The focused gate command `cargo check -p hyperlane-dusk`, the crate tests,
+  and the expanded affected-package command
+  `cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p scraper -p lander`
+  all pass against companion Dusk head
+  `63bd80803e36bdca883d815eacea74c7575199de`.
+- `cargo fmt --package hyperlane-dusk -- --check` passes. Workspace-wide
+  `cargo fmt --all -- --check` is not used as Dusk PR evidence because Cargo's
+  `--all` also formats the adjacent companion repository through the local path
+  dependency and therefore crosses the monorepo PR boundary.
+
+## 2026-07-20 Reassessment Decisions
+
+- Keep this PR scoped to Rust agent/protocol integration. The contract,
+  deployment, CLI, escrow, and dispatch-credit implementation remains in the
+  companion `dusk-network/hyperlane-dusk` repository.
+- Retain the adjacent `hyperlane-dusk-types` path dependency for internal Dusk
+  review. Publishing or vendoring that crate remains a prerequisite for an
+  upstream Hyperlane PR, not for this fork PR.
+- Update `rust/main/Cargo.lock` for the companion type crate's current direct
+  `dusk-bytes` dependency. Leaving the lock stale would make a clean checkout
+  mutate it during the Dusk agent gate.
+- Format only the owned `hyperlane-dusk` package. This records the formatter
+  change required by the current toolchain without pulling unrelated
+  companion-repository formatting into this PR.
+- Preserve explicit unsupported errors for Routing, Aggregation, CCIP-read,
+  and rate-limited ISMs/hooks. A successful compile after the upstream sync is
+  compatibility evidence, not a claim that those protocols are implemented.
+- Keep the fork sync as a separate PR (`dusk-network/hyperlane-monorepo#2`) and
+  the 47-commit Dusk feature series in PR #1. This makes upstream provenance
+  visible while avoiding a merge commit inside the feature history.
 
 The Dusk fork now also proposes
 `.github/workflows/dusk-agent-gate.yml` as a narrow PR status check for the
@@ -65,33 +92,22 @@ the upstream workflows active for the later Hyperlane PR path.
 
 ## Upstream Areas Checked
 
-Recent upstream changes around the current base include:
+Recent upstream changes relevant to the current compatibility boundary include:
 
-- `7689ff65 chore: release npm packages (#8733)`
-- `21513522 feat(sdk)!: move ICA helpers to subpath export (#8764)`
-- `2b7db706 feat(infra): add Citrea/Moonpay warp route config getters (#8722)`
-- `c6bce706 fix: reduce cctp interval to 10 retries (#8744)`
-- `7a362a09 feat: temporarily disable relaying to/from krown (#8742)`
-- `66e8c1f4 feat: whitelist moonpay route for fastpath relayer (#8725)`
-- `f758a7063 feat: rate limit ism support (#8703)`
-- `b8a600cc1 feat: add RateLimitedHook support to warp deploy and apply (#8715)`
-- `33097209a fix: rate limit ism inside aggregation ism (#8709)`
-- `8fb94f974 fix: nested trusted relayer ism (#8721)`
-- `f2ba67b2 feat(infra): expose relay API via Cloudflare tunnel sidecar (#8710)`
+- `577aa4a82e chore: release npm packages (#9070)`
+- `31abc0b089 fix: remove redundant prisma generate from ccip-server build (#9071)`
+- `a7d9af7541 fix(relayer): bound and validate CCIP-read responses (#9047)`
+- `58c5e11e1e fix(relayer): restrict CCIP-read network destinations (#9048)`
+- `e22be4b14d perf(relayer): wake database loader after indexing (#9034)`
+- `0a2a8fa51b perf(validator): remove final checkpoint pacing delay (#9033)`
+- `c5122b8b10 perf(relayer): overlap multisig checkpoint reads (#9032)`
+- `506f1ab781 fix: aggregation ism metadata building improvement (#8920)`
 
-The rate-limit ISM and rate-limited hook changes are primarily TypeScript SDK,
-CLI, deploy, and TypeScript relayer metadata changes. The Dusk Rust agent
-branch does not add TypeScript SDK/CLI support and does not claim rate-limited
-ISM or rate-limited hook support for Dusk deployments.
-
-The `21513522` ICA helper subpath export, `2b7db706` Citrea/Moonpay getter
-change, `7a362a09` Krown relaying disablement, and `66e8c1f4` fastpath relayer
-whitelist update are TypeScript SDK or infra/config-only. They do not change
-the Rust agent interfaces used by the Dusk chain crate, relayer, validator,
-scraper, or lander integration. The `c6bce706` CCTP retry interval change
-touches Rust relayer CCIP-read metadata handling only. Dusk continues to return
-explicit unsupported errors for CCIP-read ISMs, so this does not expand the
-supported Dusk behavior.
+The release and CCIP-server build commits are TypeScript/container-only. The
+Rust relayer and validator changes compile with the Dusk agent integration.
+CCIP-read and Aggregation ISM changes do not expand Dusk support: the Dusk
+builder still rejects those module types explicitly. The relayer performance
+changes do not alter the Dusk RUES or transaction-confirmation contracts.
 
 ## Current Dusk Support
 

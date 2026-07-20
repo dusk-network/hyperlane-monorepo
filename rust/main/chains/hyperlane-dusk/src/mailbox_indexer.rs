@@ -79,12 +79,11 @@ impl Indexer<HyperlaneMessage> for DuskMailboxIndexer {
                 .await?;
 
             // Decode the Dusk-format message.
-            let dusk_msg = hyperlane_dusk_types::message::decode(&encoded)
-                .ok_or_else(|| {
-                    crate::HyperlaneDuskError::Other(format!(
-                        "Failed to decode dispatched message at nonce {nonce}"
-                    ))
-                })?;
+            let dusk_msg = hyperlane_dusk_types::message::decode(&encoded).ok_or_else(|| {
+                crate::HyperlaneDuskError::Other(format!(
+                    "Failed to decode dispatched message at nonce {nonce}"
+                ))
+            })?;
 
             // Convert to hyperlane-core HyperlaneMessage.
             let core_msg = HyperlaneMessage {
@@ -179,7 +178,11 @@ impl Indexer<H256> for DuskDeliveryIndexer {
 
             let block_number: u64 = self
                 .rues
-                .contract_query(&self.mailbox_id, "processed_block_height_at_index", &(index,))
+                .contract_query(
+                    &self.mailbox_id,
+                    "processed_block_height_at_index",
+                    &(index,),
+                )
                 .await
                 .unwrap_or_default();
 

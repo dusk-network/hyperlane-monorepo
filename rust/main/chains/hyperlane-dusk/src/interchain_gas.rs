@@ -6,9 +6,9 @@ use async_trait::async_trait;
 use tracing::debug;
 
 use hyperlane_core::{
-    ChainResult, HyperlaneChain, HyperlaneContract, HyperlaneDomain, HyperlaneProvider,
-    Indexed, Indexer, InterchainGasPaymaster, InterchainGasPayment, LogMeta,
-    SequenceAwareIndexer, H256, H512, U256,
+    ChainResult, HyperlaneChain, HyperlaneContract, HyperlaneDomain, HyperlaneProvider, Indexed,
+    Indexer, InterchainGasPaymaster, InterchainGasPayment, LogMeta, SequenceAwareIndexer, H256,
+    H512, U256,
 };
 
 use hyperlane_dusk_types::GasPaymentRecord;
@@ -25,11 +25,7 @@ pub struct DuskInterchainGasPaymaster {
 
 impl DuskInterchainGasPaymaster {
     /// Create a new DuskInterchainGasPaymaster.
-    pub fn new(
-        provider: Arc<DuskProvider>,
-        igp_id: H256,
-        domain: HyperlaneDomain,
-    ) -> Self {
+    pub fn new(provider: Arc<DuskProvider>, igp_id: H256, domain: HyperlaneDomain) -> Self {
         Self {
             provider,
             igp_id: igp_id.into(),
@@ -83,7 +79,10 @@ impl Indexer<InterchainGasPayment> for DuskInterchainGasPaymasterIndexer {
     ) -> ChainResult<Vec<(Indexed<InterchainGasPayment>, LogMeta)>> {
         let mut results = Vec::new();
 
-        let payment_count: u32 = self.rues.contract_query(&self.igp_id, "gas_payment_count", &()).await?;
+        let payment_count: u32 = self
+            .rues
+            .contract_query(&self.igp_id, "gas_payment_count", &())
+            .await?;
 
         for index in range {
             if index >= payment_count {
