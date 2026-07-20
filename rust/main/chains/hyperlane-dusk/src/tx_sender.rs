@@ -21,6 +21,8 @@ use crate::{ConnectionConf, DuskSigner, HyperlaneDuskError};
 
 const DUSK_TX_HELPER_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_DUSK_TX_STREAM_BYTES: usize = 1024 * 1024;
+const MAX_DUSK_TX_ARGS_BYTES: usize = 60 * 1024;
+const MAX_PROCESS_PAYLOAD_BYTES: usize = MAX_DUSK_TX_ARGS_BYTES - 1024;
 
 /// Send a contract call via the `dusk-tx` CLI binary.
 ///
@@ -33,6 +35,53 @@ pub async fn dusk_tx_call(
     args_bytes: &[u8],
     gas_limit: Option<u64>,
 ) -> Result<Value, HyperlaneDuskError> {
+    dusk_tx_call_with_mode(
+        conn,
+        signer,
+        contract_id,
+        fn_name,
+        args_bytes,
+        gas_limit,
+        false,
+    )
+    .await
+}
+
+/// Simulate a contract call against Rusk's ephemeral execution endpoint.
+pub async fn dusk_tx_simulate_call(
+    conn: &ConnectionConf,
+    signer: &DuskSigner,
+    contract_id: &[u8; 32],
+    fn_name: &str,
+    args_bytes: &[u8],
+    gas_limit: Option<u64>,
+) -> Result<Value, HyperlaneDuskError> {
+    dusk_tx_call_with_mode(
+        conn,
+        signer,
+        contract_id,
+        fn_name,
+        args_bytes,
+        gas_limit,
+        true,
+    )
+    .await
+}
+
+async fn dusk_tx_call_with_mode(
+    conn: &ConnectionConf,
+    signer: &DuskSigner,
+    contract_id: &[u8; 32],
+    fn_name: &str,
+    args_bytes: &[u8],
+    gas_limit: Option<u64>,
+    simulate_only: bool,
+) -> Result<Value, HyperlaneDuskError> {
+    if args_bytes.len() > MAX_DUSK_TX_ARGS_BYTES {
+        return Err(HyperlaneDuskError::Other(format!(
+            "dusk-tx arguments for {fn_name} exceed the {MAX_DUSK_TX_ARGS_BYTES}-byte helper transport limit"
+        )));
+    }
     let bin = std::env::var("DUSK_TX_BIN").unwrap_or_else(|_| "dusk-tx".into());
     let contract_hex = hex::encode(contract_id);
     let args_hex = hex::encode(args_bytes);
@@ -48,8 +97,12 @@ pub async fn dusk_tx_call(
 
     let mut command = Command::new(&bin);
     command.kill_on_drop(true);
+    if simulate_only {
+        command.arg("call").arg("--simulate-only");
+    } else {
+        command.arg("call");
+    }
     let mut child = command
-        .arg("call")
         .arg("--rues-url")
         .arg(conn.url.as_str())
         .arg("--secret-key-stdin")
@@ -109,6 +162,12 @@ pub async fn dusk_tx_call(
         // Try to parse error from JSON output
         if let Ok(json) = serde_json::from_str::<Value>(&stdout) {
             if let Some(err) = json.get("error").and_then(|e| e.as_str()) {
+                if let Some(tx_id) = outcome_unknown_tx_id(err) {
+                    return Err(HyperlaneDuskError::SubmissionOutcomeUnknown {
+                        tx_id,
+                        detail: err.to_owned(),
+                    });
+                }
                 return Err(HyperlaneDuskError::Other(format!(
                     "dusk-tx call {fn_name} failed: {err}"
                 )));
@@ -235,7 +294,34 @@ pub fn process_args(
     metadata: &[u8],
     encoded_message: &[u8],
 ) -> Result<Vec<u8>, HyperlaneDuskError> {
-    rkyv_serialize(&(metadata.to_vec(), encoded_message.to_vec()))
+    let payload_len = metadata
+        .len()
+        .checked_add(encoded_message.len())
+        .ok_or_else(|| HyperlaneDuskError::Other("Dusk process payload length overflow".into()))?;
+    if payload_len > MAX_PROCESS_PAYLOAD_BYTES {
+        return Err(HyperlaneDuskError::Other(format!(
+            "Dusk process metadata and message exceed the {MAX_PROCESS_PAYLOAD_BYTES}-byte payload limit"
+        )));
+    }
+    let args = rkyv_serialize(&(metadata.to_vec(), encoded_message.to_vec()))?;
+    if args.len() > MAX_DUSK_TX_ARGS_BYTES {
+        return Err(HyperlaneDuskError::Other(format!(
+            "Serialized Dusk process arguments exceed the {MAX_DUSK_TX_ARGS_BYTES}-byte helper transport limit"
+        )));
+    }
+    Ok(args)
+}
+
+fn outcome_unknown_tx_id(error: &str) -> Option<String> {
+    if !error.contains("submission failed: Propagation outcome unknown")
+        && !error.contains("confirmation outcome unknown")
+    {
+        return None;
+    }
+    let tx_id = error.split("tx_id=").nth(1)?.split_whitespace().next()?;
+    let tx_id = tx_id.trim_end_matches(|character: char| !character.is_ascii_hexdigit());
+    (tx_id.len() == 64 && tx_id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| tx_id.to_ascii_lowercase())
 }
 
 /// Build rkyv-serialized args for validator_announce.announce(validator, location, signature).
@@ -251,6 +337,35 @@ pub fn announce_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_payload_is_bounded_before_helper_transport() {
+        let oversized = vec![0u8; MAX_PROCESS_PAYLOAD_BYTES + 1];
+        let error = process_args(&oversized, &[]).unwrap_err();
+        assert!(error.to_string().contains("payload limit"));
+    }
+
+    #[test]
+    fn only_outcome_unknown_errors_yield_a_reconciliation_hash() {
+        let tx_id = "ab".repeat(32);
+        let unknown = format!(
+            "Transaction {tx_id} submission failed: Propagation outcome unknown: closed; retain tx_id={tx_id} and reconcile this exact hash"
+        );
+        assert_eq!(outcome_unknown_tx_id(&unknown), Some(tx_id.clone()));
+
+        let confirmation_unknown = format!(
+            "Transaction {tx_id} confirmation outcome unknown: timed out; retain tx_id={tx_id}"
+        );
+        assert_eq!(
+            outcome_unknown_tx_id(&confirmation_unknown),
+            Some(tx_id.clone())
+        );
+
+        let rejected = format!(
+            "Transaction {tx_id} submission failed: Propagation rejected; retain tx_id={tx_id}"
+        );
+        assert_eq!(outcome_unknown_tx_id(&rejected), None);
+    }
 
     #[test]
     fn transaction_ids_are_left_padded_without_changing_dusk_bytes() {

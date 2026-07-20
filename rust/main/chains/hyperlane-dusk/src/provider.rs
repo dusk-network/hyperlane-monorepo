@@ -102,7 +102,7 @@ impl HyperlaneProvider for DuskProvider {
         let dusk_tx_hex = h512_to_dusk_tx_id(hash)?;
 
         let query = format!(
-            "query {{ tx(hash: \"{dusk_tx_hex}\") {{ gasSpent tx {{ gasLimit gasPrice raw callData {{ contractId }} }} }} }}"
+            "query {{ tx(hash: \"{dusk_tx_hex}\") {{ gasSpent tx {{ gasLimit gasPrice raw json callData {{ contractId }} }} }} }}"
         );
         let data = self.rues.graphql_query(&query).await?;
 
@@ -121,6 +121,15 @@ impl HyperlaneProvider for DuskProvider {
 
         let gas_limit = required_u64(inner_tx, "gasLimit", "transaction")?;
         let gas_price = required_u64(inner_tx, "gasPrice", "transaction")?;
+        let transaction_json = inner_tx
+            .get("json")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                HyperlaneDuskError::Other(format!(
+                    "GraphQL transaction is missing its JSON identity data: {data}"
+                ))
+            })?;
+        let (sender, nonce) = moonlight_identity_from_json(transaction_json)?;
 
         let raw_input_data = inner_tx
             .get("raw")
@@ -151,8 +160,8 @@ impl HyperlaneProvider for DuskProvider {
             max_priority_fee_per_gas: None,
             max_fee_per_gas: None,
             gas_price: Some(U256::from(gas_price)),
-            nonce: 0,
-            sender: H256::zero(),
+            nonce,
+            sender,
             recipient,
             receipt: Some(hyperlane_core::TxnReceiptInfo {
                 gas_used: U256::from(gas_used),
@@ -236,6 +245,44 @@ impl HyperlaneProvider for DuskProvider {
     }
 }
 
+fn moonlight_identity_from_json(value: &str) -> Result<(H256, u64), HyperlaneDuskError> {
+    let transaction: serde_json::Value = serde_json::from_str(value).map_err(|error| {
+        HyperlaneDuskError::Other(format!("Invalid ledger transaction JSON: {error}"))
+    })?;
+    if transaction.get("type").and_then(serde_json::Value::as_str) != Some("moonlight") {
+        return Err(HyperlaneDuskError::Other(
+            "Dusk transaction identity is only defined here for Moonlight transactions".into(),
+        ));
+    }
+    let nonce = transaction
+        .get("nonce")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            HyperlaneDuskError::Other(format!(
+                "Moonlight transaction JSON is missing numeric nonce: {transaction}"
+            ))
+        })?;
+    let sender_bs58 = transaction
+        .get("sender")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            HyperlaneDuskError::Other(format!(
+                "Moonlight transaction JSON is missing sender: {transaction}"
+            ))
+        })?;
+    let sender_bytes = bs58::decode(sender_bs58).into_vec().map_err(|error| {
+        HyperlaneDuskError::Other(format!("Invalid Moonlight sender encoding: {error}"))
+    })?;
+    if sender_bytes.len() != 96 {
+        return Err(HyperlaneDuskError::Other(format!(
+            "Moonlight sender must decode to 96 bytes, got {}",
+            sender_bytes.len()
+        )));
+    }
+    let sender = hyperlane_dusk_types::message::keccak256(&sender_bytes);
+    Ok((H256::from_slice(&sender), nonce))
+}
+
 fn required_u64(
     object: &serde_json::Map<String, serde_json::Value>,
     field: &str,
@@ -254,11 +301,31 @@ fn required_u64(
 
 #[cfg(test)]
 mod tests {
-    use super::required_u64;
+    use super::{moonlight_identity_from_json, required_u64};
+    use hyperlane_core::H256;
     use serde_json::{json, Map, Value};
 
     fn object(value: Value) -> Map<String, Value> {
         value.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn moonlight_transaction_identity_uses_the_real_sender_and_nonce() {
+        let sender = [7u8; 96];
+        let encoded = bs58::encode(sender).into_string();
+        let json = serde_json::json!({
+            "type": "moonlight",
+            "sender": encoded,
+            "nonce": 42,
+        })
+        .to_string();
+        let (identity, nonce) = moonlight_identity_from_json(&json).unwrap();
+        assert_eq!(
+            identity,
+            H256::from_slice(&hyperlane_dusk_types::message::keccak256(&sender))
+        );
+        assert_eq!(nonce, 42);
+        assert!(moonlight_identity_from_json(r#"{"type":"phoenix","nonce":1}"#).is_err());
     }
 
     #[test]

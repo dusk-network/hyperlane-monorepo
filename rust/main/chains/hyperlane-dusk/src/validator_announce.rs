@@ -117,7 +117,7 @@ impl ValidatorAnnounce for DuskValidatorAnnounce {
             &signature,
         )?;
 
-        let res = crate::tx_sender::dusk_tx_call(
+        let call_result = crate::tx_sender::dusk_tx_call(
             &self.conn,
             signer,
             &self.va_id,
@@ -125,15 +125,28 @@ impl ValidatorAnnounce for DuskValidatorAnnounce {
             &args,
             None,
         )
-        .await?;
+        .await;
 
-        let tx_id = res.get("tx_id").and_then(|v| v.as_str()).ok_or_else(|| {
-            HyperlaneDuskError::Other(format!("dusk-tx response is missing string tx_id: {res}"))
-        })?;
-        let transaction_id = crate::tx_sender::dusk_tx_id_to_h512(tx_id)?;
+        let tx_id = match call_result {
+            Ok(response) => response
+                .get("tx_id")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    HyperlaneDuskError::Other(format!(
+                        "dusk-tx response is missing string tx_id: {response}"
+                    ))
+                })?
+                .to_owned(),
+            Err(HyperlaneDuskError::SubmissionOutcomeUnknown { tx_id, detail }) => {
+                warn!(%tx_id, %detail, "Reconciling outcome-unknown Dusk announcement by exact hash");
+                tx_id
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let transaction_id = crate::tx_sender::dusk_tx_id_to_h512(&tx_id)?;
         let confirmed = self
             .rues
-            .wait_for_tx(tx_id, TX_CONFIRMATION_TIMEOUT)
+            .wait_for_tx(&tx_id, TX_CONFIRMATION_TIMEOUT)
             .await?;
         let executed = confirmed.error.is_none();
         if let Some(error) = &confirmed.error {

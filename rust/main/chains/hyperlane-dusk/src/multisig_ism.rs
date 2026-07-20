@@ -60,16 +60,11 @@ impl MultisigIsm for DuskMultisigIsm {
         &self,
         _message: &HyperlaneMessage,
     ) -> ChainResult<(Vec<H256>, u8)> {
-        // Query validators from the ISM contract.
-        let validators: Vec<EthAddress> = self
+        // Read the pair in one contract query so an owner update cannot be
+        // observed half-applied across independent RUES requests.
+        let (validators, threshold): (Vec<EthAddress>, u8) = self
             .rues
-            .contract_query(&self.ism_id, "validators", &())
-            .await?;
-
-        // Query threshold.
-        let threshold: u8 = self
-            .rues
-            .contract_query(&self.ism_id, "threshold", &())
+            .contract_query(&self.ism_id, "validators_and_threshold", &())
             .await?;
 
         // Convert 20-byte Ethereum addresses to H256 (left-pad with 12 zero bytes).

@@ -397,10 +397,11 @@ impl RuesClient {
             match tokio::time::timeout_at(deadline, self.graphql_query(&query)).await {
                 Ok(Ok(data)) => {
                     if let Some(tx) = data.get("tx").filter(|tx| !tx.is_null()) {
-                        match parse_confirmed_transaction(tx_id, tx) {
-                            Ok(confirmed) => return Ok(confirmed),
-                            Err(error) => last_observation_error = Some(error.to_string()),
-                        }
+                        // A non-null ledger record is an authoritative
+                        // observation. Missing or malformed execution fields
+                        // are corruption/schema drift, not a pending state that
+                        // a later response may silently overwrite.
+                        return parse_confirmed_transaction(tx_id, tx);
                     } else {
                         last_observation_error = None;
                     }
@@ -857,12 +858,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn confirmation_retries_observation_errors_for_the_same_transaction() {
+    async fn confirmation_retries_transport_errors_for_the_same_transaction() {
         let url = test_server(vec![
             (503, "temporarily unavailable"),
             (200, r#"{"errors":[{"message":"archive catching up"}]}"#),
-            (200, r#"{"tx":{"gasSpent":"not-a-number","err":null}}"#),
-            (200, r#"{"tx":{"gasSpent":41,"err":7}}"#),
             (200, r#"{"tx":{"gasSpent":42,"err":null}}"#),
         ]);
         let client = RuesClient::new(url).unwrap();
@@ -877,6 +876,25 @@ mod tests {
             .unwrap();
         assert_eq!(confirmed.gas_spent, 42);
         assert_eq!(confirmed.error, None);
+    }
+
+    #[tokio::test]
+    async fn confirmation_rejects_a_malformed_included_transaction() {
+        let url = test_server(vec![
+            (200, r#"{"tx":{"gasSpent":"not-a-number","err":null}}"#),
+            (200, r#"{"tx":{"gasSpent":42,"err":null}}"#),
+        ]);
+        let client = RuesClient::new(url).unwrap();
+        let tx_id = "ab".repeat(32);
+        let error = client
+            .wait_for_tx_with_poll_interval(
+                &tx_id,
+                Duration::from_secs(2),
+                Duration::from_millis(1),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("missing numeric gasSpent"));
     }
 
     #[tokio::test]

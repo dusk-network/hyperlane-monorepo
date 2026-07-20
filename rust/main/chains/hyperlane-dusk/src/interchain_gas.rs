@@ -17,6 +17,8 @@ use crate::rues::{contract_event_transaction_id, rkyv_serialize, ArchivedContrac
 use crate::tx_sender::{dusk_tx_id_to_h512, h512_to_dusk_tx_id};
 use crate::{DuskProvider, RuesClient};
 
+const GAS_PAYMENT_PAGE_SIZE: u32 = 256;
+
 /// Dusk InterchainGasPaymaster implementation (marker contract).
 #[derive(Debug, Clone)]
 pub struct DuskInterchainGasPaymaster {
@@ -146,58 +148,71 @@ impl Indexer<InterchainGasPayment> for DuskInterchainGasPaymasterIndexer {
             .await?;
         let (finalized_count, _) = self.finalized_payment_count(payment_count).await?;
 
-        for index in range {
-            if index >= finalized_count {
-                break;
-            }
-
-            let record: GasPaymentRecord = self
+        let mut next = *range.start();
+        let requested_end = *range.end();
+        while next < finalized_count && next <= requested_end {
+            let limit = (finalized_count - next)
+                .min(requested_end.saturating_sub(next).saturating_add(1))
+                .min(GAS_PAYMENT_PAGE_SIZE);
+            let records: Vec<GasPaymentRecord> = self
                 .rues
-                .contract_query(&self.igp_id, "gas_payment_at", &(index,))
+                .contract_query(&self.igp_id, "gas_payments", &(next, limit))
                 .await?;
-            ensure_cursor_height(record.block_height)?;
-
-            let payment = InterchainGasPayment {
-                message_id: H256::from_slice(&record.message_id),
-                destination: record.destination,
-                payment: U256::from(record.payment),
-                gas_amount: U256::from(record.gas_limit),
-            };
-
-            if archive_height != Some(record.block_height) {
-                archive_events = self.rues.contract_events_at(record.block_height).await?;
-                archive_block_hash = self.rues.block_hash_at(record.block_height).await?;
-                payment_ordinal = self
-                    .payment_ordinal_in_block(index, record.block_height)
-                    .await?;
-                archive_height = Some(record.block_height);
+            if records.len() != limit as usize {
+                return Err(crate::HyperlaneDuskError::Other(format!(
+                    "IGP returned {} payment records for page start={next} limit={limit}",
+                    records.len()
+                ))
+                .into());
             }
 
-            let expected_event = rkyv_serialize(&events::GasPayment {
-                message_id: record.message_id,
-                gas_limit: record.gas_limit,
-                payment: record.payment,
-            })?;
-            let transaction_id = contract_event_transaction_id(
-                &archive_events,
-                &self.igp_id,
-                events::GasPayment::TOPIC,
-                payment_ordinal,
-                &expected_event,
-            )?;
-            payment_ordinal += 1;
+            for (offset, record) in records.into_iter().enumerate() {
+                let index = next + offset as u32;
+                ensure_cursor_height(record.block_height)?;
 
-            let indexed = Indexed::from(payment).with_sequence(index);
-            let meta = LogMeta {
-                address: self.igp_address,
-                block_number: record.block_height,
-                block_hash: archive_block_hash,
-                transaction_id,
-                transaction_index: 0,
-                log_index: U256::from(index),
-            };
+                let payment = InterchainGasPayment {
+                    message_id: H256::from_slice(&record.message_id),
+                    destination: record.destination,
+                    payment: U256::from(record.payment),
+                    gas_amount: U256::from(record.gas_limit),
+                };
 
-            results.push((indexed, meta));
+                if archive_height != Some(record.block_height) {
+                    archive_events = self.rues.contract_events_at(record.block_height).await?;
+                    archive_block_hash = self.rues.block_hash_at(record.block_height).await?;
+                    payment_ordinal = self
+                        .payment_ordinal_in_block(index, record.block_height)
+                        .await?;
+                    archive_height = Some(record.block_height);
+                }
+
+                let expected_event = rkyv_serialize(&events::GasPayment {
+                    message_id: record.message_id,
+                    gas_limit: record.gas_limit,
+                    payment: record.payment,
+                })?;
+                let transaction_id = contract_event_transaction_id(
+                    &archive_events,
+                    &self.igp_id,
+                    events::GasPayment::TOPIC,
+                    payment_ordinal,
+                    &expected_event,
+                )?;
+                payment_ordinal += 1;
+
+                let indexed = Indexed::from(payment).with_sequence(index);
+                let meta = LogMeta {
+                    address: self.igp_address,
+                    block_number: record.block_height,
+                    block_hash: archive_block_hash,
+                    transaction_id,
+                    transaction_index: 0,
+                    log_index: U256::from(index),
+                };
+
+                results.push((indexed, meta));
+            }
+            next += limit;
         }
 
         debug!(count = results.len(), "Fetched interchain gas payment logs");

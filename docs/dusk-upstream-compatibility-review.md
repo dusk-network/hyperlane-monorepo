@@ -65,8 +65,8 @@ Earlier observation on 2026-07-20:
   and the expanded affected-package command
   `cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p scraper -p lander`
   all pass against companion base head
-  `726040440c904ec6adf6616a1963146ee9693fe4`; the combined contract/withdrawal
-  gate is `6b3a17845a3ff206bd830383d7d353ee94a34667`.
+  `4d8f5da013d56e5d3fa036ab924de6a6729b5f4f`; the combined contract/withdrawal
+  implementation is `7970f468e1accdf154d0dcb927c4d5b4addf0b40`.
 - `cargo fmt --package hyperlane-dusk --package hyperlane-base -- --check`
   passes. Workspace-wide
   `cargo fmt --all -- --check` is not used as Dusk PR evidence because Cargo's
@@ -119,8 +119,10 @@ The resulting implementation decisions are:
   hash queries now fail explicitly. This is a deliberate availability-for-
   correctness tradeoff.
 - Bound RUES response buffering to 4 MiB and make transaction observation
-  retry transient HTTP, GraphQL, and decode failures under one total deadline.
-  The transaction ID remains immutable across retries. The external `dusk-tx`
+  retry transient HTTP and GraphQL transport failures under one total deadline.
+  An explicit null/not-found record remains pending, while malformed fields in
+  a non-null ledger record fail immediately as authoritative schema drift. The
+  transaction ID remains immutable across retries. The external `dusk-tx`
   helper has its own 120-second deadline and is killed when that deadline
   expires.
 - Preserve semantic errors across the chain adapter: signer unavailability is
@@ -154,8 +156,9 @@ The follow-up raw-artifact triage added these compatibility decisions:
   same height; transaction gas limit, price, and spent values must be numeric;
   latest block height, timestamp, and 32-byte hash must be valid; and gas-price
   statistics errors remain visible rather than becoming zero/default metrics.
-- Transaction confirmation treats malformed archive observations as retryable
-  only within the existing absolute deadline. It never changes the submitted
+- Transaction confirmation retries only transport/GraphQL failures and explicit
+  not-yet-included state within the absolute deadline. Malformed fields in a
+  non-null ledger record fail immediately. It never changes the submitted
   transaction ID and never converts malformed data into execution success.
 - Dusk transaction hashes are reversible only in the canonical left-padded
   `H512` representation. Indexers now parse Dusk IDs, resolve the containing
@@ -192,9 +195,10 @@ submit, and is not a claim that transaction execution itself is free.
 
 Local regression evidence for this follow-up is:
 
-- `cargo test -p hyperlane-dusk`: 15 passed, including bounded helper output,
-  exact transaction-ID conversion, provider fail-closed parsing, archive-event
-  provenance, and malformed-observation retry behavior;
+- `cargo test -p hyperlane-dusk`: 19 passed, including bounded helper output
+  and process payloads, exact transaction-ID conversion, real Moonlight
+  identity/nonce parsing, archive-event provenance, outcome-unknown hash
+  recovery, and fail-closed malformed included-transaction behavior;
 - `cargo test -p hyperlane-base dusk_`: 7 passed, including Dusk signer,
   chain-ID, and sequence-only index-mode coverage;
 - `cargo clippy -p hyperlane-dusk --all-targets -- -D warnings`: passed;
@@ -206,6 +210,39 @@ Local regression evidence for this follow-up is:
 workflow received syntax/diff inspection here and still requires its GitHub
 workflow parser/status run. This limitation is recorded rather than treating a
 missing local tool as successful workflow validation.
+
+### 2026-07-20 cross-repository follow-up
+
+A second all-`xhigh` Controlecentrum pass inspected the complete historical PR
+head. Its Dusk-specific findings are resolved across the companion contract
+and agent changes as one compatibility boundary:
+
+- `validators_and_threshold` returns one coherent ISM policy snapshot instead
+  of two independently mutable reads.
+- Merkle message IDs and IGP payment records are read through bounded 256-item
+  pages. Restart replay remains linear in local data ingestion, but no longer
+  requires one network round trip per lifetime record.
+- `dusk-tx call --simulate-only` uses Rusk's ephemeral transaction simulation.
+  Relayer preparation now executes the exact signed payload and treats a
+  deterministic contract rejection as a dry-run failure before propagation.
+- The helper transport caps serialized arguments at 60 KiB before hex/argv
+  expansion. A Dusk destination relayer without a signer is rejected at
+  startup, while signerless read-only validator/indexer construction remains
+  supported.
+- Outcome-unknown propagation carries the exact transaction hash back across
+  the helper boundary. Mailbox and ValidatorAnnounce reconcile that hash before
+  producing a transaction outcome. Client rejections are not mislabeled as
+  ambiguous submissions.
+- Transaction lookup derives the shared sender identity from the ledger's
+  Moonlight public key and returns the real ledger nonce. A malformed non-null
+  confirmation record fails immediately; only transport/GraphQL observation
+  failures and explicit not-yet-included state are retried.
+
+The report also surfaced Squads, ALT, and AltVM findings from upstream commits
+that appear in the 61-commit historical fork diff only because fork `main` has
+not yet absorbed sync PR #2. They are not Dusk-agent changes and must be
+evaluated against upstream ownership after the sync PR is merged rather than
+being attributed to this port.
 
 The Dusk fork now also proposes
 `.github/workflows/dusk-agent-gate.yml` as a narrow PR status check for the

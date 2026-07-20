@@ -16,6 +16,7 @@ use crate::rues::rkyv_serialize;
 use crate::{ConnectionConf, DuskProvider, DuskSigner, HyperlaneDuskError, RuesClient};
 
 const TX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(120);
+const MERKLE_HISTORY_PAGE_SIZE: u32 = 256;
 
 /// Dusk Mailbox — implements both `Mailbox` and `MerkleTreeHook` traits.
 #[derive(Debug, Clone)]
@@ -123,12 +124,24 @@ impl DuskMailbox {
     async fn finalized_tree(&self) -> ChainResult<IncrementalMerkleAtBlock> {
         let (count, finalized_height) = self.finalized_merkle_view().await?;
         let mut tree = IncrementalMerkle::default();
-        for index in 0..count {
-            let message_id: [u8; 32] = self
+        let mut start = 0u32;
+        while start < count {
+            let limit = (count - start).min(MERKLE_HISTORY_PAGE_SIZE);
+            let message_ids: Vec<[u8; 32]> = self
                 .rues
-                .contract_query(&self.merkle_tree_hook_id, "message_id_at", &(index,))
+                .contract_query(&self.merkle_tree_hook_id, "message_ids", &(start, limit))
                 .await?;
-            tree.ingest(H256::from_slice(&message_id));
+            if message_ids.len() != limit as usize {
+                return Err(HyperlaneDuskError::Other(format!(
+                    "MerkleTreeHook returned {} message IDs for page start={start} limit={limit}",
+                    message_ids.len()
+                ))
+                .into());
+            }
+            for message_id in message_ids {
+                tree.ingest(H256::from_slice(&message_id));
+            }
+            start += limit;
         }
 
         if count > 0 {
@@ -248,15 +261,13 @@ impl Mailbox for DuskMailbox {
             .ok_or(HyperlaneDuskError::SignerUnavailable)?;
 
         let encoded = Self::encode_message(message);
-        let metadata_bytes = metadata.to_owned();
-
         info!(
             message_id = ?message.id(),
             nonce = message.nonce,
             "Processing message on Dusk via dusk-tx"
         );
 
-        let args = crate::tx_sender::process_args(&metadata_bytes, &encoded)?;
+        let args = crate::tx_sender::process_args(metadata, &encoded)?;
 
         let gas_limit = tx_gas_limit
             .map(|limit| {
@@ -269,7 +280,7 @@ impl Mailbox for DuskMailbox {
             })
             .transpose()?;
 
-        let res = crate::tx_sender::dusk_tx_call(
+        let call_result = crate::tx_sender::dusk_tx_call(
             &self.conn,
             signer,
             &self.mailbox_id,
@@ -277,15 +288,28 @@ impl Mailbox for DuskMailbox {
             &args,
             gas_limit,
         )
-        .await?;
+        .await;
 
-        let tx_id = res.get("tx_id").and_then(|v| v.as_str()).ok_or_else(|| {
-            HyperlaneDuskError::Other(format!("dusk-tx response is missing string tx_id: {res}"))
-        })?;
-        let transaction_id = crate::tx_sender::dusk_tx_id_to_h512(tx_id)?;
+        let tx_id = match call_result {
+            Ok(response) => response
+                .get("tx_id")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    HyperlaneDuskError::Other(format!(
+                        "dusk-tx response is missing string tx_id: {response}"
+                    ))
+                })?
+                .to_owned(),
+            Err(HyperlaneDuskError::SubmissionOutcomeUnknown { tx_id, detail }) => {
+                warn!(%tx_id, %detail, "Reconciling outcome-unknown Dusk submission by exact hash");
+                tx_id
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let transaction_id = crate::tx_sender::dusk_tx_id_to_h512(&tx_id)?;
         let confirmed = self
             .rues
-            .wait_for_tx(tx_id, TX_CONFIRMATION_TIMEOUT)
+            .wait_for_tx(&tx_id, TX_CONFIRMATION_TIMEOUT)
             .await?;
         let executed = confirmed.error.is_none();
         if let Some(error) = &confirmed.error {
@@ -310,9 +334,37 @@ impl Mailbox for DuskMailbox {
 
     async fn process_estimate_costs(
         &self,
-        _message: &HyperlaneMessage,
-        _metadata: &Metadata,
+        message: &HyperlaneMessage,
+        metadata: &Metadata,
     ) -> ChainResult<TxCostEstimate> {
+        let signer = self
+            .signer
+            .as_ref()
+            .ok_or(HyperlaneDuskError::SignerUnavailable)?;
+        let encoded = Self::encode_message(message);
+        let args = crate::tx_sender::process_args(metadata, &encoded)?;
+        let simulation = crate::tx_sender::dusk_tx_simulate_call(
+            &self.conn,
+            signer,
+            &self.mailbox_id,
+            "process",
+            &args,
+            None,
+        )
+        .await?;
+        let gas_spent = simulation
+            .get("gas_spent")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                HyperlaneDuskError::Other(format!(
+                    "dusk-tx simulation response is missing numeric gas_spent: {simulation}"
+                ))
+            })?;
+        info!(message_id = ?message.id(), gas_spent, "Dusk process simulation succeeded");
+
+        // Preserve the configured transaction ceiling for gas-payment policy
+        // and final submission. The simulation above is the payload-dependent
+        // revert gate; its measured gas is recorded for diagnostics.
         Ok(TxCostEstimate {
             gas_limit: U256::from(self.conn.gas_limit),
             gas_price: FixedPointNumber::from(self.conn.gas_price),
@@ -326,8 +378,7 @@ impl Mailbox for DuskMailbox {
         metadata: &Metadata,
     ) -> ChainResult<Vec<u8>> {
         let encoded = Self::encode_message(message);
-        let metadata_bytes = metadata.to_owned();
-        Ok(rkyv_serialize(&(metadata_bytes, encoded))?)
+        Ok(crate::tx_sender::process_args(metadata, &encoded)?)
     }
 
     fn delivered_calldata(&self, message_id: H256) -> ChainResult<Option<Vec<u8>>> {

@@ -26,6 +26,15 @@ pub enum HyperlaneDuskError {
     /// Signer is not configured.
     #[error("Signer unavailable")]
     SignerUnavailable,
+    /// The helper constructed a transaction but could not determine whether
+    /// propagation reached the node. Callers must reconcile this exact hash.
+    #[error("Dusk transaction {tx_id} propagation outcome is unknown: {detail}")]
+    SubmissionOutcomeUnknown {
+        /// Canonical 32-byte Dusk transaction hash (lowercase hex).
+        tx_id: String,
+        /// Original helper diagnostic.
+        detail: String,
+    },
     /// The configured BLS secret key is invalid.
     #[error("Invalid BLS secret key: {0}")]
     InvalidBlsSecretKey(String),
