@@ -178,6 +178,10 @@ make secret-hygiene
 The companion E2E and stress commands are recorded in its `TEST_REPORT.md`
 with exact run IDs and artifact paths.
 
+`docs/dusk-companion-compatibility.md` is the authoritative exact-head manifest
+for the reassessed agent, base contracts, stacked withdrawal, Rusk, and
+fresh-deployment boundary.
+
 ## Blockers Before Upstream
 
 - Dusk reviewers must accept or change the production decisions in
