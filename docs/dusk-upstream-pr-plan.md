@@ -94,7 +94,9 @@ From `rust/main` in this monorepo:
 ```bash
 cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p scraper -p lander
 cargo test -p hyperlane-dusk
-cargo fmt --package hyperlane-dusk -- --check
+cargo test -p hyperlane-base dusk_chain_id_rejects_truncation
+cargo fmt --package hyperlane-dusk --package hyperlane-base -- --check
+cargo clippy -p hyperlane-dusk --all-targets -- -D warnings
 ```
 
 The package-scoped formatter is deliberate. `cargo fmt --all` traverses the
@@ -111,14 +113,26 @@ adjacent layout used locally, scans `rust/main/chains/hyperlane-dusk` for
 runtime placeholder macros, and runs:
 
 ```bash
-cargo check -p hyperlane-dusk
+cargo fmt --package hyperlane-dusk --package hyperlane-base -- --check
+cargo test -p hyperlane-dusk
+cargo test -p hyperlane-base dusk_chain_id_rejects_truncation
+cargo clippy -p hyperlane-dusk --all-targets -- -D warnings
+cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p scraper -p lander
 ```
 
 The workflow needs `DUSK_ORG_READ_TOKEN` because the companion Dusk repo is
 private. It preflights that private repo access with `gh api` before checkout
-so missing token provisioning fails explicitly. It is an early agent
-compile/status gate, not a replacement for the full local `cargo check`
-command above or the companion Dusk E2E evidence.
+so missing token provisioning fails explicitly. A separate policy-gate step
+diffs the branch against live Hyperlane upstream and rejects changes outside
+the reviewed Dusk integration allowlist. Together these are the fork-scoped
+validation substitute for Hyperlane-owned infrastructure, not a replacement
+for the companion Dusk E2E evidence.
+
+Production indexers now require an archive-enabled Rusk endpoint. Canonical
+`LogMeta` is derived by matching contract state to the archived event's source,
+topic, in-block ordinal, exact serialized payload, transaction origin, and
+block hash. Missing archive data fails closed; zero provenance is not emitted
+because the scraper can filter it and still advance its cursor.
 
 The inherited upstream Rust agent and monorepo image workflows are guarded to
 run only when `github.repository_owner == 'hyperlane-xyz'`. The inherited

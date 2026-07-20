@@ -32,15 +32,25 @@ impl Indexer<MerkleTreeInsertion> for DuskMerkleTreeHookIndexer {
     ) -> ChainResult<Vec<(Indexed<MerkleTreeInsertion>, LogMeta)>> {
         let messages = Indexer::<HyperlaneMessage>::fetch_logs_in_range(&self.inner, range).await?;
 
-        let results: Vec<_> = messages
-            .into_iter()
-            .map(|(indexed_msg, meta)| {
-                let msg = indexed_msg.inner();
-                let insertion = MerkleTreeInsertion::new(msg.nonce, msg.id());
-                let indexed = Indexed::from(insertion).with_sequence(msg.nonce);
-                (indexed, meta)
-            })
-            .collect();
+        let mut results = Vec::with_capacity(messages.len());
+        for (indexed_msg, meta) in messages {
+            let sequence = indexed_msg.sequence.ok_or_else(|| {
+                crate::HyperlaneDuskError::Other(
+                    "Dusk mailbox message is missing its queried sequence".into(),
+                )
+            })?;
+            let msg = indexed_msg.inner();
+            if msg.nonce != sequence {
+                return Err(crate::HyperlaneDuskError::Other(format!(
+                    "Dusk mailbox message nonce {} does not match queried sequence {sequence}",
+                    msg.nonce
+                ))
+                .into());
+            }
+            let insertion = MerkleTreeInsertion::new(sequence, msg.id());
+            let indexed = Indexed::from(insertion).with_sequence(sequence);
+            results.push((indexed, meta));
+        }
 
         debug!(count = results.len(), "Fetched merkle tree insertion logs");
         Ok(results)

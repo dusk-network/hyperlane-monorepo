@@ -7,6 +7,7 @@
 //! This module invokes it as a subprocess.
 
 use std::process::Stdio;
+use std::time::Duration;
 
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
@@ -18,6 +19,8 @@ use hyperlane_core::H512;
 use crate::rues::rkyv_serialize;
 use crate::{ConnectionConf, DuskSigner, HyperlaneDuskError};
 
+const DUSK_TX_HELPER_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Send a contract call via the `dusk-tx` CLI binary.
 ///
 /// Returns the parsed JSON output on success.
@@ -27,6 +30,7 @@ pub async fn dusk_tx_call(
     contract_id: &[u8; 32],
     fn_name: &str,
     args_bytes: &[u8],
+    gas_limit: Option<u64>,
 ) -> Result<Value, HyperlaneDuskError> {
     let bin = std::env::var("DUSK_TX_BIN").unwrap_or_else(|_| "dusk-tx".into());
     let contract_hex = hex::encode(contract_id);
@@ -41,7 +45,9 @@ pub async fn dusk_tx_call(
         "Invoking dusk-tx call"
     );
 
-    let mut child = Command::new(&bin)
+    let mut command = Command::new(&bin);
+    command.kill_on_drop(true);
+    let mut child = command
         .arg("call")
         .arg("--rues-url")
         .arg(conn.url.as_str())
@@ -53,7 +59,7 @@ pub async fn dusk_tx_call(
         .arg("--args")
         .arg(&args_hex)
         .arg("--gas-limit")
-        .arg(conn.gas_limit.to_string())
+        .arg(gas_limit.unwrap_or(conn.gas_limit).to_string())
         .arg("--gas-price")
         .arg(conn.gas_price.to_string())
         .stdin(Stdio::piped())
@@ -82,9 +88,7 @@ pub async fn dusk_tx_call(
         })?;
     }
 
-    let output = child.wait_with_output().await.map_err(|e| {
-        HyperlaneDuskError::Other(format!("Failed to wait on dusk-tx child process: {e}"))
-    })?;
+    let output = wait_for_child_output(child, fn_name, DUSK_TX_HELPER_TIMEOUT).await?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -129,6 +133,24 @@ pub async fn dusk_tx_call(
     Ok(json)
 }
 
+async fn wait_for_child_output(
+    child: tokio::process::Child,
+    fn_name: &str,
+    timeout: Duration,
+) -> Result<std::process::Output, HyperlaneDuskError> {
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(result) => result.map_err(|error| {
+            HyperlaneDuskError::Other(format!(
+                "Failed to wait on dusk-tx child process for {fn_name}: {error}"
+            ))
+        }),
+        Err(_) => Err(HyperlaneDuskError::Other(format!(
+            "dusk-tx call {fn_name} exceeded the {}s helper deadline",
+            timeout.as_secs()
+        ))),
+    }
+}
+
 /// Convert a 32-byte Dusk transaction ID (hex) into a `H512` by left-padding with zeros.
 pub fn dusk_tx_id_to_h512(tx_id_hex: &str) -> Result<H512, HyperlaneDuskError> {
     let bytes = hex::decode(tx_id_hex).map_err(|e| {
@@ -161,4 +183,37 @@ pub fn announce_args(
 ) -> Result<Vec<u8>, HyperlaneDuskError> {
     let eth_addr = hyperlane_dusk_types::EthAddress(validator_eth_addr);
     rkyv_serialize(&(eth_addr, String::from(storage_location), signature.to_vec()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transaction_ids_are_left_padded_without_changing_dusk_bytes() {
+        let dusk_id = [0xabu8; 32];
+        let transaction_id = dusk_tx_id_to_h512(&hex::encode(dusk_id)).unwrap();
+        assert_eq!(&transaction_id.as_bytes()[..32], &[0u8; 32]);
+        assert_eq!(&transaction_id.as_bytes()[32..], &dusk_id);
+        assert!(dusk_tx_id_to_h512("abcd").is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stalled_helper_is_bounded_by_deadline() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 10")
+            .kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = command.spawn().unwrap();
+        let started = tokio::time::Instant::now();
+        let error = wait_for_child_output(child, "test", Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("helper deadline"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 }

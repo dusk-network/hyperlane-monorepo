@@ -54,6 +54,23 @@ impl HyperlaneContract for DuskIsm {
     }
 }
 
+fn parse_module_type(module_type: u8) -> ChainResult<ModuleType> {
+    ModuleType::from_u8(module_type).ok_or_else(|| {
+        crate::HyperlaneDuskError::Other(format!(
+            "Dusk ISM returned unknown module type {module_type}"
+        ))
+        .into()
+    })
+}
+
+fn map_verify_result(result: Result<bool, crate::HyperlaneDuskError>) -> ChainResult<Option<U256>> {
+    match result {
+        Ok(true) => Ok(Some(U256::zero())),
+        Ok(false) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[async_trait]
 impl InterchainSecurityModule for DuskIsm {
     async fn module_type(&self) -> ChainResult<ModuleType> {
@@ -61,7 +78,7 @@ impl InterchainSecurityModule for DuskIsm {
             .rues
             .contract_query(&self.ism_id, "module_type", &())
             .await?;
-        Ok(ModuleType::from_u8(module_type_u8).unwrap_or_default())
+        parse_module_type(module_type_u8)
     }
 
     async fn dry_run_verify(
@@ -85,9 +102,23 @@ impl InterchainSecurityModule for DuskIsm {
             .contract_query(&self.ism_id, "verify", &(metadata_bytes, encoded))
             .await;
 
-        match result {
-            Ok(true) => Ok(Some(U256::zero())),
-            Ok(false) | Err(_) => Ok(None),
-        }
+        map_verify_result(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_distinguishes_rejection_from_observation_failure() {
+        assert_eq!(map_verify_result(Ok(true)).unwrap(), Some(U256::zero()));
+        assert_eq!(map_verify_result(Ok(false)).unwrap(), None);
+        assert!(map_verify_result(Err(crate::HyperlaneDuskError::Other("rpc".into()))).is_err());
+    }
+
+    #[test]
+    fn unknown_module_types_are_rejected() {
+        assert!(parse_module_type(u8::MAX).is_err());
     }
 }

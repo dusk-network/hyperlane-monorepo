@@ -8,7 +8,9 @@ use hyperlane_core::{
     ChainResult, HyperlaneMessage, Indexed, Indexer, LogMeta, SequenceAwareIndexer, H256, H512,
     U256,
 };
+use hyperlane_dusk_types::events;
 
+use crate::rues::{contract_event_transaction_id, rkyv_serialize, ArchivedContractEvent};
 use crate::RuesClient;
 
 /// Dusk mailbox indexer for dispatch and delivery events.
@@ -33,15 +35,23 @@ impl DuskMailboxIndexer {
         }
     }
 
-    fn log_meta_for_sequence(&self, sequence: u32, block_number: u64) -> LogMeta {
-        LogMeta {
-            address: self.mailbox_address,
-            block_number,
-            block_hash: H256::zero(),
-            transaction_id: H512::zero(),
-            transaction_index: 0,
-            log_index: U256::from(sequence),
+    async fn dispatch_ordinal_in_block(
+        &self,
+        sequence: u32,
+        block_height: u64,
+    ) -> ChainResult<usize> {
+        let mut ordinal = 0usize;
+        for previous in (0..sequence).rev() {
+            let previous_height: u64 = self
+                .rues
+                .contract_query(&self.mailbox_id, "dispatched_block_height", &(previous,))
+                .await?;
+            if previous_height != block_height {
+                break;
+            }
+            ordinal += 1;
         }
+        Ok(ordinal)
     }
 }
 
@@ -56,6 +66,10 @@ impl Indexer<HyperlaneMessage> for DuskMailboxIndexer {
         range: RangeInclusive<u32>,
     ) -> ChainResult<Vec<(Indexed<HyperlaneMessage>, LogMeta)>> {
         let mut results = Vec::new();
+        let mut archive_height = None;
+        let mut archive_events = Vec::<ArchivedContractEvent>::new();
+        let mut archive_block_hash = H256::zero();
+        let mut dispatch_ordinal = 0usize;
 
         // Mailbox.nonce is the next dispatch nonce; messages exist for [0, nonce).
         let current_nonce: u32 = self
@@ -70,8 +84,7 @@ impl Indexer<HyperlaneMessage> for DuskMailboxIndexer {
             let block_number: u64 = self
                 .rues
                 .contract_query(&self.mailbox_id, "dispatched_block_height", &(nonce,))
-                .await
-                .unwrap_or_default();
+                .await?;
             // Query the encoded dispatched message at this nonce.
             let encoded: Vec<u8> = self
                 .rues
@@ -84,6 +97,35 @@ impl Indexer<HyperlaneMessage> for DuskMailboxIndexer {
                     "Failed to decode dispatched message at nonce {nonce}"
                 ))
             })?;
+            if dusk_msg.nonce != nonce {
+                return Err(crate::HyperlaneDuskError::Other(format!(
+                    "Dispatched message nonce {} does not match queried sequence {nonce}",
+                    dusk_msg.nonce
+                ))
+                .into());
+            }
+
+            if archive_height != Some(block_number) {
+                archive_events = self.rues.contract_events_at(block_number).await?;
+                archive_block_hash = self.rues.block_hash_at(block_number).await?;
+                dispatch_ordinal = self.dispatch_ordinal_in_block(nonce, block_number).await?;
+                archive_height = Some(block_number);
+            }
+
+            let expected_event = rkyv_serialize(&events::Dispatch {
+                sender: dusk_msg.sender,
+                destination: dusk_msg.destination,
+                recipient: dusk_msg.recipient,
+                message: encoded.clone(),
+            })?;
+            let transaction_id = contract_event_transaction_id(
+                &archive_events,
+                &self.mailbox_id,
+                events::Dispatch::TOPIC,
+                dispatch_ordinal,
+                &expected_event,
+            )?;
+            dispatch_ordinal += 1;
 
             // Convert to hyperlane-core HyperlaneMessage.
             let core_msg = HyperlaneMessage {
@@ -96,7 +138,14 @@ impl Indexer<HyperlaneMessage> for DuskMailboxIndexer {
                 body: dusk_msg.body,
             };
 
-            let log_meta = self.log_meta_for_sequence(nonce, block_number);
+            let log_meta = LogMeta {
+                address: self.mailbox_address,
+                block_number,
+                block_hash: archive_block_hash,
+                transaction_id,
+                transaction_index: 0,
+                log_index: U256::from(nonce),
+            };
             let indexed = Indexed::from(core_msg).with_sequence(nonce);
             results.push((indexed, log_meta));
         }
@@ -151,6 +200,29 @@ impl DuskDeliveryIndexer {
             mailbox_address: mailbox_id,
         }
     }
+
+    async fn process_ordinal_in_block(
+        &self,
+        sequence: u32,
+        block_height: u64,
+    ) -> ChainResult<usize> {
+        let mut ordinal = 0usize;
+        for previous in (0..sequence).rev() {
+            let previous_height: u64 = self
+                .rues
+                .contract_query(
+                    &self.mailbox_id,
+                    "processed_block_height_at_index",
+                    &(previous,),
+                )
+                .await?;
+            if previous_height != block_height {
+                break;
+            }
+            ordinal += 1;
+        }
+        Ok(ordinal)
+    }
 }
 
 #[async_trait]
@@ -160,6 +232,10 @@ impl Indexer<H256> for DuskDeliveryIndexer {
         range: RangeInclusive<u32>,
     ) -> ChainResult<Vec<(Indexed<H256>, LogMeta)>> {
         let mut results = Vec::new();
+        let mut archive_height = None;
+        let mut archive_events = Vec::<ArchivedContractEvent>::new();
+        let mut archive_block_hash = H256::zero();
+        let mut process_ordinal = 0usize;
 
         // Messages exist for [0, processed_count).
         let processed_count: u32 = self
@@ -183,14 +259,30 @@ impl Indexer<H256> for DuskDeliveryIndexer {
                     "processed_block_height_at_index",
                     &(index,),
                 )
-                .await
-                .unwrap_or_default();
+                .await?;
+
+            if archive_height != Some(block_number) {
+                archive_events = self.rues.contract_events_at(block_number).await?;
+                archive_block_hash = self.rues.block_hash_at(block_number).await?;
+                process_ordinal = self.process_ordinal_in_block(index, block_number).await?;
+                archive_height = Some(block_number);
+            }
+
+            let expected_event = rkyv_serialize(&events::ProcessId { message_id })?;
+            let transaction_id = contract_event_transaction_id(
+                &archive_events,
+                &self.mailbox_id,
+                events::ProcessId::TOPIC,
+                process_ordinal,
+                &expected_event,
+            )?;
+            process_ordinal += 1;
 
             let log_meta = LogMeta {
                 address: self.mailbox_address,
                 block_number,
-                block_hash: H256::zero(),
-                transaction_id: H512::zero(),
+                block_hash: archive_block_hash,
+                transaction_id,
                 transaction_index: 0,
                 log_index: U256::from(index),
             };

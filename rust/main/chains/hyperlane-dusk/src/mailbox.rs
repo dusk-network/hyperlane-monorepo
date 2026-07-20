@@ -131,7 +131,7 @@ impl Mailbox for DuskMailbox {
         &self,
         message: &HyperlaneMessage,
         metadata: &Metadata,
-        _tx_gas_limit: Option<U256>,
+        tx_gas_limit: Option<U256>,
     ) -> ChainResult<TxOutcome> {
         let signer = self
             .signer
@@ -149,9 +149,26 @@ impl Mailbox for DuskMailbox {
 
         let args = crate::tx_sender::process_args(&metadata_bytes, &encoded)?;
 
-        let res =
-            crate::tx_sender::dusk_tx_call(&self.conn, signer, &self.mailbox_id, "process", &args)
-                .await?;
+        let gas_limit = tx_gas_limit
+            .map(|limit| {
+                if limit > U256::from(u64::MAX) {
+                    return Err(HyperlaneDuskError::Other(format!(
+                        "Dusk transaction gas limit {limit} exceeds u64"
+                    )));
+                }
+                Ok(limit.low_u64())
+            })
+            .transpose()?;
+
+        let res = crate::tx_sender::dusk_tx_call(
+            &self.conn,
+            signer,
+            &self.mailbox_id,
+            "process",
+            &args,
+            gas_limit,
+        )
+        .await?;
 
         let tx_id = res.get("tx_id").and_then(|v| v.as_str()).ok_or_else(|| {
             HyperlaneDuskError::Other(format!("dusk-tx response is missing string tx_id: {res}"))
@@ -223,8 +240,10 @@ impl MerkleTreeHook for DuskMailbox {
             .contract_query(&self.merkle_tree_hook_id, "tree", &())
             .await?;
 
-        let mut tree = IncrementalMerkle::default();
-        tree.count = dusk_tree.count as usize;
+        let mut tree = IncrementalMerkle {
+            count: dusk_tree.count as usize,
+            ..Default::default()
+        };
         for (i, node) in dusk_tree.branch.iter().enumerate() {
             tree.branch[i] = H256::from_slice(node);
         }

@@ -117,9 +117,15 @@ impl ValidatorAnnounce for DuskValidatorAnnounce {
             &signature,
         )?;
 
-        let res =
-            crate::tx_sender::dusk_tx_call(&self.conn, signer, &self.va_id, "announce", &args)
-                .await?;
+        let res = crate::tx_sender::dusk_tx_call(
+            &self.conn,
+            signer,
+            &self.va_id,
+            "announce",
+            &args,
+            None,
+        )
+        .await?;
 
         let tx_id = res.get("tx_id").and_then(|v| v.as_str()).ok_or_else(|| {
             HyperlaneDuskError::Other(format!("dusk-tx response is missing string tx_id: {res}"))

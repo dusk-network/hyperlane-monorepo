@@ -36,6 +36,28 @@ pub enum HyperlaneDuskError {
 
 impl From<HyperlaneDuskError> for ChainCommunicationError {
     fn from(value: HyperlaneDuskError) -> Self {
-        ChainCommunicationError::Other(HyperlaneCustomErrorWrapper::new(Box::new(value)))
+        match value {
+            HyperlaneDuskError::SignerUnavailable => ChainCommunicationError::SignerUnavailable,
+            other => {
+                ChainCommunicationError::Other(HyperlaneCustomErrorWrapper::new(Box::new(other)))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signer_unavailable_keeps_its_non_retryable_error_domain() {
+        assert!(matches!(
+            ChainCommunicationError::from(HyperlaneDuskError::SignerUnavailable),
+            ChainCommunicationError::SignerUnavailable
+        ));
+        assert!(matches!(
+            ChainCommunicationError::from(HyperlaneDuskError::Other("rpc".into())),
+            ChainCommunicationError::Other(_)
+        ));
     }
 }

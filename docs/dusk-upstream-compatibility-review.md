@@ -46,7 +46,8 @@ Observed on 2026-07-20:
   `cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p scraper -p lander`
   all pass against companion Dusk head
   `63bd80803e36bdca883d815eacea74c7575199de`.
-- `cargo fmt --package hyperlane-dusk -- --check` passes. Workspace-wide
+- `cargo fmt --package hyperlane-dusk --package hyperlane-base -- --check`
+  passes. Workspace-wide
   `cargo fmt --all -- --check` is not used as Dusk PR evidence because Cargo's
   `--all` also formats the adjacent companion repository through the local path
   dependency and therefore crosses the monorepo PR boundary.
@@ -72,14 +73,62 @@ Observed on 2026-07-20:
   the 47-commit Dusk feature series in PR #1. This makes upstream provenance
   visible while avoiding a merge commit inside the feature history.
 
+## 2026-07-20 Deep-Review Remediation Decisions
+
+The rebased PR was also inspected with Controlecentrum in deep, blind, staged
+mode using GPT-5.6 at `xhigh` reasoning. The staged report assembler did not
+ingest the validator's fenced JSON and therefore produced a misleading
+zero-finding summary. The raw scout and validation artifacts were read
+directly; the Dusk-attributable obligations were remediated rather than
+discarded with the failed assembly. One reported Solana devnet signer-threshold
+candidate was inherited unchanged from current Hyperlane upstream and is not a
+Dusk feature change.
+
+The resulting implementation decisions are:
+
+- Treat indexer provenance as consensus-relevant data. Dispatch, delivery, and
+  gas-payment records now fail closed when their state height cannot be read,
+  require the queried sequence to match the decoded nonce where applicable,
+  and resolve nonzero block and transaction hashes from Rusk's archive API.
+  The archived event source, topic, in-block ordinal, and exact rkyv payload
+  must agree with contract state before a log is returned.
+- Require an archive-enabled Rusk endpoint for production indexing. Returning
+  zero hashes or advancing a cursor without canonical provenance could cause
+  scraper data loss, so deployments without `contractEvents(height)` and block
+  hash queries now fail explicitly. This is a deliberate availability-for-
+  correctness tradeoff.
+- Bound RUES response buffering to 4 MiB and make transaction observation
+  retry transient HTTP, GraphQL, and decode failures under one total deadline.
+  The transaction ID remains immutable across retries. The external `dusk-tx`
+  helper has its own 120-second deadline and is killed when that deadline
+  expires.
+- Preserve semantic errors across the chain adapter: signer unavailability is
+  no longer collapsed into a generic retryable communication error, an ISM
+  rejection remains distinct from a query failure, and unknown ISM module
+  types are rejected rather than defaulted.
+- Honor the relayer's process gas limit after checked `U256` to `u64`
+  conversion, and reject Dusk chain IDs outside the contract's one-byte domain
+  instead of truncating them.
+- Replace the fork-only compile check with formatting, unit tests, targeted
+  parser coverage, clippy, and checks of all affected Rust agents. A second CI
+  guard compares the PR with live Hyperlane upstream and rejects paths outside
+  the documented Dusk integration boundary. This is the scoped substitute for
+  Hyperlane-owned Depot jobs that cannot run in the Dusk fork.
+
+Regression evidence for these decisions includes exact GraphQL query bytes,
+canonical event selection and transaction origin, transient observation
+retries, oversized-response rejection, stalled-helper termination, checked
+chain-ID conversion, ISM error separation, and signer error preservation.
+
 The Dusk fork now also proposes
 `.github/workflows/dusk-agent-gate.yml` as a narrow PR status check for the
 agent crate. It checks out the companion private Dusk repo for
 `hyperlane-dusk-types`, scans `rust/main/chains/hyperlane-dusk` for runtime
 placeholder macros, preflights private repo access for `DUSK_ORG_READ_TOKEN`,
-and runs `cargo check -p hyperlane-dusk`. The workflow is intended to give the
-monorepo PR a focused status check while the full cross-repo repro and E2E
-evidence remain in `dusk-network/hyperlane-dusk`.
+then runs package formatting, unit and parser tests, Dusk clippy, the expanded
+affected-package check, and a stable-lockfile assertion. The workflow is
+intended to give the monorepo PR a focused status check while the full
+cross-repo repro and E2E evidence remain in `dusk-network/hyperlane-dusk`.
 
 The inherited upstream `rust-docker.yml` and `monorepo-docker.yml`
 image-publishing workflows have job-level

@@ -11,8 +11,9 @@ use hyperlane_core::{
     H512, U256,
 };
 
-use hyperlane_dusk_types::GasPaymentRecord;
+use hyperlane_dusk_types::{events, GasPaymentRecord};
 
+use crate::rues::{contract_event_transaction_id, rkyv_serialize, ArchivedContractEvent};
 use crate::{DuskProvider, RuesClient};
 
 /// Dusk InterchainGasPaymaster implementation (marker contract).
@@ -69,6 +70,25 @@ impl DuskInterchainGasPaymasterIndexer {
             igp_address: igp_id,
         }
     }
+
+    async fn payment_ordinal_in_block(
+        &self,
+        sequence: u32,
+        block_height: u64,
+    ) -> ChainResult<usize> {
+        let mut ordinal = 0usize;
+        for previous in (0..sequence).rev() {
+            let record: GasPaymentRecord = self
+                .rues
+                .contract_query(&self.igp_id, "gas_payment_at", &(previous,))
+                .await?;
+            if record.block_height != block_height {
+                break;
+            }
+            ordinal += 1;
+        }
+        Ok(ordinal)
+    }
 }
 
 #[async_trait]
@@ -78,6 +98,10 @@ impl Indexer<InterchainGasPayment> for DuskInterchainGasPaymasterIndexer {
         range: RangeInclusive<u32>,
     ) -> ChainResult<Vec<(Indexed<InterchainGasPayment>, LogMeta)>> {
         let mut results = Vec::new();
+        let mut archive_height = None;
+        let mut archive_events = Vec::<ArchivedContractEvent>::new();
+        let mut archive_block_hash = H256::zero();
+        let mut payment_ordinal = 0usize;
 
         let payment_count: u32 = self
             .rues
@@ -101,12 +125,35 @@ impl Indexer<InterchainGasPayment> for DuskInterchainGasPaymasterIndexer {
                 gas_amount: U256::from(record.gas_limit),
             };
 
+            if archive_height != Some(record.block_height) {
+                archive_events = self.rues.contract_events_at(record.block_height).await?;
+                archive_block_hash = self.rues.block_hash_at(record.block_height).await?;
+                payment_ordinal = self
+                    .payment_ordinal_in_block(index, record.block_height)
+                    .await?;
+                archive_height = Some(record.block_height);
+            }
+
+            let expected_event = rkyv_serialize(&events::GasPayment {
+                message_id: record.message_id,
+                gas_limit: record.gas_limit,
+                payment: record.payment,
+            })?;
+            let transaction_id = contract_event_transaction_id(
+                &archive_events,
+                &self.igp_id,
+                events::GasPayment::TOPIC,
+                payment_ordinal,
+                &expected_event,
+            )?;
+            payment_ordinal += 1;
+
             let indexed = Indexed::from(payment).with_sequence(index);
             let meta = LogMeta {
                 address: self.igp_address,
                 block_number: record.block_height,
-                block_hash: H256::zero(),
-                transaction_id: H512::zero(),
+                block_hash: archive_block_hash,
+                transaction_id,
                 transaction_index: 0,
                 log_index: U256::from(index),
             };

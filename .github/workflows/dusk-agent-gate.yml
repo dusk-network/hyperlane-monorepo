@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   dusk-agent-check:
-    name: Dusk agent cargo check
+    name: Dusk agent validation
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -81,9 +81,38 @@ jobs:
           printf 'dusk_ref=%s\n' "$DUSK_REF"
           git -C "$DUSK_DIR" rev-parse HEAD
 
-      - name: Check Dusk agent crate
+      - name: Format Dusk-owned Rust packages
         working-directory: ${{ env.MONOREPO_DIR }}/rust/main
         shell: bash
         run: |
           set -euo pipefail
-          cargo check -p hyperlane-dusk
+          cargo fmt --package hyperlane-dusk --package hyperlane-base -- --check
+
+      - name: Test Dusk agent and parser boundaries
+        working-directory: ${{ env.MONOREPO_DIR }}/rust/main
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p hyperlane-dusk
+          cargo test -p hyperlane-base dusk_chain_id_rejects_truncation
+
+      - name: Lint Dusk agent
+        working-directory: ${{ env.MONOREPO_DIR }}/rust/main
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p hyperlane-dusk --all-targets -- -D warnings
+
+      - name: Check affected Rust integration
+        working-directory: ${{ env.MONOREPO_DIR }}/rust/main
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p scraper -p lander
+
+      - name: Verify lockfile remains stable
+        working-directory: ${{ env.MONOREPO_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code -- rust/main/Cargo.lock

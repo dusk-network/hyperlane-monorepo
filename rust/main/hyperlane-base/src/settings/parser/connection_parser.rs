@@ -841,11 +841,18 @@ pub fn build_dusk_connection_conf(
     let url = rpcs.first()?.clone();
     let native_token = parse_native_token(chain, err, 9);
 
-    let chain_id = chain
+    let raw_chain_id = chain
         .chain(err)
         .get_opt_key("chainId")
         .parse_u64()
-        .unwrap_or(0) as u8;
+        .unwrap_or(0);
+    let chain_id = match parse_dusk_chain_id(raw_chain_id) {
+        Ok(chain_id) => chain_id,
+        Err(message) => {
+            err.push((&chain.cwp).add("chainId"), eyre!(message));
+            return None;
+        }
+    };
 
     let gas_limit = chain
         .chain(err)
@@ -867,6 +874,11 @@ pub fn build_dusk_connection_conf(
         native_token,
         op_submission_config: operation_batch,
     }))
+}
+
+fn parse_dusk_chain_id(value: u64) -> Result<u8, String> {
+    u8::try_from(value)
+        .map_err(|_| format!("Dusk chainId must fit in one byte (0..=255), got {value}"))
 }
 
 pub fn build_connection_conf(
@@ -925,5 +937,18 @@ pub fn is_protocol_supported(protocol: HyperlaneDomainProtocol) -> bool {
         Ethereum | Fuel | Sealevel | Cosmos | CosmosNative | Starknet | Radix | Tron | Dusk => true,
         // Aleo is feature-gated - only supported when the "aleo" feature is enabled
         Aleo => cfg!(feature = "aleo"),
+    }
+}
+
+#[cfg(test)]
+mod dusk_tests {
+    use super::parse_dusk_chain_id;
+
+    #[test]
+    fn dusk_chain_id_rejects_truncation() {
+        assert_eq!(parse_dusk_chain_id(0).unwrap(), 0);
+        assert_eq!(parse_dusk_chain_id(255).unwrap(), 255);
+        assert!(parse_dusk_chain_id(256).unwrap_err().contains("0..=255"));
+        assert!(parse_dusk_chain_id(u64::MAX).is_err());
     }
 }

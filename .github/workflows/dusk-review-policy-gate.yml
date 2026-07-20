@@ -38,3 +38,43 @@ jobs:
           else
             git diff --check HEAD~1..HEAD
           fi
+
+      - name: Verify fork-only changes stay in the Dusk integration boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags https://github.com/hyperlane-xyz/hyperlane-monorepo.git main
+          upstream_head="$(git rev-parse FETCH_HEAD)"
+          unexpected=0
+          while IFS= read -r path; do
+            case "$path" in
+              .github/workflows/dusk-agent-gate.yml|\
+              .github/workflows/dusk-review-policy-gate.yml|\
+              .github/workflows/monorepo-docker.yml|\
+              .github/workflows/rebalancer-e2e-test.yml|\
+              .github/workflows/rebalancer-sim-test.yml|\
+              .github/workflows/rust-docker.yml|\
+              .github/workflows/rust.yml|\
+              .github/workflows/test.yml|\
+              docs/dusk-upstream-compatibility-review.md|\
+              docs/dusk-upstream-pr-plan.md|\
+              rust/main/Cargo.lock|\
+              rust/main/Cargo.toml|\
+              rust/main/agents/validator/src/reorg_reporter.rs|\
+              rust/main/chains/hyperlane-dusk/*|\
+              rust/main/hyperlane-base/Cargo.toml|\
+              rust/main/hyperlane-base/src/contract_sync/cursors/mod.rs|\
+              rust/main/hyperlane-base/src/settings/chains.rs|\
+              rust/main/hyperlane-base/src/settings/parser/connection_parser.rs|\
+              rust/main/hyperlane-base/src/settings/parser/mod.rs|\
+              rust/main/hyperlane-base/src/settings/signers.rs|\
+              rust/main/hyperlane-core/src/chain.rs|\
+              rust/main/lander/src/adapter/chains/factory.rs)
+                ;;
+              *)
+                echo "::error file=$path::change falls outside the reviewed Dusk integration boundary"
+                unexpected=1
+                ;;
+            esac
+          done < <(git diff --name-only "$upstream_head"...HEAD)
+          exit "$unexpected"
