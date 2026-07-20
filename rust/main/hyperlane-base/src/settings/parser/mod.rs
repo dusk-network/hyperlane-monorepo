@@ -245,6 +245,15 @@ fn parse_chain(
                 })
                 .unwrap_or_default()
         });
+    if domain
+        .as_ref()
+        .is_some_and(|domain| !protocol_supports_index_mode(domain.domain_protocol(), mode))
+    {
+        err.push(
+            chain.cwp.clone(),
+            eyre!("Dusk indexers support only `index.mode: sequence`"),
+        );
+    }
     // Defaults to 5s; overridable via `index.interval` (seconds).
     let interval_secs = chain
         .chain(&mut err)
@@ -420,6 +429,13 @@ fn parse_chain(
             denom: native_token_denom,
         },
     })
+}
+
+fn protocol_supports_index_mode(protocol: HyperlaneDomainProtocol, mode: IndexMode) -> bool {
+    !matches!(
+        (protocol, mode),
+        (HyperlaneDomainProtocol::Dusk, IndexMode::Block)
+    )
 }
 
 /// Expects ChainMetadata
@@ -846,5 +862,21 @@ mod test {
         let value_parser = ValueParser::new(Default::default(), &val);
 
         assert!(parse_signer(value_parser).is_err());
+    }
+
+    #[test]
+    fn dusk_rejects_block_index_mode() {
+        assert!(protocol_supports_index_mode(
+            HyperlaneDomainProtocol::Dusk,
+            IndexMode::Sequence
+        ));
+        assert!(!protocol_supports_index_mode(
+            HyperlaneDomainProtocol::Dusk,
+            IndexMode::Block
+        ));
+        assert!(protocol_supports_index_mode(
+            HyperlaneDomainProtocol::Ethereum,
+            IndexMode::Block
+        ));
     }
 }

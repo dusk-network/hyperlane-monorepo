@@ -120,6 +120,57 @@ canonical event selection and transaction origin, transient observation
 retries, oversized-response rejection, stalled-helper termination, checked
 chain-ID conversion, ISM error separation, and signer error preservation.
 
+The follow-up raw-artifact triage added these compatibility decisions:
+
+- Dusk indexers are sequence-only. An explicit `index.mode: block` is rejected
+  during settings parsing instead of being accepted into an implementation
+  whose ranges are contract sequence numbers.
+- Dusk participates in shared operation-submission configuration. In
+  particular, `maxSubmitQueueLength` is no longer silently dropped, so the
+  lander/relayer backpressure policy applies to Dusk like the other supported
+  submission adapters.
+- Provider metadata fails closed. A block fetched by height must return that
+  same height; transaction gas limit, price, and spent values must be numeric;
+  latest block height, timestamp, and 32-byte hash must be valid; and gas-price
+  statistics errors remain visible rather than becoming zero/default metrics.
+- Transaction confirmation treats malformed archive observations as retryable
+  only within the existing absolute deadline. It never changes the submitted
+  transaction ID and never converts malformed data into execution success.
+- Dusk transaction hashes are reversible only in the canonical left-padded
+  `H512` representation. Indexers now parse Dusk IDs, resolve the containing
+  archive block, find that block's monotonic sequence range with binary search,
+  and retain only records whose archived transaction origin is the requested
+  transaction. Nonzero high padding and heights outside the shared `u32`
+  cursor domain are rejected.
+- Helper stdout and stderr are capped independently at 1 MiB in addition to
+  the existing 120-second deadline. This bounds memory even if the configured
+  helper is replaced or emits pathological diagnostics.
+- Same-block ordinal reconstruction now uses logarithmic boundary searches
+  over monotonic contract-record heights rather than scanning the entire prior
+  same-block prefix for every record.
+
+`announce_tokens_needed = 0` remains deliberate. Like Sealevel, Dusk validator
+announcement has no separate contract deposit; the transaction sender still
+pays normal chain execution fees. Returning zero allows the validator agent to
+submit, and is not a claim that transaction execution itself is free.
+
+Local regression evidence for this follow-up is:
+
+- `cargo test -p hyperlane-dusk`: 12 passed, including bounded helper output,
+  exact transaction-ID conversion, provider fail-closed parsing, archive-event
+  provenance, and malformed-observation retry behavior;
+- `cargo test -p hyperlane-base dusk_`: 6 passed, including Dusk signer,
+  chain-ID, and sequence-only index-mode coverage;
+- `cargo clippy -p hyperlane-dusk --all-targets -- -D warnings`: passed;
+- `cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p
+  scraper -p lander`: passed; and
+- package-scoped formatting and `git diff --check`: passed.
+
+`actionlint` was not installed in the local environment, so the modified
+workflow received syntax/diff inspection here and still requires its GitHub
+workflow parser/status run. This limitation is recorded rather than treating a
+missing local tool as successful workflow validation.
+
 The Dusk fork now also proposes
 `.github/workflows/dusk-agent-gate.yml` as a narrow PR status check for the
 agent crate. It checks out the companion private Dusk repo for

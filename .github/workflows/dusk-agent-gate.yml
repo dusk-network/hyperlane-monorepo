@@ -94,7 +94,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo test -p hyperlane-dusk
-          cargo test -p hyperlane-base dusk_chain_id_rejects_truncation
+          cargo test -p hyperlane-base dusk_
 
       - name: Lint Dusk agent
         working-directory: ${{ env.MONOREPO_DIR }}/rust/main

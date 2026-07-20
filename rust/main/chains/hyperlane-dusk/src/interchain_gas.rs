@@ -14,6 +14,7 @@ use hyperlane_core::{
 use hyperlane_dusk_types::{events, GasPaymentRecord};
 
 use crate::rues::{contract_event_transaction_id, rkyv_serialize, ArchivedContractEvent};
+use crate::tx_sender::{dusk_tx_id_to_h512, h512_to_dusk_tx_id};
 use crate::{DuskProvider, RuesClient};
 
 /// Dusk InterchainGasPaymaster implementation (marker contract).
@@ -76,18 +77,46 @@ impl DuskInterchainGasPaymasterIndexer {
         sequence: u32,
         block_height: u64,
     ) -> ChainResult<usize> {
-        let mut ordinal = 0usize;
-        for previous in (0..sequence).rev() {
-            let record: GasPaymentRecord = self
-                .rues
-                .contract_query(&self.igp_id, "gas_payment_at", &(previous,))
-                .await?;
-            if record.block_height != block_height {
-                break;
+        let first = self
+            .first_payment_at_or_after(sequence + 1, block_height)
+            .await?;
+        Ok((sequence - first) as usize)
+    }
+
+    async fn payment_record(&self, sequence: u32) -> ChainResult<GasPaymentRecord> {
+        Ok(self
+            .rues
+            .contract_query(&self.igp_id, "gas_payment_at", &(sequence,))
+            .await?)
+    }
+
+    async fn first_payment_at_or_after(&self, count: u32, block_height: u64) -> ChainResult<u32> {
+        let mut low = 0u32;
+        let mut high = count;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.payment_record(middle).await?.block_height < block_height {
+                low = middle + 1;
+            } else {
+                high = middle;
             }
-            ordinal += 1;
         }
-        Ok(ordinal)
+        Ok(low)
+    }
+
+    async fn payment_range_at_block(
+        &self,
+        count: u32,
+        block_height: u64,
+    ) -> ChainResult<Option<RangeInclusive<u32>>> {
+        let first = self.first_payment_at_or_after(count, block_height).await?;
+        if first == count || self.payment_record(first).await?.block_height != block_height {
+            return Ok(None);
+        }
+        let after = self
+            .first_payment_at_or_after(count, block_height.saturating_add(1))
+            .await?;
+        Ok(Some(first..=after - 1))
     }
 }
 
@@ -117,6 +146,7 @@ impl Indexer<InterchainGasPayment> for DuskInterchainGasPaymasterIndexer {
                 .rues
                 .contract_query(&self.igp_id, "gas_payment_at", &(index,))
                 .await?;
+            ensure_cursor_height(record.block_height)?;
 
             let payment = InterchainGasPayment {
                 message_id: H256::from_slice(&record.message_id),
@@ -171,10 +201,38 @@ impl Indexer<InterchainGasPayment> for DuskInterchainGasPaymasterIndexer {
 
     async fn fetch_logs_by_tx_hash(
         &self,
-        _tx_hash: H512,
+        tx_hash: H512,
     ) -> ChainResult<Vec<(Indexed<InterchainGasPayment>, LogMeta)>> {
-        Ok(vec![])
+        let tx_id = h512_to_dusk_tx_id(&tx_hash)?;
+        let Some(block_height) = self.rues.transaction_block_height(&tx_id).await? else {
+            return Ok(vec![]);
+        };
+        ensure_cursor_height(block_height)?;
+        let count: u32 = self
+            .rues
+            .contract_query(&self.igp_id, "gas_payment_count", &())
+            .await?;
+        let Some(range) = self.payment_range_at_block(count, block_height).await? else {
+            return Ok(vec![]);
+        };
+        let mut logs = self.fetch_logs_in_range(range).await?;
+        logs.retain(|(_, meta)| meta.transaction_id == tx_hash);
+        Ok(logs)
     }
+
+    fn parse_tx_hash(&self, tx_hash: &str) -> ChainResult<H512> {
+        Ok(dusk_tx_id_to_h512(tx_hash)?)
+    }
+}
+
+fn ensure_cursor_height(block_height: u64) -> ChainResult<()> {
+    if block_height > u64::from(u32::MAX) {
+        return Err(crate::HyperlaneDuskError::Other(format!(
+            "Dusk block height {block_height} exceeds the shared u32 cursor range"
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 #[async_trait]

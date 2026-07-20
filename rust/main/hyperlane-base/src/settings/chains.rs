@@ -226,6 +226,7 @@ impl ChainConnectionConf {
             Self::Cosmos(conf) => Some(&conf.op_submission_config),
             Self::Sealevel(conf) => Some(&conf.op_submission_config),
             Self::Starknet(config) => Some(&config.op_submission_config),
+            Self::Dusk(conf) => Some(&conf.op_submission_config),
             _ => None,
         }
     }

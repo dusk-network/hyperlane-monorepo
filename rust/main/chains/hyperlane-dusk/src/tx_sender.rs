@@ -10,7 +10,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
@@ -20,6 +20,7 @@ use crate::rues::rkyv_serialize;
 use crate::{ConnectionConf, DuskSigner, HyperlaneDuskError};
 
 const DUSK_TX_HELPER_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_DUSK_TX_STREAM_BYTES: usize = 1024 * 1024;
 
 /// Send a contract call via the `dusk-tx` CLI binary.
 ///
@@ -134,25 +135,76 @@ pub async fn dusk_tx_call(
 }
 
 async fn wait_for_child_output(
-    child: tokio::process::Child,
+    mut child: tokio::process::Child,
     fn_name: &str,
     timeout: Duration,
 ) -> Result<std::process::Output, HyperlaneDuskError> {
-    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+    let stdout = child.stdout.take().ok_or_else(|| {
+        HyperlaneDuskError::Other("dusk-tx stdout pipe was not configured".into())
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        HyperlaneDuskError::Other("dusk-tx stderr pipe was not configured".into())
+    })?;
+    let stdout_task = tokio::spawn(read_bounded_stream(stdout, "stdout"));
+    let stderr_task = tokio::spawn(read_bounded_stream(stderr, "stderr"));
+
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(result) => result.map_err(|error| {
             HyperlaneDuskError::Other(format!(
                 "Failed to wait on dusk-tx child process for {fn_name}: {error}"
             ))
-        }),
-        Err(_) => Err(HyperlaneDuskError::Other(format!(
-            "dusk-tx call {fn_name} exceeded the {}s helper deadline",
-            timeout.as_secs()
-        ))),
+        })?,
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(HyperlaneDuskError::Other(format!(
+                "dusk-tx call {fn_name} exceeded the {}s helper deadline",
+                timeout.as_secs()
+            )));
+        }
+    };
+
+    let stdout = stdout_task.await.map_err(|error| {
+        HyperlaneDuskError::Other(format!("Failed to join dusk-tx stdout reader: {error}"))
+    })??;
+    let stderr = stderr_task.await.map_err(|error| {
+        HyperlaneDuskError::Other(format!("Failed to join dusk-tx stderr reader: {error}"))
+    })??;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+async fn read_bounded_stream(
+    reader: impl AsyncRead + Unpin,
+    stream_name: &'static str,
+) -> Result<Vec<u8>, HyperlaneDuskError> {
+    let mut bytes = Vec::new();
+    reader
+        .take((MAX_DUSK_TX_STREAM_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| {
+            HyperlaneDuskError::Other(format!("Failed to read dusk-tx {stream_name}: {error}"))
+        })?;
+    if bytes.len() > MAX_DUSK_TX_STREAM_BYTES {
+        return Err(HyperlaneDuskError::Other(format!(
+            "dusk-tx {stream_name} exceeds {MAX_DUSK_TX_STREAM_BYTES} bytes"
+        )));
     }
+    Ok(bytes)
 }
 
 /// Convert a 32-byte Dusk transaction ID (hex) into a `H512` by left-padding with zeros.
 pub fn dusk_tx_id_to_h512(tx_id_hex: &str) -> Result<H512, HyperlaneDuskError> {
+    let tx_id_hex = tx_id_hex
+        .strip_prefix("0x")
+        .or_else(|| tx_id_hex.strip_prefix("0X"))
+        .unwrap_or(tx_id_hex);
     let bytes = hex::decode(tx_id_hex).map_err(|e| {
         HyperlaneDuskError::Other(format!("Invalid dusk tx_id hex '{tx_id_hex}': {e}"))
     })?;
@@ -165,6 +217,17 @@ pub fn dusk_tx_id_to_h512(tx_id_hex: &str) -> Result<H512, HyperlaneDuskError> {
     let mut h512 = [0u8; 64];
     h512[32..64].copy_from_slice(&bytes);
     Ok(H512::from_slice(&h512))
+}
+
+/// Recover a Dusk transaction ID from its left-padded common representation.
+pub fn h512_to_dusk_tx_id(transaction_id: &H512) -> Result<String, HyperlaneDuskError> {
+    let bytes = transaction_id.as_bytes();
+    if bytes[..32] != [0u8; 32] {
+        return Err(HyperlaneDuskError::Other(
+            "Dusk H512 transaction ID has nonzero padding".into(),
+        ));
+    }
+    Ok(hex::encode(&bytes[32..]))
 }
 
 /// Build rkyv-serialized args for mailbox.process(metadata, encoded_message).
@@ -196,6 +259,11 @@ mod tests {
         assert_eq!(&transaction_id.as_bytes()[..32], &[0u8; 32]);
         assert_eq!(&transaction_id.as_bytes()[32..], &dusk_id);
         assert!(dusk_tx_id_to_h512("abcd").is_err());
+        assert_eq!(
+            h512_to_dusk_tx_id(&transaction_id).unwrap(),
+            hex::encode(dusk_id)
+        );
+        assert!(h512_to_dusk_tx_id(&H512::from([1u8; 64])).is_err());
     }
 
     #[cfg(unix)]
@@ -215,5 +283,25 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("helper deadline"));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn noisy_helper_output_is_bounded() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!(
+                "head -c {} /dev/zero",
+                MAX_DUSK_TX_STREAM_BYTES + 1
+            ))
+            .kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = command.spawn().unwrap();
+        let error = wait_for_child_output(child, "test", Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("stdout exceeds"));
     }
 }

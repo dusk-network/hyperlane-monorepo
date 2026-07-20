@@ -11,6 +11,7 @@ use hyperlane_core::{
 use hyperlane_dusk_types::events;
 
 use crate::rues::{contract_event_transaction_id, rkyv_serialize, ArchivedContractEvent};
+use crate::tx_sender::{dusk_tx_id_to_h512, h512_to_dusk_tx_id};
 use crate::RuesClient;
 
 /// Dusk mailbox indexer for dispatch and delivery events.
@@ -40,18 +41,46 @@ impl DuskMailboxIndexer {
         sequence: u32,
         block_height: u64,
     ) -> ChainResult<usize> {
-        let mut ordinal = 0usize;
-        for previous in (0..sequence).rev() {
-            let previous_height: u64 = self
-                .rues
-                .contract_query(&self.mailbox_id, "dispatched_block_height", &(previous,))
-                .await?;
-            if previous_height != block_height {
-                break;
+        let first = self
+            .first_dispatch_at_or_after(sequence + 1, block_height)
+            .await?;
+        Ok((sequence - first) as usize)
+    }
+
+    async fn dispatch_height(&self, sequence: u32) -> ChainResult<u64> {
+        Ok(self
+            .rues
+            .contract_query(&self.mailbox_id, "dispatched_block_height", &(sequence,))
+            .await?)
+    }
+
+    async fn first_dispatch_at_or_after(&self, count: u32, block_height: u64) -> ChainResult<u32> {
+        let mut low = 0u32;
+        let mut high = count;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.dispatch_height(middle).await? < block_height {
+                low = middle + 1;
+            } else {
+                high = middle;
             }
-            ordinal += 1;
         }
-        Ok(ordinal)
+        Ok(low)
+    }
+
+    async fn dispatch_range_at_block(
+        &self,
+        count: u32,
+        block_height: u64,
+    ) -> ChainResult<Option<RangeInclusive<u32>>> {
+        let first = self.first_dispatch_at_or_after(count, block_height).await?;
+        if first == count || self.dispatch_height(first).await? != block_height {
+            return Ok(None);
+        }
+        let after = self
+            .first_dispatch_at_or_after(count, block_height.saturating_add(1))
+            .await?;
+        Ok(Some(first..=after - 1))
     }
 }
 
@@ -85,6 +114,7 @@ impl Indexer<HyperlaneMessage> for DuskMailboxIndexer {
                 .rues
                 .contract_query(&self.mailbox_id, "dispatched_block_height", &(nonce,))
                 .await?;
+            ensure_cursor_height(block_number)?;
             // Query the encoded dispatched message at this nonce.
             let encoded: Vec<u8> = self
                 .rues
@@ -161,9 +191,27 @@ impl Indexer<HyperlaneMessage> for DuskMailboxIndexer {
 
     async fn fetch_logs_by_tx_hash(
         &self,
-        _tx_hash: H512,
+        tx_hash: H512,
     ) -> ChainResult<Vec<(Indexed<HyperlaneMessage>, LogMeta)>> {
-        Ok(vec![])
+        let tx_id = h512_to_dusk_tx_id(&tx_hash)?;
+        let Some(block_height) = self.rues.transaction_block_height(&tx_id).await? else {
+            return Ok(vec![]);
+        };
+        ensure_cursor_height(block_height)?;
+        let count: u32 = self
+            .rues
+            .contract_query(&self.mailbox_id, "nonce", &())
+            .await?;
+        let Some(range) = self.dispatch_range_at_block(count, block_height).await? else {
+            return Ok(vec![]);
+        };
+        let mut logs = self.fetch_logs_in_range(range).await?;
+        logs.retain(|(_, meta)| meta.transaction_id == tx_hash);
+        Ok(logs)
+    }
+
+    fn parse_tx_hash(&self, tx_hash: &str) -> ChainResult<H512> {
+        Ok(dusk_tx_id_to_h512(tx_hash)?)
     }
 }
 
@@ -206,22 +254,50 @@ impl DuskDeliveryIndexer {
         sequence: u32,
         block_height: u64,
     ) -> ChainResult<usize> {
-        let mut ordinal = 0usize;
-        for previous in (0..sequence).rev() {
-            let previous_height: u64 = self
-                .rues
-                .contract_query(
-                    &self.mailbox_id,
-                    "processed_block_height_at_index",
-                    &(previous,),
-                )
-                .await?;
-            if previous_height != block_height {
-                break;
+        let first = self
+            .first_process_at_or_after(sequence + 1, block_height)
+            .await?;
+        Ok((sequence - first) as usize)
+    }
+
+    async fn process_height(&self, sequence: u32) -> ChainResult<u64> {
+        Ok(self
+            .rues
+            .contract_query(
+                &self.mailbox_id,
+                "processed_block_height_at_index",
+                &(sequence,),
+            )
+            .await?)
+    }
+
+    async fn first_process_at_or_after(&self, count: u32, block_height: u64) -> ChainResult<u32> {
+        let mut low = 0u32;
+        let mut high = count;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.process_height(middle).await? < block_height {
+                low = middle + 1;
+            } else {
+                high = middle;
             }
-            ordinal += 1;
         }
-        Ok(ordinal)
+        Ok(low)
+    }
+
+    async fn process_range_at_block(
+        &self,
+        count: u32,
+        block_height: u64,
+    ) -> ChainResult<Option<RangeInclusive<u32>>> {
+        let first = self.first_process_at_or_after(count, block_height).await?;
+        if first == count || self.process_height(first).await? != block_height {
+            return Ok(None);
+        }
+        let after = self
+            .first_process_at_or_after(count, block_height.saturating_add(1))
+            .await?;
+        Ok(Some(first..=after - 1))
     }
 }
 
@@ -260,6 +336,7 @@ impl Indexer<H256> for DuskDeliveryIndexer {
                     &(index,),
                 )
                 .await?;
+            ensure_cursor_height(block_number)?;
 
             if archive_height != Some(block_number) {
                 archive_events = self.rues.contract_events_at(block_number).await?;
@@ -302,10 +379,38 @@ impl Indexer<H256> for DuskDeliveryIndexer {
 
     async fn fetch_logs_by_tx_hash(
         &self,
-        _tx_hash: H512,
+        tx_hash: H512,
     ) -> ChainResult<Vec<(Indexed<H256>, LogMeta)>> {
-        Ok(vec![])
+        let tx_id = h512_to_dusk_tx_id(&tx_hash)?;
+        let Some(block_height) = self.rues.transaction_block_height(&tx_id).await? else {
+            return Ok(vec![]);
+        };
+        ensure_cursor_height(block_height)?;
+        let count: u32 = self
+            .rues
+            .contract_query(&self.mailbox_id, "processed_count", &())
+            .await?;
+        let Some(range) = self.process_range_at_block(count, block_height).await? else {
+            return Ok(vec![]);
+        };
+        let mut logs = self.fetch_logs_in_range(range).await?;
+        logs.retain(|(_, meta)| meta.transaction_id == tx_hash);
+        Ok(logs)
     }
+
+    fn parse_tx_hash(&self, tx_hash: &str) -> ChainResult<H512> {
+        Ok(dusk_tx_id_to_h512(tx_hash)?)
+    }
+}
+
+fn ensure_cursor_height(block_height: u64) -> ChainResult<()> {
+    if block_height > u64::from(u32::MAX) {
+        return Err(crate::HyperlaneDuskError::Other(format!(
+            "Dusk block height {block_height} exceeds the shared u32 cursor range"
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 #[async_trait]

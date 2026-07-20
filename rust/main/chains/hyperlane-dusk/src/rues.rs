@@ -299,6 +299,28 @@ impl RuesClient {
         parse_h256_hex(hash, "block hash")
     }
 
+    /// Resolve the canonical block height containing a transaction.
+    pub(crate) async fn transaction_block_height(
+        &self,
+        tx_id: &str,
+    ) -> Result<Option<u64>, HyperlaneDuskError> {
+        validate_transaction_id(tx_id)?;
+        let query = format!(r#"query {{ tx(hash: "{tx_id}") {{ blockHeight }} }}"#);
+        let data = self.graphql_query(&query).await?;
+        let Some(transaction) = data.get("tx").filter(|value| !value.is_null()) else {
+            return Ok(None);
+        };
+        let height = transaction
+            .get("blockHeight")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| {
+                HyperlaneDuskError::Other(format!(
+                    "Ledger transaction {tx_id} is missing numeric blockHeight: {transaction}"
+                ))
+            })?;
+        Ok(Some(height))
+    }
+
     /// Wait for a propagated transaction to be included in the ledger.
     ///
     /// Propagation only acknowledges admission to the mempool. Hyperlane must not
@@ -319,11 +341,7 @@ impl RuesClient {
         timeout: Duration,
         poll_interval: Duration,
     ) -> Result<ConfirmedTransaction, HyperlaneDuskError> {
-        if tx_id.len() != 64 || !tx_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(HyperlaneDuskError::Other(format!(
-                "Invalid Dusk transaction ID '{tx_id}'"
-            )));
-        }
+        validate_transaction_id(tx_id)?;
 
         let query = transaction_query(tx_id);
         let deadline = tokio::time::Instant::now() + timeout;
@@ -341,26 +359,13 @@ impl RuesClient {
             match tokio::time::timeout_at(deadline, self.graphql_query(&query)).await {
                 Ok(Ok(data)) => {
                     if let Some(tx) = data.get("tx").filter(|tx| !tx.is_null()) {
-                        let gas_spent =
-                            tx.get("gasSpent")
-                                .and_then(JsonValue::as_u64)
-                                .ok_or_else(|| {
-                                    HyperlaneDuskError::Other(format!(
-                                    "Ledger transaction {tx_id} is missing numeric gasSpent: {tx}"
-                                ))
-                                })?;
-                        let error = match tx.get("err") {
-                            Some(JsonValue::Null) | None => None,
-                            Some(JsonValue::String(error)) => Some(error.clone()),
-                            Some(other) => {
-                                return Err(HyperlaneDuskError::Other(format!(
-                                    "Ledger transaction {tx_id} has invalid err field: {other}"
-                                )))
-                            }
-                        };
-                        return Ok(ConfirmedTransaction { gas_spent, error });
+                        match parse_confirmed_transaction(tx_id, tx) {
+                            Ok(confirmed) => return Ok(confirmed),
+                            Err(error) => last_observation_error = Some(error.to_string()),
+                        }
+                    } else {
+                        last_observation_error = None;
                     }
-                    last_observation_error = None;
                 }
                 Ok(Err(error)) => last_observation_error = Some(error.to_string()),
                 Err(_) => {
@@ -470,6 +475,39 @@ impl RuesClient {
         );
         headers
     }
+}
+
+fn validate_transaction_id(tx_id: &str) -> Result<(), HyperlaneDuskError> {
+    if tx_id.len() != 64 || !tx_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(HyperlaneDuskError::Other(format!(
+            "Invalid Dusk transaction ID '{tx_id}'"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_confirmed_transaction(
+    tx_id: &str,
+    transaction: &JsonValue,
+) -> Result<ConfirmedTransaction, HyperlaneDuskError> {
+    let gas_spent = transaction
+        .get("gasSpent")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| {
+            HyperlaneDuskError::Other(format!(
+                "Ledger transaction {tx_id} is missing numeric gasSpent: {transaction}"
+            ))
+        })?;
+    let error = match transaction.get("err") {
+        Some(JsonValue::Null) | None => None,
+        Some(JsonValue::String(error)) => Some(error.clone()),
+        Some(other) => {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Ledger transaction {tx_id} has invalid err field: {other}"
+            )))
+        }
+    };
+    Ok(ConfirmedTransaction { gas_spent, error })
 }
 
 pub(crate) fn contract_event_transaction_id(
@@ -698,6 +736,8 @@ mod tests {
         let url = test_server(vec![
             (503, "temporarily unavailable"),
             (200, r#"{"errors":[{"message":"archive catching up"}]}"#),
+            (200, r#"{"tx":{"gasSpent":"not-a-number","err":null}}"#),
+            (200, r#"{"tx":{"gasSpent":41,"err":7}}"#),
             (200, r#"{"tx":{"gasSpent":42,"err":null}}"#),
         ]);
         let client = RuesClient::new(url).unwrap();

@@ -94,7 +94,7 @@ From `rust/main` in this monorepo:
 ```bash
 cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p scraper -p lander
 cargo test -p hyperlane-dusk
-cargo test -p hyperlane-base dusk_chain_id_rejects_truncation
+cargo test -p hyperlane-base dusk_
 cargo fmt --package hyperlane-dusk --package hyperlane-base -- --check
 cargo clippy -p hyperlane-dusk --all-targets -- -D warnings
 ```
@@ -115,7 +115,7 @@ runtime placeholder macros, and runs:
 ```bash
 cargo fmt --package hyperlane-dusk --package hyperlane-base -- --check
 cargo test -p hyperlane-dusk
-cargo test -p hyperlane-base dusk_chain_id_rejects_truncation
+cargo test -p hyperlane-base dusk_
 cargo clippy -p hyperlane-dusk --all-targets -- -D warnings
 cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p scraper -p lander
 ```
@@ -133,6 +133,13 @@ Production indexers now require an archive-enabled Rusk endpoint. Canonical
 topic, in-block ordinal, exact serialized payload, transaction origin, and
 block hash. Missing archive data fails closed; zero provenance is not emitted
 because the scraper can filter it and still advance its cursor.
+
+The indexer API also supports canonical transaction-hash lookups. Dusk's
+32-byte transaction ID is represented as a zero-left-padded common `H512`;
+lookups reject noncanonical padding, resolve the containing block through Rusk,
+binary-search the contract sequence interval for that block, and filter on the
+archived transaction origin. Dusk configuration rejects block index mode and
+retains shared operation-submission queue limits.
 
 The inherited upstream Rust agent and monorepo image workflows are guarded to
 run only when `github.repository_owner == 'hyperlane-xyz'`. The inherited

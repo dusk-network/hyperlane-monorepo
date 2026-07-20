@@ -5,7 +5,7 @@ use async_trait::async_trait;
 
 use hyperlane_core::{
     BlockInfo, ChainCommunicationError, ChainInfo, ChainResult, HyperlaneChain, HyperlaneDomain,
-    HyperlaneProvider, TxnInfo, H256, H512, U256,
+    HyperlaneProvider, HyperlaneProviderError, TxnInfo, H256, H512, U256,
 };
 
 use crate::{HyperlaneDuskError, RuesClient};
@@ -60,6 +60,13 @@ impl HyperlaneProvider for DuskProvider {
                 HyperlaneDuskError::Other(format!("GraphQL block response missing header: {data}"))
             })?;
 
+        let returned_height = required_u64(header, "height", "block header")?;
+        if returned_height != height {
+            return Err(
+                HyperlaneProviderError::IncorrectBlockByHeight(height, returned_height).into(),
+            );
+        }
+
         let hash_hex = header.get("hash").and_then(|v| v.as_str()).ok_or_else(|| {
             HyperlaneDuskError::Other(format!("GraphQL block header missing hash: {data}"))
         })?;
@@ -95,7 +102,7 @@ impl HyperlaneProvider for DuskProvider {
         let dusk_tx_hex = hex::encode(dusk_tx_id);
 
         let query = format!(
-            "query {{ tx(hash: \"{dusk_tx_hex}\") {{ gasSpent blockHeight err tx {{ id gasLimit gasPrice raw callData {{ contractId fnName data }} }} }} }}"
+            "query {{ tx(hash: \"{dusk_tx_hex}\") {{ gasSpent tx {{ gasLimit gasPrice raw callData {{ contractId }} }} }} }}"
         );
         let data = self.rues.graphql_query(&query).await?;
 
@@ -112,14 +119,8 @@ impl HyperlaneProvider for DuskProvider {
             HyperlaneDuskError::Other(format!("GraphQL tx response missing tx field: {data}"))
         })?;
 
-        let gas_limit = inner_tx
-            .get("gasLimit")
-            .and_then(|v| v.as_u64())
-            .unwrap_or_default();
-        let gas_price = inner_tx
-            .get("gasPrice")
-            .and_then(|v| v.as_u64())
-            .unwrap_or_default();
+        let gas_limit = required_u64(inner_tx, "gasLimit", "transaction")?;
+        let gas_price = required_u64(inner_tx, "gasPrice", "transaction")?;
 
         let raw_input_data = inner_tx
             .get("raw")
@@ -138,7 +139,11 @@ impl HyperlaneProvider for DuskProvider {
         let gas_used = spent
             .get("gasSpent")
             .and_then(|v| v.as_u64())
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                HyperlaneDuskError::Other(format!(
+                    "GraphQL spent transaction missing numeric gasSpent: {data}"
+                ))
+            })?;
 
         Ok(TxnInfo {
             hash: *hash,
@@ -201,26 +206,24 @@ impl HyperlaneProvider for DuskProvider {
                 HyperlaneDuskError::Other(format!("GraphQL blocks response missing header: {data}"))
             })?;
 
-        let height = header
-            .get("height")
-            .and_then(|v| v.as_u64())
-            .unwrap_or_default();
-        let timestamp = header
-            .get("timestamp")
-            .and_then(|v| v.as_u64())
-            .unwrap_or_default();
-        let hash_hex = header
-            .get("hash")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        let hash_bytes = hex::decode(hash_hex).unwrap_or_default();
-        let hash = if hash_bytes.len() == 32 {
-            H256::from_slice(&hash_bytes)
-        } else {
-            H256::zero()
-        };
+        let height = required_u64(header, "height", "latest block header")?;
+        let timestamp = required_u64(header, "timestamp", "latest block header")?;
+        let hash_hex = header.get("hash").and_then(|v| v.as_str()).ok_or_else(|| {
+            HyperlaneDuskError::Other(format!("GraphQL latest block header missing hash: {data}"))
+        })?;
+        let hash_bytes = hex::decode(hash_hex).map_err(|error| {
+            HyperlaneDuskError::Other(format!("Invalid latest block hash '{hash_hex}': {error}"))
+        })?;
+        if hash_bytes.len() != 32 {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Latest block hash is not 32 bytes (got {}): {hash_hex}",
+                hash_bytes.len()
+            ))
+            .into());
+        }
+        let hash = H256::from_slice(&hash_bytes);
 
-        let gas_price = self.rues.gas_price_stats(200).await.ok().map(|s| s.average);
+        let gas_price = self.rues.gas_price_stats(200).await?.average;
 
         Ok(Some(ChainInfo::new(
             BlockInfo {
@@ -228,7 +231,43 @@ impl HyperlaneProvider for DuskProvider {
                 timestamp,
                 number: height,
             },
-            gas_price.map(U256::from),
+            Some(U256::from(gas_price)),
         )))
+    }
+}
+
+fn required_u64(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    context: &str,
+) -> Result<u64, HyperlaneDuskError> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            HyperlaneDuskError::Other(format!(
+                "GraphQL {context} missing numeric {field}: {}",
+                serde_json::Value::Object(object.clone())
+            ))
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::required_u64;
+    use serde_json::{json, Map, Value};
+
+    fn object(value: Value) -> Map<String, Value> {
+        value.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn mandatory_ledger_numbers_fail_closed() {
+        assert_eq!(
+            required_u64(&object(json!({ "height": 42 })), "height", "block").unwrap(),
+            42
+        );
+        assert!(required_u64(&object(json!({})), "height", "block").is_err());
+        assert!(required_u64(&object(json!({ "height": "42" })), "height", "block").is_err());
     }
 }
