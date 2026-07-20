@@ -56,6 +56,7 @@ jobs:
               .github/workflows/rust-docker.yml|\
               .github/workflows/rust.yml|\
               .github/workflows/test.yml|\
+              docs/dusk-companion-compatibility.md|\
               docs/dusk-upstream-compatibility-review.md|\
               docs/dusk-upstream-pr-plan.md|\
               rust/main/Cargo.lock|\
