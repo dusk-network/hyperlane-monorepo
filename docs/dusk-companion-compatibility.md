@@ -48,10 +48,16 @@ The post-compatibility-pin rerun passed the same commands against base head
 `813c98d7b0536be360dded774eebb8bcc844a349925a1cbf0c2c34f127ba810b`).
 
 The refreshed base contract gate passed 95 VM tests, while the combined stacked
-gate passed 101, plus 7 data-driver tests and 18 CLI tests. The prior fresh-state
-bidirectional E2E runs `1784592169` (TestMock) and `1784592942`
-(MessageIdMultisig) remain historical evidence for the preceding exact heads;
-fresh post-compatibility-fix run identifiers are recorded below when complete.
+gate passed 101, plus 7 data-driver tests and 18 CLI tests. Fresh-state
+bidirectional E2E then passed on the exact manifest heads in TestMock run
+`1784597325` and MessageIdMultisig run `1784598195`. Both validated the full
+saved topology before agent-config generation, confirmed a live one-LUX
+dispatch-credit withdrawal, delivered the synthetic/native/collateral routes in
+both directions, asserted exact fee/custody/allowance changes, and observed
+successful Dusk process simulation. The multisig run produced and consumed a
+real signed checkpoint. Combined harness log:
+`/tmp/hyperlane-final-e2e-b16af0c-dbed54a.log` (SHA-256
+`5d59231d77c1cce8fafa42e1527eecd9ba1d41993b18a8fc947a63257933170d`).
 
 Any source change to the Dusk agent or any deployed versioned contract
 invalidates this manifest and requires a new exact pin plus focused and E2E
