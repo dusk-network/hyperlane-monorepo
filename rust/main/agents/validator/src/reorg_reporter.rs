@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,9 +27,17 @@ pub trait ReorgReporter: Send + Sync + Debug {
     async fn report_with_reorg_period(&self, reorg_period: &ReorgPeriod);
 }
 
-#[derive(Debug)]
 pub struct LatestCheckpointReorgReporter {
     merkle_tree_hooks: HashMap<Url, Arc<dyn MerkleTreeHook>>,
+}
+
+impl fmt::Debug for LatestCheckpointReorgReporter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LatestCheckpointReorgReporter")
+            .field("endpoint_count", &self.merkle_tree_hooks.len())
+            .finish()
+    }
 }
 
 #[derive(Serialize)]
@@ -418,6 +426,18 @@ impl LatestCheckpointReorgReporterWithStorageWriter {
 mod tests {
     use super::*;
     use hyperlane_core::Checkpoint;
+
+    #[test]
+    fn reporter_debug_exposes_only_the_endpoint_count() {
+        let reporter = LatestCheckpointReorgReporter {
+            merkle_tree_hooks: HashMap::new(),
+        };
+
+        assert_eq!(
+            format!("{reporter:?}"),
+            "LatestCheckpointReorgReporter { endpoint_count: 0 }"
+        );
+    }
 
     #[test]
     fn reorg_report_keeps_requested_and_observed_heights_distinct() {

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::{Mutex as StdMutex, OnceLock};
@@ -32,12 +33,22 @@ static SHARED_RUES_CLIENTS: OnceLock<StdMutex<SharedRuesClients>> = OnceLock::ne
 /// Communicates with Dusk nodes using the RUES protocol:
 /// - Contract queries: `POST /on/contracts:{hex_id}/{method}`
 /// - Transaction propagation: `POST /on/transactions/propagate`
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RuesClient {
     client: reqwest::Client,
     base_url: String,
     finalized_event_caches: Arc<tokio::sync::Mutex<HashMap<[u8; 32], FinalizedEventCache>>>,
     event_store: Option<Arc<DB>>,
+}
+
+impl fmt::Debug for RuesClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuesClient")
+            .field("base_url", &"<redacted>")
+            .field("event_store_configured", &self.event_store.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Account status returned by Rusk for a Moonlight account.
@@ -1291,6 +1302,28 @@ mod tests {
     use std::thread;
 
     use super::*;
+
+    #[test]
+    fn client_debug_never_contains_url_credentials_or_private_components() {
+        let client = RuesClient::new(
+            Url::parse(
+                "https://debug-user:debug-password@rpc.example/private-path?token=query-sentinel",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let rendered = format!("{client:?}");
+
+        assert!(rendered.contains("<redacted>"));
+        for secret in [
+            "debug-user",
+            "debug-password",
+            "private-path",
+            "query-sentinel",
+        ] {
+            assert!(!rendered.contains(secret));
+        }
+    }
 
     fn test_server(responses: Vec<(u16, &'static str)>) -> Url {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

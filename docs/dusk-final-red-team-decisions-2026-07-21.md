@@ -34,6 +34,11 @@ in `FINAL_RED_TEAM_DECISIONS_2026-07-21.md` on the companion Dusk PR heads.
   static error categories and hash only the normalized origin
   (scheme/host/port); raw error strings, URL userinfo, paths, and query
   parameters are never serialized, logged, or included in the hash oracle.
+- Generic `Debug` formatting cannot bypass that boundary: Dusk connection
+  configuration, RUES clients, validator RPC configuration, and the reorg
+  reporter use explicit redacted implementations. Transitive provider,
+  indexer, chain, and validator settings formatting therefore cannot expose
+  URL userinfo, path credentials, or query tokens.
 - Signer configuration implements an explicitly redacted `Debug` surface, and
   signer construction instrumentation skips `self`. Raw hex, Dusk, AWS,
   Cosmos, Radix, and Stark key material cannot enter tracing output through
