@@ -16,8 +16,8 @@ Current base:
   exact reassessment candidate is pinned in
   `docs/dusk-companion-compatibility.md`: agent runtime
   `af957a9fc814fa7533aadf997104863306eed645`, companion base
-  `a1a248b30dae15b11aad923fe5d92989dd711a41`, and stacked withdrawal
-  `baf8d6e149503e1e6c58cb9f860bcbfca94c9240`.
+  `401b9504481ccefcbd7a6f546fd99d957e513506`, and stacked withdrawal
+  `bf51e41b97f70e7f8f4901378578f5755ceb3410`.
 - Focused Dusk tests, clippy, and the expanded affected-package cargo check
   pass at that runtime boundary. Earlier E2E and gate logs are regression
   history and must not be presented as evidence for this candidate.
