@@ -6,6 +6,11 @@ This note records the upstream Hyperlane areas checked before keeping the Dusk
 integration scoped to internal review. It is not an upstream PR; upstream PR
 preparation remains blocked on the companion Dusk sign-off tracker.
 
+> Historical note: the exact heads, finality/cursor design, simulation policy,
+> and replacement-evidence status in this narrative are superseded by
+> `docs/dusk-companion-compatibility.md`. Older hashes and run IDs below remain
+> useful chronology but are not evidence for the reopened candidate.
+
 ## Base
 
 Current Dusk branch:
@@ -227,17 +232,18 @@ and agent changes as one compatibility boundary:
 - Merkle message IDs and IGP payment records are read through bounded 256-item
   pages. Restart replay remains linear in local data ingestion, but no longer
   requires one network round trip per lifetime record.
-- `dusk-tx call --simulate-only` uses Rusk's ephemeral transaction simulation.
-  Relayer preparation now executes the exact signed payload and treats a
-  deterministic contract rejection as a dry-run failure before propagation.
+- Rusk's simulation endpoint was later found to accept an ordinary replayable
+  signed transaction. The current agent refuses that path before signer access,
+  performs bounded local payload preparation, and uses the configured
+  conservative gas ceiling.
 - The helper transport caps serialized arguments at 60 KiB before hex/argv
   expansion. A Dusk destination relayer without a signer is rejected at
   startup, while signerless read-only validator/indexer construction remains
   supported.
 - Outcome-unknown propagation carries the exact transaction hash back across
   the helper boundary. Mailbox and ValidatorAnnounce reconcile that hash before
-  producing a transaction outcome. Client rejections are not mislabeled as
-  ambiguous submissions.
+  producing a transaction outcome. Every non-success after propagation begins,
+  including 4xx, remains ambiguous until exact-hash ledger reconciliation.
 - Transaction lookup derives the shared sender identity from the ledger's
   Moonlight public key and returns the real ledger nonce. A malformed non-null
   confirmation record fails immediately; only transport/GraphQL observation

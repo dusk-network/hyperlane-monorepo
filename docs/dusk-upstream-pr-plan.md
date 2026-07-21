@@ -7,23 +7,20 @@ remaining production decisions are accepted or changed.
 Current base:
 
 - Current Dusk monorepo branch head: see the GitHub PR header.
-- Upstream Hyperlane `main`: `6c2ca1d5514907f6875b6b6729cbffc31e97c09c`
+- Upstream Hyperlane `main`: `669d966ad71582fe3c9d96b5ed1b8ea3724e07fe`
 - Rebase/check evidence: use the live `git fetch upstream main`,
   `git merge-base HEAD upstream/main`, and
   `git rev-list --left-right --count HEAD...upstream/main` checks recorded in
   the companion Dusk gate reports.
-- The final 2026-07-20 refresh rebased the 50-commit feature series from
-  `577aa4a82e1082aed35dcde589c9b51bed787478` onto that upstream head. The three
-  intervening commits change SVM/warp TypeScript, mainnet infrastructure
-  configuration, and TypeScript SDK warp checks; none touches the Dusk Rust
-  paths. `git range-diff` pairs all 50 commits exactly and the `rust/main` tree
-  remains `18cc899741589bff06b831ff0f2904b7b0997a36` before and after the rebase.
-- Post-rebase validation passes the focused Dusk gate, Dusk crate tests,
-  package-scoped formatting, and the expanded affected-package cargo check
-  against companion base-contract head
-  `8a2467acd5edba5e08cd6b7954f7c3dc622340b5` and stacked dispatch-withdrawal
-  head `b16af0c05547a5d8e8687f47895c664b1aa93c00` (tested code boundary
-  `265b7e9b1e47f4feadc4e71644d23df04680661c`).
+- The fork was fetched against that upstream head and is not behind it. The
+  exact reassessment candidate is pinned in
+  `docs/dusk-companion-compatibility.md`: agent runtime
+  `af957a9fc814fa7533aadf997104863306eed645`, companion base
+  `a1a248b30dae15b11aad923fe5d92989dd711a41`, and stacked withdrawal
+  `baf8d6e149503e1e6c58cb9f860bcbfca94c9240`.
+- Focused Dusk tests, clippy, and the expanded affected-package cargo check
+  pass at that runtime boundary. Earlier E2E and gate logs are regression
+  history and must not be presented as evidence for this candidate.
 - Dusk signer test cleanup evidence commit:
   `b989bbcfbb2a427d3a538c5201f5d7214de6ba84`
 
@@ -136,11 +133,17 @@ the reviewed Dusk integration allowlist. Together these are the fork-scoped
 validation substitute for Hyperlane-owned infrastructure, not a replacement
 for the companion Dusk E2E evidence.
 
-Production indexers now require an archive-enabled Rusk endpoint. Canonical
-`LogMeta` is derived by matching contract state to the archived event's source,
-topic, in-block ordinal, exact serialized payload, transaction origin, and
-block hash. Missing archive data fails closed; zero provenance is not emitted
-because the scraper can filter it and still advance its cursor.
+Production indexers require an archive-enabled Rusk endpoint and an exclusive
+`eventCursorDir`. Canonical `LogMeta` is derived from contract-scoped,
+cursor-paginated finalized-event rows by matching state height/data to each
+row's source, topic, exact serialized payload, transaction origin, and block
+hash, followed by `checkBlock(..., onlyFinalized: true)`. Missing archive data
+fails closed; whole blocks are not buffered below the helper transport cap.
+
+The opaque cursor, per-topic sequence counts, and row provenance are stored in
+an exclusive RocksDB. Page rows and cursor state are committed atomically; a
+caught-up page is polled again for later events rather than treated as permanent
+archive exhaustion.
 
 All sequence indexers are additionally capped at Rusk's consensus-finalized
 height. Merkle insertion records and validator checkpoints come from the
