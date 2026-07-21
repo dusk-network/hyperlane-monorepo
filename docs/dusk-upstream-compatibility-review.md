@@ -77,26 +77,24 @@ Earlier observation on 2026-07-20:
   passed with that implementation set. Both observed successful Rusk process
   simulation and all three route round trips; the latter also consumed real
   signed validator-checkpoint metadata.
-- `cargo fmt --package hyperlane-dusk --package hyperlane-base -- --check`
-  passes. Workspace-wide
-  `cargo fmt --all -- --check` is not used as Dusk PR evidence because Cargo's
-  `--all` also formats the adjacent companion repository through the local path
-  dependency and therefore crosses the monorepo PR boundary.
+- `cargo fmt --all -- --check` passes. The exact Git-pinned companion type
+  source is outside this workspace, so workspace formatting no longer crosses
+  the companion PR boundary.
 
 ## 2026-07-20 Reassessment Decisions
 
 - Keep this PR scoped to Rust agent/protocol integration. The contract,
   deployment, CLI, escrow, and dispatch-credit implementation remains in the
   companion `dusk-network/hyperlane-dusk` repository.
-- Retain the adjacent `hyperlane-dusk-types` path dependency for internal Dusk
-  review. Publishing or vendoring that crate remains a prerequisite for an
-  upstream Hyperlane PR, not for this fork PR.
+- Pin `hyperlane-dusk-types` to the exact reviewed public companion commit for
+  internal Dusk review and reproducible Docker builds. Publishing, vendoring,
+  or retaining an immutable Git source remains an upstream-maintainer decision,
+  not a fork merge blocker.
 - Update `rust/main/Cargo.lock` for the companion type crate's current direct
   `dusk-bytes` dependency. Leaving the lock stale would make a clean checkout
   mutate it during the Dusk agent gate.
-- Format only the owned `hyperlane-dusk` package. This records the formatter
-  change required by the current toolchain without pulling unrelated
-  companion-repository formatting into this PR.
+- Validate formatting workspace-wide; the Git-pinned companion source is no
+  longer traversed as a local workspace path.
 - Preserve explicit unsupported errors for Routing, Aggregation, CCIP-read,
   and rate-limited ISMs/hooks. A successful compile after the upstream sync is
   compatibility evidence, not a claim that those protocols are implemented.
@@ -149,9 +147,10 @@ The resulting implementation decisions are:
   Hyperlane-owned Depot jobs that cannot run in the Dusk fork.
 
 Regression evidence for these decisions includes exact GraphQL query bytes,
-canonical event selection and transaction origin, transient observation
-retries, oversized-response rejection, stalled-helper termination, checked
-chain-ID conversion, ISM error separation, and signer error preservation.
+canonical event selection and transaction-origin parsing/filtering, transient
+observation retries, oversized-response rejection, stalled-helper termination,
+checked chain-ID conversion, ISM error separation, and signer error
+preservation.
 
 The follow-up raw-artifact triage added these compatibility decisions:
 

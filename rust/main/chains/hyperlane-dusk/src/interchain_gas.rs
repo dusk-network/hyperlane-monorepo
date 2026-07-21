@@ -107,7 +107,11 @@ impl DuskInterchainGasPaymasterIndexer {
         let after = self
             .first_payment_at_or_after(count, block_height.saturating_add(1))
             .await?;
-        Ok(Some(first..=after - 1))
+        Ok(Some(crate::bounded_block_range(
+            first,
+            after,
+            "IGP payment",
+        )?))
     }
 
     async fn finalized_payment_count(&self, current_count: u32) -> ChainResult<(u32, u32)> {
@@ -220,8 +224,16 @@ impl Indexer<InterchainGasPayment> for DuskInterchainGasPaymasterIndexer {
         let Some(range) = self.payment_range_at_block(count, block_height).await? else {
             return Ok(vec![]);
         };
-        let mut logs = self.fetch_logs_in_range(range).await?;
-        logs.retain(|(_, meta)| meta.transaction_id == tx_hash);
+        crate::ensure_tx_hash_lookup_budget(&range, "IGP payment")?;
+        let mut logs = Vec::new();
+        for chunk in crate::block_range_chunks(range) {
+            logs.extend(
+                self.fetch_logs_in_range(chunk)
+                    .await?
+                    .into_iter()
+                    .filter(|(_, meta)| meta.transaction_id == tx_hash),
+            );
+        }
         Ok(logs)
     }
 

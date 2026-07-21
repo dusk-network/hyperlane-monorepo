@@ -11,8 +11,9 @@ pub struct ConnectionConf {
     pub url: Url,
     /// Dusk chain ID (used in Moonlight transactions).
     pub chain_id: u8,
-    /// Agent-owned directory for durable finalized-event cursors and row
-    /// provenance. Different agent processes must use different directories.
+    /// Agent-owned directory for independently authenticated finalized-event
+    /// rows. Endpoint-owned scan cursors remain process-local. Different agent
+    /// processes must use different directories.
     pub event_cursor_dir: PathBuf,
     /// Default gas limit for transactions.
     pub gas_limit: u64,

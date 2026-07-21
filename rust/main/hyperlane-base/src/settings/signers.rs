@@ -198,7 +198,7 @@ impl DuskSignerKeyConf {
 }
 
 /// Signer types
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Clone)]
 pub enum SignerConf {
     /// A local hex key
     HexKey {
@@ -248,9 +248,50 @@ pub enum SignerConf {
     Node,
 }
 
+impl fmt::Debug for SignerConf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HexKey { .. } => f
+                .debug_struct("HexKey")
+                .field("key", &"<redacted>")
+                .finish(),
+            Self::Aws { region, .. } => f
+                .debug_struct("Aws")
+                .field("id", &"<redacted>")
+                .field("region", region)
+                .finish(),
+            Self::CosmosKey {
+                prefix,
+                account_address_type,
+                ..
+            } => f
+                .debug_struct("CosmosKey")
+                .field("key", &"<redacted>")
+                .field("prefix", prefix)
+                .field("account_address_type", account_address_type)
+                .finish(),
+            Self::RadixKey { suffix, .. } => f
+                .debug_struct("RadixKey")
+                .field("key", &"<redacted>")
+                .field("suffix", suffix)
+                .finish(),
+            Self::StarkKey {
+                address, is_legacy, ..
+            } => f
+                .debug_struct("StarkKey")
+                .field("key", &"<redacted>")
+                .field("address", address)
+                .field("is_legacy", is_legacy)
+                .finish(),
+            Self::DuskKey { key } => f.debug_struct("DuskKey").field("key", key).finish(),
+            Self::Node => f.write_str("Node"),
+        }
+    }
+}
+
 impl SignerConf {
     /// Try to convert the ethereum signer to a local wallet
-    #[instrument(err)]
+    #[instrument(err, skip(self))]
     pub async fn build<S: BuildableWithSignerConf>(&self) -> Result<S, Report> {
         S::build(self).await
     }
@@ -557,6 +598,27 @@ mod tests {
         .resolve()
         .expect("length validation should pass");
         assert!(hyperlane_dusk::DuskSigner::new(noncanonical).is_err());
+    }
+
+    #[test]
+    fn signer_debug_never_contains_raw_key_material() {
+        let sentinel = H256::from([0xA7u8; 32]);
+        let rendered = format!("{:?}", SignerConf::HexKey { key: sentinel });
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered
+            .to_ascii_lowercase()
+            .contains(&hex::encode(sentinel)));
+
+        let dusk = SignerConf::DuskKey {
+            key: super::DuskSignerKeyConf::Inline {
+                key: hex::encode(sentinel),
+            },
+        };
+        let rendered = format!("{dusk:?}");
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered
+            .to_ascii_lowercase()
+            .contains(&hex::encode(sentinel)));
     }
 
     /// Exercises the exact coalescing mechanism `build_aws_signer` relies on

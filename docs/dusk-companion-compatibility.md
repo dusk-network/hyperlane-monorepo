@@ -88,12 +88,14 @@ source, topic, data, and reverted flag. State-derived height/data is matched to
 that row and `checkBlock(..., onlyFinalized: true)` validates its finalized
 block. Whole-block event buffering is not used.
 
-Opaque cursors, per-topic sequence counts, and row provenance are stored in an
-exclusive RocksDB under `eventCursorDir`. Each page and its cursor are written
-in one synchronous atomic batch. Rows are keyed by contract, topic, and
-sequence, so the store does not rewrite or deserialize an ever-growing JSON
-history. A caught-up page is temporary: later events continue from the last
-opaque cursor.
+Endpoint cursors and row IDs remain process-local scan hints, independently
+tracked per topic; they never become durable authority. The exclusive RocksDB
+under `eventCursorDir` stores only the exact requested row after its direct
+contract state and finalized block have been authenticated. Durable v2 keys
+bind contract, topic, and local sequence; page peers and legacy page-derived
+v1 entries are ignored. On restart the scanner performs page-bounded replay to
+recover its remote position. A caught-up page remains temporary and is polled
+again for later events.
 
 Current Rusk simulation accepts an ordinary signed transaction whose bytes can
 be replayed. The agent therefore performs bounded local payload preparation and

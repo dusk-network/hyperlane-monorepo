@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
+use base64::engine::{general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use rkyv::ser::serializers::AllocSerializer;
 use rkyv::ser::Serializer;
@@ -20,8 +21,6 @@ use crate::HyperlaneDuskError;
 
 const MAX_RUES_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const FINALIZED_EVENT_PAGE_SIZE: usize = 16;
-const MAX_FINALIZED_EVENT_STATE_BYTES: usize = 256 * 1024;
-const MAX_TRACKED_EVENT_TOPICS: usize = 256;
 const MAX_EVENT_TOPIC_BYTES: usize = 256;
 const TX_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -106,11 +105,20 @@ struct FinalizedEventPage {
     has_next_page: bool,
 }
 
-#[derive(Debug, Clone, Default, SerdeDeserialize, SerdeSerialize)]
+#[derive(Debug, Clone, Default)]
 struct FinalizedEventCache {
+    /// Each requested topic scans the contract stream independently. This
+    /// prevents one topic from skipping unrequested peers without retaining an
+    /// unbounded pending-event buffer. All endpoint-owned scan state is
+    /// process-local and rebuilt from genesis after restart.
+    scans: HashMap<String, FinalizedEventScan>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FinalizedEventScan {
     cursor: Option<String>,
     last_id: Option<i64>,
-    topic_lengths: HashMap<String, usize>,
+    replayed: usize,
 }
 
 /// Row-owned provenance for one finalized, state-matched contract event.
@@ -139,8 +147,9 @@ impl RuesClient {
         })
     }
 
-    /// Create a RUES client whose contract event cursors survive process
-    /// restart. The configured directory must be owned by one agent process.
+    /// Create a RUES client whose validated contract event rows survive
+    /// restart. Endpoint-owned cursors are rebuilt from genesis. The
+    /// configured directory must be owned by one agent process.
     pub fn new_with_event_cursor_dir(
         url: Url,
         event_cursor_dir: PathBuf,
@@ -398,29 +407,8 @@ impl RuesClient {
         expected_data: &[u8],
     ) -> Result<FinalizedEventProvenance, HyperlaneDuskError> {
         loop {
-            let (cached, cursor, last_id) = {
-                let mut caches = self.finalized_event_caches.lock().await;
-                if !caches.contains_key(contract_id) {
-                    let cache = self.load_finalized_event_cache(contract_id)?;
-                    caches.insert(*contract_id, cache);
-                }
-                let cache = caches.get(contract_id);
-                let cached = match cache
-                    .and_then(|cache| cache.topic_lengths.get(topic))
-                    .is_some_and(|length| sequence < *length)
-                {
-                    true => self.load_finalized_event(contract_id, topic, sequence)?,
-                    false => None,
-                };
-                (
-                    cached,
-                    cache.and_then(|cache| cache.cursor.clone()),
-                    cache.and_then(|cache| cache.last_id),
-                )
-            };
-
-            if let Some(event) = cached {
-                return self
+            if let Some(event) = self.load_finalized_event(contract_id, topic, sequence)? {
+                let result = self
                     .validate_finalized_event(
                         contract_id,
                         topic,
@@ -430,12 +418,35 @@ impl RuesClient {
                         event,
                     )
                     .await;
+                if result.is_err() {
+                    self.invalidate_finalized_event(contract_id, topic, sequence)
+                        .await?;
+                }
+                return result;
             }
 
+            let scan = {
+                let mut caches = self.finalized_event_caches.lock().await;
+                let cache = caches.entry(*contract_id).or_default();
+                let scan = cache.scans.entry(topic.to_owned()).or_default();
+                // Exact rows are cached independently, so callers may begin at
+                // any sequence. Rewind a transient scan when asked to move
+                // behind it rather than trusting a remote cursor as authority.
+                if sequence < scan.replayed {
+                    *scan = FinalizedEventScan::default();
+                }
+                scan.clone()
+            };
+
             let page = self
-                .finalized_event_page(contract_id, cursor.as_deref())
+                .finalized_event_page(contract_id, scan.cursor.as_deref())
                 .await?;
-            validate_finalized_event_page(contract_id, cursor.as_deref(), last_id, &page)?;
+            validate_finalized_event_page(
+                contract_id,
+                scan.cursor.as_deref(),
+                scan.last_id,
+                &page,
+            )?;
             let has_next_page = page.has_next_page;
 
             // Only one concurrent fetch may advance a contract cursor. If
@@ -443,48 +454,74 @@ impl RuesClient {
             // now-current cache rather than duplicating rows.
             let mut caches = self.finalized_event_caches.lock().await;
             let cache = caches.entry(*contract_id).or_default();
-            if cache.cursor != cursor || cache.last_id != last_id {
+            let current_scan = cache.scans.get(topic).cloned().unwrap_or_default();
+            if current_scan != scan {
                 continue;
             }
-            let mut candidate = cache.clone();
-            let mut new_rows = Vec::new();
+            let mut candidate_scan = scan;
             let mut cached = None;
             for event in page.events {
-                candidate.last_id = Some(event.id);
-                if !event.reverted {
-                    let topic_sequence = *candidate.topic_lengths.get(&event.topic).unwrap_or(&0);
-                    if event.topic == topic && topic_sequence == sequence {
-                        cached = Some(event.clone());
+                candidate_scan.last_id = Some(event.id);
+                if !event.reverted && event.topic == topic {
+                    let replayed = candidate_scan.replayed;
+                    // Only the caller-requested row becomes a candidate.
+                    // Prefix and page-peer rows remain endpoint assertions and
+                    // never acquire durable authority transitively.
+                    if replayed == sequence {
+                        let mut durable_event = event.clone();
+                        durable_event.id = i64::try_from(sequence).map_err(|_| {
+                            HyperlaneDuskError::Other(
+                                "Dusk finalized-event sequence exceeds i64 provenance range".into(),
+                            )
+                        })?;
+                        cached = Some(durable_event);
                     }
-                    let next_topic_sequence = topic_sequence.checked_add(1).ok_or_else(|| {
+                    let next_replayed = replayed.checked_add(1).ok_or_else(|| {
                         HyperlaneDuskError::Other(
-                            "Dusk finalized-event topic sequence overflow".into(),
+                            "Dusk finalized-event replay sequence overflow".into(),
                         )
                     })?;
-                    candidate
-                        .topic_lengths
-                        .insert(event.topic.clone(), next_topic_sequence);
-                    new_rows.push((event.topic.clone(), topic_sequence, event));
+                    candidate_scan.replayed = next_replayed;
+
+                    // Keep the transient cursor immediately after the target
+                    // row. Advancing to the end of this page would skip
+                    // uncommitted later rows on the next request.
+                    if cached.is_some() {
+                        break;
+                    }
                 }
             }
-            // An empty caught-up page has no end cursor. Preserve the last
-            // opaque cursor so the next poll asks only for newer rows.
-            candidate.cursor = page.end_cursor.or(cursor);
-            self.persist_finalized_event_page(contract_id, &candidate, &new_rows)?;
-            *cache = candidate;
+            // This cursor is locally encoded but still derived from an
+            // endpoint-owned row ID. It is useful only in this process and is
+            // omitted from durable state.
+            candidate_scan.cursor = candidate_scan.last_id.map(canonical_event_cursor);
+            cache.scans.insert(topic.to_owned(), candidate_scan);
 
             if let Some(event) = cached {
                 drop(caches);
-                return self
+                let result = self
                     .validate_finalized_event(
                         contract_id,
                         topic,
                         sequence,
                         expected_block_height,
                         expected_data,
-                        event,
+                        event.clone(),
                     )
                     .await;
+                let provenance = match result {
+                    Ok(provenance) => provenance,
+                    Err(error) => {
+                        self.invalidate_finalized_event(contract_id, topic, sequence)
+                            .await?;
+                        return Err(error);
+                    }
+                };
+                // Contract state and checkBlock have authenticated this exact
+                // row. Persist it independently; no prefix or page peer is
+                // promoted by association.
+                self.persist_finalized_event(contract_id, topic, sequence, &event)?;
+                return Ok(provenance);
             }
             if !has_next_page {
                 return Err(HyperlaneDuskError::Other(format!(
@@ -503,33 +540,6 @@ impl RuesClient {
         })
     }
 
-    fn load_finalized_event_cache(
-        &self,
-        contract_id: &[u8; 32],
-    ) -> Result<FinalizedEventCache, HyperlaneDuskError> {
-        let Some(bytes) = self
-            .event_store()?
-            .get(finalized_event_state_key(contract_id))
-            .map_err(|error| {
-                HyperlaneDuskError::Other(format!(
-                    "Failed to read Dusk finalized-event cursor state: {error}"
-                ))
-            })?
-        else {
-            return Ok(FinalizedEventCache::default());
-        };
-        if bytes.len() > MAX_FINALIZED_EVENT_STATE_BYTES {
-            return Err(HyperlaneDuskError::Other(format!(
-                "Dusk finalized-event cursor state exceeds {MAX_FINALIZED_EVENT_STATE_BYTES} bytes"
-            )));
-        }
-        let cache: FinalizedEventCache = serde_json::from_slice(&bytes).map_err(|error| {
-            HyperlaneDuskError::Other(format!("Failed to decode Dusk event cursor: {error}"))
-        })?;
-        validate_loaded_event_cache(&cache)?;
-        Ok(cache)
-    }
-
     fn load_finalized_event(
         &self,
         contract_id: &[u8; 32],
@@ -545,66 +555,86 @@ impl RuesClient {
                 ))
             })?
         else {
-            return Err(HyperlaneDuskError::Other(format!(
-                "Dusk finalized-event cursor references missing row {}/{topic}/{sequence}",
-                hex::encode(contract_id)
-            )));
+            return Ok(None);
         };
         if bytes.len() > MAX_RUES_RESPONSE_BYTES {
             return Err(HyperlaneDuskError::Other(
                 "Persisted Dusk finalized event exceeds the transport bound".into(),
             ));
         }
-        let event: FinalizedContractEvent = serde_json::from_slice(&bytes).map_err(|error| {
-            HyperlaneDuskError::Other(format!(
-                "Failed to decode persisted Dusk finalized event: {error}"
-            ))
+        let mut event: FinalizedContractEvent =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                HyperlaneDuskError::Other(format!(
+                    "Failed to decode persisted Dusk finalized event: {error}"
+                ))
+            })?;
+        // Archive row IDs are pagination hints, not durable provenance. Use
+        // the locally owned topic sequence.
+        event.id = i64::try_from(sequence).map_err(|_| {
+            HyperlaneDuskError::Other(
+                "Dusk finalized-event sequence exceeds i64 provenance range".into(),
+            )
         })?;
         validate_persisted_event(contract_id, topic, &event)?;
         Ok(Some(event))
     }
 
-    fn persist_finalized_event_page(
+    fn persist_finalized_event(
         &self,
         contract_id: &[u8; 32],
-        cache: &FinalizedEventCache,
-        rows: &[(String, usize, FinalizedContractEvent)],
+        topic: &str,
+        sequence: usize,
+        event: &FinalizedContractEvent,
     ) -> Result<(), HyperlaneDuskError> {
-        validate_loaded_event_cache(cache)?;
-        let state = serde_json::to_vec(cache).map_err(|error| {
-            HyperlaneDuskError::Other(format!("Failed to encode Dusk event cursor: {error}"))
+        validate_persisted_event(contract_id, topic, event)?;
+        let bytes = serde_json::to_vec(event).map_err(|error| {
+            HyperlaneDuskError::Other(format!("Failed to encode Dusk finalized event: {error}"))
         })?;
-        if state.len() > MAX_FINALIZED_EVENT_STATE_BYTES {
-            return Err(HyperlaneDuskError::Other(format!(
-                "Dusk finalized-event cursor state exceeds {MAX_FINALIZED_EVENT_STATE_BYTES} bytes"
-            )));
+        if bytes.len() > MAX_RUES_RESPONSE_BYTES {
+            return Err(HyperlaneDuskError::Other(
+                "Dusk finalized event exceeds the transport bound".into(),
+            ));
         }
 
         let mut batch = WriteBatch::default();
-        for (topic, sequence, event) in rows {
-            let bytes = serde_json::to_vec(event).map_err(|error| {
-                HyperlaneDuskError::Other(format!("Failed to encode Dusk finalized event: {error}"))
-            })?;
-            if bytes.len() > MAX_RUES_RESPONSE_BYTES {
-                return Err(HyperlaneDuskError::Other(
-                    "Dusk finalized event exceeds the transport bound".into(),
-                ));
-            }
-            batch.put(
-                finalized_event_row_key(contract_id, topic, *sequence)?,
-                bytes,
-            );
-        }
-        batch.put(finalized_event_state_key(contract_id), state);
+        batch.put(
+            finalized_event_row_key(contract_id, topic, sequence)?,
+            bytes,
+        );
         let mut write_options = WriteOptions::default();
         write_options.set_sync(true);
         self.event_store()?
             .write_opt(batch, &write_options)
             .map_err(|error| {
                 HyperlaneDuskError::Other(format!(
-                    "Failed to atomically persist Dusk finalized-event page: {error}"
+                    "Failed to durably persist authenticated Dusk finalized event: {error}"
                 ))
             })
+    }
+
+    async fn invalidate_finalized_event(
+        &self,
+        contract_id: &[u8; 32],
+        topic: &str,
+        sequence: usize,
+    ) -> Result<(), HyperlaneDuskError> {
+        let mut caches = self.finalized_event_caches.lock().await;
+        let cache = caches.entry(*contract_id).or_default();
+        cache.scans.remove(topic);
+
+        let mut batch = WriteBatch::default();
+        batch.delete(finalized_event_row_key(contract_id, topic, sequence)?);
+        let mut write_options = WriteOptions::default();
+        write_options.set_sync(true);
+        self.event_store()?
+            .write_opt(batch, &write_options)
+            .map_err(|error| {
+                HyperlaneDuskError::Other(format!(
+                    "Failed to invalidate Dusk finalized event {}/{topic}/{sequence}: {error}",
+                    hex::encode(contract_id)
+                ))
+            })?;
+        Ok(())
     }
 
     async fn finalized_event_page(
@@ -1000,6 +1030,20 @@ fn validate_finalized_event_page(
     page: &FinalizedEventPage,
 ) -> Result<(), HyperlaneDuskError> {
     let source = hex::encode(contract_id);
+    match (requested_cursor, previous_id) {
+        (None, None) => {}
+        (Some(cursor), Some(id)) if decode_event_cursor(cursor)? == id => {}
+        (Some(_), Some(id)) => {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Dusk transient event cursor does not match last event ID {id} for {source}"
+            )));
+        }
+        _ => {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Dusk transient event cursor and last event ID are inconsistent for {source}"
+            )));
+        }
+    }
     if page.events.len() > FINALIZED_EVENT_PAGE_SIZE {
         return Err(HyperlaneDuskError::Other(format!(
             "Rusk finalizedEvents returned {} rows above requested limit {FINALIZED_EVENT_PAGE_SIZE}",
@@ -1017,6 +1061,19 @@ fn validate_finalized_event_page(
     if page.start_cursor.is_none() || page.end_cursor.is_none() {
         return Err(HyperlaneDuskError::Other(format!(
             "Rusk finalizedEvents omitted page cursors for {source}"
+        )));
+    }
+    let (Some(first_event), Some(last_event)) = (page.events.first(), page.events.last()) else {
+        return Err(HyperlaneDuskError::Other(
+            "Rusk finalizedEvents page unexpectedly became empty".into(),
+        ));
+    };
+    let start_cursor_id = decode_event_cursor(page.start_cursor.as_deref().unwrap_or_default())?;
+    let end_cursor_id = decode_event_cursor(page.end_cursor.as_deref().unwrap_or_default())?;
+    if start_cursor_id != first_event.id || end_cursor_id != last_event.id {
+        return Err(HyperlaneDuskError::Other(format!(
+            "Rusk finalizedEvents cursors do not match page row IDs for {source}: start={start_cursor_id}/{} end={end_cursor_id}/{}",
+            first_event.id, last_event.id
         )));
     }
     if requested_cursor == page.end_cursor.as_deref() {
@@ -1049,25 +1106,34 @@ fn validate_finalized_event_page(
     Ok(())
 }
 
-fn validate_loaded_event_cache(cache: &FinalizedEventCache) -> Result<(), HyperlaneDuskError> {
-    if cache.last_id.is_some() && cache.cursor.is_none() {
+fn canonical_event_cursor(id: i64) -> String {
+    BASE64_STANDARD.encode(format!("v1:{id}"))
+}
+
+fn decode_event_cursor(cursor: &str) -> Result<i64, HyperlaneDuskError> {
+    let decoded = BASE64_STANDARD.decode(cursor).map_err(|error| {
+        HyperlaneDuskError::Other(format!(
+            "Invalid Dusk finalized-event cursor encoding: {error}"
+        ))
+    })?;
+    let decoded = std::str::from_utf8(&decoded).map_err(|error| {
+        HyperlaneDuskError::Other(format!("Invalid Dusk finalized-event cursor text: {error}"))
+    })?;
+    let id = decoded
+        .strip_prefix("v1:")
+        .ok_or_else(|| {
+            HyperlaneDuskError::Other("Unsupported Dusk finalized-event cursor version".into())
+        })?
+        .parse::<i64>()
+        .map_err(|error| {
+            HyperlaneDuskError::Other(format!("Invalid Dusk finalized-event cursor ID: {error}"))
+        })?;
+    if id < 0 || canonical_event_cursor(id) != cursor {
         return Err(HyperlaneDuskError::Other(
-            "Dusk event cursor has rows but no opaque archive cursor".into(),
+            "Dusk finalized-event cursor is negative or non-canonical".into(),
         ));
     }
-    if cache.topic_lengths.len() > MAX_TRACKED_EVENT_TOPICS {
-        return Err(HyperlaneDuskError::Other(format!(
-            "Dusk event cursor tracks more than {MAX_TRACKED_EVENT_TOPICS} topics"
-        )));
-    }
-    for topic in cache.topic_lengths.keys() {
-        if topic.is_empty() || topic.len() > MAX_EVENT_TOPIC_BYTES {
-            return Err(HyperlaneDuskError::Other(format!(
-                "Dusk event cursor contains an empty or oversized topic (maximum {MAX_EVENT_TOPIC_BYTES} bytes)"
-            )));
-        }
-    }
-    Ok(())
+    Ok(id)
 }
 
 fn validate_persisted_event(
@@ -1095,12 +1161,6 @@ fn validate_persisted_event(
     Ok(())
 }
 
-fn finalized_event_state_key(contract_id: &[u8; 32]) -> Vec<u8> {
-    let mut key = b"dusk-finalized-state-v1:".to_vec();
-    key.extend_from_slice(contract_id);
-    key
-}
-
 fn finalized_event_row_key(
     contract_id: &[u8; 32],
     topic: &str,
@@ -1114,7 +1174,9 @@ fn finalized_event_row_key(
     let sequence = u64::try_from(sequence)
         .map_err(|_| HyperlaneDuskError::Other("Dusk event sequence does not fit in u64".into()))?;
     let topic_hash = hyperlane_dusk_types::message::keccak256(topic.as_bytes());
-    let mut key = b"dusk-finalized-row-v1:".to_vec();
+    // v2 stores only independently state/checkBlock-authenticated rows. It
+    // deliberately ignores v1 page-derived cache entries during migration.
+    let mut key = b"dusk-finalized-row-v2:".to_vec();
     key.extend_from_slice(contract_id);
     key.extend_from_slice(&topic_hash);
     key.extend_from_slice(&sequence.to_be_bytes());
@@ -1404,7 +1466,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalized_events_use_row_owned_provenance_and_durable_cursor() {
+    async fn finalized_events_use_row_owned_provenance_and_durable_semantic_cache() {
         let contract_id = [7u8; 32];
         let expected_data = vec![1, 2, 3];
         let origin = [9u8; 32];
@@ -1440,12 +1502,12 @@ mod tests {
             .unwrap();
         assert_eq!(provenance.block_hash, H256::from(block_hash));
         assert_eq!(&provenance.transaction_id.as_bytes()[32..], &origin);
-        assert_eq!(provenance.event_id, 11);
+        assert_eq!(provenance.event_id, 0);
         assert!(store_path.join("CURRENT").is_file());
         drop(client);
 
-        // A fresh client loads the opaque cursor and row mapping rather than
-        // requesting finalizedEvents from genesis again. It performs only the
+        // A fresh client can serve an already indexed row without trusting or
+        // loading any endpoint-owned pagination cursor. It performs only the
         // row's finalized checkBlock validation.
         let url = test_server(vec![(200, r#"{"checkBlock":true}"#)]);
         let restarted = test_client_with_event_store(url, &store_path);
@@ -1519,7 +1581,7 @@ mod tests {
             .finalized_contract_event(&contract_id, "dispatch", 1, 8, &second_data)
             .await
             .unwrap();
-        assert_eq!(later.event_id, 12);
+        assert_eq!(later.event_id, 1);
     }
 
     #[test]
@@ -1544,6 +1606,343 @@ mod tests {
         assert!(
             validate_finalized_event_page(&contract_id, Some("same"), Some(10), &page).is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn paired_max_row_id_and_cursor_cannot_poison_restart() {
+        let contract_id = [7u8; 32];
+        let source = hex::encode(contract_id);
+        let first_data = vec![1u8];
+        let second_data = vec![2u8];
+        let poison = canonical_event_cursor(i64::MAX);
+        let poisoned_page = serde_json::json!({
+            "finalizedEvents": { "json": {
+                "events": [{
+                    "id": i64::MAX,
+                    "block_height": 7,
+                    "block_hash": hex::encode([8u8; 32]),
+                    "origin": hex::encode([9u8; 32]),
+                    "topic": "dispatch",
+                    "source": source,
+                    "data": hex::encode(&first_data),
+                    "reverted": false
+                }],
+                "startCursor": poison,
+                "endCursor": poison,
+                "hasNextPage": false
+            }}
+        })
+        .to_string();
+        let poisoned_page: &'static str = Box::leak(poisoned_page.into_boxed_str());
+        let cursor_dir = tempfile::tempdir().unwrap();
+        let store_path = cursor_dir.path().join("event-store");
+        let poisoned = test_client_with_event_store(
+            test_server(vec![(200, poisoned_page), (200, r#"{"checkBlock":true}"#)]),
+            &store_path,
+        );
+        let first = poisoned
+            .finalized_contract_event(&contract_id, "dispatch", 0, 7, &first_data)
+            .await
+            .unwrap();
+        assert_eq!(
+            first.event_id, 0,
+            "provenance uses the local topic sequence"
+        );
+        drop(poisoned);
+
+        let repaired_first = serde_json::json!({
+            "finalizedEvents": { "json": {
+                "events": [{
+                    "id": 11,
+                    "block_height": 7,
+                    "block_hash": hex::encode([8u8; 32]),
+                    "origin": hex::encode([9u8; 32]),
+                    "topic": "dispatch",
+                    "source": hex::encode(contract_id),
+                    "data": hex::encode(&first_data),
+                    "reverted": false
+                }],
+                "startCursor": canonical_event_cursor(11),
+                "endCursor": canonical_event_cursor(11),
+                "hasNextPage": true
+            }}
+        })
+        .to_string();
+        let repaired_second = serde_json::json!({
+            "finalizedEvents": { "json": {
+                "events": [{
+                    "id": 12,
+                    "block_height": 8,
+                    "block_hash": hex::encode([10u8; 32]),
+                    "origin": hex::encode([11u8; 32]),
+                    "topic": "dispatch",
+                    "source": hex::encode(contract_id),
+                    "data": hex::encode(&second_data),
+                    "reverted": false
+                }],
+                "startCursor": canonical_event_cursor(12),
+                "endCursor": canonical_event_cursor(12),
+                "hasNextPage": false
+            }}
+        })
+        .to_string();
+        let repaired_first: &'static str = Box::leak(repaired_first.into_boxed_str());
+        let repaired_second: &'static str = Box::leak(repaired_second.into_boxed_str());
+        let repaired = test_client_with_event_store(
+            test_server(vec![
+                (200, repaired_first),
+                (200, repaired_second),
+                (200, r#"{"checkBlock":true}"#),
+            ]),
+            &store_path,
+        );
+        let later = repaired
+            .finalized_contract_event(&contract_id, "dispatch", 1, 8, &second_data)
+            .await
+            .expect("a repaired endpoint must advance after a poisoned prior process");
+        assert_eq!(later.event_id, 1);
+    }
+
+    #[tokio::test]
+    async fn unrequested_page_peer_cannot_poison_durable_semantic_rows() {
+        let contract_id = [17u8; 32];
+        let source = hex::encode(contract_id);
+        let first_data = vec![1u8];
+        let second_data = vec![2u8];
+        let duplicate_page = serde_json::json!({
+            "finalizedEvents": { "json": {
+                "events": [{
+                    "id": 11,
+                    "block_height": 7,
+                    "block_hash": hex::encode([8u8; 32]),
+                    "origin": hex::encode([9u8; 32]),
+                    "topic": "dispatch",
+                    "source": source,
+                    "data": hex::encode(&first_data),
+                    "reverted": false
+                }, {
+                    "id": 12,
+                    "block_height": 7,
+                    "block_hash": hex::encode([8u8; 32]),
+                    "origin": hex::encode([9u8; 32]),
+                    "topic": "dispatch",
+                    "source": hex::encode(contract_id),
+                    "data": hex::encode(&first_data),
+                    "reverted": false
+                }],
+                "startCursor": canonical_event_cursor(11),
+                "endCursor": canonical_event_cursor(12),
+                "hasNextPage": false
+            }}
+        })
+        .to_string();
+        let duplicate_page: &'static str = Box::leak(duplicate_page.into_boxed_str());
+        let cursor_dir = tempfile::tempdir().unwrap();
+        let store_path = cursor_dir.path().join("event-store");
+        let poisoned = test_client_with_event_store(
+            test_server(vec![(200, duplicate_page), (200, r#"{"checkBlock":true}"#)]),
+            &store_path,
+        );
+        poisoned
+            .finalized_contract_event(&contract_id, "dispatch", 0, 7, &first_data)
+            .await
+            .unwrap();
+        assert!(poisoned
+            .load_finalized_event(&contract_id, "dispatch", 1)
+            .unwrap()
+            .is_none());
+        drop(poisoned);
+
+        let repaired_page = serde_json::json!({
+            "finalizedEvents": { "json": {
+                "events": [{
+                    "id": 21,
+                    "block_height": 7,
+                    "block_hash": hex::encode([8u8; 32]),
+                    "origin": hex::encode([9u8; 32]),
+                    "topic": "dispatch",
+                    "source": hex::encode(contract_id),
+                    "data": hex::encode(&first_data),
+                    "reverted": false
+                }, {
+                    "id": 22,
+                    "block_height": 8,
+                    "block_hash": hex::encode([10u8; 32]),
+                    "origin": hex::encode([11u8; 32]),
+                    "topic": "dispatch",
+                    "source": hex::encode(contract_id),
+                    "data": hex::encode(&second_data),
+                    "reverted": false
+                }],
+                "startCursor": canonical_event_cursor(21),
+                "endCursor": canonical_event_cursor(22),
+                "hasNextPage": false
+            }}
+        })
+        .to_string();
+        let repaired_page: &'static str = Box::leak(repaired_page.into_boxed_str());
+        let repaired = test_client_with_event_store(
+            test_server(vec![(200, repaired_page), (200, r#"{"checkBlock":true}"#)]),
+            &store_path,
+        );
+        let later = repaired
+            .finalized_contract_event(&contract_id, "dispatch", 1, 8, &second_data)
+            .await
+            .expect("a repaired endpoint must supply the real next semantic row");
+        assert_eq!(later.event_id, 1);
+    }
+
+    #[tokio::test]
+    async fn repaired_endpoint_can_replace_an_exact_poisoned_cached_row() {
+        let contract_id = [37u8; 32];
+        let false_first = vec![41u8];
+        let false_second = vec![42u8];
+        let compromised_page = serde_json::json!({
+            "finalizedEvents": { "json": {
+                "events": [{
+                    "id": 1,
+                    "block_height": 9,
+                    "block_hash": hex::encode([43u8; 32]),
+                    "origin": hex::encode([44u8; 32]),
+                    "topic": "dispatch",
+                    "source": hex::encode(contract_id),
+                    "data": hex::encode(&false_first),
+                    "reverted": false
+                }, {
+                    "id": 2,
+                    "block_height": 10,
+                    "block_hash": hex::encode([45u8; 32]),
+                    "origin": hex::encode([46u8; 32]),
+                    "topic": "dispatch",
+                    "source": hex::encode(contract_id),
+                    "data": hex::encode(&false_second),
+                    "reverted": false
+                }],
+                "startCursor": canonical_event_cursor(1),
+                "endCursor": canonical_event_cursor(2),
+                "hasNextPage": false
+            }}
+        })
+        .to_string();
+        let compromised_page: &'static str = Box::leak(compromised_page.into_boxed_str());
+        let cursor_dir = tempfile::tempdir().unwrap();
+        let store_path = cursor_dir.path().join("event-store");
+        let compromised = test_client_with_event_store(
+            test_server(vec![
+                (200, compromised_page),
+                (200, r#"{"checkBlock":true}"#),
+            ]),
+            &store_path,
+        );
+        compromised
+            .finalized_contract_event(&contract_id, "dispatch", 1, 10, &false_second)
+            .await
+            .unwrap();
+        drop(compromised);
+
+        let honest_first = vec![51u8];
+        let honest_second = vec![52u8];
+        let repaired_page = serde_json::json!({
+            "finalizedEvents": { "json": {
+                "events": [{
+                    "id": 11,
+                    "block_height": 19,
+                    "block_hash": hex::encode([53u8; 32]),
+                    "origin": hex::encode([54u8; 32]),
+                    "topic": "dispatch",
+                    "source": hex::encode(contract_id),
+                    "data": hex::encode(&honest_first),
+                    "reverted": false
+                }, {
+                    "id": 12,
+                    "block_height": 20,
+                    "block_hash": hex::encode([55u8; 32]),
+                    "origin": hex::encode([56u8; 32]),
+                    "topic": "dispatch",
+                    "source": hex::encode(contract_id),
+                    "data": hex::encode(&honest_second),
+                    "reverted": false
+                }],
+                "startCursor": canonical_event_cursor(11),
+                "endCursor": canonical_event_cursor(12),
+                "hasNextPage": false
+            }}
+        })
+        .to_string();
+        let repaired_page: &'static str = Box::leak(repaired_page.into_boxed_str());
+        let repaired = test_client_with_event_store(
+            test_server(vec![(200, repaired_page), (200, r#"{"checkBlock":true}"#)]),
+            &store_path,
+        );
+        let error = repaired
+            .finalized_contract_event(&contract_id, "dispatch", 1, 20, &honest_second)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("contract state says 20"));
+
+        let replaced = repaired
+            .finalized_contract_event(&contract_id, "dispatch", 1, 20, &honest_second)
+            .await
+            .expect("retry must replay and replace the exact poisoned row");
+        assert_eq!(replaced.event_id, 1);
+        assert_eq!(replaced.block_height, 20);
+    }
+
+    #[tokio::test]
+    async fn one_topic_scan_cannot_skip_an_earlier_unrequested_topic() {
+        let contract_id = [27u8; 32];
+        let process_data = vec![3u8];
+        let dispatch_data = vec![4u8];
+        let page = serde_json::json!({
+            "finalizedEvents": { "json": {
+                "events": [{
+                    "id": 1,
+                    "block_height": 9,
+                    "block_hash": hex::encode([28u8; 32]),
+                    "origin": hex::encode([29u8; 32]),
+                    "topic": "process",
+                    "source": hex::encode(contract_id),
+                    "data": hex::encode(&process_data),
+                    "reverted": false
+                }, {
+                    "id": 2,
+                    "block_height": 10,
+                    "block_hash": hex::encode([30u8; 32]),
+                    "origin": hex::encode([31u8; 32]),
+                    "topic": "dispatch",
+                    "source": hex::encode(contract_id),
+                    "data": hex::encode(&dispatch_data),
+                    "reverted": false
+                }],
+                "startCursor": canonical_event_cursor(1),
+                "endCursor": canonical_event_cursor(2),
+                "hasNextPage": false
+            }}
+        })
+        .to_string();
+        let first_page: &'static str = Box::leak(page.clone().into_boxed_str());
+        let second_page: &'static str = Box::leak(page.into_boxed_str());
+        let cursor_dir = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(
+            test_server(vec![
+                (200, first_page),
+                (200, r#"{"checkBlock":true}"#),
+                (200, second_page),
+                (200, r#"{"checkBlock":true}"#),
+            ]),
+            cursor_dir.path(),
+        );
+
+        let dispatch = client
+            .finalized_contract_event(&contract_id, "dispatch", 0, 10, &dispatch_data)
+            .await
+            .unwrap();
+        let process = client
+            .finalized_contract_event(&contract_id, "process", 0, 9, &process_data)
+            .await
+            .expect("the earlier process event must remain independently discoverable");
+        assert_eq!(dispatch.event_id, 0);
+        assert_eq!(process.event_id, 0);
     }
 
     #[tokio::test]

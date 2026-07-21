@@ -6,7 +6,6 @@ on:
   pull_request_target:
     branches:
       - main
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -87,7 +86,11 @@ jobs:
         with:
           script: |
             const { owner, repo } = context.repo;
-            const headSha = context.payload.pull_request.head.sha;
+            const pullRequest = context.payload.pull_request;
+            const prNumber = pullRequest.number;
+            const headSha = pullRequest.head.sha;
+            const baseSha = pullRequest.base.sha;
+            const baseRef = pullRequest.base.ref;
             const expected = [
               ['Dusk proposal validation', 'dusk-proposal-validation.yml'],
               ['Dusk agent validation', 'dusk-agent-gate.yml'],
@@ -103,10 +106,19 @@ jobs:
                   event: 'pull_request',
                   per_page: 100,
                 });
-                runs.set(name, data.workflow_runs.find(
+                const matchingRuns = data.workflow_runs.filter(
                   (run) => run.head_sha === headSha &&
-                    run.event === 'pull_request',
-                ));
+                    run.event === 'pull_request' &&
+                    run.pull_requests?.some((pr) =>
+                      pr.number === prNumber &&
+                      pr.head?.sha === headSha &&
+                      pr.base?.sha === baseSha &&
+                      pr.base?.ref === baseRef
+                    ),
+                );
+                runs.set(name, matchingRuns.sort(
+                  (left, right) => Date.parse(right.created_at) - Date.parse(left.created_at),
+                )[0]);
               }
               const complete = expected.every(
                 ([name]) => runs.get(name)?.status === 'completed',
@@ -117,7 +129,7 @@ jobs:
                   const conclusion = run?.conclusion;
                   if (conclusion !== 'success') {
                     core.setFailed(
-                      `${name} (${workflowId}) concluded ${conclusion} for ${headSha}: ${run?.html_url}`,
+                      `${name} (${workflowId}) concluded ${conclusion} for PR #${prNumber} ${baseSha}...${headSha}: ${run?.html_url}`,
                     );
                   }
                 }
@@ -126,5 +138,5 @@ jobs:
               await new Promise((resolve) => setTimeout(resolve, 15000));
             }
             core.setFailed(
-              `Timed out waiting for proposal checks on ${headSha}`,
+              `Timed out waiting for proposal checks on PR #${prNumber} ${baseSha}...${headSha}`,
             );

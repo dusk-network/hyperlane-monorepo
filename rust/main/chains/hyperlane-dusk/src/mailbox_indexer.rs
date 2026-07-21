@@ -69,7 +69,7 @@ impl DuskMailboxIndexer {
         let after = self
             .first_dispatch_at_or_after(count, block_height.saturating_add(1))
             .await?;
-        Ok(Some(first..=after - 1))
+        Ok(Some(crate::bounded_block_range(first, after, "dispatch")?))
     }
 
     async fn finalized_dispatch_count(&self, current_count: u32) -> ChainResult<(u32, u32)> {
@@ -196,8 +196,16 @@ impl Indexer<HyperlaneMessage> for DuskMailboxIndexer {
         let Some(range) = self.dispatch_range_at_block(count, block_height).await? else {
             return Ok(vec![]);
         };
-        let mut logs = self.fetch_logs_in_range(range).await?;
-        logs.retain(|(_, meta)| meta.transaction_id == tx_hash);
+        crate::ensure_tx_hash_lookup_budget(&range, "dispatch")?;
+        let mut logs = Vec::new();
+        for chunk in crate::block_range_chunks(range) {
+            logs.extend(
+                self.fetch_logs_in_range(chunk)
+                    .await?
+                    .into_iter()
+                    .filter(|(_, meta)| meta.transaction_id == tx_hash),
+            );
+        }
         Ok(logs)
     }
 
@@ -277,7 +285,7 @@ impl DuskDeliveryIndexer {
         let after = self
             .first_process_at_or_after(count, block_height.saturating_add(1))
             .await?;
-        Ok(Some(first..=after - 1))
+        Ok(Some(crate::bounded_block_range(first, after, "delivery")?))
     }
 
     async fn finalized_process_count(&self, current_count: u32) -> ChainResult<(u32, u32)> {
@@ -376,8 +384,16 @@ impl Indexer<H256> for DuskDeliveryIndexer {
         let Some(range) = self.process_range_at_block(count, block_height).await? else {
             return Ok(vec![]);
         };
-        let mut logs = self.fetch_logs_in_range(range).await?;
-        logs.retain(|(_, meta)| meta.transaction_id == tx_hash);
+        crate::ensure_tx_hash_lookup_budget(&range, "delivery")?;
+        let mut logs = Vec::new();
+        for chunk in crate::block_range_chunks(range) {
+            logs.extend(
+                self.fetch_logs_in_range(chunk)
+                    .await?
+                    .into_iter()
+                    .filter(|(_, meta)| meta.transaction_id == tx_hash),
+            );
+        }
         Ok(logs)
     }
 

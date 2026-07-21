@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::vec;
@@ -21,6 +23,7 @@ use hyperlane_core::{
 use hyperlane_ethereum::{Signers, SingletonSignerHandle};
 
 use crate::reorg_reporter::ReorgReporter;
+use crate::reorg_tombstone;
 
 const CHECKPOINT_SUBMISSION_CHUNK_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -37,6 +40,11 @@ pub(crate) struct ValidatorSubmitter {
     metrics: ValidatorSubmitterMetrics,
     max_sign_concurrency: usize,
     reorg_reporter: Arc<dyn ReorgReporter>,
+    reorg_tombstone_path: PathBuf,
+    /// Process-wide live fail-stop shared by the backfill and tip clones.
+    reorg_fail_stop: Arc<AtomicBool>,
+    #[cfg(test)]
+    sign_attempts: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ValidatorSubmitter {
@@ -52,6 +60,7 @@ impl ValidatorSubmitter {
         metrics: ValidatorSubmitterMetrics,
         max_sign_concurrency: usize,
         reorg_reporter: Arc<dyn ReorgReporter>,
+        reorg_tombstone_path: PathBuf,
     ) -> Self {
         Self {
             reorg_period,
@@ -64,7 +73,46 @@ impl ValidatorSubmitter {
             metrics,
             max_sign_concurrency,
             reorg_reporter,
+            reorg_tombstone_path,
+            reorg_fail_stop: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            sign_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn new_for_test(
+        interval: Duration,
+        reorg_period: ReorgPeriod,
+        merkle_tree_hook: Arc<dyn MerkleTreeHook>,
+        singleton_signer: SingletonSignerHandle,
+        signer: Signers,
+        checkpoint_syncer: Arc<dyn CheckpointSyncer>,
+        db: Arc<dyn HyperlaneDb>,
+        metrics: ValidatorSubmitterMetrics,
+        max_sign_concurrency: usize,
+        reorg_reporter: Arc<dyn ReorgReporter>,
+    ) -> Self {
+        static NEXT_PATH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = NEXT_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "hyperlane-validator-test-{}-{unique}.reorg-fail-stop",
+            std::process::id()
+        ));
+        Self::new(
+            interval,
+            reorg_period,
+            merkle_tree_hook,
+            singleton_signer,
+            signer,
+            checkpoint_syncer,
+            db,
+            metrics,
+            max_sign_concurrency,
+            reorg_reporter,
+            path,
+        )
     }
 
     pub(crate) fn checkpoint(&self, tree: &IncrementalMerkle) -> Checkpoint {
@@ -88,6 +136,7 @@ impl ValidatorSubmitter {
     /// Submits signed checkpoints from index 0 until the target checkpoint (inclusive).
     /// Runs idly forever once the target checkpoint is reached to avoid exiting the task.
     pub(crate) async fn backfill_checkpoint_submitter(self, target_checkpoint: CheckpointAtBlock) {
+        self.assert_reorg_fail_stop_inactive();
         let mut tree = IncrementalMerkle::default();
         self.submit_checkpoints_until_correctness_checkpoint(&mut tree, &target_checkpoint)
             .await;
@@ -121,6 +170,7 @@ impl ValidatorSubmitter {
         };
 
         loop {
+            self.assert_reorg_fail_stop_inactive();
             // Lag by reorg period because this is our correctness checkpoint.
             let latest_checkpoint = call_and_retry_indefinitely(|| {
                 let merkle_tree_hook = self.merkle_tree_hook.clone();
@@ -128,6 +178,7 @@ impl ValidatorSubmitter {
                 Box::pin(async move { merkle_tree_hook.latest_checkpoint(&reorg_period).await })
             })
             .await;
+            self.assert_reorg_fail_stop_inactive();
 
             self.metrics
                 .set_latest_checkpoint_observed(&latest_checkpoint);
@@ -175,6 +226,7 @@ impl ValidatorSubmitter {
         tree: &mut IncrementalMerkle,
         correctness_checkpoint: &CheckpointAtBlock,
     ) {
+        self.assert_reorg_fail_stop_inactive();
         let start = Instant::now();
         // This should never be called with a tree that is ahead of the correctness checkpoint.
         assert!(
@@ -240,6 +292,10 @@ impl ValidatorSubmitter {
         // If the tree's checkpoint doesn't match the correctness checkpoint, something went wrong
         // and we bail loudly.
         if checkpoint != correctness_checkpoint.checkpoint {
+            // This is deliberately the first mismatch action and contains no
+            // await: every submitter clone observes it before diagnostics or
+            // remote marker I/O can delay the fail-stop path.
+            self.reorg_fail_stop.store(true, Ordering::SeqCst);
             let reorg_event = ReorgEvent::new(
                 tree.root(),
                 correctness_checkpoint.root,
@@ -258,6 +314,14 @@ impl ValidatorSubmitter {
             // diagnostics. A dead or malicious RPC must never make a restart
             // forget that this validator observed a conflicting root.
             let mut panic_message = "Incorrect tree root. Most likely a reorg has occurred. Please reach out for help, this is a potentially serious error impacting signed messages. Do NOT forcefully resume operation of this validator. Keep it crashlooping or shut down until you receive support.".to_owned();
+            reorg_tombstone::persist(&self.reorg_tombstone_path, &reorg_event).unwrap_or_else(
+                |error| {
+                    panic!(
+                        "Failed to persist mandatory local reorg fail-stop tombstone at {:?}: {error}",
+                        self.reorg_tombstone_path
+                    );
+                },
+            );
             if let Err(e) = self
                 .checkpoint_syncer
                 .write_reorg_status(&reorg_event)
@@ -307,6 +371,9 @@ impl ValidatorSubmitter {
         let signer_retries = 5;
 
         for i in 0..signer_retries {
+            self.assert_reorg_fail_stop_inactive();
+            #[cfg(test)]
+            self.sign_attempts.fetch_add(1, Ordering::SeqCst);
             match self.signer.sign(checkpoint).await {
                 Ok(signed_checkpoint) => return Ok(signed_checkpoint),
                 Err(err) => {
@@ -329,6 +396,9 @@ impl ValidatorSubmitter {
         );
 
         // Now try the singleton signer as a last resort
+        self.assert_reorg_fail_stop_inactive();
+        #[cfg(test)]
+        self.sign_attempts.fetch_add(1, Ordering::SeqCst);
         Ok(self.singleton_signer.sign(checkpoint).await?)
     }
 
@@ -336,6 +406,7 @@ impl ValidatorSubmitter {
         &self,
         checkpoint: CheckpointWithMessageId,
     ) -> ChainResult<bool> {
+        self.assert_reorg_fail_stop_inactive();
         let start = Instant::now();
         let existing = self
             .checkpoint_syncer
@@ -364,6 +435,7 @@ impl ValidatorSubmitter {
             }
         }
 
+        self.assert_reorg_fail_stop_inactive();
         let start = Instant::now();
         let signed_checkpoint = self.sign_checkpoint(checkpoint).await?;
         tracing::trace!(
@@ -372,6 +444,10 @@ impl ValidatorSubmitter {
         );
 
         let start = Instant::now();
+        // A sibling may have detected the reorg while this task awaited the
+        // signer. Stop before publishing even though an in-flight signer call
+        // itself cannot be revoked.
+        self.assert_reorg_fail_stop_inactive();
         self.checkpoint_syncer
             .write_checkpoint(&signed_checkpoint)
             .await?;
@@ -385,6 +461,7 @@ impl ValidatorSubmitter {
 
     /// Signs and submits any previously unsubmitted checkpoints.
     async fn sign_and_submit_checkpoints(&self, mut checkpoints: Vec<CheckpointWithMessageId>) {
+        self.assert_reorg_fail_stop_inactive();
         // The checkpoints are ordered by index, so the last one is the highest index.
         let last_checkpoint_index = match checkpoints.last() {
             Some(c) => c.index,
@@ -396,6 +473,7 @@ impl ValidatorSubmitter {
         let mut first_chunk = true;
 
         while !checkpoints.is_empty() {
+            self.assert_reorg_fail_stop_inactive();
             let start = Instant::now();
 
             // Take a chunk of checkpoints, starting with the highest index.
@@ -447,9 +525,11 @@ impl ValidatorSubmitter {
 
             // If it's the first chunk, update the latest index
             if first_chunk {
+                self.assert_reorg_fail_stop_inactive();
                 call_and_retry_indefinitely(|| {
                     let self_clone = self.clone();
                     Box::pin(async move {
+                        self_clone.assert_reorg_fail_stop_inactive();
                         let start = Instant::now();
                         self_clone
                             .checkpoint_syncer
@@ -472,6 +552,24 @@ impl ValidatorSubmitter {
                 sleep(CHECKPOINT_SUBMISSION_CHUNK_INTERVAL).await;
             }
         }
+    }
+
+    /// Panic immediately once any submitter clone has observed a conflicting root.
+    fn assert_reorg_fail_stop_inactive(&self) {
+        assert!(
+            !self.reorg_fail_stop.load(Ordering::SeqCst),
+            "Validator reorg fail-stop is active; checkpoint signing and publication are disabled"
+        );
+    }
+
+    #[cfg(test)]
+    fn trip_reorg_fail_stop_for_test(&self) {
+        self.reorg_fail_stop.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn sign_attempts_for_test(&self) -> usize {
+        self.sign_attempts.load(Ordering::SeqCst)
     }
 }
 

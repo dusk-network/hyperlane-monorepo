@@ -12,7 +12,9 @@ use url::Url;
 
 use hyperlane_base::settings::ChainConnectionConf;
 use hyperlane_base::{CheckpointSyncer, CoreMetrics};
-use hyperlane_core::{CheckpointAtBlock, HyperlaneDomain, MerkleTreeHook, ReorgPeriod, H256};
+use hyperlane_core::{
+    ChainCommunicationError, CheckpointAtBlock, HyperlaneDomain, MerkleTreeHook, ReorgPeriod, H256,
+};
 use hyperlane_ethereum::RpcConnectionConf;
 
 use crate::settings::ValidatorSettings;
@@ -52,9 +54,10 @@ impl ReorgReportRpcResponse {
         reorg_period: Option<ReorgPeriod>,
     ) -> Self {
         let observed_height = latest_checkpoint.block_height;
+        let (rpc_url_hash, rpc_host_hash) = rpc_hashes(&url);
         ReorgReportRpcResponse {
-            rpc_host_hash: H256::from_slice(&keccak256(url.host_str().unwrap_or("").as_bytes())),
-            rpc_url_hash: H256::from_slice(&keccak256(url.as_str().as_bytes())),
+            rpc_host_hash,
+            rpc_url_hash,
             requested_height,
             observed_height,
             endpoint_lag: requested_height
@@ -74,9 +77,10 @@ impl ReorgReportRpcResponse {
         reorg_period: Option<ReorgPeriod>,
         error: String,
     ) -> Self {
+        let (rpc_url_hash, rpc_host_hash) = rpc_hashes(&url);
         Self {
-            rpc_host_hash: H256::from_slice(&keccak256(url.host_str().unwrap_or("").as_bytes())),
-            rpc_url_hash: H256::from_slice(&keccak256(url.as_str().as_bytes())),
+            rpc_host_hash,
+            rpc_url_hash,
             requested_height,
             observed_height: None,
             endpoint_lag: false,
@@ -87,6 +91,29 @@ impl ReorgReportRpcResponse {
             timestamp: chrono::Utc::now().to_rfc3339(),
         }
     }
+}
+
+fn public_diagnostic_error(error: &ChainCommunicationError) -> String {
+    match error {
+        ChainCommunicationError::TransactionTimeout => {
+            "diagnostic RPC transaction timed out".to_owned()
+        }
+        ChainCommunicationError::SignerUnavailable => {
+            "diagnostic RPC signer unavailable".to_owned()
+        }
+        _ => "diagnostic RPC request failed".to_owned(),
+    }
+}
+
+fn rpc_hashes(url: &Url) -> (H256, H256) {
+    // Commit only to scheme/host/port. Hashing the full URL would still let a
+    // public diagnostic act as an offline oracle for low-entropy basic-auth,
+    // path, or query credentials.
+    let endpoint_identity = url.origin().ascii_serialization();
+    (
+        H256::from_slice(&keccak256(endpoint_identity.as_bytes())),
+        H256::from_slice(&keccak256(url.host_str().unwrap_or("").as_bytes())),
+    )
 }
 
 #[async_trait]
@@ -115,17 +142,21 @@ impl LatestCheckpointReorgReporter {
                 .await
                 {
                     Ok(Ok(latest_checkpoint)) => {
+                        let (rpc_url_hash, _) = rpc_hashes(&url);
                         info!(
-                            ?url,
+                            ?rpc_url_hash,
                             ?height,
                             ?latest_checkpoint,
                             "Report latest checkpoint on reorg"
                         );
                         ReorgReportRpcResponse::new(url, latest_checkpoint, Some(height), None)
                     }
-                    Ok(Err(error)) => {
-                        ReorgReportRpcResponse::failure(url, Some(height), None, error.to_string())
-                    }
+                    Ok(Err(error)) => ReorgReportRpcResponse::failure(
+                        url,
+                        Some(height),
+                        None,
+                        public_diagnostic_error(&error),
+                    ),
                     Err(_) => ReorgReportRpcResponse::failure(
                         url,
                         Some(height),
@@ -162,8 +193,9 @@ impl LatestCheckpointReorgReporter {
                 .await
                 {
                     Ok(Ok(latest_checkpoint)) => {
+                        let (rpc_url_hash, _) = rpc_hashes(&url);
                         info!(
-                            ?url,
+                            ?rpc_url_hash,
                             ?reorg_period,
                             ?latest_checkpoint,
                             "Report latest checkpoint on reorg"
@@ -179,7 +211,7 @@ impl LatestCheckpointReorgReporter {
                         url,
                         None,
                         Some(reorg_period),
-                        error.to_string(),
+                        public_diagnostic_error(&error),
                     ),
                     Err(_) => ReorgReportRpcResponse::failure(
                         url,
@@ -407,5 +439,41 @@ mod tests {
         assert_eq!(response.requested_height, Some(42));
         assert_eq!(response.observed_height, Some(39));
         assert!(response.endpoint_lag);
+    }
+
+    #[test]
+    fn public_reorg_report_never_serializes_rpc_url_or_error_details() {
+        let url = Url::parse(
+            "https://basic-user:basic-password@rpc.example/private-path?token=query-sentinel",
+        )
+        .unwrap();
+        let error = ChainCommunicationError::CustomError(
+            "private-path query-sentinel basic-user basic-password".into(),
+        );
+        let response = ReorgReportRpcResponse::failure(
+            url.clone(),
+            Some(42),
+            None,
+            public_diagnostic_error(&error),
+        );
+        let serialized = serde_json::to_string(&response).unwrap();
+        for secret in [
+            "private-path",
+            "query-sentinel",
+            "basic-user",
+            "basic-password",
+        ] {
+            assert!(!serialized.contains(secret));
+        }
+        assert_eq!(
+            rpc_hashes(&url),
+            rpc_hashes(&Url::parse("https://rpc.example/").unwrap()),
+            "userinfo, path, query, and fragment must not influence public hashes"
+        );
+        assert_ne!(
+            rpc_hashes(&url).0,
+            rpc_hashes(&Url::parse("https://rpc.example:8443/").unwrap()).0,
+            "the public endpoint identity should retain an explicit port"
+        );
     }
 }

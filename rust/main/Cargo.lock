@@ -6341,6 +6341,7 @@ name = "hyperlane-dusk"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.21.7",
  "bls12_381-bls",
  "bs58 0.5.1",
  "derive-new",
@@ -6367,6 +6368,7 @@ dependencies = [
 [[package]]
 name = "hyperlane-dusk-types"
 version = "0.1.0"
+source = "git+https://github.com/dusk-network/hyperlane-dusk?rev=f6be24a411f2a0a247b8d1b798106c37449f7dcf#f6be24a411f2a0a247b8d1b798106c37449f7dcf"
 dependencies = [
  "bytecheck",
  "dusk-bytes",

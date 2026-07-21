@@ -57,12 +57,12 @@ The current upstream-facing diff is intentionally limited to Rust agent support:
 - `rust/main/agents/validator/src/reorg_reporter.rs`
 - `rust/main/lander/src/adapter/chains/factory.rs`
 
-The Dusk Rust agent crate currently depends on `hyperlane-dusk-types` through
-the adjacent companion Dusk repo path (`../../../../../dusk/types`). That keeps
-Dusk-specific message/metadata/token encoding shared with the Dusk contract
-ports during internal review. An upstream Hyperlane PR should either vendor or
-publish that type crate in the shape Hyperlane maintainers prefer, or replace
-the path dependency before upstream submission.
+The Dusk Rust agent crate depends on `hyperlane-dusk-types` at the exact public
+companion commit `f6be24a411f2a0a247b8d1b798106c37449f7dcf`. This keeps
+Dusk-specific message/metadata/token encoding shared with the reviewed Dusk
+contract port without an adjacent checkout or moving branch. An upstream
+Hyperlane PR must still decide whether to retain that immutable Git source,
+publish the crate, or vendor it in the shape Hyperlane maintainers prefer.
 
 ## Companion Evidence
 
@@ -101,16 +101,14 @@ From `rust/main` in this monorepo:
 cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p scraper -p lander
 cargo test -p hyperlane-dusk
 cargo test -p hyperlane-base dusk_
-cargo fmt --package hyperlane-dusk --package hyperlane-base -- --check
+cargo fmt --all -- --check
 cargo clippy -p hyperlane-dusk --all-targets -- -D warnings
 ```
 
-The package-scoped formatter is deliberate. `cargo fmt --all` traverses the
-adjacent companion Dusk repository because `hyperlane-dusk-types` is a local
-path dependency, which would mix formatting from a different PR into this
-one. The current companion type crate also has a direct `dusk-bytes`
-dependency; `rust/main/Cargo.lock` is kept current so a clean agent-gate
-checkout does not rewrite the lockfile.
+The exact Git dependency is outside this workspace, so workspace-wide format
+validation no longer crosses into a different PR. `rust/main/Cargo.lock`
+records the full immutable source and remains stable in clean agent and Docker
+builds.
 
 The fork also includes `.github/workflows/dusk-agent-gate.yml` as a narrow
 pull-request status check for the Dusk agent crate. It checks out this
@@ -142,14 +140,20 @@ for the companion Dusk E2E evidence.
 Production indexers require an archive-enabled Rusk endpoint and an exclusive
 `eventCursorDir`. Canonical `LogMeta` is derived from contract-scoped,
 cursor-paginated finalized-event rows by matching state height/data to each
-row's source, topic, exact serialized payload, transaction origin, and block
-hash, followed by `checkBlock(..., onlyFinalized: true)`. Missing archive data
-fails closed; whole blocks are not buffered below the helper transport cap.
+row's source, topic, exact serialized payload, and block hash, followed by
+`checkBlock(..., onlyFinalized: true)`. The archived transaction origin is
+parsed into `LogMeta` but remains endpoint-supplied metadata; it is filtered
+against the caller's requested hash on transaction-hash lookups, not
+independently proven by direct contract state. Missing archive data fails
+closed; whole blocks are not buffered below the helper transport cap.
 
-The opaque cursor, per-topic sequence counts, and row provenance are stored in
-an exclusive RocksDB. Page rows and cursor state are committed atomically; a
-caught-up page is polled again for later events rather than treated as permanent
-archive exhaustion.
+Endpoint cursors and row IDs are independent process-local hints per topic and
+are rebuilt by page-bounded replay after restart. The exclusive RocksDB stores
+only an exact requested row after direct state and finalized-block validation,
+under a v2 key bound to contract, topic, and local sequence. Page peers and
+legacy v1 page-derived entries are never durable authority. A caught-up page is
+polled again for later events rather than treated as permanent archive
+exhaustion.
 
 All sequence indexers are additionally capped at Rusk's consensus-finalized
 height. Merkle insertion records and validator checkpoints come from the

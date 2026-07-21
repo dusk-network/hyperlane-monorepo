@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   dusk-agent-check:
-    name: Dusk agent validation
+    name: ${{ github.event_name == 'pull_request' && 'Dusk agent validation' || 'Dusk agent manual validation' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:

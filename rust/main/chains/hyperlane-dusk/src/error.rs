@@ -4,8 +4,13 @@ use hyperlane_core::{ChainCommunicationError, HyperlaneCustomErrorWrapper, H512}
 #[derive(Debug, thiserror::Error)]
 pub enum HyperlaneDuskError {
     /// HTTP error communicating with the RUES endpoint.
-    #[error("RUES HTTP error: {0}")]
-    RuesHttp(#[from] reqwest::Error),
+    #[error("RUES HTTP request failed ({kind}, status={status:?})")]
+    RuesHttp {
+        /// Stable failure class without request URL or response details.
+        kind: &'static str,
+        /// HTTP status when the failure reached a response.
+        status: Option<u16>,
+    },
     /// Non-success response from the RUES endpoint.
     #[error("RUES error response ({status}): {body}")]
     RuesResponse {
@@ -43,6 +48,29 @@ pub enum HyperlaneDuskError {
     Other(String),
 }
 
+impl From<reqwest::Error> for HyperlaneDuskError {
+    fn from(error: reqwest::Error) -> Self {
+        let error = error.without_url();
+        let status = error.status().map(|status| status.as_u16());
+        let kind = if error.is_timeout() {
+            "timeout"
+        } else if error.is_connect() {
+            "connect"
+        } else if error.is_request() {
+            "request"
+        } else if error.is_body() {
+            "body"
+        } else if error.is_decode() {
+            "decode"
+        } else if error.is_status() {
+            "status"
+        } else {
+            "other"
+        };
+        Self::RuesHttp { kind, status }
+    }
+}
+
 impl From<HyperlaneDuskError> for ChainCommunicationError {
     fn from(value: HyperlaneDuskError) -> Self {
         match value {
@@ -68,5 +96,21 @@ mod tests {
             ChainCommunicationError::from(HyperlaneDuskError::Other("rpc".into())),
             ChainCommunicationError::Other(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn rues_http_errors_never_retain_url_credentials_or_paths() {
+        let sentinel = "private-path-sentinel";
+        let error = reqwest::Client::new()
+            .get(format!(
+                "http://user:password@127.0.0.1:1/{sentinel}?token=query-sentinel"
+            ))
+            .send()
+            .await
+            .unwrap_err();
+        let public = HyperlaneDuskError::from(error).to_string();
+        for secret in [sentinel, "query-sentinel", "user", "password"] {
+            assert!(!public.contains(secret));
+        }
     }
 }

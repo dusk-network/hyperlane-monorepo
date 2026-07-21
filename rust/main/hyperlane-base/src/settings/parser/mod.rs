@@ -618,9 +618,10 @@ fn parse_signer(signer: ValueParser) -> ConfigResult<SignerConf> {
                 .map(str::to_owned)
                 .end();
 
-            let configured_sources = usize::from(inline_key.is_some())
-                + usize::from(key_file.is_some())
-                + usize::from(key_env.is_some());
+            let configured_sources = [inline_key.is_some(), key_file.is_some(), key_env.is_some()]
+                .into_iter()
+                .filter(|configured| *configured)
+                .count();
             if configured_sources != 1 {
                 err.push(
                     (&signer.cwp).add("key"),

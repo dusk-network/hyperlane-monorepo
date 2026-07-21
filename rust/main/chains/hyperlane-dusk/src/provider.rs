@@ -108,7 +108,7 @@ impl HyperlaneProvider for DuskProvider {
 
         let spent = data
             .get("tx")
-            .ok_or_else(|| HyperlaneDuskError::TransactionNotFound(*hash))?;
+            .ok_or(HyperlaneDuskError::TransactionNotFound(*hash))?;
         if spent.is_null() {
             return Err(ChainCommunicationError::from_other(
                 HyperlaneDuskError::TransactionNotFound(*hash),

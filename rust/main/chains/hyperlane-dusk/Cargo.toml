@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 async-trait.workspace = true
+base64.workspace = true
 bs58.workspace = true
 derive-new.workspace = true
 eyre.workspace = true
@@ -28,8 +29,10 @@ dusk-bytes = "0.1.7"
 # Uses software keccak256 fallback (no `abi` feature).
 # NOTE: dusk-core is NOT a dependency here because it requires nightly Rust.
 # The monorepo uses stable Rust. Transaction construction is delegated to the
-# separately built `dusk-tx` helper.
-hyperlane-dusk-types = { path = "../../../../../dusk/types", features = ["serde"] }
+# separately built `dusk-tx` helper. Pin the companion repository to an exact
+# reviewed commit so release/Docker builds do not depend on an adjacent checkout
+# and cannot drift with a moving branch.
+hyperlane-dusk-types = { git = "https://github.com/dusk-network/hyperlane-dusk", rev = "f6be24a411f2a0a247b8d1b798106c37449f7dcf", features = ["serde"] }
 
 # rkyv for RUES binary serialization (matching on-chain contract serialization)
 rkyv = { version = "0.7", features = ["validation"] }
