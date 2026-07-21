@@ -65,7 +65,7 @@ Earlier observation on 2026-07-20:
   and the expanded affected-package command
   `cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p scraper -p lander`
   all pass against companion base head
-  `f826a6dab2cdc464afc473f25c2375097ef088fa`; the combined
+  `8a2467acd5edba5e08cd6b7954f7c3dc622340b5`; the combined
   contract/withdrawal tested implementation is
   `265b7e9b1e47f4feadc4e71644d23df04680661c`.
 - Fresh-state TestMock run `1784592169` and MessageIdMultisig run `1784592942`

@@ -9,7 +9,7 @@ reassessment. Moving branch names are not compatibility evidence.
 | --- | --- | --- |
 | Hyperlane upstream base | `6c2ca1d5514907f6875b6b6729cbffc31e97c09c` | Base of monorepo PR #1 |
 | Dusk agent implementation | `37e24eed2c7ad7aed63e3fa033d1fe8a28355ec0` | Finality, bounded history, simulation, transaction reconciliation/provenance, and signer enforcement |
-| Dusk base contracts | `f826a6dab2cdc464afc473f25c2375097ef088fa` | Complete deployed-contract compatibility matrix, contract/agent ABI, shared types, and hermetic policy guards used by the default agent gate |
+| Dusk base contracts | `8a2467acd5edba5e08cd6b7954f7c3dc622340b5` | Complete deployed-contract compatibility matrix, contract/agent ABI, shared types, and hermetic policy guards used by the default agent gate |
 | Stacked withdrawal contracts | `b16af0c05547a5d8e8687f47895c664b1aa93c00` | Payer-owned dispatch-credit withdrawal layer; tested code boundary `265b7e9b1e47f4feadc4e71644d23df04680661c` |
 | Rusk | `5c6a0bab11c61fb4c81275afdeceb97fb942d85e` | Clean Dusk 1.7.1 build, VM, and live E2E anchor |
 
@@ -43,9 +43,9 @@ Validation at the agent implementation commit passed:
   scraper -p lander`.
 
 The post-compatibility-pin rerun passed the same commands against base head
-`f826a6dab2cdc464afc473f25c2375097ef088fa`. Durable local log:
-`/tmp/hyperlane-monorepo-agent-gate-f826a6d-20260721.log` (SHA-256
-`85a3edb88c528d191b96e3ee22c2440594c95a52a1ae21c7608ee89bd153145d`).
+`8a2467acd5edba5e08cd6b7954f7c3dc622340b5`. Durable local log:
+`/tmp/hyperlane-monorepo-agent-gate-8a2467a-20260721.log` (SHA-256
+`4f087ba4d47c96424a2f2c42d6635378612fc9a404c81e7568160724751d32b4`).
 
 The refreshed base contract gate passed 95 VM tests, while the combined stacked
 gate passed 101, plus 7 data-driver tests and 18 CLI tests. Fresh-state
