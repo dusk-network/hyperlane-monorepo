@@ -249,11 +249,7 @@ impl Mailbox for DuskMailbox {
     }
 
     async fn count(&self, _reorg_period: &ReorgPeriod) -> ChainResult<u32> {
-        let nonce: u32 = self
-            .rues
-            .contract_query(&self.mailbox_id, "nonce", &())
-            .await?;
-        Ok(nonce)
+        Ok(self.finalized_merkle_view().await?.0)
     }
 
     async fn delivered(&self, id: H256) -> ChainResult<bool> {

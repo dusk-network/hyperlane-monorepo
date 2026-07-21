@@ -91,6 +91,7 @@ jobs:
           set -euo pipefail
           cargo test -p hyperlane-dusk
           cargo test -p hyperlane-base dusk_
+          cargo test -p validator reorg
 
       - name: Lint Dusk agent
         working-directory: ${{ env.MONOREPO_DIR }}/rust/main

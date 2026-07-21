@@ -16,6 +16,11 @@ in `FINAL_RED_TEAM_DECISIONS_2026-07-21.md` on the companion Dusk PR heads.
   directory/type, and other I/O errors remain errors across restart.
 - The restart regression models a failed flag write followed by an unreadable
   flag path and proves validation fails closed.
+- `Mailbox::count` uses the same finalized Merkle-tree view as the dedicated
+  MerkleTreeHook adapter. The current Mailbox nonce is intentionally not used
+  as a proxy for a reorg-safe leaf count.
+- The hosted Dusk agent gate executes `cargo test -p validator reorg`; compiling
+  the validator is not sufficient evidence for the changed fail-stop behavior.
 
 ## Deliberate evidence boundaries
 
