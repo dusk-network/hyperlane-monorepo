@@ -1,6 +1,6 @@
 # Dusk Upstream Compatibility Review
 
-Date: 2026-07-20
+Date: 2026-07-21
 
 This note records the upstream Hyperlane areas checked before keeping the Dusk
 integration scoped to internal review. It is not an upstream PR; upstream PR
@@ -32,6 +32,24 @@ git merge-base HEAD upstream/main
 git rev-list --left-right --count HEAD...upstream/main
 cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p scraper -p lander
 ```
+
+Final upstream refresh on 2026-07-21:
+
+- `upstream/main` and the feature branch merge-base both resolve to
+  `3811ba9961d4110674c166ca02cfe7e6e94fc932`; immediately after the merge the
+  branch was 89 commits ahead and zero behind.
+- The new upstream commits are `213f626b3e` (treat the Paradex
+  `collateralDex` annotation as collateral in AltVM warp checks) and
+  `3811ba9961` (skip the synthetic token field and exclude the SMOL route in
+  warp checks).
+- Their complete delta is six TypeScript/changeset files and does not overlap
+  `rust/main`, the Dusk fork workflows, or the Dusk documentation. The merge
+  was conflict-free and the Dusk Rust production tree and immutable companion
+  types pin remain unchanged.
+- Exact-head Dusk package tests, the full validator suite, scoped formatting,
+  clippy with `-D warnings`, stable `Cargo.lock`, and the complete affected
+  Rust package check were rerun after the merge. Hosted and independent review
+  receipts must identify the final live PR head that includes this note.
 
 Final upstream refresh on 2026-07-20:
 

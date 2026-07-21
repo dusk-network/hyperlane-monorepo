@@ -7,7 +7,7 @@ remaining production decisions are accepted or changed.
 Current base:
 
 - Current Dusk monorepo branch head: see the GitHub PR header.
-- Upstream Hyperlane `main`: `bf7c658857148410924d9eddd2618ff64d3fc5e2`
+- Upstream Hyperlane `main`: `3811ba9961d4110674c166ca02cfe7e6e94fc932`
 - Rebase/check evidence: use the live `git fetch upstream main`,
   `git merge-base HEAD upstream/main`, and
   `git rev-list --left-right --count HEAD...upstream/main` checks recorded in
@@ -15,11 +15,14 @@ Current base:
 - The fork candidate merges that upstream head and is not behind it. The exact
   reassessment set is pinned in `docs/dusk-companion-compatibility.md`:
   production agent source `c4597e01418f117c4779336b70a8b9274a22c967`,
-  companion base `f6be24a411f2a0a247b8d1b798106c37449f7dcf`,
-  stacked withdrawal `4ed5734816287a9d08bc8bdaf87d000afb38b5f9`, and
+  current companion base review head `45384b1febbfe1bdb8799239173945a773804399`,
+  stacked withdrawal review head `87988f1c8ad457a3b7d0ebd379e02536dc87a8e5`, and
   manual-reproduction policy `da4db7e62234bf1a9a0c9033a7520fc37fab85a3`.
-  The live PR head adds only documented workflow/test maintenance after the
-  production-source anchor and is the SHA that hosted checks must attest.
+  The exact types dependency remains pinned to
+  `f6be24a411f2a0a247b8d1b798106c37449f7dcf`; the later companion changes do
+  not alter that crate. The live PR head adds only documented workflow/test
+  maintenance and upstream synchronization after the production-source anchor
+  and is the SHA that hosted checks must attest.
 - Focused Dusk tests, clippy, and the expanded affected-package cargo check
   pass at that runtime boundary. The exact companion base/stack gates and both
   live E2E security modes are recorded in the compatibility manifest; earlier

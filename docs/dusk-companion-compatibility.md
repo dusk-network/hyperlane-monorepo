@@ -10,7 +10,7 @@ history only; they are not release evidence for this candidate.
 
 | Component | Exact reference | Role |
 | --- | --- | --- |
-| Hyperlane upstream base | `bf7c658857148410924d9eddd2618ff64d3fc5e2` | Current `hyperlane-xyz/hyperlane-monorepo` base merged into this fork candidate |
+| Hyperlane upstream base | `3811ba9961d4110674c166ca02cfe7e6e94fc932` | Current `hyperlane-xyz/hyperlane-monorepo` base merged into this fork candidate |
 | Dusk agent production source | `c4597e01418f117c4779336b70a8b9274a22c967` | Dusk protocol adapter, bounded/authenticated indexers, redacted signer/config parsing, and validator fail-stop integration; later changes are workflow, documentation, or test-assertion only |
 | Dusk agent review head | Resolve live monorepo PR #1 head | Moving review head; use the exact hosted-check SHA from the PR, not this label, as release evidence |
 | Dusk base tested code | `f6be24a411f2a0a247b8d1b798106c37449f7dcf` | Escrow, dispatch-credit custody/consumption, authenticated route funding, Mailbox reentrancy guard, canonical DRC20 boundary, deployment and E2E harness |
@@ -130,11 +130,12 @@ nonce races by sharing a signer across concurrent roles.
 
 ## Current local validation
 
-At the runtime commit above, the focused agent boundary passed:
+At the current review head, whose production Dusk source remains the runtime
+commit above, the focused agent boundary passed:
 
-- `cargo test -p hyperlane-dusk`: 22 passed;
+- `cargo test -p hyperlane-dusk`: 30 passed;
 - `cargo test -p hyperlane-base --lib dusk_`: 9 passed;
-- `cargo test -p validator reorg`: 2 passed;
+- `cargo test -p validator`: 27 passed;
 - `cargo clippy -p hyperlane-dusk --all-targets -- -D warnings`; and
 - `cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p scraper -p lander`.
 
@@ -161,11 +162,16 @@ five-transfer-per-direction relayer restart/backlog run. Its aggregate log is
 `/tmp/hyperlane-stack-fault-e2e-dc8aba0-6ef326b.log`, SHA-256
 `6841c405430020027665ba37d282cf63724b32605407e40ab68b2318a7b0378b`.
 
-After upstream advanced by one SVM/TypeScript-only commit, the fork was rebased
-onto `67933966`. `git range-diff` marked all 79 Dusk commits patch-equivalent;
-the old-to-new tree delta contains only that upstream SVM/TypeScript change.
-The complete affected Rust package cargo check passed again at the rebased
-head.
+The fork was first rebased onto `67933966`; `git range-diff` marked all 79 Dusk
+commits patch-equivalent. During the final 2026-07-21 review, upstream advanced
+again to `3811ba9961d4110674c166ca02cfe7e6e94fc932`. That two-commit delta changes
+only six TypeScript warp-check files. It was merged without conflict, leaving
+the Dusk Rust production tree and immutable companion types pin unchanged.
+Immediately after that merge the feature branch was 89 commits ahead and zero
+behind, and the focused tests, clippy, lockfile check, and complete affected
+Rust package check above passed again. Hosted and adversarial evidence must use
+the final live PR head containing this documentation, not the pre-documentation
+merge commit.
 
 Fresh independent GPT-5.6 xhigh and Controlecentrum deep/xhigh reviews must
 target these frozen source heads. Any source change after those reviews
