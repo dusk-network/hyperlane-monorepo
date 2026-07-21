@@ -13,7 +13,7 @@ history only; they are not release evidence for this candidate.
 | Hyperlane upstream base | `669d966ad71582fe3c9d96b5ed1b8ea3724e07fe` | Current `hyperlane-xyz/hyperlane-monorepo` base; the fork was fetched and is not behind it |
 | Dusk agent runtime | `af957a9fc814fa7533aadf997104863306eed645` | Dusk protocol adapter, indexers, signer/config parsing, relayer and validator integration |
 | Dusk base contracts | `f4fc63983cf67ea05378cf01aa73743d3564a2f7` | Escrow, dispatch-credit custody/consumption, canonical DRC20 boundary, deployment and E2E harness |
-| Stacked withdrawal contracts | `3ee9b4ca918da3745184a04b8c813a0847af02f6` | Beneficiary-authorized dispatch-credit withdrawal and route-owner proxy methods, stacked on the exact base head |
+| Stacked withdrawal contracts | `77238aee8d46aadc8cf9bab58adb194d7708ed67` | Beneficiary-authorized dispatch-credit withdrawal and route-owner proxy methods, stacked on the exact base head |
 | Rusk | `5c6a0bab11c61fb4c81275afdeceb97fb942d85e` | Frozen clean Dusk 1.7.1 dependency, VM, archive API, and live-node boundary |
 
 The default `dusk-agent-gate.yml` companion checkout is the exact base-contract

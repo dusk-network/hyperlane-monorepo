@@ -17,7 +17,7 @@ Current base:
   `docs/dusk-companion-compatibility.md`: agent runtime
   `af957a9fc814fa7533aadf997104863306eed645`, companion base
   `f4fc63983cf67ea05378cf01aa73743d3564a2f7`, and stacked withdrawal
-  `3ee9b4ca918da3745184a04b8c813a0847af02f6`.
+  `77238aee8d46aadc8cf9bab58adb194d7708ed67`.
 - Focused Dusk tests, clippy, and the expanded affected-package cargo check
   pass at that runtime boundary. Earlier E2E and gate logs are regression
   history and must not be presented as evidence for this candidate.
