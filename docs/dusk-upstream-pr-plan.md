@@ -15,8 +15,8 @@ Current base:
 - The fork candidate merges that upstream head and is not behind it. The exact
   reassessment set is pinned in `docs/dusk-companion-compatibility.md`:
   production agent source `c4597e01418f117c4779336b70a8b9274a22c967`,
-  current companion base review head `45384b1febbfe1bdb8799239173945a773804399`,
-  stacked withdrawal review head `87988f1c8ad457a3b7d0ebd379e02536dc87a8e5`, and
+  current companion base review head `e2b0bd199b748ee68fefcf61133f523dd7f3da5d`,
+  stacked withdrawal review head `3ecc19e157211f318801a8b4d52be2aaf4ba7e82`, and
   manual-reproduction policy `da4db7e62234bf1a9a0c9033a7520fc37fab85a3`.
   The exact types dependency remains pinned to
   `f6be24a411f2a0a247b8d1b798106c37449f7dcf`; the later companion changes do

@@ -146,14 +146,23 @@ and the same remaining boundaries. Their log SHA-256 values are respectively
 `16ac8e62d2d8c5952a9363c90f77e15ff756043a102302780f0f9e272a166d62`
 and `03de4d4e1597c8136e9a00bbb74e7fbbe290b5b2fa3e8cb8d82e004a31f640fb`.
 
-At the exact stack code anchor, TestMock run `1784638666` and
-MessageIdMultisig run `1784639741` each passed beneficiary withdrawal plus
-synthetic, native, and canonical DRC20 routes in both directions. The multisig
-logs contain only validator `0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC`
-through checkpoint index 2; neither run contains `nonce too low`, leaked signer
-material, an orphan agent, or a surviving test listener. The harness log hashes
-are `a195ea9f8c7e47e8c27c2e1ad728d83b9af0a23ff2ca79c59b52fd37fe5683bc`
-and `9d7a6db2e3599591c8c364d44187a61f9bb7b30b3067c058812fa2480cef85c9`.
+At the historical stack code anchor, TestMock run `1784638666` and
+MessageIdMultisig run `1784639741` exercised synthetic, native, and canonical
+DRC20 routes in both directions. The multisig logs contain only validator
+`0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC` through checkpoint index 2;
+neither run contains `nonce too low`, leaked signer material, an orphan agent,
+or a surviving test listener. The harness log hashes are
+`a195ea9f8c7e47e8c27c2e1ad728d83b9af0a23ff2ca79c59b52fd37fe5683bc` and
+`9d7a6db2e3599591c8c364d44187a61f9bb7b30b3067c058812fa2480cef85c9`.
+
+Those historical receipts are not withdrawal evidence. The old agent-E2E
+withdrawal command expanded an uninitialized lowercase native-chain-ID
+variable under `set -u`. The final stacked head loads the persisted
+two-hex-digit chain ID, validates and converts it before invoking
+`withdraw-dispatch`, with a fail-closed source-order regression. Fresh exact-head
+live TestMock and MessageIdMultisig runs remain required before claiming live
+withdrawal coverage; the protected runner and environment-scoped private-source
+token are not currently provisioned.
 
 The sequential live fault suite also passed dirty-redeploy refusal, validator
 delay, corrupt-checkpoint rejection/recovery, low-signer rejection/recovery,
