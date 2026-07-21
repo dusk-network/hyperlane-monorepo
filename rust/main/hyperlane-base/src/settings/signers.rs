@@ -1,3 +1,6 @@
+use std::fmt;
+use std::fs;
+use std::io::Read;
 use std::str::FromStr;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -18,6 +21,7 @@ use super::aws_credentials::AwsChainCredentialsProvider;
 use crate::types::utils;
 
 const AWS_SIGNER_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_DUSK_SIGNER_KEY_FILE_BYTES: u64 = 16 * 1024;
 
 /// Resolve an AWS region string into a `rusoto_core::Region` without relying on
 /// rusoto's `FromStr` allowlist, which rejects regions added after rusoto was
@@ -63,8 +67,138 @@ async fn build_aws_signer(id: &str, region: &str) -> Result<AwsSigner, Report> {
         .map_err(|arc_err| eyre::eyre!("{arc_err}"))
 }
 
+/// Dusk signer key material source.
+#[derive(Clone)]
+pub enum DuskSignerKeyConf {
+    /// Inline raw key material. Supported for backwards compatibility and local
+    /// dev only; prefer File or Env for review/CI configs.
+    Inline {
+        /// Private key value
+        key: String,
+    },
+    /// Path to a file containing hex/base58/bech32 raw key material.
+    File {
+        /// File path
+        path: String,
+    },
+    /// Environment variable containing hex/base58/bech32 raw key material.
+    Env {
+        /// Environment variable name
+        var: String,
+    },
+}
+
+impl fmt::Debug for DuskSignerKeyConf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inline { .. } => f
+                .debug_struct("Inline")
+                .field("key", &"<redacted>")
+                .finish(),
+            Self::File { path } => f.debug_struct("File").field("path", path).finish(),
+            Self::Env { var } => f.debug_struct("Env").field("var", var).finish(),
+        }
+    }
+}
+
+impl DuskSignerKeyConf {
+    fn resolve(&self) -> Result<H256, Report> {
+        match self {
+            Self::Inline { key } => {
+                Self::parse_key_material(key).context("Invalid inline Dusk signer key")
+            }
+            Self::File { path } => {
+                let key = Self::read_key_file(path)?;
+                Self::parse_key_material(&key)
+                    .with_context(|| format!("Invalid Dusk signer key file `{path}`"))
+            }
+            Self::Env { var } => {
+                let key = std::env::var(var)
+                    .with_context(|| format!("Dusk signer key env var `{var}` is not set"))?;
+                Self::parse_key_material(&key)
+                    .with_context(|| format!("Invalid Dusk signer key env var `{var}`"))
+            }
+        }
+    }
+
+    fn read_key_file(path: &str) -> Result<String, Report> {
+        // Inspect and read through the same open handle. This avoids a path
+        // replacement race between permission validation and key loading.
+        let file = fs::File::open(path)
+            .with_context(|| format!("Failed to open Dusk signer key file `{path}`"))?;
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("Failed to inspect Dusk signer key file `{path}`"))?;
+
+        if !metadata.is_file() {
+            bail!("Dusk signer key file `{path}` must be a regular file");
+        }
+
+        if metadata.len() > MAX_DUSK_SIGNER_KEY_FILE_BYTES {
+            bail!("Dusk signer key file `{path}` exceeds {MAX_DUSK_SIGNER_KEY_FILE_BYTES} bytes");
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = metadata.permissions().mode();
+            if mode & 0o077 != 0 {
+                bail!(
+                    "Dusk signer key file `{path}` permissions must not allow group or world access; found mode {:o}",
+                    mode & 0o777
+                );
+            }
+        }
+
+        let mut reader = file.take(MAX_DUSK_SIGNER_KEY_FILE_BYTES + 1);
+        let mut key = String::new();
+        reader
+            .read_to_string(&mut key)
+            .with_context(|| format!("Failed to read Dusk signer key file `{path}`"))?;
+        if key.len() as u64 > MAX_DUSK_SIGNER_KEY_FILE_BYTES {
+            bail!("Dusk signer key file `{path}` exceeds {MAX_DUSK_SIGNER_KEY_FILE_BYTES} bytes");
+        }
+        Ok(key)
+    }
+
+    fn parse_key_material(key: &str) -> Result<H256, Report> {
+        let key = key.trim();
+        if key.is_empty() {
+            bail!("Dusk signer key material is empty");
+        }
+
+        // Dusk signer material is a BLS scalar, not an address. Do not use the
+        // shared address parser here: it accepts 20-byte EVM values, Tron
+        // addresses, and short bech32 values by left-padding them to H256.
+        let bytes = if let Some(hex_key) = key.strip_prefix("0x").or_else(|| key.strip_prefix("0X"))
+        {
+            hex::decode(hex_key).context("Invalid hexadecimal Dusk signer key")?
+        } else if key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            hex::decode(key).context("Invalid hexadecimal Dusk signer key")?
+        } else if let Ok((_, decoded)) = bech32::decode(key) {
+            decoded
+        } else {
+            bs58::decode(key)
+                .into_vec()
+                .context("Invalid base58 Dusk signer key")?
+        };
+
+        let key: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
+            eyre::eyre!(
+                "Dusk signer key must decode to exactly 32 bytes, got {}",
+                bytes.len()
+            )
+        })?;
+        if key == [0u8; 32] {
+            bail!("Dusk signer key must be nonzero");
+        }
+        Ok(H256::from(key))
+    }
+}
+
 /// Signer types
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Clone)]
 pub enum SignerConf {
     /// A local hex key
     HexKey {
@@ -104,14 +238,60 @@ pub enum SignerConf {
         /// Whether the Starknet signer is legacy
         is_legacy: bool,
     },
+    /// Dusk Specific key
+    DuskKey {
+        /// Private key source
+        key: DuskSignerKeyConf,
+    },
     /// Assume node will sign on RPC calls
     #[default]
     Node,
 }
 
+impl fmt::Debug for SignerConf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HexKey { .. } => f
+                .debug_struct("HexKey")
+                .field("key", &"<redacted>")
+                .finish(),
+            Self::Aws { region, .. } => f
+                .debug_struct("Aws")
+                .field("id", &"<redacted>")
+                .field("region", region)
+                .finish(),
+            Self::CosmosKey {
+                prefix,
+                account_address_type,
+                ..
+            } => f
+                .debug_struct("CosmosKey")
+                .field("key", &"<redacted>")
+                .field("prefix", prefix)
+                .field("account_address_type", account_address_type)
+                .finish(),
+            Self::RadixKey { suffix, .. } => f
+                .debug_struct("RadixKey")
+                .field("key", &"<redacted>")
+                .field("suffix", suffix)
+                .finish(),
+            Self::StarkKey {
+                address, is_legacy, ..
+            } => f
+                .debug_struct("StarkKey")
+                .field("key", &"<redacted>")
+                .field("address", address)
+                .field("is_legacy", is_legacy)
+                .finish(),
+            Self::DuskKey { key } => f.debug_struct("DuskKey").field("key", key).finish(),
+            Self::Node => f.write_str("Node"),
+        }
+    }
+}
+
 impl SignerConf {
     /// Try to convert the ethereum signer to a local wallet
-    #[instrument(err)]
+    #[instrument(err, skip(self))]
     pub async fn build<S: BuildableWithSignerConf>(&self) -> Result<S, Report> {
         S::build(self).await
     }
@@ -154,6 +334,9 @@ impl BuildableWithSignerConf for hyperlane_ethereum::Signers {
             SignerConf::Node => bail!("Node signer"),
             SignerConf::RadixKey { .. } => {
                 bail!("radixKey signer is not supported by Ethereum")
+            }
+            SignerConf::DuskKey { .. } => {
+                bail!("duskKey signer is not supported by Ethereum")
             }
         })
     }
@@ -352,6 +535,28 @@ impl ChainSigner for hyperlane_aleo::AleoSigner {
     }
 }
 
+#[async_trait]
+impl BuildableWithSignerConf for hyperlane_dusk::DuskSigner {
+    async fn build(conf: &SignerConf) -> Result<Self, Report> {
+        if let SignerConf::DuskKey { key } = conf {
+            let key = key.resolve()?;
+            hyperlane_dusk::DuskSigner::new(key).map_err(|e| eyre::eyre!(e.to_string()))
+        } else {
+            bail!(format!("{conf:?} key is not supported by dusk"));
+        }
+    }
+}
+
+impl ChainSigner for hyperlane_dusk::DuskSigner {
+    fn address_string(&self) -> String {
+        self.address_string()
+    }
+
+    fn address_h256(&self) -> H256 {
+        self.eth_address()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -365,6 +570,56 @@ mod tests {
 
     use super::resolve_kms_region;
     use crate::settings::{ChainSigner, SignerConf};
+
+    #[test]
+    fn dusk_key_decoder_rejects_address_padding_and_invalid_scalars() {
+        use crate::settings::signers::DuskSignerKeyConf;
+
+        let valid = DuskSignerKeyConf::Inline {
+            key: format!("0x{}", "11".repeat(32)),
+        }
+        .resolve()
+        .expect("32-byte key must parse");
+        hyperlane_dusk::DuskSigner::new(valid).expect("canonical nonzero scalar must build");
+
+        for invalid in [
+            format!("0x{}", "11".repeat(20)),
+            bs58::encode([0x41u8; 25]).into_string(),
+            format!("0x{}", "00".repeat(32)),
+        ] {
+            assert!(DuskSignerKeyConf::Inline { key: invalid }
+                .resolve()
+                .is_err());
+        }
+
+        let noncanonical = DuskSignerKeyConf::Inline {
+            key: format!("0x{}", "ff".repeat(32)),
+        }
+        .resolve()
+        .expect("length validation should pass");
+        assert!(hyperlane_dusk::DuskSigner::new(noncanonical).is_err());
+    }
+
+    #[test]
+    fn signer_debug_never_contains_raw_key_material() {
+        let sentinel = H256::from([0xA7u8; 32]);
+        let rendered = format!("{:?}", SignerConf::HexKey { key: sentinel });
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered
+            .to_ascii_lowercase()
+            .contains(&hex::encode(sentinel)));
+
+        let dusk = SignerConf::DuskKey {
+            key: super::DuskSignerKeyConf::Inline {
+                key: hex::encode(sentinel),
+            },
+        };
+        let rendered = format!("{dusk:?}");
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered
+            .to_ascii_lowercase()
+            .contains(&hex::encode(sentinel)));
+    }
 
     /// Exercises the exact coalescing mechanism `build_aws_signer` relies on
     /// (`moka::future::Cache::try_get_with`) against a fake, always-failing initializer -
@@ -557,6 +812,105 @@ mod tests {
         assert_eq!(
             "TWfaDp7My62uVWnxPiohWau4HyanfDG31N",
             tron_signer.address_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn dusk_signer_builds_from_key_file() {
+        use crate::settings::signers::{BuildableWithSignerConf, DuskSignerKeyConf};
+
+        let tempdir = tempfile::tempdir().expect("create tempdir");
+        let key_path = tempdir.path().join("dusk-signer.key");
+        let private_key = format!("0x{}", "11".repeat(32));
+        std::fs::write(&key_path, format!("{private_key}\n")).expect("write key file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+                .expect("set key file permissions");
+        }
+
+        let signer_config = SignerConf::DuskKey {
+            key: DuskSignerKeyConf::File {
+                path: key_path.to_string_lossy().to_string(),
+            },
+        };
+
+        let signer = hyperlane_dusk::DuskSigner::build(&signer_config)
+            .await
+            .expect("build Dusk signer from key file");
+
+        assert_eq!(
+            signer.address_h256(),
+            H256::from_slice(
+                &hex::decode("45f325943f47c662afbdfc9bd0b48f38b162441d92363746d8582677d7e4ce4a")
+                    .expect("decode expected Dusk address")
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dusk_signer_rejects_loose_key_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::settings::signers::{BuildableWithSignerConf, DuskSignerKeyConf};
+
+        let tempdir = tempfile::tempdir().expect("create tempdir");
+        let key_path = tempdir.path().join("dusk-signer.key");
+        std::fs::write(&key_path, "unread-before-permission-check\n").expect("write key file");
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644))
+            .expect("set loose key file permissions");
+
+        let signer_config = SignerConf::DuskKey {
+            key: DuskSignerKeyConf::File {
+                path: key_path.to_string_lossy().to_string(),
+            },
+        };
+
+        let err = hyperlane_dusk::DuskSigner::build(&signer_config)
+            .await
+            .expect_err("loose Dusk signer key file permissions must be rejected");
+
+        assert!(
+            err.to_string().contains("permissions"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dusk_signer_rejects_oversized_key_file() {
+        use crate::settings::signers::{
+            BuildableWithSignerConf, DuskSignerKeyConf, MAX_DUSK_SIGNER_KEY_FILE_BYTES,
+        };
+
+        let tempdir = tempfile::tempdir().expect("create tempdir");
+        let key_path = tempdir.path().join("oversized-dusk-signer.key");
+        std::fs::write(
+            &key_path,
+            vec![b'a'; (MAX_DUSK_SIGNER_KEY_FILE_BYTES + 1) as usize],
+        )
+        .expect("write oversized key file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+                .expect("set key file permissions");
+        }
+
+        let signer_config = SignerConf::DuskKey {
+            key: DuskSignerKeyConf::File {
+                path: key_path.to_string_lossy().to_string(),
+            },
+        };
+        let err = hyperlane_dusk::DuskSigner::build(&signer_config)
+            .await
+            .expect_err("oversized Dusk signer key file must be rejected");
+        assert!(
+            err.to_string().contains("exceeds"),
+            "unexpected error: {err:?}"
         );
     }
 }

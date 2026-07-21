@@ -1,0 +1,115 @@
+name: Dusk Hyperlane Agent Gate
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      dusk_ref:
+        description: "Exact dusk-network/hyperlane-dusk commit SHA for shared types"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  dusk-agent-check:
+    name: ${{ github.event_name == 'pull_request' && 'Dusk agent validation' || 'Dusk agent manual validation' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      DUSK_REF: ${{ inputs.dusk_ref || 'f6be24a411f2a0a247b8d1b798106c37449f7dcf' }}
+      MONOREPO_DIR: ${{ github.workspace }}/hyperlane/hyperlane-monorepo
+      DUSK_DIR: ${{ github.workspace }}/hyperlane/dusk
+
+    steps:
+      - name: Checkout Hyperlane monorepo
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          path: hyperlane/hyperlane-monorepo
+          persist-credentials: false
+
+      - name: Scan Dusk agent runtime placeholders
+        working-directory: ${{ env.MONOREPO_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git grep -n -E 'todo!|unimplemented!|panic!|expect\(' -- rust/main/chains/hyperlane-dusk/src; then
+            echo "::error::Dusk agent runtime panic/placeholder path found"
+            exit 1
+          fi
+
+      - name: Validate exact public companion ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$DUSK_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::dusk_ref must be an exact 40-character commit SHA"
+            exit 1
+          fi
+
+      - name: Checkout Dusk Hyperlane shared types
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: dusk-network/hyperlane-dusk
+          ref: ${{ env.DUSK_REF }}
+          path: hyperlane/dusk
+          persist-credentials: false
+
+      - name: Report resolved check refs
+        shell: bash
+        run: |
+          set -euo pipefail
+          resolved_monorepo_sha="$(git -C "$MONOREPO_DIR" rev-parse HEAD)"
+          resolved_dusk_sha="$(git -C "$DUSK_DIR" rev-parse HEAD)"
+          [ "$resolved_monorepo_sha" = "$GITHUB_SHA" ]
+          [ "$resolved_dusk_sha" = "${DUSK_REF,,}" ]
+          printf 'resolved_monorepo_sha=%s\n' "$resolved_monorepo_sha"
+          printf 'requested_dusk_ref=%s\n' "$DUSK_REF"
+          printf 'resolved_dusk_sha=%s\n' "$resolved_dusk_sha"
+
+      - name: Report runner disk capacity
+        shell: bash
+        run: df -h
+
+      - name: Format Dusk-owned Rust packages
+        working-directory: ${{ env.MONOREPO_DIR }}/rust/main
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --package hyperlane-dusk --package hyperlane-base -- --check
+
+      - name: Test Dusk agent and parser boundaries
+        working-directory: ${{ env.MONOREPO_DIR }}/rust/main
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p hyperlane-dusk
+          cargo test -p hyperlane-base dusk_
+          cargo test -p validator reorg
+
+      - name: Lint Dusk agent
+        working-directory: ${{ env.MONOREPO_DIR }}/rust/main
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p hyperlane-dusk --all-targets -- -D warnings
+
+      - name: Check affected Rust integration
+        working-directory: ${{ env.MONOREPO_DIR }}/rust/main
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p scraper -p lander
+
+      - name: Verify lockfile remains stable
+        working-directory: ${{ env.MONOREPO_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code -- rust/main/Cargo.lock

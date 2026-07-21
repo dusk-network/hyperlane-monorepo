@@ -1,0 +1,142 @@
+name: Dusk Review Policy Gate
+
+on:
+  # Run only the trusted default-branch policy. Proposed code is fetched as
+  # Git data and never checked out or executed in this privileged context.
+  pull_request_target:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  review-policy-gate:
+    name: Dusk review policy gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout trusted base policy
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Lint trusted GitHub Actions workflows
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/repo:ro" \
+            -w /repo \
+            rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 \
+            -color \
+            .github/workflows/dusk-agent-gate.yml \
+            .github/workflows/dusk-proposal-validation.yml \
+            .github/workflows/dusk-review-policy-gate.yml
+
+      - name: Inspect proposed commit as data
+        if: github.event_name == 'pull_request_target'
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "pull/${PR_NUMBER}/head"
+          fetched_sha="$(git rev-parse FETCH_HEAD)"
+          [ "$fetched_sha" = "$HEAD_SHA" ] || {
+            echo "::error::fetched PR head $fetched_sha differs from event head $HEAD_SHA"
+            exit 1
+          }
+          git diff --check "$BASE_SHA...$HEAD_SHA"
+
+          for path in \
+            rust/main/chains/hyperlane-dusk/Cargo.toml \
+            rust/main/chains/hyperlane-dusk/src/lib.rs \
+            rust/main/hyperlane-base/src/settings/chains.rs \
+            rust/main/hyperlane-core/src/chain.rs; do
+            mode="$(git ls-tree "$HEAD_SHA" -- "$path" | awk '{print $1}')"
+            case "$mode" in
+              100644|100755) ;;
+              *)
+                echo "::error::$path is not a regular file in proposed commit $HEAD_SHA"
+                exit 1
+                ;;
+            esac
+          done
+
+          for path in \
+            .github/workflows/dusk-agent-gate.yml \
+            .github/workflows/dusk-proposal-validation.yml \
+            .github/workflows/dusk-review-policy-gate.yml; do
+            if ! git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- "$path"; then
+              echo "::error::$path is policy-locked; use the documented owner-supervised bootstrap"
+              exit 1
+            fi
+          done
+
+      - name: Require unprivileged proposal checks
+        if: github.event_name == 'pull_request_target'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pullRequest = context.payload.pull_request;
+            const prNumber = pullRequest.number;
+            const headSha = pullRequest.head.sha;
+            const baseSha = pullRequest.base.sha;
+            const baseRef = pullRequest.base.ref;
+            const expected = [
+              ['Dusk proposal validation', 'dusk-proposal-validation.yml'],
+              ['Dusk agent validation', 'dusk-agent-gate.yml'],
+            ];
+            for (let attempt = 0; attempt < 120; attempt += 1) {
+              const runs = new Map();
+              for (const [name, workflowId] of expected) {
+                const { data } = await github.rest.actions.listWorkflowRuns({
+                  owner,
+                  repo,
+                  workflow_id: workflowId,
+                  head_sha: headSha,
+                  event: 'pull_request',
+                  per_page: 100,
+                });
+                const matchingRuns = data.workflow_runs.filter(
+                  (run) => run.head_sha === headSha &&
+                    run.event === 'pull_request' &&
+                    run.pull_requests?.some((pr) =>
+                      pr.number === prNumber &&
+                      pr.head?.sha === headSha &&
+                      pr.base?.sha === baseSha &&
+                      pr.base?.ref === baseRef
+                    ),
+                );
+                runs.set(name, matchingRuns.sort(
+                  (left, right) => Date.parse(right.created_at) - Date.parse(left.created_at),
+                )[0]);
+              }
+              const complete = expected.every(
+                ([name]) => runs.get(name)?.status === 'completed',
+              );
+              if (complete) {
+                for (const [name, workflowId] of expected) {
+                  const run = runs.get(name);
+                  const conclusion = run?.conclusion;
+                  if (conclusion !== 'success') {
+                    core.setFailed(
+                      `${name} (${workflowId}) concluded ${conclusion} for PR #${prNumber} ${baseSha}...${headSha}: ${run?.html_url}`,
+                    );
+                  }
+                }
+                return;
+              }
+              await new Promise((resolve) => setTimeout(resolve, 15000));
+            }
+            core.setFailed(
+              `Timed out waiting for proposal checks on PR #${prNumber} ${baseSha}...${headSha}`,
+            );

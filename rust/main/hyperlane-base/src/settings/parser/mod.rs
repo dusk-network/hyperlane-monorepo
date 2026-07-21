@@ -30,7 +30,7 @@ use crate::settings::{
     chains::IndexSettings,
     parser::connection_parser::{build_connection_conf, is_protocol_supported},
     trace::TracingConfig,
-    ChainConf, CoreContractAddresses, Settings, SignerConf,
+    ChainConf, CoreContractAddresses, DuskSignerKeyConf, Settings, SignerConf,
 };
 
 pub use super::envs::*;
@@ -238,11 +238,22 @@ fn parse_chain(
                 .as_ref()
                 .and_then(|d| match d.domain_protocol() {
                     HyperlaneDomainProtocol::Ethereum => Some(IndexMode::Block),
-                    HyperlaneDomainProtocol::Sealevel => Some(IndexMode::Sequence),
+                    HyperlaneDomainProtocol::Sealevel | HyperlaneDomainProtocol::Dusk => {
+                        Some(IndexMode::Sequence)
+                    }
                     _ => None,
                 })
                 .unwrap_or_default()
         });
+    if domain
+        .as_ref()
+        .is_some_and(|domain| !protocol_supports_index_mode(domain.domain_protocol(), mode))
+    {
+        err.push(
+            chain.cwp.clone(),
+            eyre!("Dusk indexers support only `index.mode: sequence`"),
+        );
+    }
     // Defaults to 5s; overridable via `index.interval` (seconds).
     let interval_secs = chain
         .chain(&mut err)
@@ -420,6 +431,13 @@ fn parse_chain(
     })
 }
 
+fn protocol_supports_index_mode(protocol: HyperlaneDomainProtocol, mode: IndexMode) -> bool {
+    !matches!(
+        (protocol, mode),
+        (HyperlaneDomainProtocol::Dusk, IndexMode::Block)
+    )
+}
+
 /// Expects ChainMetadata
 fn parse_domain(chain: ValueParser, name: &str) -> ConfigResult<HyperlaneDomain> {
     let mut err = ConfigParsingError::default();
@@ -438,18 +456,31 @@ fn parse_domain(chain: ValueParser, name: &str) -> ConfigResult<HyperlaneDomain>
     }
     .take_err(&mut err, || (&chain.cwp).add("name"));
 
-    let domain_id = chain
+    let explicit_domain_id = chain
         .chain(&mut err)
         .get_opt_key("domainId")
         .parse_u32()
-        .end()
-        .or_else(|| chain.chain(&mut err).get_key("chainId").parse_u32().end());
+        .end();
 
     let protocol = chain
         .chain(&mut err)
         .get_key("protocol")
         .parse_from_str::<HyperlaneDomainProtocol>("Invalid Hyperlane domain protocol")
         .end();
+
+    let domain_id = match protocol {
+        Some(HyperlaneDomainProtocol::Dusk) => {
+            if explicit_domain_id.is_none() {
+                err.push(
+                    (&chain.cwp).add("domainid"),
+                    eyre!("Dusk chains require an explicit `domainId`; native `chainId` is not a Hyperlane domain"),
+                );
+            }
+            explicit_domain_id
+        }
+        _ => explicit_domain_id
+            .or_else(|| chain.chain(&mut err).get_key("chainId").parse_u32().end()),
+    };
 
     let technical_stack = chain
         .chain(&mut err)
@@ -567,6 +598,49 @@ fn parse_signer(signer: ValueParser) -> ConfigResult<SignerConf> {
                 suffix: suffix.to_owned(),
             })
         }};
+        (duskKey) => {{
+            let inline_key = signer
+                .chain(&mut err)
+                .get_opt_key("key")
+                .parse_string()
+                .map(str::to_owned)
+                .end();
+            let key_file = signer
+                .chain(&mut err)
+                .get_opt_key("keyFile")
+                .parse_string()
+                .map(str::to_owned)
+                .end();
+            let key_env = signer
+                .chain(&mut err)
+                .get_opt_key("keyEnv")
+                .parse_string()
+                .map(str::to_owned)
+                .end();
+
+            let configured_sources = [inline_key.is_some(), key_file.is_some(), key_env.is_some()]
+                .into_iter()
+                .filter(|configured| *configured)
+                .count();
+            if configured_sources != 1 {
+                err.push(
+                    (&signer.cwp).add("key"),
+                    eyre!("duskKey signer requires exactly one of `key`, `keyFile`, or `keyEnv`"),
+                );
+            }
+
+            let key = if let Some(key) = inline_key {
+                DuskSignerKeyConf::Inline { key }
+            } else if let Some(path) = key_file {
+                DuskSignerKeyConf::File { path }
+            } else if let Some(var) = key_env {
+                DuskSignerKeyConf::Env { var }
+            } else {
+                DuskSignerKeyConf::Inline { key: String::new() }
+            };
+
+            err.into_result(SignerConf::DuskKey { key })
+        }};
     }
 
     match signer_type {
@@ -575,6 +649,7 @@ fn parse_signer(signer: ValueParser) -> ConfigResult<SignerConf> {
         Some("cosmosKey") => parse_signer!(cosmosKey),
         Some("starkKey") => parse_signer!(starkKey),
         Some("radixKey") => parse_signer!(radixKey),
+        Some("duskKey") => parse_signer!(duskKey),
         Some(t) => {
             Err(eyre!("Unknown signer type `{t}`")).into_config_result(|| (&signer.cwp).add("type"))
         }
@@ -756,6 +831,7 @@ fn parse_base_and_override_urls(
 #[cfg(test)]
 mod test {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn supports_sequence_h256s() {
@@ -769,5 +845,81 @@ mod test {
         let val: serde_json::Value = serde_json::from_str(json_str).unwrap();
         let value_parser = ValueParser::new(Default::default(), &val);
         parse_matching_list(value_parser).unwrap();
+    }
+
+    #[test]
+    fn parses_dusk_signer_key_file() {
+        let val = json!({
+            "type": "duskKey",
+            "keyfile": "/run/secrets/dusk-signer.key"
+        });
+        let value_parser = ValueParser::new(Default::default(), &val);
+
+        let signer = parse_signer(value_parser).unwrap();
+
+        assert!(matches!(
+            signer,
+            SignerConf::DuskKey {
+                key: DuskSignerKeyConf::File { ref path },
+            } if path == "/run/secrets/dusk-signer.key"
+        ));
+    }
+
+    #[test]
+    fn rejects_dusk_signer_with_multiple_key_sources() {
+        let val = json!({
+            "type": "duskKey",
+            "key": "inline-key-present",
+            "keyfile": "/run/secrets/dusk-signer.key"
+        });
+        let value_parser = ValueParser::new(Default::default(), &val);
+
+        assert!(parse_signer(value_parser).is_err());
+    }
+
+    #[test]
+    fn dusk_rejects_block_index_mode() {
+        assert!(protocol_supports_index_mode(
+            HyperlaneDomainProtocol::Dusk,
+            IndexMode::Sequence
+        ));
+        assert!(!protocol_supports_index_mode(
+            HyperlaneDomainProtocol::Dusk,
+            IndexMode::Block
+        ));
+        assert!(protocol_supports_index_mode(
+            HyperlaneDomainProtocol::Ethereum,
+            IndexMode::Block
+        ));
+    }
+
+    #[test]
+    fn dusk_requires_domain_id_distinct_from_native_chain_id() {
+        let missing_domain = json!({
+            "name": "dusk-test",
+            "chainid": 1,
+            "protocol": "dusk"
+        });
+        assert!(parse_domain(
+            ValueParser::new(Default::default(), &missing_domain),
+            "dusk-test"
+        )
+        .is_err());
+
+        let explicit_domain = json!({
+            "name": "dusk-test",
+            "domainid": 4242,
+            "chainid": 1,
+            "protocol": "dusk"
+        });
+        assert_eq!(
+            parse_domain(
+                ValueParser::new(Default::default(), &explicit_domain),
+                "dusk-test"
+            )
+            .unwrap()
+            .id(),
+            4242
+        );
     }
 }

@@ -1,4 +1,11 @@
-use std::{fmt::Debug, sync::Arc, time::Duration};
+use std::{
+    fmt::Debug,
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc, Barrier,
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use eyre::Result;
@@ -88,6 +95,64 @@ fn dummy_singleton_handle() -> SingletonSignerHandle {
     SingletonSignerHandle::new(H160::from_low_u64_be(0), mpsc::unbounded_channel().0)
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_reorg_latch_stops_a_sibling_paused_before_signing() {
+    let checkpoint = CheckpointWithMessageId {
+        checkpoint: Checkpoint {
+            root: H256::zero(),
+            merkle_tree_hook_address: H256::zero(),
+            mailbox_domain: 0,
+            index: 7,
+        },
+        message_id: H256::zero(),
+    };
+    let fetch_entered = Arc::new(Barrier::new(2));
+    let fetch_release = Arc::new(Barrier::new(2));
+    let mut checkpoint_syncer = MockCheckpointSyncer::new();
+    let entered = fetch_entered.clone();
+    let release = fetch_release.clone();
+    checkpoint_syncer
+        .expect_fetch_checkpoint()
+        .once()
+        .returning(move |_| {
+            entered.wait();
+            release.wait();
+            Ok(None)
+        });
+    checkpoint_syncer.expect_write_checkpoint().never();
+
+    let signer: Signers = ethers::signers::LocalWallet::new(&mut rand::thread_rng()).into();
+    let submitter = ValidatorSubmitter::new_for_test(
+        Duration::from_secs(1),
+        ReorgPeriod::from_blocks(1),
+        Arc::new(MockMerkleTreeHook::new()),
+        dummy_singleton_handle(),
+        signer,
+        Arc::new(checkpoint_syncer),
+        Arc::new(MockDb::new()),
+        dummy_metrics(),
+        1,
+        Arc::new(MockReorgReporter::new()),
+    );
+    let observer = submitter.clone();
+    let task = tokio::spawn(async move { submitter.sign_and_submit_checkpoint(checkpoint).await });
+
+    // The sibling has passed its entry check but is paused before the signer.
+    fetch_entered.wait();
+    observer.trip_reorg_fail_stop_for_test();
+    fetch_release.wait();
+
+    let failure = task
+        .await
+        .expect_err("the latched sibling must panic closed");
+    assert!(failure.is_panic());
+    assert_eq!(
+        observer.sign_attempts_for_test(),
+        0,
+        "the sibling must not invoke either signer after the latch trips"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn single_checkpoint_chunk_has_no_throttle_tail() {
     let checkpoint = CheckpointWithMessageId {
@@ -116,7 +181,7 @@ async fn single_checkpoint_chunk_has_no_throttle_tail() {
         .returning(|_| Ok(()));
 
     let signer: Signers = ethers::signers::LocalWallet::new(&mut rand::thread_rng()).into();
-    let submitter = ValidatorSubmitter::new(
+    let submitter = ValidatorSubmitter::new_for_test(
         Duration::from_secs(1),
         ReorgPeriod::from_blocks(1),
         Arc::new(MockMerkleTreeHook::new()),
@@ -173,7 +238,7 @@ async fn two_written_chunks_have_one_inter_chunk_throttle() {
         .returning(|_| Ok(()));
 
     let signer: Signers = ethers::signers::LocalWallet::new(&mut rand::thread_rng()).into();
-    let submitter = ValidatorSubmitter::new(
+    let submitter = ValidatorSubmitter::new_for_test(
         Duration::from_secs(1),
         ReorgPeriod::from_blocks(1),
         Arc::new(MockMerkleTreeHook::new()),
@@ -245,7 +310,7 @@ async fn all_existing_chunks_skip_inter_chunk_throttle() {
         .once()
         .returning(|_| Ok(()));
 
-    let submitter = ValidatorSubmitter::new(
+    let submitter = ValidatorSubmitter::new_for_test(
         Duration::from_secs(1),
         ReorgPeriod::from_blocks(1),
         Arc::new(MockMerkleTreeHook::new()),
@@ -303,10 +368,7 @@ fn reorg_event_is_correct(
 }
 
 #[tokio::test]
-#[should_panic(
-    expected = "Incorrect tree root. Most likely a reorg has occurred. Please reach out for help, this is a potentially serious error impacting signed messages. Do NOT forcefully resume operation of this validator. Keep it crashlooping or shut down until you receive support."
-)]
-async fn reorg_is_detected_and_persisted_to_checkpoint_storage() {
+async fn reorg_local_tombstone_survives_remote_marker_failure() {
     let expected_reorg_period = 12;
 
     let pre_reorg_merke_insertions = [
@@ -354,12 +416,24 @@ async fn reorg_is_detected_and_persisted_to_checkpoint_storage() {
     // expect the checkpoint syncer to post the reorg event to the checkpoint storage
     // and not submit any checkpoints (this is checked implicitly, by not setting any `expect`s)
     let unix_timestamp = chrono::Utc::now().timestamp() as u64;
+    let fail_stop_order = Arc::new(AtomicU8::new(0));
+    let tombstone_directory = tempfile::tempdir().unwrap();
+    let tombstone_path = tombstone_directory.path().join("reorg-fail-stop");
     let mut mock_checkpoint_syncer = MockCheckpointSyncer::new();
     let mock_onchain_merkle_tree_clone = mock_onchain_merkle_tree.clone();
+    let write_order = fail_stop_order.clone();
+    let write_tombstone_path = tombstone_path.clone();
     mock_checkpoint_syncer
         .expect_write_reorg_status()
         .once()
         .returning(move |reorg_event| {
+            assert!(
+                crate::reorg_tombstone::ensure_absent(&write_tombstone_path).is_err(),
+                "local fail-stop tombstone must be durable before remote marker I/O"
+            );
+            write_order
+                .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                .expect("remote marker write order changed");
             // unit test correctness criteria
             reorg_event_is_correct(
                 reorg_event,
@@ -368,7 +442,7 @@ async fn reorg_is_detected_and_persisted_to_checkpoint_storage() {
                 unix_timestamp,
                 ReorgPeriod::from_blocks(expected_reorg_period),
             );
-            Ok(())
+            Err(eyre::eyre!("remote marker unavailable"))
         });
 
     let signer: Signers = "1111111111111111111111111111111111111111111111111111111111111111"
@@ -377,10 +451,17 @@ async fn reorg_is_detected_and_persisted_to_checkpoint_storage() {
         .into();
 
     let mut mock_reorg_reporter = MockReorgReporter::new();
+    let report_order = fail_stop_order.clone();
+    let report_tombstone_path = tombstone_path.clone();
     mock_reorg_reporter
         .expect_report_at_block()
         .once()
-        .return_once(|_| {});
+        .return_once(move |_| {
+            assert!(crate::reorg_tombstone::ensure_absent(&report_tombstone_path).is_err());
+            report_order
+                .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
+                .expect("reorg diagnostics ran before the fail-stop flag was durable");
+        });
 
     // instantiate the validator submitter
     let validator_submitter = ValidatorSubmitter::new(
@@ -394,6 +475,7 @@ async fn reorg_is_detected_and_persisted_to_checkpoint_storage() {
         dummy_metrics(),
         50,
         Arc::new(mock_reorg_reporter),
+        tombstone_path.clone(),
     );
 
     // mock the correctness checkpoint response
@@ -408,14 +490,20 @@ async fn reorg_is_detected_and_persisted_to_checkpoint_storage() {
         block_height: Some(42),
     };
 
-    // Start the submitter with an empty merkle tree, so it gets rebuilt from the db.
-    // A panic is expected here, as the merkle root inconsistency is a critical error that may indicate fraud.
-    validator_submitter
-        .submit_checkpoints_until_correctness_checkpoint(
-            &mut IncrementalMerkle::default(),
-            &mock_onchain_checkpoint,
-        )
-        .await;
+    // A failed remote marker write must not erase local fail-stop state. Model
+    // a restart where remote storage would report a healthy missing marker:
+    // startup must still stop on the local tombstone before trusting it.
+    let result = tokio::spawn(async move {
+        validator_submitter
+            .submit_checkpoints_until_correctness_checkpoint(
+                &mut IncrementalMerkle::default(),
+                &mock_onchain_checkpoint,
+            )
+            .await;
+    })
+    .await;
+    assert!(result.unwrap_err().is_panic());
+    assert!(crate::reorg_tombstone::ensure_absent(&tombstone_path).is_err());
 }
 
 #[tokio::test]
@@ -501,7 +589,7 @@ async fn sign_and_submit_checkpoint_same_signature() {
     let mock_reorg_reporter = MockReorgReporter::new();
 
     // instantiate the validator submitter
-    let validator_submitter = ValidatorSubmitter::new(
+    let validator_submitter = ValidatorSubmitter::new_for_test(
         Duration::from_secs(1),
         ReorgPeriod::from_blocks(expected_reorg_period),
         Arc::new(mock_merkle_tree_hook),
@@ -620,7 +708,7 @@ async fn sign_and_submit_checkpoint_different_signature() {
     let mock_reorg_reporter = MockReorgReporter::new();
 
     // instantiate the validator submitter
-    let validator_submitter = ValidatorSubmitter::new(
+    let validator_submitter = ValidatorSubmitter::new_for_test(
         Duration::from_secs(1),
         ReorgPeriod::from_blocks(expected_reorg_period),
         Arc::new(mock_merkle_tree_hook),

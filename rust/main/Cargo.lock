@@ -1504,6 +1504,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake2b_simd"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b79834656f71332577234b50bfc009996f7449e0c056884e6a02492ded0ca2f3"
+dependencies = [
+ "arrayref",
+ "arrayvec",
+ "constant_time_eq 0.4.2",
+]
+
+[[package]]
 name = "blake2s_simd"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1511,7 +1522,7 @@ checksum = "e90f7deecfac93095eb874a40febd69427776e24e1bd7f87f33ac62d6f0174df"
 dependencies = [
  "arrayref",
  "arrayvec",
- "constant_time_eq",
+ "constant_time_eq 0.3.1",
 ]
 
 [[package]]
@@ -1524,7 +1535,7 @@ dependencies = [
  "arrayvec",
  "cc",
  "cfg-if",
- "constant_time_eq",
+ "constant_time_eq 0.3.1",
  "digest 0.10.7",
 ]
 
@@ -1574,6 +1585,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fa79dedbb091f449f1f39e53edf88d5dbe95f895dae6135a8d7b881fb5af73f5"
 dependencies = [
  "byte-tools",
+]
+
+[[package]]
+name = "bls12_381-bls"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4e6b7c24701ff5167f336478ec29dc176455f5396f62b8f0951cc1fdddf249b"
+dependencies = [
+ "dusk-bls12_381",
+ "dusk-bytes",
+ "ff 0.13.0",
+ "rand_core 0.6.4",
+ "zeroize",
 ]
 
 [[package]]
@@ -2573,6 +2597,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
 
 [[package]]
+name = "constant_time_eq"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
+
+[[package]]
 name = "convert_case"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3489,6 +3519,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "derive-hex"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b6618553c32cd1c1f4fbdb9418cc035f3168422f24406ebb08576f6db5ed6ec"
+dependencies = [
+ "proc-macro2",
+ "quote 1.0.42",
+ "syn 1.0.109",
+]
+
+[[package]]
 name = "derive-new"
 version = "0.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3752,6 +3793,31 @@ name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
+name = "dusk-bls12_381"
+version = "0.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "633aa835dd9e4db7ad5dc94a3f95d44ff5c6856ec3c83c15eb75366cfb5ee68a"
+dependencies = [
+ "blake2b_simd",
+ "dusk-bytes",
+ "ff 0.13.0",
+ "group 0.13.0",
+ "pairing",
+ "rand_core 0.6.4",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "dusk-bytes"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5d209b92f0741edf1d99369bd4c1a1ef2fd0a85e885220f9e3fb0df3c61337f"
+dependencies = [
+ "derive-hex",
+]
 
 [[package]]
 name = "dyn-clone"
@@ -6078,6 +6144,7 @@ dependencies = [
  "axum 0.8.4",
  "backtrace",
  "backtrace-oneline",
+ "bech32 0.11.0",
  "bs58 0.5.1",
  "chrono",
  "color-eyre",
@@ -6094,10 +6161,12 @@ dependencies = [
  "fuels",
  "futures",
  "futures-util",
+ "hex 0.4.3",
  "hyper 0.14.30",
  "hyperlane-aleo",
  "hyperlane-core",
  "hyperlane-cosmos",
+ "hyperlane-dusk",
  "hyperlane-ethereum",
  "hyperlane-fuel",
  "hyperlane-metric",
@@ -6107,7 +6176,7 @@ dependencies = [
  "hyperlane-starknet",
  "hyperlane-test",
  "hyperlane-tron",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "maplit",
  "mockall",
  "moka",
@@ -6164,7 +6233,7 @@ dependencies = [
  "getrandom 0.2.15",
  "hex 0.4.3",
  "hyperlane-application",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "num 0.4.3",
  "num-derive",
  "num-traits",
@@ -6213,7 +6282,7 @@ dependencies = [
  "ibc-proto",
  "injective-protobuf",
  "injective-std",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "once_cell",
  "pin-project",
  "protobuf 2.28.0",
@@ -6226,7 +6295,7 @@ dependencies = [
  "time",
  "tokio",
  "tonic 0.12.3",
- "tower 0.4.13",
+ "tower 0.5.2",
  "tracing",
  "tracing-futures",
  "url",
@@ -6268,6 +6337,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyperlane-dusk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.21.7",
+ "bls12_381-bls",
+ "bs58 0.5.1",
+ "derive-new",
+ "dusk-bytes",
+ "eyre",
+ "hex 0.4.3",
+ "hyperlane-core",
+ "hyperlane-dusk-types",
+ "hyperlane-operation-verifier",
+ "num-traits",
+ "reqwest 0.11.27",
+ "rkyv",
+ "rocksdb",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.63",
+ "tokio",
+ "tracing",
+ "tracing-futures",
+ "url",
+]
+
+[[package]]
+name = "hyperlane-dusk-types"
+version = "0.1.0"
+source = "git+https://github.com/dusk-network/hyperlane-dusk?rev=f6be24a411f2a0a247b8d1b798106c37449f7dcf#f6be24a411f2a0a247b8d1b798106c37449f7dcf"
+dependencies = [
+ "bytecheck",
+ "dusk-bytes",
+ "rkyv",
+ "serde",
+]
+
+[[package]]
 name = "hyperlane-ethereum"
 version = "2.2.0"
 dependencies = [
@@ -6288,7 +6397,7 @@ dependencies = [
  "hyperlane-metric",
  "hyperlane-operation-verifier",
  "hyperlane-warp-route",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "num 0.4.3",
  "num-traits",
  "reqwest 0.11.27",
@@ -6633,7 +6742,7 @@ dependencies = [
  "hyperlane-metric",
  "hyperlane-operation-verifier",
  "hyperlane-warp-route",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "num 0.4.3",
  "num-traits",
  "prost 0.13.4",
@@ -7353,7 +7462,7 @@ dependencies = [
  "hyperlane-radix",
  "hyperlane-sealevel",
  "hyperlane-tron",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "mockall",
  "prometheus",
  "radix-common",
@@ -8319,6 +8428,15 @@ dependencies = [
  "borsh 1.6.0",
  "serializable-account-meta",
  "solana-program 3.0.0",
+]
+
+[[package]]
+name = "pairing"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81fec4625e73cf41ef4bb6846cafa6d44736525f442ba45e407c4a000a13996f"
+dependencies = [
+ "group 0.13.0",
 ]
 
 [[package]]
@@ -9669,7 +9787,7 @@ dependencies = [
  "hyperlane-operation-verifier",
  "hyperlane-sealevel",
  "hyperlane-test",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "lander",
  "maplit",
  "mockall",
@@ -9692,7 +9810,7 @@ dependencies = [
  "tokio",
  "tokio-metrics",
  "tokio-test",
- "tower 0.4.13",
+ "tower 0.5.2",
  "tower-http",
  "tracing",
  "tracing-futures",
@@ -10651,7 +10769,7 @@ dependencies = [
  "hyperlane-core",
  "hyperlane-ethereum",
  "hyperlane-test",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "migration",
  "num-bigint 0.4.6",
  "num-traits",
@@ -17335,7 +17453,7 @@ dependencies = [
  "hyperlane-cosmos",
  "hyperlane-ethereum",
  "hyperlane-test",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "k256 0.13.4",
  "mockall",
  "prometheus",
@@ -17348,7 +17466,7 @@ dependencies = [
  "thiserror 1.0.63",
  "tokio",
  "tokio-test",
- "tower 0.4.13",
+ "tower 0.5.2",
  "tracing",
  "tracing-futures",
  "tracing-test",
