@@ -13,9 +13,9 @@ history only; they are not release evidence for this candidate.
 | Hyperlane upstream base | `669d966ad71582fe3c9d96b5ed1b8ea3724e07fe` | Current `hyperlane-xyz/hyperlane-monorepo` base; the fork was fetched and is not behind it |
 | Dusk agent runtime | `af957a9fc814fa7533aadf997104863306eed645` | Dusk protocol adapter, indexers, signer/config parsing, relayer and validator integration |
 | Dusk base tested code | `876848ecc6c671995fad3ae7b22843e68a3ce8ca` | Escrow, dispatch-credit custody/consumption, canonical DRC20 boundary, deployment and E2E harness |
-| Dusk base review head | `c22c7671c672d7f42943bfe0afed3b6fac5eab9e` | Tested code plus the authoritative decision, evidence, and readiness-policy record |
+| Dusk base review head | `e1cc8ee4f338170c60834b79d7bf3bc398b11aa6` | Tested code plus the authoritative decision, immutable-evidence hygiene, and readiness-policy record |
 | Stacked withdrawal tested code | `b28d575527421d2a67245921ce561c88f554c099` | Beneficiary-authorized dispatch-credit withdrawal and route-owner proxy methods, stacked on the exact tested base code |
-| Stacked withdrawal review head | `d8d6c3b4234b391c282ff9622fa59a9ffc05e057` | Tested stack plus the synchronized base decision and evidence record |
+| Stacked withdrawal review head | `ecf333c33d9c32ebbcfad28456340737399fcc0d` | Tested stack plus the synchronized base decision and immutable-evidence hygiene record |
 | Rusk | `5c6a0bab11c61fb4c81275afdeceb97fb942d85e` | Frozen clean Dusk 1.7.1 dependency, VM, archive API, and live-node boundary |
 
 The default `dusk-agent-gate.yml` companion checkout is the exact base-contract

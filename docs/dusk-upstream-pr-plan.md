@@ -17,9 +17,9 @@ Current base:
   `docs/dusk-companion-compatibility.md`: agent runtime
   `af957a9fc814fa7533aadf997104863306eed645`, companion base
   code `876848ecc6c671995fad3ae7b22843e68a3ce8ca` (review head
-  `c22c7671c672d7f42943bfe0afed3b6fac5eab9e`), and stacked withdrawal code
+  `e1cc8ee4f338170c60834b79d7bf3bc398b11aa6`), and stacked withdrawal code
   `b28d575527421d2a67245921ce561c88f554c099` (review head
-  `d8d6c3b4234b391c282ff9622fa59a9ffc05e057`).
+  `ecf333c33d9c32ebbcfad28456340737399fcc0d`).
 - Focused Dusk tests, clippy, and the expanded affected-package cargo check
   pass at that runtime boundary. The exact companion base/stack gates and both
   live E2E security modes are recorded in the compatibility manifest; earlier
