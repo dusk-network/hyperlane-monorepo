@@ -63,6 +63,8 @@ jobs:
               rust/main/Cargo.toml|\
               rust/main/agents/relayer/src/relayer/destination.rs|\
               rust/main/agents/validator/src/reorg_reporter.rs|\
+              rust/main/agents/validator/src/submit.rs|\
+              rust/main/agents/validator/src/submit/tests.rs|\
               rust/main/chains/hyperlane-dusk/*|\
               rust/main/hyperlane-base/Cargo.toml|\
               rust/main/hyperlane-base/src/contract_sync/cursors/mod.rs|\
