@@ -64,10 +64,16 @@ in `FINAL_RED_TEAM_DECISIONS_2026-07-21.md` on the companion Dusk PR heads.
   as a proxy for a reorg-safe leaf count.
 - The hosted Dusk agent gate executes `cargo test -p validator reorg`; compiling
   the validator is not sufficient evidence for the changed fail-stop behavior.
-- The unprivileged proposal gate expands its reviewed-boundary allowlist only
-  for the three files introduced by this hardening: this decision record,
-  `checkpoint_syncer.rs`, and `local_storage.rs`. The boundary remains an
-  explicit fail-closed file list rather than a broad directory exemption.
+- The unprivileged proposal gate keeps an explicit file-by-file reviewed
+  boundary for the validator lifecycle, reorg tombstone, checkpoint-syncer,
+  and local-storage changes. The four validator files added during the final
+  fail-stop pass are named individually; the boundary is not widened to a
+  validator-directory exemption.
+- The hosted runtime-placeholder scan remains deliberately lexical and covers
+  the complete Dusk crate source tree. Four new test-only success assertions
+  use `unwrap()` instead of `expect(...)` so they do not masquerade as runtime
+  findings. The scanner itself is not weakened, and the tests still fail on an
+  unexpected error.
 
 ## Deliberate evidence boundaries
 
@@ -87,9 +93,11 @@ in `FINAL_RED_TEAM_DECISIONS_2026-07-21.md` on the companion Dusk PR heads.
   branch, merge, or tag. Deleting the only containing ref would turn future
   clean release builds into an availability failure even though Cargo pins the
   object immutably.
-- The previously hosted Dusk agent validation succeeded for the exact tested
-  agent source anchor `e95d3ea282a55ead114471ffb1dece77706ffc81`.
-  Later policy or documentation commits are not relabeled as having run it.
+- Production Dusk runtime source is anchored at
+  `c4597e01418f117c4779336b70a8b9274a22c967`; later workflow, documentation,
+  and test-assertion-only commits are not relabeled as production-code
+  changes. Hosted evidence is identified by the exact PR head and Actions run
+  recorded in the PR rather than by a self-referential commit claim here.
 - Compatibility entries resolve the live PR heads at review time while retaining
   exact immutable tested refs for runtime, static, and policy evidence.
 - A whole-package `hyperlane-base` clippy pass currently reaches an unrelated

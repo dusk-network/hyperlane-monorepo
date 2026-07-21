@@ -7,21 +7,19 @@ remaining production decisions are accepted or changed.
 Current base:
 
 - Current Dusk monorepo branch head: see the GitHub PR header.
-- Upstream Hyperlane `main`: `67933966ed9c6f9e3d5ec095372e11414c82e4e7`
+- Upstream Hyperlane `main`: `bf7c658857148410924d9eddd2618ff64d3fc5e2`
 - Rebase/check evidence: use the live `git fetch upstream main`,
   `git merge-base HEAD upstream/main`, and
   `git rev-list --left-right --count HEAD...upstream/main` checks recorded in
   the companion Dusk gate reports.
-- The fork was fetched against that upstream head and is not behind it. The
-  exact reassessment candidate is pinned in
-  `docs/dusk-companion-compatibility.md`: agent runtime
-  `e95d3ea282a55ead114471ffb1dece77706ffc81`, companion base
-  code `9058755927473239d59ce702a8074acbae0e0a24` (review head
-  `6a2d7fda8d3f5eea52aa56af910e93c29a167d81`), and stacked withdrawal code
-  `dc8aba07773993878edd81735d59e66beddd66a3` (review head
-  `d1bb490c469142f154727f0a7aab5476b064eb59`). The separately validated
-  review-policy boundary anchor is
-  `c35f86405cf8cd83927860aca8b5c38b042ee198`.
+- The fork candidate merges that upstream head and is not behind it. The exact
+  reassessment set is pinned in `docs/dusk-companion-compatibility.md`:
+  production agent source `c4597e01418f117c4779336b70a8b9274a22c967`,
+  companion base `f6be24a411f2a0a247b8d1b798106c37449f7dcf`,
+  stacked withdrawal `4ed5734816287a9d08bc8bdaf87d000afb38b5f9`, and
+  manual-reproduction policy `da4db7e62234bf1a9a0c9033a7520fc37fab85a3`.
+  The live PR head adds only documented workflow/test maintenance after the
+  production-source anchor and is the SHA that hosted checks must attest.
 - Focused Dusk tests, clippy, and the expanded affected-package cargo check
   pass at that runtime boundary. The exact companion base/stack gates and both
   live E2E security modes are recorded in the compatibility manifest; earlier
@@ -53,8 +51,17 @@ The current upstream-facing diff is intentionally limited to Rust agent support:
 - `rust/main/hyperlane-base/src/settings/parser/mod.rs`
 - `rust/main/hyperlane-base/src/settings/signers.rs`
 - `rust/main/hyperlane-base/src/contract_sync/cursors/mod.rs`
+- `rust/main/hyperlane-base/src/settings/checkpoint_syncer.rs`
+- `rust/main/hyperlane-base/src/types/local_storage.rs`
 - `rust/main/hyperlane-core/src/chain.rs`
+- `rust/main/agents/relayer/src/relayer/destination.rs`
+- `rust/main/agents/validator/src/main.rs`
 - `rust/main/agents/validator/src/reorg_reporter.rs`
+- `rust/main/agents/validator/src/reorg_tombstone.rs`
+- `rust/main/agents/validator/src/settings.rs`
+- `rust/main/agents/validator/src/submit.rs`
+- `rust/main/agents/validator/src/submit/tests.rs`
+- `rust/main/agents/validator/src/validator.rs`
 - `rust/main/lander/src/adapter/chains/factory.rs`
 
 The Dusk Rust agent crate depends on `hyperlane-dusk-types` at the exact public

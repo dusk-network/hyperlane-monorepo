@@ -1732,7 +1732,7 @@ mod tests {
         let later = repaired
             .finalized_contract_event(&contract_id, "dispatch", 1, 8, &second_data)
             .await
-            .expect("a repaired endpoint must advance after a poisoned prior process");
+            .unwrap();
         assert_eq!(later.event_id, 1);
     }
 
@@ -1821,7 +1821,7 @@ mod tests {
         let later = repaired
             .finalized_contract_event(&contract_id, "dispatch", 1, 8, &second_data)
             .await
-            .expect("a repaired endpoint must supply the real next semantic row");
+            .unwrap();
         assert_eq!(later.event_id, 1);
     }
 
@@ -1916,7 +1916,7 @@ mod tests {
         let replaced = repaired
             .finalized_contract_event(&contract_id, "dispatch", 1, 20, &honest_second)
             .await
-            .expect("retry must replay and replace the exact poisoned row");
+            .unwrap();
         assert_eq!(replaced.event_id, 1);
         assert_eq!(replaced.block_height, 20);
     }
@@ -1973,7 +1973,7 @@ mod tests {
         let process = client
             .finalized_contract_event(&contract_id, "process", 0, 9, &process_data)
             .await
-            .expect("the earlier process event must remain independently discoverable");
+            .unwrap();
         assert_eq!(dispatch.event_id, 0);
         assert_eq!(process.event_id, 0);
     }

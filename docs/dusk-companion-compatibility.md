@@ -1,6 +1,6 @@
 # Dusk companion compatibility manifest
 
-Date: 2026-07-20
+Date: 2026-07-21
 
 This manifest is the cross-repository authority for the reopened Hyperlane/Dusk
 reassessment. Branch names and evidence from earlier heads are regression
@@ -10,18 +10,18 @@ history only; they are not release evidence for this candidate.
 
 | Component | Exact reference | Role |
 | --- | --- | --- |
-| Hyperlane upstream base | `67933966ed9c6f9e3d5ec095372e11414c82e4e7` | Current `hyperlane-xyz/hyperlane-monorepo` base; the fork is 0 commits behind it |
-| Dusk agent runtime | `e95d3ea282a55ead114471ffb1dece77706ffc81` | Rebased equivalent of tested runtime `af957a9fc814fa7533aadf997104863306eed645`; Dusk protocol adapter, indexers, signer/config parsing, relayer and validator integration |
-| Dusk base tested code | `9058755927473239d59ce702a8074acbae0e0a24` | Escrow, dispatch-credit custody/consumption, Mailbox reentrancy guard, canonical DRC20 boundary, deployment and E2E harness |
+| Hyperlane upstream base | `bf7c658857148410924d9eddd2618ff64d3fc5e2` | Current `hyperlane-xyz/hyperlane-monorepo` base merged into this fork candidate |
+| Dusk agent production source | `c4597e01418f117c4779336b70a8b9274a22c967` | Dusk protocol adapter, bounded/authenticated indexers, redacted signer/config parsing, and validator fail-stop integration; later changes are workflow, documentation, or test-assertion only |
+| Dusk agent review head | Resolve live monorepo PR #1 head | Moving review head; use the exact hosted-check SHA from the PR, not this label, as release evidence |
+| Dusk base tested code | `f6be24a411f2a0a247b8d1b798106c37449f7dcf` | Escrow, dispatch-credit custody/consumption, authenticated route funding, Mailbox reentrancy guard, canonical DRC20 boundary, deployment and E2E harness |
 | Dusk base review head | Resolve live PR #1 head | Moving review head; tested runtime remains the exact immutable commit above |
-| Stacked withdrawal tested code | `dc8aba07773993878edd81735d59e66beddd66a3` | Beneficiary-authorized dispatch-credit withdrawal and route-owner proxy methods, stacked on the exact tested base code |
+| Stacked withdrawal tested code | `4ed5734816287a9d08bc8bdaf87d000afb38b5f9` | Beneficiary-authorized dispatch-credit withdrawal, route-owner proxy methods, and prepared-transaction hash reporting, stacked on the exact tested base code |
 | Stacked withdrawal review head | Resolve live PR #10 head | Moving review head; tested runtime remains the exact immutable commit above |
-| Static covered monorepo checkout | `833b77b4436e146a4776a3b35db68525014b3adb` | Rebased equivalent of clean-repro checkout `b4c46ce9bdade2590018facaa51255d497a80db2` |
-| Review-policy boundary anchor | `c35f86405cf8cd83927860aca8b5c38b042ee198` | Rebased equivalent of `dad14dbbea4bbd59f6c6697f89cc245d5c1cf2a0`; adds validator fail-stop source files to the fork boundary |
+| Manual reproduction policy | `da4db7e62234bf1a9a0c9033a7520fc37fab85a3` | Exact-ref dispatcher, protected environment, and distinct manual evidence check contexts; live execution still needs the provisioned runner and read token |
 | Rusk | `5c6a0bab11c61fb4c81275afdeceb97fb942d85e` | Frozen clean Dusk 1.7.1 dependency, VM, archive API, and live-node boundary |
 
-The default `dusk-agent-gate.yml` companion checkout is the exact base-contract
-commit above. A manual workflow input may deliberately select another exact
+The default `dusk-agent-gate.yml` companion checkout is exact base-contract
+commit `f6be24a411f2a0a247b8d1b798106c37449f7dcf`. A manual workflow input may deliberately select another exact
 reference, but a moving branch is not accepted as compatibility evidence.
 
 ## Contract decisions
