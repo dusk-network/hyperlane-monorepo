@@ -48,7 +48,7 @@ import {
 import { WarpCoreConfig } from '../warp/types.js';
 
 import { EvmWarpRouteReader } from './EvmWarpRouteReader.js';
-import { TokenType } from './config.js';
+import { TokenType, isSyntheticTokenType } from './config.js';
 import {
   expandVirtualWarpDeployConfig,
   expandWarpDeployConfig,
@@ -221,7 +221,17 @@ export function derivedWarpConfigToCheckConfig(
   if (protocol !== ProtocolType.CosmosNative && !isNullish(decimals)) {
     result.decimals = decimals;
   }
-  if ('token' in config && typeof config.token === 'string') {
+  // A synthetic token's `token` (the SVM mint / cosmos denom) is a deterministic
+  // deployment artifact derived from the deployed router, not a user-configured
+  // value -- the SVM reader populates it while the deploy-config-derived expected
+  // side has no counterpart, producing a spurious ConfigMismatch. Skip it here so
+  // both sides stay symmetric; the router that determines the mint is checked via
+  // remoteRouters. See expandedDeployConfigToAltVmCheckConfig for the mirror.
+  if (
+    !isSyntheticTokenType(config.type) &&
+    'token' in config &&
+    typeof config.token === 'string'
+  ) {
     result.token = normalizeAddress(config.token, protocol);
   }
   if (!isNullish(config.contractVersion)) {
@@ -272,6 +282,16 @@ function normalizeCrossCollateralRouters(
     ).filter(([, addresses]) => addresses.length > 0),
   );
   return Object.keys(normalized).length > 0 ? normalized : undefined;
+}
+
+// `collateralDex` is a paradex-only registry annotation for a collateral route
+// that performs a DEX conversion (see registry ETH/paradex & DIME/paradex). It has
+// no matching SDK TokenType, and on-chain the leg is a standard collateral router,
+// so the deriver reports `collateral`. Treat the annotation as its underlying
+// collateral type so the generic altVM diff doesn't false-flag a `type` mismatch.
+const COLLATERAL_DEX_TYPE_ALIAS = 'collateralDex';
+export function normalizeAltVmExpectedTokenType(type: string): string {
+  return type === COLLATERAL_DEX_TYPE_ALIAS ? TokenType.collateral : type;
 }
 
 export function expandedDeployConfigToAltVmCheckConfig(
@@ -331,7 +351,7 @@ export function expandedDeployConfigToAltVmCheckConfig(
   // altVmScaleMismatch (exact bigint fraction compare against the raw expected
   // config.scale), not through this generic diff. See checkWarpRouteDeployConfig.
   const result: AltVmCheckConfig = {
-    type: config.type,
+    type: normalizeAltVmExpectedTokenType(config.type),
     owner: normalizeAddress(config.owner, protocol),
     mailbox: normalizeAddress(config.mailbox, protocol),
     interchainSecurityModule: ismAddress,
@@ -351,7 +371,14 @@ export function expandedDeployConfigToAltVmCheckConfig(
     result.decimals = config.decimals;
   }
 
-  if ('token' in config && typeof config.token === 'string') {
+  // Mirror of derivedWarpConfigToCheckConfig: a synthetic token's `token` is a
+  // deterministic deployment artifact, not user config, so it's excluded from
+  // the diff to avoid a spurious mismatch against the reader-populated value.
+  if (
+    !isSyntheticTokenType(config.type) &&
+    'token' in config &&
+    typeof config.token === 'string'
+  ) {
     result.token = normalizeAddress(config.token, protocol);
   }
 
