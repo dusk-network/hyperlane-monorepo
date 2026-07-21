@@ -9,7 +9,7 @@ on:
       dusk_ref:
         description: "dusk-network/hyperlane-dusk ref to checkout for shared types"
         required: true
-        default: "f4fc63983cf67ea05378cf01aa73743d3564a2f7"
+        default: "876848ecc6c671995fad3ae7b22843e68a3ce8ca"
 
 permissions:
   contents: read
@@ -26,7 +26,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
       GH_TOKEN: ${{ secrets.DUSK_ORG_READ_TOKEN || github.token }}
       DUSK_ORG_READ_TOKEN_CONFIGURED: ${{ secrets.DUSK_ORG_READ_TOKEN != '' }}
-      DUSK_REF: ${{ inputs.dusk_ref || 'f4fc63983cf67ea05378cf01aa73743d3564a2f7' }}
+      DUSK_REF: ${{ inputs.dusk_ref || '876848ecc6c671995fad3ae7b22843e68a3ce8ca' }}
       MONOREPO_DIR: ${{ github.workspace }}/hyperlane/hyperlane-monorepo
       DUSK_DIR: ${{ github.workspace }}/hyperlane/dusk
 

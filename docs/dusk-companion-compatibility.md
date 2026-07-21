@@ -12,8 +12,10 @@ history only; they are not release evidence for this candidate.
 | --- | --- | --- |
 | Hyperlane upstream base | `669d966ad71582fe3c9d96b5ed1b8ea3724e07fe` | Current `hyperlane-xyz/hyperlane-monorepo` base; the fork was fetched and is not behind it |
 | Dusk agent runtime | `af957a9fc814fa7533aadf997104863306eed645` | Dusk protocol adapter, indexers, signer/config parsing, relayer and validator integration |
-| Dusk base contracts | `f4fc63983cf67ea05378cf01aa73743d3564a2f7` | Escrow, dispatch-credit custody/consumption, canonical DRC20 boundary, deployment and E2E harness |
-| Stacked withdrawal contracts | `77238aee8d46aadc8cf9bab58adb194d7708ed67` | Beneficiary-authorized dispatch-credit withdrawal and route-owner proxy methods, stacked on the exact base head |
+| Dusk base tested code | `876848ecc6c671995fad3ae7b22843e68a3ce8ca` | Escrow, dispatch-credit custody/consumption, canonical DRC20 boundary, deployment and E2E harness |
+| Dusk base review head | `ec53c5f642b2815b5a61ee811d5cdc774e78b397` | Tested code plus the authoritative decision, evidence, and readiness-policy record |
+| Stacked withdrawal tested code | `b28d575527421d2a67245921ce561c88f554c099` | Beneficiary-authorized dispatch-credit withdrawal and route-owner proxy methods, stacked on the exact tested base code |
+| Stacked withdrawal review head | `5a267654938684b404926fc55ae33b4cbf046527` | Tested stack plus the synchronized base decision and evidence record |
 | Rusk | `5c6a0bab11c61fb4c81275afdeceb97fb942d85e` | Frozen clean Dusk 1.7.1 dependency, VM, archive API, and live-node boundary |
 
 The default `dusk-agent-gate.yml` companion checkout is the exact base-contract
@@ -115,6 +117,12 @@ prove payer isolation, beneficiary-authorized withdrawal, route-owned proxy
 withdrawal, remaining-credit consumption, exact custody, allowance use, and
 secret/archive hygiene.
 
+The live harness assigns different pre-funded Anvil accounts to the operator,
+relayer, and validator. Both EVM and Dusk multisig ISMs consume the identical
+validator address and threshold. Operator withdrawal and other setup complete
+before either validator starts, so the test cannot manufacture EVM or Dusk
+nonce races by sharing a signer across concurrent roles.
+
 ## Current local validation
 
 At the runtime commit above, the focused agent boundary passed:
@@ -125,13 +133,23 @@ At the runtime commit above, the focused agent boundary passed:
 - `cargo clippy -p hyperlane-dusk --all-targets -- -D warnings`; and
 - `cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p scraper -p lander`.
 
-The base helper test passed 17 tests and the stacked helper passed 19 tests
-against the frozen clean Rusk 1.7.1 dependency graph. Shell parsing and the EVM
-MessageIdMultisig constructor ABI were also checked.
+The base gate passed 12 WASMs, clippy, 29 type tests, 108 VM tests, 17 helper
+tests, 5 driver tests, hygiene, and the full agent compile boundary. The stack
+gate passed 114 VM tests, 19 helper tests, 7 driver tests, release driver WASM,
+and the same remaining boundaries. Their log SHA-256 values are respectively
+`182691cb5ef5c864c3fc657cd4bd87134d7a1cc71f6f14a4513d5e2095b8a364`
+and `c0a47f43340d35369725bd3f215d120a62e0aab0a7558cb37fa2e24b023cbf62`.
 
-Replacement contract gates and live two-mode E2E evidence are intentionally
-not recorded as complete here yet. They must be regenerated from the exact
-heads in this manifest. After that, fresh independent GPT-5.6 xhigh and
-Controlecentrum deep/xhigh reviews must target the same frozen heads. Any
-source change after those reviews invalidates the evidence and requires a new
-pin and proportionate rerun.
+At the exact stack code anchor, TestMock run `1784629402` and
+MessageIdMultisig run `1784628130` each passed beneficiary withdrawal plus
+synthetic, native, and canonical DRC20 routes in both directions. The multisig
+logs contain only validator `0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC`
+through checkpoint index 2; neither run contains `nonce too low`, leaked signer
+material, an orphan agent, or a surviving test listener. The harness log hashes
+are `c155747f8d49beb16e8cf005c3bca77eff62b3d3fe0c3e86fa4737a8ca3b0540`
+and `d6d9100b3f306662000d5d865d849f492bf1810f88c245a53fda998843898df6`.
+
+Fresh independent GPT-5.6 xhigh and Controlecentrum deep/xhigh reviews must
+target these frozen source heads. Any source change after those reviews
+invalidates the affected evidence and requires a new pin and proportionate
+rerun.
