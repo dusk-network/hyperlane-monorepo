@@ -35,48 +35,6 @@ pub async fn dusk_tx_call(
     args_bytes: &[u8],
     gas_limit: Option<u64>,
 ) -> Result<Value, HyperlaneDuskError> {
-    dusk_tx_call_with_mode(
-        conn,
-        signer,
-        contract_id,
-        fn_name,
-        args_bytes,
-        gas_limit,
-        false,
-    )
-    .await
-}
-
-/// Simulate a contract call against Rusk's ephemeral execution endpoint.
-pub async fn dusk_tx_simulate_call(
-    conn: &ConnectionConf,
-    signer: &DuskSigner,
-    contract_id: &[u8; 32],
-    fn_name: &str,
-    args_bytes: &[u8],
-    gas_limit: Option<u64>,
-) -> Result<Value, HyperlaneDuskError> {
-    dusk_tx_call_with_mode(
-        conn,
-        signer,
-        contract_id,
-        fn_name,
-        args_bytes,
-        gas_limit,
-        true,
-    )
-    .await
-}
-
-async fn dusk_tx_call_with_mode(
-    conn: &ConnectionConf,
-    signer: &DuskSigner,
-    contract_id: &[u8; 32],
-    fn_name: &str,
-    args_bytes: &[u8],
-    gas_limit: Option<u64>,
-    simulate_only: bool,
-) -> Result<Value, HyperlaneDuskError> {
     if args_bytes.len() > MAX_DUSK_TX_ARGS_BYTES {
         return Err(HyperlaneDuskError::Other(format!(
             "dusk-tx arguments for {fn_name} exceed the {MAX_DUSK_TX_ARGS_BYTES}-byte helper transport limit"
@@ -97,14 +55,12 @@ async fn dusk_tx_call_with_mode(
 
     let mut command = Command::new(&bin);
     command.kill_on_drop(true);
-    if simulate_only {
-        command.arg("call").arg("--simulate-only");
-    } else {
-        command.arg("call");
-    }
+    command.arg("call");
     let mut child = command
         .arg("--rues-url")
         .arg(conn.url.as_str())
+        .arg("--expected-chain-id")
+        .arg(conn.chain_id.to_string())
         .arg("--secret-key-stdin")
         .arg("--contract")
         .arg(&contract_hex)

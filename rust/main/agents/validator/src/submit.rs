@@ -254,15 +254,9 @@ impl ValidatorSubmitter {
                 "Incorrect tree root. Most likely a reorg has occurred. Please reach out for help, this is a potentially serious error impacting signed messages. Do NOT forcefully resume operation of this validator. Keep it crashlooping or shut down until you receive support."
             );
 
-            if let Some(height) = correctness_checkpoint.block_height {
-                self.reorg_reporter.report_at_block(height).await;
-            } else {
-                info!("Blockchain does not support block height, reporting with reorg period");
-                self.reorg_reporter
-                    .report_with_reorg_period(&self.reorg_period)
-                    .await;
-            }
-
+            // Persist the fail-stop flag before any best-effort network
+            // diagnostics. A dead or malicious RPC must never make a restart
+            // forget that this validator observed a conflicting root.
             let mut panic_message = "Incorrect tree root. Most likely a reorg has occurred. Please reach out for help, this is a potentially serious error impacting signed messages. Do NOT forcefully resume operation of this validator. Keep it crashlooping or shut down until you receive support.".to_owned();
             if let Err(e) = self
                 .checkpoint_syncer
@@ -270,8 +264,17 @@ impl ValidatorSubmitter {
                 .await
             {
                 panic_message.push_str(&format!(
-                    " Reorg troubleshooting details couldn't be written to checkpoint storage: {e}"
+                    " Reorg fail-stop flag couldn't be written to checkpoint storage: {e}"
                 ));
+            }
+
+            if let Some(height) = correctness_checkpoint.block_height {
+                self.reorg_reporter.report_at_block(height).await;
+            } else {
+                info!("Blockchain does not support block height, reporting with reorg period");
+                self.reorg_reporter
+                    .report_with_reorg_period(&self.reorg_period)
+                    .await;
             }
             panic!("{panic_message}");
         }

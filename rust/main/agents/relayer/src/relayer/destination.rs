@@ -207,7 +207,7 @@ impl DestinationFactory {
             && chain_conf.signer.is_none()
         {
             return Err(FactoryError::MissingConfiguration(format!(
-                "Dusk destination {} requires a signer for simulation and submission",
+                "Dusk destination {} requires a signer for submission",
                 domain.name()
             )));
         }

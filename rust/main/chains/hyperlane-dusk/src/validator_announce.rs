@@ -15,6 +15,8 @@ use hyperlane_dusk_types::EthAddress;
 use crate::{ConnectionConf, DuskProvider, DuskSigner, HyperlaneDuskError, RuesClient};
 
 const TX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_ANNOUNCED_LOCATION_BYTES: usize = 1024;
+const MAX_LOCATIONS_PER_VALIDATOR: usize = 16;
 
 /// Dusk ValidatorAnnounce implementation.
 #[derive(Debug, Clone)]
@@ -70,26 +72,49 @@ impl ValidatorAnnounce for DuskValidatorAnnounce {
         &self,
         validators: &[H256],
     ) -> ChainResult<Vec<Vec<String>>> {
-        // Convert H256 validator addresses to 20-byte EthAddress (last 20 bytes).
-        let eth_addrs: Vec<EthAddress> = validators
-            .iter()
-            .map(|h| {
-                let mut addr = [0u8; 20];
-                addr.copy_from_slice(&h.as_bytes()[12..]);
-                EthAddress(addr)
-            })
-            .collect();
-
-        let locations: Vec<Vec<String>> = self
-            .rues
-            .contract_query(
-                &self.va_id,
-                "get_announced_storage_locations",
-                &(eth_addrs,),
-            )
-            .await?;
-
-        Ok(locations)
+        // Query one validator at a time. A legacy/poisoned record or one
+        // unavailable response must not prevent the relayer from using enough
+        // healthy validators to satisfy the ISM threshold.
+        let mut all_locations = Vec::with_capacity(validators.len());
+        for validator in validators {
+            let mut address = [0u8; 20];
+            address.copy_from_slice(&validator.as_bytes()[12..]);
+            let result: Result<Vec<String>, _> = self
+                .rues
+                .contract_query(
+                    &self.va_id,
+                    "get_announced_storage_locations_for_validator",
+                    &EthAddress(address),
+                )
+                .await;
+            match result {
+                Ok(locations)
+                    if locations.len() <= MAX_LOCATIONS_PER_VALIDATOR
+                        && locations.iter().all(|location| {
+                            !location.is_empty() && location.len() <= MAX_ANNOUNCED_LOCATION_BYTES
+                        }) =>
+                {
+                    all_locations.push(locations)
+                }
+                Ok(locations) => {
+                    warn!(
+                        validator = ?validator,
+                        locations = locations.len(),
+                        "Ignoring invalid Dusk validator location history"
+                    );
+                    all_locations.push(Vec::new());
+                }
+                Err(error) => {
+                    warn!(
+                        validator = ?validator,
+                        %error,
+                        "Ignoring unavailable Dusk validator location history"
+                    );
+                    all_locations.push(Vec::new());
+                }
+            }
+        }
+        Ok(all_locations)
     }
 
     async fn announce(&self, announcement: SignedType<Announcement>) -> ChainResult<TxOutcome> {
@@ -104,9 +129,10 @@ impl ValidatorAnnounce for DuskValidatorAnnounce {
             "Announcing validator storage location on Dusk via dusk-tx"
         );
 
-        // Extract the 20-byte validator Ethereum address from the H256.
-        let mut validator_eth_addr = [0u8; 20];
-        validator_eth_addr.copy_from_slice(&announcement.value.validator.as_bytes()[12..]);
+        // `Announcement::validator` is already an H160. Slicing it as though it
+        // were an H256 leaves only eight bytes and panics on every normal
+        // self-announcement.
+        let validator_eth_addr = *announcement.value.validator.as_fixed_bytes();
 
         // Extract the 65-byte ECDSA signature.
         let signature: [u8; 65] = announcement.signature.into();

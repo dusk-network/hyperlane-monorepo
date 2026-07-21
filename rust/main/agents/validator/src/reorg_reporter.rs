@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use ethers::utils::keccak256;
@@ -11,11 +12,12 @@ use url::Url;
 
 use hyperlane_base::settings::ChainConnectionConf;
 use hyperlane_base::{CheckpointSyncer, CoreMetrics};
-use hyperlane_core::rpc_clients::call_and_retry_indefinitely;
 use hyperlane_core::{CheckpointAtBlock, HyperlaneDomain, MerkleTreeHook, ReorgPeriod, H256};
 use hyperlane_ethereum::RpcConnectionConf;
 
 use crate::settings::ValidatorSettings;
+
+const REORG_DIAGNOSTIC_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[async_trait]
 pub trait ReorgReporter: Send + Sync + Debug {
@@ -32,10 +34,13 @@ pub struct LatestCheckpointReorgReporter {
 struct ReorgReportRpcResponse {
     rpc_url_hash: H256,
     rpc_host_hash: H256,
-    height: Option<u64>,
+    requested_height: Option<u64>,
+    observed_height: Option<u64>,
+    endpoint_lag: bool,
     reorg_period: Option<ReorgPeriod>,
-    merkle_root_index: u32,
-    merkle_root_hash: H256,
+    merkle_root_index: Option<u32>,
+    merkle_root_hash: Option<H256>,
+    error: Option<String>,
     timestamp: String,
 }
 
@@ -43,16 +48,42 @@ impl ReorgReportRpcResponse {
     fn new(
         url: Url,
         latest_checkpoint: CheckpointAtBlock,
-        height: Option<u64>,
+        requested_height: Option<u64>,
         reorg_period: Option<ReorgPeriod>,
     ) -> Self {
+        let observed_height = latest_checkpoint.block_height;
         ReorgReportRpcResponse {
             rpc_host_hash: H256::from_slice(&keccak256(url.host_str().unwrap_or("").as_bytes())),
             rpc_url_hash: H256::from_slice(&keccak256(url.as_str().as_bytes())),
-            height,
+            requested_height,
+            observed_height,
+            endpoint_lag: requested_height
+                .zip(observed_height)
+                .is_some_and(|(requested, observed)| observed < requested),
             reorg_period,
-            merkle_root_hash: latest_checkpoint.checkpoint.root,
-            merkle_root_index: latest_checkpoint.checkpoint.index,
+            merkle_root_hash: Some(latest_checkpoint.checkpoint.root),
+            merkle_root_index: Some(latest_checkpoint.checkpoint.index),
+            error: None,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    fn failure(
+        url: Url,
+        requested_height: Option<u64>,
+        reorg_period: Option<ReorgPeriod>,
+        error: String,
+    ) -> Self {
+        Self {
+            rpc_host_hash: H256::from_slice(&keccak256(url.host_str().unwrap_or("").as_bytes())),
+            rpc_url_hash: H256::from_slice(&keccak256(url.as_str().as_bytes())),
+            requested_height,
+            observed_height: None,
+            endpoint_lag: false,
+            reorg_period,
+            merkle_root_index: None,
+            merkle_root_hash: None,
+            error: Some(error),
             timestamp: chrono::Utc::now().to_rfc3339(),
         }
     }
@@ -74,17 +105,37 @@ impl LatestCheckpointReorgReporter {
         info!(?height, "Reporting latest checkpoint on reorg");
         let mut futures = vec![];
         for (url, merkle_tree_hook) in &self.merkle_tree_hooks {
-            let future = async {
-                let latest_checkpoint = call_and_retry_indefinitely(|| {
-                    let merkle_tree_hook = merkle_tree_hook.clone();
-                    Box::pin(
-                        async move { merkle_tree_hook.latest_checkpoint_at_block(height).await },
-                    )
-                })
-                .await;
-
-                info!(url = ?url.clone(), ?height, ?latest_checkpoint, "Report latest checkpoint on reorg");
-                ReorgReportRpcResponse::new(url.clone(), latest_checkpoint, Some(height), None)
+            let url = url.clone();
+            let merkle_tree_hook = merkle_tree_hook.clone();
+            let future = async move {
+                match tokio::time::timeout(
+                    REORG_DIAGNOSTIC_RPC_TIMEOUT,
+                    merkle_tree_hook.latest_checkpoint_at_block(height),
+                )
+                .await
+                {
+                    Ok(Ok(latest_checkpoint)) => {
+                        info!(
+                            ?url,
+                            ?height,
+                            ?latest_checkpoint,
+                            "Report latest checkpoint on reorg"
+                        );
+                        ReorgReportRpcResponse::new(url, latest_checkpoint, Some(height), None)
+                    }
+                    Ok(Err(error)) => {
+                        ReorgReportRpcResponse::failure(url, Some(height), None, error.to_string())
+                    }
+                    Err(_) => ReorgReportRpcResponse::failure(
+                        url,
+                        Some(height),
+                        None,
+                        format!(
+                            "diagnostic RPC timed out after {}s",
+                            REORG_DIAGNOSTIC_RPC_TIMEOUT.as_secs()
+                        ),
+                    ),
+                }
             };
 
             futures.push(future);
@@ -100,21 +151,46 @@ impl LatestCheckpointReorgReporter {
         info!(?reorg_period, "Reporting latest checkpoint on reorg");
         let mut futures = vec![];
         for (url, merkle_tree_hook) in &self.merkle_tree_hooks {
-            let future = async {
-                let latest_checkpoint = call_and_retry_indefinitely(|| {
-                    let merkle_tree_hook = merkle_tree_hook.clone();
-                    let period = reorg_period.clone();
-                    Box::pin(async move { merkle_tree_hook.latest_checkpoint(&period).await })
-                })
-                .await;
-
-                info!(url = ?url.clone(), ?reorg_period, ?latest_checkpoint, "Report latest checkpoint on reorg");
-                ReorgReportRpcResponse::new(
-                    url.clone(),
-                    latest_checkpoint,
-                    None,
-                    Some(reorg_period.clone()),
+            let url = url.clone();
+            let merkle_tree_hook = merkle_tree_hook.clone();
+            let reorg_period = reorg_period.clone();
+            let future = async move {
+                match tokio::time::timeout(
+                    REORG_DIAGNOSTIC_RPC_TIMEOUT,
+                    merkle_tree_hook.latest_checkpoint(&reorg_period),
                 )
+                .await
+                {
+                    Ok(Ok(latest_checkpoint)) => {
+                        info!(
+                            ?url,
+                            ?reorg_period,
+                            ?latest_checkpoint,
+                            "Report latest checkpoint on reorg"
+                        );
+                        ReorgReportRpcResponse::new(
+                            url,
+                            latest_checkpoint,
+                            None,
+                            Some(reorg_period),
+                        )
+                    }
+                    Ok(Err(error)) => ReorgReportRpcResponse::failure(
+                        url,
+                        None,
+                        Some(reorg_period),
+                        error.to_string(),
+                    ),
+                    Err(_) => ReorgReportRpcResponse::failure(
+                        url,
+                        None,
+                        Some(reorg_period),
+                        format!(
+                            "diagnostic RPC timed out after {}s",
+                            REORG_DIAGNOSTIC_RPC_TIMEOUT.as_secs()
+                        ),
+                    ),
+                }
             };
 
             futures.push(future);
@@ -303,5 +379,33 @@ impl LatestCheckpointReorgReporterWithStorageWriter {
             .unwrap_or_else(|e| {
                 warn!("Error writing checkpoint syncer to reorg log: {}", e);
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyperlane_core::Checkpoint;
+
+    #[test]
+    fn reorg_report_keeps_requested_and_observed_heights_distinct() {
+        let response = ReorgReportRpcResponse::new(
+            Url::parse("https://rpc.example").unwrap(),
+            CheckpointAtBlock {
+                checkpoint: Checkpoint {
+                    merkle_tree_hook_address: H256::zero(),
+                    mailbox_domain: 1000,
+                    root: H256::from_low_u64_be(7),
+                    index: 8,
+                },
+                block_height: Some(39),
+            },
+            Some(42),
+            None,
+        );
+
+        assert_eq!(response.requested_height, Some(42));
+        assert_eq!(response.observed_height, Some(39));
+        assert!(response.endpoint_lag);
     }
 }

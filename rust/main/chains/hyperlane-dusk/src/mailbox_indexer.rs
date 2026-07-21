@@ -10,7 +10,7 @@ use hyperlane_core::{
 };
 use hyperlane_dusk_types::events;
 
-use crate::rues::{contract_event_transaction_id, rkyv_serialize, ArchivedContractEvent};
+use crate::rues::rkyv_serialize;
 use crate::tx_sender::{dusk_tx_id_to_h512, h512_to_dusk_tx_id};
 use crate::RuesClient;
 
@@ -34,17 +34,6 @@ impl DuskMailboxIndexer {
             mailbox_id: mailbox_id.into(),
             mailbox_address: mailbox_id,
         }
-    }
-
-    async fn dispatch_ordinal_in_block(
-        &self,
-        sequence: u32,
-        block_height: u64,
-    ) -> ChainResult<usize> {
-        let first = self
-            .first_dispatch_at_or_after(sequence + 1, block_height)
-            .await?;
-        Ok((sequence - first) as usize)
     }
 
     async fn dispatch_height(&self, sequence: u32) -> ChainResult<u64> {
@@ -103,10 +92,6 @@ impl Indexer<HyperlaneMessage> for DuskMailboxIndexer {
         range: RangeInclusive<u32>,
     ) -> ChainResult<Vec<(Indexed<HyperlaneMessage>, LogMeta)>> {
         let mut results = Vec::new();
-        let mut archive_height = None;
-        let mut archive_events = Vec::<ArchivedContractEvent>::new();
-        let mut archive_block_hash = H256::zero();
-        let mut dispatch_ordinal = 0usize;
 
         // Mailbox.nonce is the next dispatch nonce; messages exist for [0, nonce).
         let current_nonce: u32 = self
@@ -144,27 +129,22 @@ impl Indexer<HyperlaneMessage> for DuskMailboxIndexer {
                 .into());
             }
 
-            if archive_height != Some(block_number) {
-                archive_events = self.rues.contract_events_at(block_number).await?;
-                archive_block_hash = self.rues.block_hash_at(block_number).await?;
-                dispatch_ordinal = self.dispatch_ordinal_in_block(nonce, block_number).await?;
-                archive_height = Some(block_number);
-            }
-
             let expected_event = rkyv_serialize(&events::Dispatch {
                 sender: dusk_msg.sender,
                 destination: dusk_msg.destination,
                 recipient: dusk_msg.recipient,
                 message: encoded.clone(),
             })?;
-            let transaction_id = contract_event_transaction_id(
-                &archive_events,
-                &self.mailbox_id,
-                events::Dispatch::TOPIC,
-                dispatch_ordinal,
-                &expected_event,
-            )?;
-            dispatch_ordinal += 1;
+            let provenance = self
+                .rues
+                .finalized_contract_event(
+                    &self.mailbox_id,
+                    events::Dispatch::TOPIC,
+                    nonce as usize,
+                    block_number,
+                    &expected_event,
+                )
+                .await?;
 
             // Convert to hyperlane-core HyperlaneMessage.
             let core_msg = HyperlaneMessage {
@@ -179,9 +159,9 @@ impl Indexer<HyperlaneMessage> for DuskMailboxIndexer {
 
             let log_meta = LogMeta {
                 address: self.mailbox_address,
-                block_number,
-                block_hash: archive_block_hash,
-                transaction_id,
+                block_number: provenance.block_height,
+                block_hash: provenance.block_hash,
+                transaction_id: provenance.transaction_id,
                 transaction_index: 0,
                 log_index: U256::from(nonce),
             };
@@ -260,17 +240,6 @@ impl DuskDeliveryIndexer {
         }
     }
 
-    async fn process_ordinal_in_block(
-        &self,
-        sequence: u32,
-        block_height: u64,
-    ) -> ChainResult<usize> {
-        let first = self
-            .first_process_at_or_after(sequence + 1, block_height)
-            .await?;
-        Ok((sequence - first) as usize)
-    }
-
     async fn process_height(&self, sequence: u32) -> ChainResult<u64> {
         Ok(self
             .rues
@@ -327,10 +296,6 @@ impl Indexer<H256> for DuskDeliveryIndexer {
         range: RangeInclusive<u32>,
     ) -> ChainResult<Vec<(Indexed<H256>, LogMeta)>> {
         let mut results = Vec::new();
-        let mut archive_height = None;
-        let mut archive_events = Vec::<ArchivedContractEvent>::new();
-        let mut archive_block_hash = H256::zero();
-        let mut process_ordinal = 0usize;
 
         // Messages exist for [0, processed_count).
         let processed_count: u32 = self
@@ -358,28 +323,23 @@ impl Indexer<H256> for DuskDeliveryIndexer {
                 .await?;
             ensure_cursor_height(block_number)?;
 
-            if archive_height != Some(block_number) {
-                archive_events = self.rues.contract_events_at(block_number).await?;
-                archive_block_hash = self.rues.block_hash_at(block_number).await?;
-                process_ordinal = self.process_ordinal_in_block(index, block_number).await?;
-                archive_height = Some(block_number);
-            }
-
             let expected_event = rkyv_serialize(&events::ProcessId { message_id })?;
-            let transaction_id = contract_event_transaction_id(
-                &archive_events,
-                &self.mailbox_id,
-                events::ProcessId::TOPIC,
-                process_ordinal,
-                &expected_event,
-            )?;
-            process_ordinal += 1;
+            let provenance = self
+                .rues
+                .finalized_contract_event(
+                    &self.mailbox_id,
+                    events::ProcessId::TOPIC,
+                    index as usize,
+                    block_number,
+                    &expected_event,
+                )
+                .await?;
 
             let log_meta = LogMeta {
                 address: self.mailbox_address,
-                block_number,
-                block_hash: archive_block_hash,
-                transaction_id,
+                block_number: provenance.block_height,
+                block_hash: provenance.block_hash,
+                transaction_id: provenance.transaction_id,
                 transaction_index: 0,
                 log_index: U256::from(index),
             };

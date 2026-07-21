@@ -11,6 +11,7 @@ eyre.workspace = true
 hex.workspace = true
 num-traits.workspace = true
 reqwest.workspace = true
+rocksdb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -36,3 +37,6 @@ rkyv = { version = "0.7", features = ["validation"] }
 # Hyperlane core traits
 hyperlane-core = { path = "../../hyperlane-core", features = ["async"] }
 hyperlane-operation-verifier = { path = "../../applications/hyperlane-operation-verifier" }
+
+[dev-dependencies]
+tempfile.workspace = true

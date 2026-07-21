@@ -841,11 +841,7 @@ pub fn build_dusk_connection_conf(
     let url = rpcs.first()?.clone();
     let native_token = parse_native_token(chain, err, 9);
 
-    let raw_chain_id = chain
-        .chain(err)
-        .get_opt_key("chainId")
-        .parse_u64()
-        .unwrap_or(0);
+    let raw_chain_id = chain.chain(err).get_key("chainId").parse_u64().end()?;
     let chain_id = match parse_dusk_chain_id(raw_chain_id) {
         Ok(chain_id) => chain_id,
         Err(message) => {
@@ -853,6 +849,20 @@ pub fn build_dusk_connection_conf(
             return None;
         }
     };
+
+    let event_cursor_dir = chain
+        .chain(err)
+        .get_key("eventCursorDir")
+        .parse_string()
+        .map(std::path::PathBuf::from)
+        .end()?;
+    if event_cursor_dir.as_os_str().is_empty() {
+        err.push(
+            (&chain.cwp).add("eventcursordir"),
+            eyre!("Dusk eventCursorDir must not be empty"),
+        );
+        return None;
+    }
 
     let gas_limit = chain
         .chain(err)
@@ -869,6 +879,7 @@ pub fn build_dusk_connection_conf(
     Some(ChainConnectionConf::Dusk(hyperlane_dusk::ConnectionConf {
         url,
         chain_id,
+        event_cursor_dir,
         gas_limit,
         gas_price,
         native_token,

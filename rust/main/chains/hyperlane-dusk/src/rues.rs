@@ -1,3 +1,7 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
@@ -5,7 +9,8 @@ use rkyv::ser::serializers::AllocSerializer;
 use rkyv::ser::Serializer;
 use rkyv::validation::validators::DefaultValidator;
 use rkyv::{check_archived_root, Archive, Deserialize, Infallible, Serialize};
-use serde::Deserialize as SerdeDeserialize;
+use rocksdb::{Options, WriteBatch, WriteOptions, DB};
+use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 use serde_json::Value as JsonValue;
 use url::Url;
 
@@ -14,7 +19,14 @@ use hyperlane_core::{H256, H512};
 use crate::HyperlaneDuskError;
 
 const MAX_RUES_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const FINALIZED_EVENT_PAGE_SIZE: usize = 16;
+const MAX_FINALIZED_EVENT_STATE_BYTES: usize = 256 * 1024;
+const MAX_TRACKED_EVENT_TOPICS: usize = 256;
+const MAX_EVENT_TOPIC_BYTES: usize = 256;
 const TX_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+type SharedRuesClients = HashMap<(String, PathBuf), RuesClient>;
+static SHARED_RUES_CLIENTS: OnceLock<StdMutex<SharedRuesClients>> = OnceLock::new();
 
 /// RUES (Rusk Unified Event System) HTTP client.
 ///
@@ -25,6 +37,8 @@ const TX_POLL_INTERVAL: Duration = Duration::from_secs(2);
 pub struct RuesClient {
     client: reqwest::Client,
     base_url: String,
+    finalized_event_caches: Arc<tokio::sync::Mutex<HashMap<[u8; 32], FinalizedEventCache>>>,
+    event_store: Option<Arc<DB>>,
 }
 
 /// Account status returned by Rusk for a Moonlight account.
@@ -70,15 +84,42 @@ pub struct ConfirmedTransaction {
     pub error: Option<String>,
 }
 
-/// Raw contract event returned by Rusk's archive GraphQL API.
-#[derive(Debug, Clone, PartialEq, Eq, SerdeDeserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ArchivedContractEvent {
+/// Contract-scoped finalized event returned by Rusk's archive GraphQL API.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeDeserialize, SerdeSerialize)]
+struct FinalizedContractEvent {
+    id: i64,
+    block_height: u64,
+    block_hash: String,
     pub origin: String,
     pub topic: String,
     pub source: String,
     pub data: String,
     pub reverted: bool,
+}
+
+#[derive(Debug, Clone, SerdeDeserialize)]
+#[serde(rename_all = "camelCase")]
+struct FinalizedEventPage {
+    events: Vec<FinalizedContractEvent>,
+    start_cursor: Option<String>,
+    end_cursor: Option<String>,
+    has_next_page: bool,
+}
+
+#[derive(Debug, Clone, Default, SerdeDeserialize, SerdeSerialize)]
+struct FinalizedEventCache {
+    cursor: Option<String>,
+    last_id: Option<i64>,
+    topic_lengths: HashMap<String, usize>,
+}
+
+/// Row-owned provenance for one finalized, state-matched contract event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FinalizedEventProvenance {
+    pub block_height: u64,
+    pub block_hash: H256,
+    pub transaction_id: H512,
+    pub event_id: i64,
 }
 
 impl RuesClient {
@@ -90,7 +131,96 @@ impl RuesClient {
         // Normalize to avoid footguns around missing/extra trailing slashes.
         let base_url = url.to_string();
         let base_url = base_url.trim_end_matches('/').to_string();
-        Ok(Self { client, base_url })
+        Ok(Self {
+            client,
+            base_url,
+            finalized_event_caches: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            event_store: None,
+        })
+    }
+
+    /// Create a RUES client whose contract event cursors survive process
+    /// restart. The configured directory must be owned by one agent process.
+    pub fn new_with_event_cursor_dir(
+        url: Url,
+        event_cursor_dir: PathBuf,
+    ) -> Result<Self, HyperlaneDuskError> {
+        let key = (
+            url.as_str().trim_end_matches('/').to_owned(),
+            event_cursor_dir.clone(),
+        );
+        let shared = SHARED_RUES_CLIENTS.get_or_init(|| StdMutex::new(HashMap::new()));
+        let mut shared = shared.lock().map_err(|_| {
+            HyperlaneDuskError::Other("Shared Dusk RUES client registry is poisoned".into())
+        })?;
+        if let Some(client) = shared.get(&key) {
+            return Ok(client.clone());
+        }
+        let mut options = Options::default();
+        options.create_if_missing(true);
+        let event_store = DB::open(&options, &event_cursor_dir).map_err(|error| {
+            HyperlaneDuskError::Other(format!(
+                "Failed to open exclusive Dusk event cursor store {}: {error}",
+                event_cursor_dir.display()
+            ))
+        })?;
+        let mut client = Self::new(url)?;
+        client.event_store = Some(Arc::new(event_store));
+        shared.insert(key, client.clone());
+        Ok(client)
+    }
+
+    /// Query the native Dusk chain ID from the transfer contract.
+    pub async fn chain_id(&self) -> Result<u8, HyperlaneDuskError> {
+        let mut transfer_contract = [0u8; 32];
+        transfer_contract[0] = 1;
+        let bytes = self
+            .contract_query_raw(&transfer_contract, "chain_id", &[])
+            .await?;
+        match bytes.as_slice() {
+            [chain_id] => Ok(*chain_id),
+            _ => Err(HyperlaneDuskError::Other(format!(
+                "Unexpected Dusk chain_id response length: {}",
+                bytes.len()
+            ))),
+        }
+    }
+
+    /// Validate the endpoint and deployed Hyperlane contracts before an agent
+    /// indexes or submits anything.
+    pub async fn validate_chain_identity(
+        &self,
+        expected_chain_id: u8,
+        expected_domain: u32,
+        mailbox_id: &[u8; 32],
+        validator_announce_id: &[u8; 32],
+    ) -> Result<(), HyperlaneDuskError> {
+        let observed_chain_id = self.chain_id().await?;
+        if observed_chain_id != expected_chain_id {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Configured Dusk chainId {expected_chain_id} does not match endpoint chain ID {observed_chain_id}"
+            )));
+        }
+
+        for (label, contract_id) in [
+            ("Mailbox", mailbox_id),
+            ("ValidatorAnnounce", validator_announce_id),
+        ] {
+            let observed_domain: u32 = self
+                .contract_query(contract_id, "local_domain", &())
+                .await
+                .map_err(|error| {
+                    HyperlaneDuskError::Other(format!(
+                        "Failed to query Dusk {label} local_domain: {error}"
+                    ))
+                })?;
+            if observed_domain != expected_domain {
+                return Err(HyperlaneDuskError::Other(format!(
+                    "Configured Dusk domainId {expected_domain} does not match {label} local_domain {observed_domain}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Query a contract method, sending and receiving raw bytes.
@@ -257,66 +387,338 @@ impl RuesClient {
         Ok(payload.get("data").cloned().unwrap_or(payload))
     }
 
-    /// Return archived contract events emitted in one block.
-    pub(crate) async fn contract_events_at(
+    /// Return one finalized contract event by its topic-local sequence and
+    /// prove its row-owned provenance against finalized block state.
+    pub(crate) async fn finalized_contract_event(
         &self,
-        block_height: u64,
-    ) -> Result<Vec<ArchivedContractEvent>, HyperlaneDuskError> {
-        let query = format!("query {{ contractEvents(height: {block_height}) {{ json }} }}");
-        let data = self.graphql_query(&query).await?;
-        let events = data
-            .get("contractEvents")
+        contract_id: &[u8; 32],
+        topic: &str,
+        sequence: usize,
+        expected_block_height: u64,
+        expected_data: &[u8],
+    ) -> Result<FinalizedEventProvenance, HyperlaneDuskError> {
+        loop {
+            let (cached, cursor, last_id) = {
+                let mut caches = self.finalized_event_caches.lock().await;
+                if !caches.contains_key(contract_id) {
+                    let cache = self.load_finalized_event_cache(contract_id)?;
+                    caches.insert(*contract_id, cache);
+                }
+                let cache = caches.get(contract_id);
+                let cached = match cache
+                    .and_then(|cache| cache.topic_lengths.get(topic))
+                    .is_some_and(|length| sequence < *length)
+                {
+                    true => self.load_finalized_event(contract_id, topic, sequence)?,
+                    false => None,
+                };
+                (
+                    cached,
+                    cache.and_then(|cache| cache.cursor.clone()),
+                    cache.and_then(|cache| cache.last_id),
+                )
+            };
+
+            if let Some(event) = cached {
+                return self
+                    .validate_finalized_event(
+                        contract_id,
+                        topic,
+                        sequence,
+                        expected_block_height,
+                        expected_data,
+                        event,
+                    )
+                    .await;
+            }
+
+            let page = self
+                .finalized_event_page(contract_id, cursor.as_deref())
+                .await?;
+            validate_finalized_event_page(contract_id, cursor.as_deref(), last_id, &page)?;
+            let has_next_page = page.has_next_page;
+
+            // Only one concurrent fetch may advance a contract cursor. If
+            // another task won the race, discard this page and retry from the
+            // now-current cache rather than duplicating rows.
+            let mut caches = self.finalized_event_caches.lock().await;
+            let cache = caches.entry(*contract_id).or_default();
+            if cache.cursor != cursor || cache.last_id != last_id {
+                continue;
+            }
+            let mut candidate = cache.clone();
+            let mut new_rows = Vec::new();
+            let mut cached = None;
+            for event in page.events {
+                candidate.last_id = Some(event.id);
+                if !event.reverted {
+                    let topic_sequence = *candidate.topic_lengths.get(&event.topic).unwrap_or(&0);
+                    if event.topic == topic && topic_sequence == sequence {
+                        cached = Some(event.clone());
+                    }
+                    let next_topic_sequence = topic_sequence.checked_add(1).ok_or_else(|| {
+                        HyperlaneDuskError::Other(
+                            "Dusk finalized-event topic sequence overflow".into(),
+                        )
+                    })?;
+                    candidate
+                        .topic_lengths
+                        .insert(event.topic.clone(), next_topic_sequence);
+                    new_rows.push((event.topic.clone(), topic_sequence, event));
+                }
+            }
+            // An empty caught-up page has no end cursor. Preserve the last
+            // opaque cursor so the next poll asks only for newer rows.
+            candidate.cursor = page.end_cursor.or(cursor);
+            self.persist_finalized_event_page(contract_id, &candidate, &new_rows)?;
+            *cache = candidate;
+
+            if let Some(event) = cached {
+                drop(caches);
+                return self
+                    .validate_finalized_event(
+                        contract_id,
+                        topic,
+                        sequence,
+                        expected_block_height,
+                        expected_data,
+                        event,
+                    )
+                    .await;
+            }
+            if !has_next_page {
+                return Err(HyperlaneDuskError::Other(format!(
+                    "Finalized Dusk event {}/{topic} sequence {sequence} is not archived yet",
+                    hex::encode(contract_id)
+                )));
+            }
+        }
+    }
+
+    fn event_store(&self) -> Result<&DB, HyperlaneDuskError> {
+        self.event_store.as_deref().ok_or_else(|| {
+            HyperlaneDuskError::Other(
+                "Dusk finalized-event indexing requires a durable eventCursorDir".into(),
+            )
+        })
+    }
+
+    fn load_finalized_event_cache(
+        &self,
+        contract_id: &[u8; 32],
+    ) -> Result<FinalizedEventCache, HyperlaneDuskError> {
+        let Some(bytes) = self
+            .event_store()?
+            .get(finalized_event_state_key(contract_id))
+            .map_err(|error| {
+                HyperlaneDuskError::Other(format!(
+                    "Failed to read Dusk finalized-event cursor state: {error}"
+                ))
+            })?
+        else {
+            return Ok(FinalizedEventCache::default());
+        };
+        if bytes.len() > MAX_FINALIZED_EVENT_STATE_BYTES {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Dusk finalized-event cursor state exceeds {MAX_FINALIZED_EVENT_STATE_BYTES} bytes"
+            )));
+        }
+        let cache: FinalizedEventCache = serde_json::from_slice(&bytes).map_err(|error| {
+            HyperlaneDuskError::Other(format!("Failed to decode Dusk event cursor: {error}"))
+        })?;
+        validate_loaded_event_cache(&cache)?;
+        Ok(cache)
+    }
+
+    fn load_finalized_event(
+        &self,
+        contract_id: &[u8; 32],
+        topic: &str,
+        sequence: usize,
+    ) -> Result<Option<FinalizedContractEvent>, HyperlaneDuskError> {
+        let Some(bytes) = self
+            .event_store()?
+            .get(finalized_event_row_key(contract_id, topic, sequence)?)
+            .map_err(|error| {
+                HyperlaneDuskError::Other(format!(
+                    "Failed to read persisted Dusk finalized event: {error}"
+                ))
+            })?
+        else {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Dusk finalized-event cursor references missing row {}/{topic}/{sequence}",
+                hex::encode(contract_id)
+            )));
+        };
+        if bytes.len() > MAX_RUES_RESPONSE_BYTES {
+            return Err(HyperlaneDuskError::Other(
+                "Persisted Dusk finalized event exceeds the transport bound".into(),
+            ));
+        }
+        let event: FinalizedContractEvent = serde_json::from_slice(&bytes).map_err(|error| {
+            HyperlaneDuskError::Other(format!(
+                "Failed to decode persisted Dusk finalized event: {error}"
+            ))
+        })?;
+        validate_persisted_event(contract_id, topic, &event)?;
+        Ok(Some(event))
+    }
+
+    fn persist_finalized_event_page(
+        &self,
+        contract_id: &[u8; 32],
+        cache: &FinalizedEventCache,
+        rows: &[(String, usize, FinalizedContractEvent)],
+    ) -> Result<(), HyperlaneDuskError> {
+        validate_loaded_event_cache(cache)?;
+        let state = serde_json::to_vec(cache).map_err(|error| {
+            HyperlaneDuskError::Other(format!("Failed to encode Dusk event cursor: {error}"))
+        })?;
+        if state.len() > MAX_FINALIZED_EVENT_STATE_BYTES {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Dusk finalized-event cursor state exceeds {MAX_FINALIZED_EVENT_STATE_BYTES} bytes"
+            )));
+        }
+
+        let mut batch = WriteBatch::default();
+        for (topic, sequence, event) in rows {
+            let bytes = serde_json::to_vec(event).map_err(|error| {
+                HyperlaneDuskError::Other(format!("Failed to encode Dusk finalized event: {error}"))
+            })?;
+            if bytes.len() > MAX_RUES_RESPONSE_BYTES {
+                return Err(HyperlaneDuskError::Other(
+                    "Dusk finalized event exceeds the transport bound".into(),
+                ));
+            }
+            batch.put(
+                finalized_event_row_key(contract_id, topic, *sequence)?,
+                bytes,
+            );
+        }
+        batch.put(finalized_event_state_key(contract_id), state);
+        let mut write_options = WriteOptions::default();
+        write_options.set_sync(true);
+        self.event_store()?
+            .write_opt(batch, &write_options)
+            .map_err(|error| {
+                HyperlaneDuskError::Other(format!(
+                    "Failed to atomically persist Dusk finalized-event page: {error}"
+                ))
+            })
+    }
+
+    async fn finalized_event_page(
+        &self,
+        contract_id: &[u8; 32],
+        cursor: Option<&str>,
+    ) -> Result<FinalizedEventPage, HyperlaneDuskError> {
+        let cursor_argument = match cursor {
+            Some(cursor) => format!(
+                ", cursor: {}",
+                serde_json::to_string(cursor).map_err(|error| {
+                    HyperlaneDuskError::Other(format!(
+                        "Failed to encode finalizedEvents cursor: {error}"
+                    ))
+                })?
+            ),
+            None => String::new(),
+        };
+        let query = format!(
+            "query {{ finalizedEvents(contractId: \"{}\", limit: {FINALIZED_EVENT_PAGE_SIZE}{cursor_argument}) {{ json }} }}",
+            hex::encode(contract_id)
+        );
+        let data = self.graphql_query(&query).await.map_err(|error| {
+            HyperlaneDuskError::Other(format!(
+                "Dusk endpoint does not provide usable archive finalizedEvents pagination: {error}"
+            ))
+        })?;
+        let page = data
+            .get("finalizedEvents")
             .and_then(|events| events.get("json"))
             .ok_or_else(|| {
                 HyperlaneDuskError::Other(format!(
-                    "Rusk archive response is missing contractEvents.json at block {block_height}: {data}"
+                    "Rusk archive response is missing finalizedEvents.json: {data}"
                 ))
             })?;
-        serde_json::from_value(events.clone()).map_err(|error| {
+        serde_json::from_value(page.clone()).map_err(|error| {
             HyperlaneDuskError::Other(format!(
-                "Failed to decode archived contract events at block {block_height}: {error}"
+                "Failed to decode Rusk finalizedEvents page: {error}"
             ))
         })
     }
 
-    /// Resolve a canonical block hash by height.
-    pub(crate) async fn block_hash_at(
+    async fn validate_finalized_event(
         &self,
-        block_height: u64,
-    ) -> Result<H256, HyperlaneDuskError> {
-        let query =
-            format!("query {{ block(height: {block_height}) {{ header {{ height hash }} }} }}");
-        let data = self.graphql_query(&query).await?;
-        let header = data
-            .get("block")
-            .and_then(|block| block.get("header"))
-            .ok_or_else(|| {
-                HyperlaneDuskError::Other(format!(
-                    "GraphQL block response is missing header at height {block_height}: {data}"
-                ))
-            })?;
-        let returned_height = header
-            .get("height")
-            .and_then(JsonValue::as_u64)
-            .ok_or_else(|| {
-                HyperlaneDuskError::Other(format!(
-                    "GraphQL block response is missing numeric header.height at requested height {block_height}: {data}"
-                ))
-            })?;
-        if returned_height != block_height {
+        contract_id: &[u8; 32],
+        topic: &str,
+        sequence: usize,
+        expected_block_height: u64,
+        expected_data: &[u8],
+        event: FinalizedContractEvent,
+    ) -> Result<FinalizedEventProvenance, HyperlaneDuskError> {
+        if event.reverted || event.topic != topic {
             return Err(HyperlaneDuskError::Other(format!(
-                "GraphQL block lookup requested height {block_height} but returned {returned_height}"
+                "Finalized Dusk event {}/{topic} sequence {sequence} is reverted or has the wrong topic",
+                hex::encode(contract_id)
             )));
         }
-        let hash = header
-            .get("hash")
-            .and_then(JsonValue::as_str)
-            .ok_or_else(|| {
+        if event.block_height != expected_block_height {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Finalized Dusk event {}/{topic} sequence {sequence} has block height {}, contract state says {expected_block_height}",
+                hex::encode(contract_id),
+                event.block_height
+            )));
+        }
+        let data = hex::decode(strip_hex_prefix(&event.data)).map_err(|error| {
+            HyperlaneDuskError::Other(format!(
+                "Finalized Dusk event {}/{topic} sequence {sequence} has invalid data: {error}",
+                hex::encode(contract_id)
+            ))
+        })?;
+        if data != expected_data {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Finalized Dusk event {}/{topic} sequence {sequence} does not match contract state",
+                hex::encode(contract_id)
+            )));
+        }
+
+        let block_hash = parse_h256_hex(&event.block_hash, "finalized event block hash")?;
+        let encoded_block_hash = serde_json::to_string(strip_hex_prefix(&event.block_hash))
+            .map_err(|error| {
                 HyperlaneDuskError::Other(format!(
-                    "GraphQL block response is missing header.hash at height {block_height}: {data}"
+                    "Failed to encode finalized event block hash: {error}"
                 ))
             })?;
-        parse_h256_hex(hash, "block hash")
+        let check_query = format!(
+            "query {{ checkBlock(height: {}, hash: {encoded_block_hash}, onlyFinalized: true) }}",
+            event.block_height
+        );
+        let checked = self
+            .graphql_query(&check_query)
+            .await?
+            .get("checkBlock")
+            .and_then(JsonValue::as_bool)
+            .ok_or_else(|| {
+                HyperlaneDuskError::Other(
+                    "Rusk checkBlock response is missing a boolean result".into(),
+                )
+            })?;
+        if !checked {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Finalized Dusk event block {}/{} failed checkBlock",
+                event.block_height, event.block_hash
+            )));
+        }
+
+        let origin = parse_h256_hex(&event.origin, "finalized event origin")?;
+        let mut transaction_id = [0u8; 64];
+        transaction_id[32..].copy_from_slice(origin.as_bytes());
+        Ok(FinalizedEventProvenance {
+            block_height: event.block_height,
+            block_hash,
+            transaction_id: H512::from(transaction_id),
+            event_id: event.id,
+        })
     }
 
     /// Return the latest block height finalized by the node's consensus view.
@@ -591,43 +993,132 @@ fn parse_finalized_block_height(data: &JsonValue) -> Result<u64, HyperlaneDuskEr
     Ok(finalized)
 }
 
-pub(crate) fn contract_event_transaction_id(
-    events: &[ArchivedContractEvent],
+fn validate_finalized_event_page(
     contract_id: &[u8; 32],
-    topic: &str,
-    ordinal: usize,
-    expected_data: &[u8],
-) -> Result<H512, HyperlaneDuskError> {
+    requested_cursor: Option<&str>,
+    previous_id: Option<i64>,
+    page: &FinalizedEventPage,
+) -> Result<(), HyperlaneDuskError> {
     let source = hex::encode(contract_id);
-    let event = events
-        .iter()
-        .filter(|event| {
-            !event.reverted
-                && event.topic == topic
-                && strip_hex_prefix(&event.source).eq_ignore_ascii_case(&source)
-        })
-        .nth(ordinal)
-        .ok_or_else(|| {
-            HyperlaneDuskError::Other(format!(
-                "Archived event {source}/{topic} ordinal {ordinal} was not found"
-            ))
-        })?;
-
-    let data = hex::decode(strip_hex_prefix(&event.data)).map_err(|error| {
-        HyperlaneDuskError::Other(format!(
-            "Archived event {source}/{topic} has invalid hex data: {error}"
-        ))
-    })?;
-    if data != expected_data {
+    if page.events.len() > FINALIZED_EVENT_PAGE_SIZE {
         return Err(HyperlaneDuskError::Other(format!(
-            "Archived event {source}/{topic} ordinal {ordinal} does not match contract state"
+            "Rusk finalizedEvents returned {} rows above requested limit {FINALIZED_EVENT_PAGE_SIZE}",
+            page.events.len()
+        )));
+    }
+    if page.events.is_empty() {
+        if page.has_next_page || page.start_cursor.is_some() || page.end_cursor.is_some() {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Rusk finalizedEvents returned an inconsistent empty page for {source}"
+            )));
+        }
+        return Ok(());
+    }
+    if page.start_cursor.is_none() || page.end_cursor.is_none() {
+        return Err(HyperlaneDuskError::Other(format!(
+            "Rusk finalizedEvents omitted page cursors for {source}"
+        )));
+    }
+    if requested_cursor == page.end_cursor.as_deref() {
+        return Err(HyperlaneDuskError::Other(format!(
+            "Rusk finalizedEvents did not advance the cursor for {source}"
         )));
     }
 
-    let origin = parse_h256_hex(&event.origin, "contract event origin")?;
-    let mut transaction_id = [0u8; 64];
-    transaction_id[32..].copy_from_slice(origin.as_bytes());
-    Ok(H512::from(transaction_id))
+    let mut last_id = previous_id;
+    for event in &page.events {
+        if event.topic.is_empty() || event.topic.len() > MAX_EVENT_TOPIC_BYTES {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Rusk finalizedEvents returned an empty or oversized topic for {source}"
+            )));
+        }
+        if event.id < 0 || last_id.is_some_and(|last_id| event.id <= last_id) {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Rusk finalizedEvents returned a non-monotonic event ID {} for {source}",
+                event.id
+            )));
+        }
+        if !strip_hex_prefix(&event.source).eq_ignore_ascii_case(&source) {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Rusk finalizedEvents returned source {} while querying {source}",
+                event.source
+            )));
+        }
+        last_id = Some(event.id);
+    }
+    Ok(())
+}
+
+fn validate_loaded_event_cache(cache: &FinalizedEventCache) -> Result<(), HyperlaneDuskError> {
+    if cache.last_id.is_some() && cache.cursor.is_none() {
+        return Err(HyperlaneDuskError::Other(
+            "Dusk event cursor has rows but no opaque archive cursor".into(),
+        ));
+    }
+    if cache.topic_lengths.len() > MAX_TRACKED_EVENT_TOPICS {
+        return Err(HyperlaneDuskError::Other(format!(
+            "Dusk event cursor tracks more than {MAX_TRACKED_EVENT_TOPICS} topics"
+        )));
+    }
+    for topic in cache.topic_lengths.keys() {
+        if topic.is_empty() || topic.len() > MAX_EVENT_TOPIC_BYTES {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Dusk event cursor contains an empty or oversized topic (maximum {MAX_EVENT_TOPIC_BYTES} bytes)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_persisted_event(
+    contract_id: &[u8; 32],
+    topic: &str,
+    event: &FinalizedContractEvent,
+) -> Result<(), HyperlaneDuskError> {
+    let source = hex::encode(contract_id);
+    if event.reverted
+        || event.topic != topic
+        || !strip_hex_prefix(&event.source).eq_ignore_ascii_case(&source)
+        || event.id < 0
+    {
+        return Err(HyperlaneDuskError::Other(format!(
+            "Persisted Dusk finalized event has invalid {source}/{topic} provenance"
+        )));
+    }
+    parse_h256_hex(&event.block_hash, "persisted finalized event block hash")?;
+    parse_h256_hex(&event.origin, "persisted finalized event origin")?;
+    hex::decode(strip_hex_prefix(&event.data)).map_err(|error| {
+        HyperlaneDuskError::Other(format!(
+            "Persisted Dusk finalized event contains invalid data: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+fn finalized_event_state_key(contract_id: &[u8; 32]) -> Vec<u8> {
+    let mut key = b"dusk-finalized-state-v1:".to_vec();
+    key.extend_from_slice(contract_id);
+    key
+}
+
+fn finalized_event_row_key(
+    contract_id: &[u8; 32],
+    topic: &str,
+    sequence: usize,
+) -> Result<Vec<u8>, HyperlaneDuskError> {
+    if topic.is_empty() || topic.len() > MAX_EVENT_TOPIC_BYTES {
+        return Err(HyperlaneDuskError::Other(format!(
+            "Dusk event topic must contain 1..={MAX_EVENT_TOPIC_BYTES} bytes"
+        )));
+    }
+    let sequence = u64::try_from(sequence)
+        .map_err(|_| HyperlaneDuskError::Other("Dusk event sequence does not fit in u64".into()))?;
+    let topic_hash = hyperlane_dusk_types::message::keccak256(topic.as_bytes());
+    let mut key = b"dusk-finalized-row-v1:".to_vec();
+    key.extend_from_slice(contract_id);
+    key.extend_from_slice(&topic_hash);
+    key.extend_from_slice(&sequence.to_be_bytes());
+    Ok(key)
 }
 
 fn transaction_query(tx_id: &str) -> String {
@@ -783,6 +1274,14 @@ mod tests {
         Url::parse(&format!("http://{address}")).unwrap()
     }
 
+    fn test_client_with_event_store(url: Url, path: &std::path::Path) -> RuesClient {
+        let mut options = Options::default();
+        options.create_if_missing(true);
+        let mut client = RuesClient::new(url).unwrap();
+        client.event_store = Some(Arc::new(DB::open(&options, path).unwrap()));
+        client
+    }
+
     fn oversized_response_server() -> Url {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -905,47 +1404,145 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn block_hash_lookup_rejects_a_mismatched_returned_height() {
-        let url = test_server(vec![(
-            200,
-            r#"{"block":{"header":{"height":8,"hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}"#,
-        )]);
-        let client = RuesClient::new(url).unwrap();
-        let error = client.block_hash_at(7).await.unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("requested height 7 but returned 8"));
+    async fn finalized_events_use_row_owned_provenance_and_durable_cursor() {
+        let contract_id = [7u8; 32];
+        let expected_data = vec![1, 2, 3];
+        let origin = [9u8; 32];
+        let block_hash = [8u8; 32];
+        let page = serde_json::json!({
+            "finalizedEvents": {
+                "json": {
+                    "events": [{
+                        "id": 11,
+                        "block_height": 7,
+                        "block_hash": hex::encode(block_hash),
+                        "origin": hex::encode(origin),
+                        "topic": "dispatch",
+                        "source": hex::encode(contract_id),
+                        "data": hex::encode(&expected_data),
+                        "reverted": false
+                    }],
+                    "startCursor": "djE6MTE=",
+                    "endCursor": "djE6MTE=",
+                    "hasNextPage": false
+                }
+            }
+        })
+        .to_string();
+        let page: &'static str = Box::leak(page.into_boxed_str());
+        let url = test_server(vec![(200, page), (200, r#"{"checkBlock":true}"#)]);
+        let cursor_dir = tempfile::tempdir().unwrap();
+        let store_path = cursor_dir.path().join("event-store");
+        let client = test_client_with_event_store(url, &store_path);
+        let provenance = client
+            .finalized_contract_event(&contract_id, "dispatch", 0, 7, &expected_data)
+            .await
+            .unwrap();
+        assert_eq!(provenance.block_hash, H256::from(block_hash));
+        assert_eq!(&provenance.transaction_id.as_bytes()[32..], &origin);
+        assert_eq!(provenance.event_id, 11);
+        assert!(store_path.join("CURRENT").is_file());
+        drop(client);
+
+        // A fresh client loads the opaque cursor and row mapping rather than
+        // requesting finalizedEvents from genesis again. It performs only the
+        // row's finalized checkBlock validation.
+        let url = test_server(vec![(200, r#"{"checkBlock":true}"#)]);
+        let restarted = test_client_with_event_store(url, &store_path);
+        let replayed = restarted
+            .finalized_contract_event(&contract_id, "dispatch", 0, 7, &expected_data)
+            .await
+            .unwrap();
+        assert_eq!(replayed, provenance);
+    }
+
+    #[tokio::test]
+    async fn caught_up_finalized_cursor_can_index_later_events() {
+        let contract_id = [7u8; 32];
+        let source = hex::encode(contract_id);
+        let first_data = vec![1u8];
+        let second_data = vec![2u8];
+        let first_page = serde_json::json!({
+            "finalizedEvents": { "json": {
+                "events": [{
+                    "id": 11,
+                    "block_height": 7,
+                    "block_hash": hex::encode([8u8; 32]),
+                    "origin": hex::encode([9u8; 32]),
+                    "topic": "dispatch",
+                    "source": source,
+                    "data": hex::encode(&first_data),
+                    "reverted": false
+                }],
+                "startCursor": "djE6MTE=",
+                "endCursor": "djE6MTE=",
+                "hasNextPage": false
+            }}
+        })
+        .to_string();
+        let second_page = serde_json::json!({
+            "finalizedEvents": { "json": {
+                "events": [{
+                    "id": 12,
+                    "block_height": 8,
+                    "block_hash": hex::encode([10u8; 32]),
+                    "origin": hex::encode([11u8; 32]),
+                    "topic": "dispatch",
+                    "source": hex::encode(contract_id),
+                    "data": hex::encode(&second_data),
+                    "reverted": false
+                }],
+                "startCursor": "djE6MTI=",
+                "endCursor": "djE6MTI=",
+                "hasNextPage": false
+            }}
+        })
+        .to_string();
+        let first_page: &'static str = Box::leak(first_page.into_boxed_str());
+        let second_page: &'static str = Box::leak(second_page.into_boxed_str());
+        let cursor_dir = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(
+            test_server(vec![
+                (200, first_page),
+                (200, r#"{"checkBlock":true}"#),
+                (200, second_page),
+                (200, r#"{"checkBlock":true}"#),
+            ]),
+            cursor_dir.path(),
+        );
+
+        client
+            .finalized_contract_event(&contract_id, "dispatch", 0, 7, &first_data)
+            .await
+            .unwrap();
+        let later = client
+            .finalized_contract_event(&contract_id, "dispatch", 1, 8, &second_data)
+            .await
+            .unwrap();
+        assert_eq!(later.event_id, 12);
     }
 
     #[test]
-    fn archived_event_selection_preserves_real_transaction_origin_and_order() {
+    fn finalized_event_pages_reject_cursor_rollback_and_wrong_source() {
         let contract_id = [7u8; 32];
-        let expected_data = vec![1, 2, 3];
-        let first_origin = [8u8; 32];
-        let second_origin = [9u8; 32];
-        let events = vec![
-            ArchivedContractEvent {
-                origin: format!("0x{}", hex::encode(first_origin)),
-                topic: "dispatch".into(),
-                source: format!("0x{}", hex::encode(contract_id)),
-                data: format!("0x{}", hex::encode(&expected_data)),
-                reverted: false,
-            },
-            ArchivedContractEvent {
-                origin: hex::encode(second_origin),
-                topic: "dispatch".into(),
-                source: hex::encode(contract_id),
-                data: hex::encode(&expected_data),
-                reverted: false,
-            },
-        ];
-
-        let transaction_id =
-            contract_event_transaction_id(&events, &contract_id, "dispatch", 1, &expected_data)
-                .unwrap();
-        assert_eq!(&transaction_id.as_bytes()[32..], &second_origin);
+        let event = FinalizedContractEvent {
+            id: 10,
+            block_height: 7,
+            block_hash: hex::encode([8u8; 32]),
+            origin: hex::encode([9u8; 32]),
+            topic: "dispatch".into(),
+            source: hex::encode([6u8; 32]),
+            data: String::new(),
+            reverted: false,
+        };
+        let page = FinalizedEventPage {
+            events: vec![event],
+            start_cursor: Some("same".into()),
+            end_cursor: Some("same".into()),
+            has_next_page: true,
+        };
         assert!(
-            contract_event_transaction_id(&events, &contract_id, "dispatch", 0, b"wrong").is_err()
+            validate_finalized_event_page(&contract_id, Some("same"), Some(10), &page).is_err()
         );
     }
 
@@ -957,5 +1554,17 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("Invalid Dusk transaction ID"));
+    }
+
+    #[tokio::test]
+    async fn endpoint_chain_id_mismatch_fails_before_contract_queries() {
+        let client = RuesClient::new(test_server(vec![(200, "\u{2}")])).unwrap();
+        let error = client
+            .validate_chain_identity(1, 4242, &[3u8; 32], &[4u8; 32])
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match endpoint chain ID 2"));
     }
 }

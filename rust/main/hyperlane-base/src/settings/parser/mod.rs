@@ -23,7 +23,7 @@ use hyperlane_core::matching_list::MatchingList;
 use h_cosmos::RawCosmosAmount;
 use hyperlane_core::{
     cfg_unwrap_all, config::*, HyperlaneDomain, HyperlaneDomainProtocol,
-    HyperlaneDomainTechnicalStack, IndexMode, NativeToken, ReorgPeriod, SubmitterType, H256,
+    HyperlaneDomainTechnicalStack, IndexMode, NativeToken, ReorgPeriod, SubmitterType,
 };
 
 use crate::settings::{
@@ -456,18 +456,31 @@ fn parse_domain(chain: ValueParser, name: &str) -> ConfigResult<HyperlaneDomain>
     }
     .take_err(&mut err, || (&chain.cwp).add("name"));
 
-    let domain_id = chain
+    let explicit_domain_id = chain
         .chain(&mut err)
         .get_opt_key("domainId")
         .parse_u32()
-        .end()
-        .or_else(|| chain.chain(&mut err).get_key("chainId").parse_u32().end());
+        .end();
 
     let protocol = chain
         .chain(&mut err)
         .get_key("protocol")
         .parse_from_str::<HyperlaneDomainProtocol>("Invalid Hyperlane domain protocol")
         .end();
+
+    let domain_id = match protocol {
+        Some(HyperlaneDomainProtocol::Dusk) => {
+            if explicit_domain_id.is_none() {
+                err.push(
+                    (&chain.cwp).add("domainid"),
+                    eyre!("Dusk chains require an explicit `domainId`; native `chainId` is not a Hyperlane domain"),
+                );
+            }
+            explicit_domain_id
+        }
+        _ => explicit_domain_id
+            .or_else(|| chain.chain(&mut err).get_key("chainId").parse_u32().end()),
+    };
 
     let technical_stack = chain
         .chain(&mut err)
@@ -589,7 +602,8 @@ fn parse_signer(signer: ValueParser) -> ConfigResult<SignerConf> {
             let inline_key = signer
                 .chain(&mut err)
                 .get_opt_key("key")
-                .parse_private_key()
+                .parse_string()
+                .map(str::to_owned)
                 .end();
             let key_file = signer
                 .chain(&mut err)
@@ -621,9 +635,7 @@ fn parse_signer(signer: ValueParser) -> ConfigResult<SignerConf> {
             } else if let Some(var) = key_env {
                 DuskSignerKeyConf::Env { var }
             } else {
-                DuskSignerKeyConf::Inline {
-                    key: H256::default(),
-                }
+                DuskSignerKeyConf::Inline { key: String::new() }
             };
 
             err.into_result(SignerConf::DuskKey { key })
@@ -878,5 +890,35 @@ mod test {
             HyperlaneDomainProtocol::Ethereum,
             IndexMode::Block
         ));
+    }
+
+    #[test]
+    fn dusk_requires_domain_id_distinct_from_native_chain_id() {
+        let missing_domain = json!({
+            "name": "dusk-test",
+            "chainid": 1,
+            "protocol": "dusk"
+        });
+        assert!(parse_domain(
+            ValueParser::new(Default::default(), &missing_domain),
+            "dusk-test"
+        )
+        .is_err());
+
+        let explicit_domain = json!({
+            "name": "dusk-test",
+            "domainid": 4242,
+            "chainid": 1,
+            "protocol": "dusk"
+        });
+        assert_eq!(
+            parse_domain(
+                ValueParser::new(Default::default(), &explicit_domain),
+                "dusk-test"
+            )
+            .unwrap()
+            .id(),
+            4242
+        );
     }
 }

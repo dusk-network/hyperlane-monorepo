@@ -10,7 +10,7 @@ use hyperlane_core::{
 };
 use hyperlane_dusk_types::events;
 
-use crate::rues::{contract_event_transaction_id, rkyv_serialize, ArchivedContractEvent};
+use crate::rues::rkyv_serialize;
 use crate::tx_sender::{dusk_tx_id_to_h512, h512_to_dusk_tx_id};
 use crate::RuesClient;
 
@@ -53,17 +53,6 @@ impl DuskMerkleTreeHookIndexer {
         Ok(low)
     }
 
-    async fn insertion_ordinal_in_block(
-        &self,
-        sequence: u32,
-        block_height: u64,
-    ) -> ChainResult<usize> {
-        let first = self
-            .first_insertion_at_or_after(sequence + 1, block_height)
-            .await?;
-        Ok((sequence - first) as usize)
-    }
-
     async fn insertion_range_at_block(
         &self,
         count: u32,
@@ -102,10 +91,6 @@ impl Indexer<MerkleTreeInsertion> for DuskMerkleTreeHookIndexer {
             .await?;
         let (finalized_count, _) = self.finalized_insertion_count(count).await?;
         let mut results = Vec::new();
-        let mut archive_height = None;
-        let mut archive_events = Vec::<ArchivedContractEvent>::new();
-        let mut archive_block_hash = H256::zero();
-        let mut insertion_ordinal = 0usize;
 
         for index in range {
             if index >= finalized_count {
@@ -118,30 +103,25 @@ impl Indexer<MerkleTreeInsertion> for DuskMerkleTreeHookIndexer {
             let block_number = self.insertion_height(index).await?;
             ensure_cursor_height(block_number)?;
 
-            if archive_height != Some(block_number) {
-                archive_events = self.rues.contract_events_at(block_number).await?;
-                archive_block_hash = self.rues.block_hash_at(block_number).await?;
-                insertion_ordinal = self.insertion_ordinal_in_block(index, block_number).await?;
-                archive_height = Some(block_number);
-            }
-
             let expected_event = rkyv_serialize(&events::InsertedIntoTree { message_id, index })?;
-            let transaction_id = contract_event_transaction_id(
-                &archive_events,
-                &self.hook_id,
-                events::InsertedIntoTree::TOPIC,
-                insertion_ordinal,
-                &expected_event,
-            )?;
-            insertion_ordinal += 1;
+            let provenance = self
+                .rues
+                .finalized_contract_event(
+                    &self.hook_id,
+                    events::InsertedIntoTree::TOPIC,
+                    index as usize,
+                    block_number,
+                    &expected_event,
+                )
+                .await?;
 
             let insertion = MerkleTreeInsertion::new(index, H256::from_slice(&message_id));
             let indexed = Indexed::from(insertion).with_sequence(index);
             let meta = LogMeta {
                 address: self.hook_address,
-                block_number,
-                block_hash: archive_block_hash,
-                transaction_id,
+                block_number: provenance.block_height,
+                block_hash: provenance.block_hash,
+                transaction_id: provenance.transaction_id,
                 transaction_index: 0,
                 log_index: U256::from(index),
             };

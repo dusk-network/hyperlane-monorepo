@@ -1,4 +1,11 @@
-use std::{fmt::Debug, sync::Arc, time::Duration};
+use std::{
+    fmt::Debug,
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use eyre::Result;
@@ -354,12 +361,17 @@ async fn reorg_is_detected_and_persisted_to_checkpoint_storage() {
     // expect the checkpoint syncer to post the reorg event to the checkpoint storage
     // and not submit any checkpoints (this is checked implicitly, by not setting any `expect`s)
     let unix_timestamp = chrono::Utc::now().timestamp() as u64;
+    let fail_stop_order = Arc::new(AtomicU8::new(0));
     let mut mock_checkpoint_syncer = MockCheckpointSyncer::new();
     let mock_onchain_merkle_tree_clone = mock_onchain_merkle_tree.clone();
+    let write_order = fail_stop_order.clone();
     mock_checkpoint_syncer
         .expect_write_reorg_status()
         .once()
         .returning(move |reorg_event| {
+            write_order
+                .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                .expect("reorg fail-stop flag must be the first side effect");
             // unit test correctness criteria
             reorg_event_is_correct(
                 reorg_event,
@@ -377,10 +389,15 @@ async fn reorg_is_detected_and_persisted_to_checkpoint_storage() {
         .into();
 
     let mut mock_reorg_reporter = MockReorgReporter::new();
+    let report_order = fail_stop_order.clone();
     mock_reorg_reporter
         .expect_report_at_block()
         .once()
-        .return_once(|_| {});
+        .return_once(move |_| {
+            report_order
+                .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
+                .expect("reorg diagnostics ran before the fail-stop flag was durable");
+        });
 
     // instantiate the validator submitter
     let validator_submitter = ValidatorSubmitter::new(

@@ -15,7 +15,7 @@ use rusoto_core::Region;
 use rusoto_kms::KmsClient;
 use tracing::instrument;
 
-use hyperlane_core::{utils::hex_or_base58_or_bech32_to_h256, AccountAddressType, H256};
+use hyperlane_core::{AccountAddressType, H256};
 
 use super::aws_credentials::AwsChainCredentialsProvider;
 use crate::types::utils;
@@ -74,7 +74,7 @@ pub enum DuskSignerKeyConf {
     /// dev only; prefer File or Env for review/CI configs.
     Inline {
         /// Private key value
-        key: H256,
+        key: String,
     },
     /// Path to a file containing hex/base58/bech32 raw key material.
     File {
@@ -104,7 +104,9 @@ impl fmt::Debug for DuskSignerKeyConf {
 impl DuskSignerKeyConf {
     fn resolve(&self) -> Result<H256, Report> {
         match self {
-            Self::Inline { key } => Ok(*key),
+            Self::Inline { key } => {
+                Self::parse_key_material(key).context("Invalid inline Dusk signer key")
+            }
             Self::File { path } => {
                 let key = Self::read_key_file(path)?;
                 Self::parse_key_material(&key)
@@ -165,8 +167,33 @@ impl DuskSignerKeyConf {
         if key.is_empty() {
             bail!("Dusk signer key material is empty");
         }
-        hex_or_base58_or_bech32_to_h256(key)
-            .context("Expected a valid Dusk signer key in hex, base58, or bech32")
+
+        // Dusk signer material is a BLS scalar, not an address. Do not use the
+        // shared address parser here: it accepts 20-byte EVM values, Tron
+        // addresses, and short bech32 values by left-padding them to H256.
+        let bytes = if let Some(hex_key) = key.strip_prefix("0x").or_else(|| key.strip_prefix("0X"))
+        {
+            hex::decode(hex_key).context("Invalid hexadecimal Dusk signer key")?
+        } else if key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            hex::decode(key).context("Invalid hexadecimal Dusk signer key")?
+        } else if let Ok((_, decoded)) = bech32::decode(key) {
+            decoded
+        } else {
+            bs58::decode(key)
+                .into_vec()
+                .context("Invalid base58 Dusk signer key")?
+        };
+
+        let key: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
+            eyre::eyre!(
+                "Dusk signer key must decode to exactly 32 bytes, got {}",
+                bytes.len()
+            )
+        })?;
+        if key == [0u8; 32] {
+            bail!("Dusk signer key must be nonzero");
+        }
+        Ok(H256::from(key))
     }
 }
 
@@ -502,6 +529,35 @@ mod tests {
 
     use super::resolve_kms_region;
     use crate::settings::{ChainSigner, SignerConf};
+
+    #[test]
+    fn dusk_key_decoder_rejects_address_padding_and_invalid_scalars() {
+        use crate::settings::signers::DuskSignerKeyConf;
+
+        let valid = DuskSignerKeyConf::Inline {
+            key: format!("0x{}", "11".repeat(32)),
+        }
+        .resolve()
+        .expect("32-byte key must parse");
+        hyperlane_dusk::DuskSigner::new(valid).expect("canonical nonzero scalar must build");
+
+        for invalid in [
+            format!("0x{}", "11".repeat(20)),
+            bs58::encode([0x41u8; 25]).into_string(),
+            format!("0x{}", "00".repeat(32)),
+        ] {
+            assert!(DuskSignerKeyConf::Inline { key: invalid }
+                .resolve()
+                .is_err());
+        }
+
+        let noncanonical = DuskSignerKeyConf::Inline {
+            key: format!("0x{}", "ff".repeat(32)),
+        }
+        .resolve()
+        .expect("length validation should pass");
+        assert!(hyperlane_dusk::DuskSigner::new(noncanonical).is_err());
+    }
 
     /// Exercises the exact coalescing mechanism `build_aws_signer` relies on
     /// (`moka::future::Cache::try_get_with`) against a fake, always-failing initializer -

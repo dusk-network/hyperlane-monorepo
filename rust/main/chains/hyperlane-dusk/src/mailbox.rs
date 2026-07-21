@@ -18,7 +18,7 @@ use crate::{ConnectionConf, DuskProvider, DuskSigner, HyperlaneDuskError, RuesCl
 const TX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(120);
 const MERKLE_HISTORY_PAGE_SIZE: u32 = 256;
 
-/// Dusk Mailbox — implements both `Mailbox` and `MerkleTreeHook` traits.
+/// Dusk Mailbox contract adapter.
 #[derive(Debug, Clone)]
 pub struct DuskMailbox {
     provider: Arc<DuskProvider>,
@@ -203,6 +203,39 @@ impl HyperlaneContract for DuskMailbox {
     }
 }
 
+/// Identity-correct MerkleTreeHook adapter.
+///
+/// The Mailbox and hook share query helpers, but Hyperlane checkpoints bind to
+/// the hook contract address. Returning the Mailbox identity here creates a
+/// deterministic false-reorg at validator startup.
+#[derive(Debug, Clone)]
+pub struct DuskMerkleTreeHook {
+    inner: DuskMailbox,
+}
+
+impl DuskMerkleTreeHook {
+    /// Create a hook adapter over the same Dusk connection and topology.
+    pub fn new(inner: DuskMailbox) -> Self {
+        Self { inner }
+    }
+}
+
+impl HyperlaneChain for DuskMerkleTreeHook {
+    fn domain(&self) -> &HyperlaneDomain {
+        self.inner.domain()
+    }
+
+    fn provider(&self) -> Box<dyn HyperlaneProvider> {
+        self.inner.provider()
+    }
+}
+
+impl HyperlaneContract for DuskMerkleTreeHook {
+    fn address(&self) -> H256 {
+        H256::from_slice(&self.inner.merkle_tree_hook_id)
+    }
+}
+
 #[async_trait]
 impl Mailbox for DuskMailbox {
     fn domain_hash(&self) -> H256 {
@@ -337,34 +370,12 @@ impl Mailbox for DuskMailbox {
         message: &HyperlaneMessage,
         metadata: &Metadata,
     ) -> ChainResult<TxCostEstimate> {
-        let signer = self
-            .signer
-            .as_ref()
-            .ok_or(HyperlaneDuskError::SignerUnavailable)?;
+        // Current Rusk simulation accepts an ordinary signed transaction that
+        // a remote endpoint can replay through propagation. Until consensus
+        // has a non-propagatable simulation envelope, validate the payload
+        // locally and return the configured conservative ceiling.
         let encoded = Self::encode_message(message);
-        let args = crate::tx_sender::process_args(metadata, &encoded)?;
-        let simulation = crate::tx_sender::dusk_tx_simulate_call(
-            &self.conn,
-            signer,
-            &self.mailbox_id,
-            "process",
-            &args,
-            None,
-        )
-        .await?;
-        let gas_spent = simulation
-            .get("gas_spent")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| {
-                HyperlaneDuskError::Other(format!(
-                    "dusk-tx simulation response is missing numeric gas_spent: {simulation}"
-                ))
-            })?;
-        info!(message_id = ?message.id(), gas_spent, "Dusk process simulation succeeded");
-
-        // Preserve the configured transaction ceiling for gas-payment policy
-        // and final submission. The simulation above is the payload-dependent
-        // revert gate; its measured gas is recorded for diagnostics.
+        crate::tx_sender::process_args(metadata, &encoded)?;
         Ok(TxCostEstimate {
             gas_limit: U256::from(self.conn.gas_limit),
             gas_price: FixedPointNumber::from(self.conn.gas_price),
@@ -387,33 +398,75 @@ impl Mailbox for DuskMailbox {
     }
 }
 
-// Also implement MerkleTreeHook, since the Dusk mailbox struct holds
-// both mailbox and merkle tree hook contract IDs.
 #[async_trait]
-impl MerkleTreeHook for DuskMailbox {
+impl MerkleTreeHook for DuskMerkleTreeHook {
     async fn tree(&self, _reorg_period: &ReorgPeriod) -> ChainResult<IncrementalMerkleAtBlock> {
         // Rusk does not expose historical contract-state queries. Reconstruct
         // the one-time validator start tree from hook-owned insertion history,
         // capped at consensus finality, and verify it against the stored root.
-        self.finalized_tree().await
+        self.inner.finalized_tree().await
     }
 
     async fn count(&self, _reorg_period: &ReorgPeriod) -> ChainResult<u32> {
-        Ok(self.finalized_merkle_view().await?.0)
+        Ok(self.inner.finalized_merkle_view().await?.0)
     }
 
     async fn latest_checkpoint(
         &self,
         _reorg_period: &ReorgPeriod,
     ) -> ChainResult<CheckpointAtBlock> {
-        let finalized_height = self.rues.finalized_block_height().await?;
-        self.checkpoint_at_height(finalized_height).await
+        let finalized_height = self.inner.rues.finalized_block_height().await?;
+        self.inner.checkpoint_at_height(finalized_height).await
     }
 
     async fn latest_checkpoint_at_block(&self, height: u64) -> ChainResult<CheckpointAtBlock> {
-        self.checkpoint_at_height(height).await
+        self.inner.checkpoint_at_height(height).await
     }
 }
 
 // Bring ChainCommunicationError into scope for process_batch
 use hyperlane_core::ChainCommunicationError;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyperlane_core::config::OpSubmissionConfig;
+    use hyperlane_core::{HyperlaneDomainProtocol, HyperlaneDomainTechnicalStack, NativeToken};
+    use url::Url;
+
+    #[test]
+    fn mailbox_and_hook_adapters_report_distinct_contract_identities() {
+        let mailbox_id = H256::from([1u8; 32]);
+        let hook_id = H256::from([2u8; 32]);
+        let rues = Arc::new(RuesClient::new(Url::parse("http://127.0.0.1:1").unwrap()).unwrap());
+        let domain = HyperlaneDomain::from_config(
+            4242,
+            "dusk-test",
+            HyperlaneDomainProtocol::Dusk,
+            HyperlaneDomainTechnicalStack::Other,
+        )
+        .unwrap();
+        let provider = Arc::new(DuskProvider::new(domain.clone(), rues.clone()));
+        let mailbox = DuskMailbox::new(
+            provider,
+            rues,
+            mailbox_id,
+            hook_id,
+            domain,
+            None,
+            ConnectionConf {
+                url: Url::parse("http://127.0.0.1:1").unwrap(),
+                chain_id: 1,
+                event_cursor_dir: std::env::temp_dir(),
+                gas_limit: 1,
+                gas_price: 1,
+                native_token: NativeToken::default(),
+                op_submission_config: OpSubmissionConfig::default(),
+            },
+        );
+        let hook = DuskMerkleTreeHook::new(mailbox.clone());
+        assert_eq!(mailbox.address(), mailbox_id);
+        assert_eq!(hook.address(), hook_id);
+        assert_ne!(mailbox.address(), hook.address());
+    }
+}
