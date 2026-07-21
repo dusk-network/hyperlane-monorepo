@@ -13,9 +13,9 @@ history only; they are not release evidence for this candidate.
 | Hyperlane upstream base | `669d966ad71582fe3c9d96b5ed1b8ea3724e07fe` | Current `hyperlane-xyz/hyperlane-monorepo` base; the fork was fetched and is not behind it |
 | Dusk agent runtime | `af957a9fc814fa7533aadf997104863306eed645` | Dusk protocol adapter, indexers, signer/config parsing, relayer and validator integration |
 | Dusk base tested code | `876848ecc6c671995fad3ae7b22843e68a3ce8ca` | Escrow, dispatch-credit custody/consumption, canonical DRC20 boundary, deployment and E2E harness |
-| Dusk base review head | `ec53c5f642b2815b5a61ee811d5cdc774e78b397` | Tested code plus the authoritative decision, evidence, and readiness-policy record |
+| Dusk base review head | `c22c7671c672d7f42943bfe0afed3b6fac5eab9e` | Tested code plus the authoritative decision, evidence, and readiness-policy record |
 | Stacked withdrawal tested code | `b28d575527421d2a67245921ce561c88f554c099` | Beneficiary-authorized dispatch-credit withdrawal and route-owner proxy methods, stacked on the exact tested base code |
-| Stacked withdrawal review head | `5a267654938684b404926fc55ae33b4cbf046527` | Tested stack plus the synchronized base decision and evidence record |
+| Stacked withdrawal review head | `d8d6c3b4234b391c282ff9622fa59a9ffc05e057` | Tested stack plus the synchronized base decision and evidence record |
 | Rusk | `5c6a0bab11c61fb4c81275afdeceb97fb942d85e` | Frozen clean Dusk 1.7.1 dependency, VM, archive API, and live-node boundary |
 
 The default `dusk-agent-gate.yml` companion checkout is the exact base-contract
@@ -137,8 +137,8 @@ The base gate passed 12 WASMs, clippy, 29 type tests, 108 VM tests, 17 helper
 tests, 5 driver tests, hygiene, and the full agent compile boundary. The stack
 gate passed 114 VM tests, 19 helper tests, 7 driver tests, release driver WASM,
 and the same remaining boundaries. Their log SHA-256 values are respectively
-`182691cb5ef5c864c3fc657cd4bd87134d7a1cc71f6f14a4513d5e2095b8a364`
-and `c0a47f43340d35369725bd3f215d120a62e0aab0a7558cb37fa2e24b023cbf62`.
+`b4d3864dfb178adc283e8a3cc6f137c4c9580525b4bd1ffb07d7ef9a0bdbdedd`
+and `314ff8b12204be6dcf9055ce9917013d47e6c93d4adfca88b6e53c55e0434ec6`.
 
 At the exact stack code anchor, TestMock run `1784629402` and
 MessageIdMultisig run `1784628130` each passed beneficiary withdrawal plus
