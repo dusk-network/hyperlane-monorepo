@@ -9,7 +9,7 @@ reassessment. Moving branch names are not compatibility evidence.
 | --- | --- | --- |
 | Hyperlane upstream base | `6c2ca1d5514907f6875b6b6729cbffc31e97c09c` | Base of monorepo PR #1 |
 | Dusk agent implementation | `37e24eed2c7ad7aed63e3fa033d1fe8a28355ec0` | Finality, bounded history, simulation, transaction reconciliation/provenance, and signer enforcement |
-| Dusk base contracts | `8a2467acd5edba5e08cd6b7954f7c3dc622340b5` | Complete deployed-contract compatibility matrix, contract/agent ABI, shared types, and hermetic policy guards used by the default agent gate |
+| Dusk base contracts | `75293b9695dbca8dd8c36024b285fb38c099e78f` (code anchor `d32c0f56c66d93be203cc44e3f48a0a7257216f0`) | Complete deployed-contract compatibility matrix, fail-closed IGP policy, contract/agent ABI, shared types, and hermetic policy guards used by the default agent gate |
 | Stacked withdrawal contracts | `b16af0c05547a5d8e8687f47895c664b1aa93c00` | Payer-owned dispatch-credit withdrawal layer; tested code boundary `265b7e9b1e47f4feadc4e71644d23df04680661c` |
 | Rusk | `5c6a0bab11c61fb4c81275afdeceb97fb942d85e` | Clean Dusk 1.7.1 build, VM, and live E2E anchor |
 
@@ -21,13 +21,15 @@ points; the agent does not consume that event, so its shared-type build remains
 correctly pinned to the independently mergeable base PR.
 
 Every deployed base contract has an explicit compatibility version. Mailbox,
-MerkleTreeHook, TestMock, MessageIdMultisigISM, ValidatorAnnounce, IGP,
-ProtocolFee, AggregationHook, WarpNative, WarpDrc20Collateral, and TestRecipient
-are version 1; WarpDrc20 is version 2 for its aggregate pending-supply reserve.
-The stacked withdrawal layer advances Mailbox to version 2 so a base Mailbox
-without `withdraw_dispatch_credit` cannot be reused. Both reuse boundaries
-validate the complete 12-contract matrix while retaining semantic kind and
-default-ISM checks. These contracts must be freshly deployed. The
+MerkleTreeHook, TestMock, MessageIdMultisigISM, ValidatorAnnounce, ProtocolFee,
+AggregationHook, WarpNative, WarpDrc20Collateral, and TestRecipient are version
+1. WarpDrc20 is version 2 for its aggregate pending-supply reserve, and IGP is
+version 2 for explicit fail-closed destination pricing. The stacked withdrawal
+layer additionally advances Mailbox to version 2 so a base Mailbox without
+`withdraw_dispatch_credit` cannot be reused. Both reuse boundaries validate the
+complete 12-contract matrix while retaining semantic kind, live default-ISM,
+and exact saved/live IGP configuration checks. These contracts must be freshly
+deployed. The
 agent depends on bounded `message_ids` and `gas_payments` pages, coherent
 `validators_and_threshold`, hook insertion-height/root history, and Rusk's
 transaction simulation endpoint. Older serialized instances are incompatible;
