@@ -249,21 +249,22 @@ and agent changes as one compatibility boundary:
   confirmation record fails immediately; only transport/GraphQL observation
   failures and explicit not-yet-included state are retried.
 
-The report also surfaced Squads, ALT, and AltVM findings from upstream commits
-that appear in the 61-commit historical fork diff only because fork `main` has
-not yet absorbed sync PR #2. They are not Dusk-agent changes and must be
-evaluated against upstream ownership after the sync PR is merged rather than
-being attributed to this port.
+The report also surfaced Squads, ALT, and AltVM findings from upstream commits.
+They are not Dusk-agent changes and must be evaluated under upstream ownership
+rather than being attributed to this port. The internal branch is now rebased
+onto upstream `67933966ed9c6f9e3d5ec095372e11414c82e4e7`; `git range-diff`
+marks all 79 Dusk commits patch-equivalent across that rebase.
 
 The Dusk fork now also proposes
 `.github/workflows/dusk-agent-gate.yml` as a narrow PR status check for the
-agent crate. It checks out the companion private Dusk repo for
-`hyperlane-dusk-types`, scans `rust/main/chains/hyperlane-dusk` for runtime
-placeholder macros, preflights private repo access for `DUSK_ORG_READ_TOKEN`,
-then runs package formatting, unit and parser tests, Dusk clippy, the expanded
+agent crate. It checks out the public companion Dusk repo at an exact SHA for
+`hyperlane-dusk-types` without a repository secret, scans
+`rust/main/chains/hyperlane-dusk` for runtime placeholder macros, then runs
+package formatting, unit and parser tests, Dusk clippy, the expanded
 affected-package check, and a stable-lockfile assertion. The workflow is
-intended to give the monorepo PR a focused status check while the full
-cross-repo repro and E2E evidence remain in `dusk-network/hyperlane-dusk`.
+intended to give the monorepo PR a focused unprivileged status check while the
+full cross-repo repro and E2E evidence remain in
+`dusk-network/hyperlane-dusk`.
 
 The inherited upstream `rust-docker.yml` and `monorepo-docker.yml`
 image-publishing workflows have job-level

@@ -1,84 +1,116 @@
 name: Dusk Review Policy Gate
 
 on:
-  pull_request:
+  # Run only the trusted default-branch policy. Proposed code is fetched as
+  # Git data and never checked out or executed in this privileged context.
+  pull_request_target:
     branches:
       - main
   workflow_dispatch:
 
 permissions:
   contents: read
+  checks: read
 
 jobs:
   review-policy-gate:
     name: Dusk review policy gate
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - name: Checkout trusted base policy
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Check worktree and diff hygiene
+      - name: Lint trusted GitHub Actions workflows
+        uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+
+      - name: Inspect proposed commit as data
+        if: github.event_name == 'pull_request_target'
         shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
-          if [ -n "$(git ls-files --others --exclude-standard)" ]; then
-            git ls-files --others --exclude-standard
-            echo "::error::untracked source paths found"
+          git fetch --no-tags origin "pull/${PR_NUMBER}/head"
+          fetched_sha="$(git rev-parse FETCH_HEAD)"
+          [ "$fetched_sha" = "$HEAD_SHA" ] || {
+            echo "::error::fetched PR head $fetched_sha differs from event head $HEAD_SHA"
             exit 1
-          fi
+          }
+          git diff --check "$BASE_SHA...$HEAD_SHA"
 
-          base_ref="${GITHUB_BASE_REF:-main}"
-          if git rev-parse --verify "origin/$base_ref" >/dev/null 2>&1; then
-            git diff --check "origin/$base_ref"...HEAD
-          else
-            git diff --check HEAD~1..HEAD
-          fi
-
-      - name: Verify fork-only changes stay in the Dusk integration boundary
-        shell: bash
-        run: |
-          set -euo pipefail
-          git fetch --no-tags https://github.com/hyperlane-xyz/hyperlane-monorepo.git main
-          upstream_head="$(git rev-parse FETCH_HEAD)"
-          unexpected=0
-          while IFS= read -r path; do
-            case "$path" in
-              .github/workflows/dusk-agent-gate.yml|\
-              .github/workflows/dusk-review-policy-gate.yml|\
-              .github/workflows/monorepo-docker.yml|\
-              .github/workflows/rebalancer-e2e-test.yml|\
-              .github/workflows/rebalancer-sim-test.yml|\
-              .github/workflows/rust-docker.yml|\
-              .github/workflows/rust.yml|\
-              .github/workflows/test.yml|\
-              docs/dusk-companion-compatibility.md|\
-              docs/dusk-upstream-compatibility-review.md|\
-              docs/dusk-upstream-pr-plan.md|\
-              rust/main/Cargo.lock|\
-              rust/main/Cargo.toml|\
-              rust/main/agents/relayer/src/relayer/destination.rs|\
-              rust/main/agents/validator/src/reorg_reporter.rs|\
-              rust/main/agents/validator/src/submit.rs|\
-              rust/main/agents/validator/src/submit/tests.rs|\
-              rust/main/chains/hyperlane-dusk/*|\
-              rust/main/hyperlane-base/Cargo.toml|\
-              rust/main/hyperlane-base/src/contract_sync/cursors/mod.rs|\
-              rust/main/hyperlane-base/src/settings/chains.rs|\
-              rust/main/hyperlane-base/src/settings/parser/connection_parser.rs|\
-              rust/main/hyperlane-base/src/settings/parser/mod.rs|\
-              rust/main/hyperlane-base/src/settings/signers.rs|\
-              rust/main/hyperlane-core/src/chain.rs|\
-              rust/main/lander/src/adapter/chains/factory.rs)
-                ;;
+          for path in \
+            rust/main/chains/hyperlane-dusk/Cargo.toml \
+            rust/main/chains/hyperlane-dusk/src/lib.rs \
+            rust/main/hyperlane-base/src/settings/chains.rs \
+            rust/main/hyperlane-core/src/chain.rs; do
+            mode="$(git ls-tree "$HEAD_SHA" -- "$path" | awk '{print $1}')"
+            case "$mode" in
+              100644|100755) ;;
               *)
-                echo "::error file=$path::change falls outside the reviewed Dusk integration boundary"
-                unexpected=1
+                echo "::error::$path is not a regular file in proposed commit $HEAD_SHA"
+                exit 1
                 ;;
             esac
-          done < <(git diff --name-only "$upstream_head"...HEAD)
-          exit "$unexpected"
+          done
+
+          for path in \
+            .github/workflows/dusk-agent-gate.yml \
+            .github/workflows/dusk-proposal-validation.yml \
+            .github/workflows/dusk-review-policy-gate.yml; do
+            if ! git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- "$path"; then
+              echo "::error::$path is policy-locked; use the documented owner-supervised bootstrap"
+              exit 1
+            fi
+          done
+
+      - name: Require unprivileged proposal checks
+        if: github.event_name == 'pull_request_target'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const headSha = context.payload.pull_request.head.sha;
+            const expectedNames = [
+              'Dusk proposal validation',
+              'Dusk agent validation',
+            ];
+            for (let attempt = 0; attempt < 120; attempt += 1) {
+              const { data } = await github.rest.checks.listForRef({
+                owner,
+                repo,
+                ref: headSha,
+                filter: 'latest',
+                per_page: 100,
+              });
+              const checks = new Map(
+                data.check_runs
+                  .filter((run) => run.app?.slug === 'github-actions')
+                  .map((run) => [run.name, run]),
+              );
+              const complete = expectedNames.every(
+                (name) => checks.get(name)?.status === 'completed',
+              );
+              if (complete) {
+                for (const name of expectedNames) {
+                  const conclusion = checks.get(name)?.conclusion;
+                  if (conclusion !== 'success') {
+                    core.setFailed(
+                      `${name} concluded ${conclusion} for ${headSha}`,
+                    );
+                  }
+                }
+                return;
+              }
+              await new Promise((resolve) => setTimeout(resolve, 15000));
+            }
+            core.setFailed(
+              `Timed out waiting for proposal checks on ${headSha}`,
+            );

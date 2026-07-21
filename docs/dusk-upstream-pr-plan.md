@@ -7,7 +7,7 @@ remaining production decisions are accepted or changed.
 Current base:
 
 - Current Dusk monorepo branch head: see the GitHub PR header.
-- Upstream Hyperlane `main`: `669d966ad71582fe3c9d96b5ed1b8ea3724e07fe`
+- Upstream Hyperlane `main`: `67933966ed9c6f9e3d5ec095372e11414c82e4e7`
 - Rebase/check evidence: use the live `git fetch upstream main`,
   `git merge-base HEAD upstream/main`, and
   `git rev-list --left-right --count HEAD...upstream/main` checks recorded in
@@ -15,13 +15,13 @@ Current base:
 - The fork was fetched against that upstream head and is not behind it. The
   exact reassessment candidate is pinned in
   `docs/dusk-companion-compatibility.md`: agent runtime
-  `af957a9fc814fa7533aadf997104863306eed645`, companion base
-  code `876848ecc6c671995fad3ae7b22843e68a3ce8ca` (review head
-  `3ca993be235c59ebb2ce84ac8a7401102ab0fcc8`), and stacked withdrawal code
-  `b28d575527421d2a67245921ce561c88f554c099` (review head
-  `0bf477b2a50a918d56c80aaf074ef711e6c0915b`). The separately validated
+  `e95d3ea282a55ead114471ffb1dece77706ffc81`, companion base
+  code `9058755927473239d59ce702a8074acbae0e0a24` (review head
+  `6a2d7fda8d3f5eea52aa56af910e93c29a167d81`), and stacked withdrawal code
+  `dc8aba07773993878edd81735d59e66beddd66a3` (review head
+  `d1bb490c469142f154727f0a7aab5476b064eb59`). The separately validated
   review-policy boundary anchor is
-  `dad14dbbea4bbd59f6c6697f89cc245d5c1cf2a0`.
+  `c35f86405cf8cd83927860aca8b5c38b042ee198`.
 - Focused Dusk tests, clippy, and the expanded affected-package cargo check
   pass at that runtime boundary. The exact companion base/stack gates and both
   live E2E security modes are recorded in the compatibility manifest; earlier
@@ -126,12 +126,13 @@ cargo clippy -p hyperlane-dusk --all-targets -- -D warnings
 cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p scraper -p lander
 ```
 
-The workflow needs `DUSK_ORG_READ_TOKEN` because the companion Dusk repo is
-private. It preflights that private repo access with `gh api` before checkout
-so missing token provisioning fails explicitly. Its default companion checkout
-is an exact reviewed Dusk commit rather than a moving branch; the manual
-`workflow_dispatch` input is the only intentional override. This pin is part of
-the contract/agent ABI compatibility record, not merely build reproducibility.
+A repository checkout secret is deliberately not used: the companion Dusk repo
+is public, and exposing an organization token to proposed workflow code would
+add authority without adding checkout capability. The default companion
+checkout is an exact reviewed Dusk commit rather than a moving branch; the
+manual `workflow_dispatch` input is the only intentional override. This pin is
+part of the contract/agent ABI compatibility record, not merely build
+reproducibility.
 A separate policy-gate step
 diffs the branch against live Hyperlane upstream and rejects changes outside
 the reviewed Dusk integration allowlist. Together these are the fork-scoped

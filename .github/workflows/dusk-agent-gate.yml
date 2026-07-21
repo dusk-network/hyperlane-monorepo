@@ -7,9 +7,8 @@ on:
   workflow_dispatch:
     inputs:
       dusk_ref:
-        description: "dusk-network/hyperlane-dusk ref to checkout for shared types"
+        description: "Exact dusk-network/hyperlane-dusk commit SHA for shared types"
         required: true
-        default: "876848ecc6c671995fad3ae7b22843e68a3ce8ca"
 
 permissions:
   contents: read
@@ -24,15 +23,13 @@ jobs:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
-      GH_TOKEN: ${{ secrets.DUSK_ORG_READ_TOKEN || github.token }}
-      DUSK_ORG_READ_TOKEN_CONFIGURED: ${{ secrets.DUSK_ORG_READ_TOKEN != '' }}
-      DUSK_REF: ${{ inputs.dusk_ref || '876848ecc6c671995fad3ae7b22843e68a3ce8ca' }}
+      DUSK_REF: ${{ inputs.dusk_ref || '9058755927473239d59ce702a8074acbae0e0a24' }}
       MONOREPO_DIR: ${{ github.workspace }}/hyperlane/hyperlane-monorepo
       DUSK_DIR: ${{ github.workspace }}/hyperlane/dusk
 
     steps:
       - name: Checkout Hyperlane monorepo
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           path: hyperlane/hyperlane-monorepo
           persist-credentials: false
@@ -47,42 +44,34 @@ jobs:
             exit 1
           fi
 
-      - name: Verify private Dusk checkout access
+      - name: Validate exact public companion ref
         shell: bash
         run: |
           set -euo pipefail
-          printf 'dusk_org_read_token_configured=%s\n' "$DUSK_ORG_READ_TOKEN_CONFIGURED"
-          if [ "$DUSK_ORG_READ_TOKEN_CONFIGURED" = "true" ]; then
-            printf 'dusk_agent_gate_token_source=%s\n' 'DUSK_ORG_READ_TOKEN'
-          else
-            printf 'dusk_agent_gate_token_source=%s\n' 'github.token'
-          fi
-          gh api repos/dusk-network/hyperlane-dusk --jq .full_name >/dev/null || {
-            if [ "$DUSK_ORG_READ_TOKEN_CONFIGURED" = "true" ]; then
-              echo "::error::DUSK_ORG_READ_TOKEN is configured but does not grant read access to dusk-network/hyperlane-dusk for the Dusk agent cargo check"
-            else
-              echo "::error::DUSK_ORG_READ_TOKEN is not configured or not available to this workflow; the Dusk agent cargo check cannot read dusk-network/hyperlane-dusk"
-            fi
+          if [[ ! "$DUSK_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::dusk_ref must be an exact 40-character commit SHA"
             exit 1
-          }
+          fi
 
       - name: Checkout Dusk Hyperlane shared types
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: dusk-network/hyperlane-dusk
           ref: ${{ env.DUSK_REF }}
           path: hyperlane/dusk
-          token: ${{ env.GH_TOKEN }}
           persist-credentials: false
 
       - name: Report resolved check refs
         shell: bash
         run: |
           set -euo pipefail
-          printf 'monorepo_ref=%s\n' "$GITHUB_SHA"
-          git -C "$MONOREPO_DIR" rev-parse HEAD
-          printf 'dusk_ref=%s\n' "$DUSK_REF"
-          git -C "$DUSK_DIR" rev-parse HEAD
+          resolved_monorepo_sha="$(git -C "$MONOREPO_DIR" rev-parse HEAD)"
+          resolved_dusk_sha="$(git -C "$DUSK_DIR" rev-parse HEAD)"
+          [ "$resolved_monorepo_sha" = "$GITHUB_SHA" ]
+          [ "$resolved_dusk_sha" = "${DUSK_REF,,}" ]
+          printf 'resolved_monorepo_sha=%s\n' "$resolved_monorepo_sha"
+          printf 'requested_dusk_ref=%s\n' "$DUSK_REF"
+          printf 'resolved_dusk_sha=%s\n' "$resolved_dusk_sha"
 
       - name: Report runner disk capacity
         shell: bash
