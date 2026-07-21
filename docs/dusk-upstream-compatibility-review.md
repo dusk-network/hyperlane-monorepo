@@ -66,7 +66,11 @@ Earlier observation on 2026-07-20:
   `cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p scraper -p lander`
   all pass against companion base head
   `4d8f5da013d56e5d3fa036ab924de6a6729b5f4f`; the combined contract/withdrawal
-  implementation is `7970f468e1accdf154d0dcb927c4d5b4addf0b40`.
+  implementation is `183b56a875e5c2962ef621937258b8e497baef2a`.
+- Fresh-state TestMock run `1784592169` and MessageIdMultisig run `1784592942`
+  passed with that implementation set. Both observed successful Rusk process
+  simulation and all three route round trips; the latter also consumed real
+  signed validator-checkpoint metadata.
 - `cargo fmt --package hyperlane-dusk --package hyperlane-base -- --check`
   passes. Workspace-wide
   `cargo fmt --all -- --check` is not used as Dusk PR evidence because Cargo's
