@@ -21,6 +21,10 @@ in `FINAL_RED_TEAM_DECISIONS_2026-07-21.md` on the companion Dusk PR heads.
   as a proxy for a reorg-safe leaf count.
 - The hosted Dusk agent gate executes `cargo test -p validator reorg`; compiling
   the validator is not sufficient evidence for the changed fail-stop behavior.
+- The unprivileged proposal gate expands its reviewed-boundary allowlist only
+  for the three files introduced by this hardening: this decision record,
+  `checkpoint_syncer.rs`, and `local_storage.rs`. The boundary remains an
+  explicit fail-closed file list rather than a broad directory exemption.
 
 ## Deliberate evidence boundaries
 

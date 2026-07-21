@@ -67,6 +67,7 @@ jobs:
               .github/workflows/test.yml|\
               docs/dusk-ci-bootstrap-decisions.md|\
               docs/dusk-companion-compatibility.md|\
+              docs/dusk-final-red-team-decisions-2026-07-21.md|\
               docs/dusk-upstream-compatibility-review.md|\
               docs/dusk-upstream-pr-plan.md|\
               rust/main/Cargo.lock|\
@@ -79,9 +80,11 @@ jobs:
               rust/main/hyperlane-base/Cargo.toml|\
               rust/main/hyperlane-base/src/contract_sync/cursors/mod.rs|\
               rust/main/hyperlane-base/src/settings/chains.rs|\
+              rust/main/hyperlane-base/src/settings/checkpoint_syncer.rs|\
               rust/main/hyperlane-base/src/settings/parser/connection_parser.rs|\
               rust/main/hyperlane-base/src/settings/parser/mod.rs|\
               rust/main/hyperlane-base/src/settings/signers.rs|\
+              rust/main/hyperlane-base/src/types/local_storage.rs|\
               rust/main/hyperlane-core/src/chain.rs|\
               rust/main/lander/src/adapter/chains/factory.rs)
                 ;;
