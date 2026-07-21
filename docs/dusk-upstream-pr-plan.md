@@ -21,7 +21,7 @@ Current base:
 - Post-rebase validation passes the focused Dusk gate, Dusk crate tests,
   package-scoped formatting, and the expanded affected-package cargo check
   against companion base-contract head
-  `1bc0fa2eaee41758d917213c1d2864d4b38f6670` and stacked dispatch-withdrawal
+  `f826a6dab2cdc464afc473f25c2375097ef088fa` and stacked dispatch-withdrawal
   head `b16af0c05547a5d8e8687f47895c664b1aa93c00` (tested code boundary
   `265b7e9b1e47f4feadc4e71644d23df04680661c`).
 - Dusk signer test cleanup evidence commit:
