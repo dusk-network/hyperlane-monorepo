@@ -13,9 +13,9 @@ history only; they are not release evidence for this candidate.
 | Hyperlane upstream base | `67933966ed9c6f9e3d5ec095372e11414c82e4e7` | Current `hyperlane-xyz/hyperlane-monorepo` base; the fork is 0 commits behind it |
 | Dusk agent runtime | `e95d3ea282a55ead114471ffb1dece77706ffc81` | Rebased equivalent of tested runtime `af957a9fc814fa7533aadf997104863306eed645`; Dusk protocol adapter, indexers, signer/config parsing, relayer and validator integration |
 | Dusk base tested code | `9058755927473239d59ce702a8074acbae0e0a24` | Escrow, dispatch-credit custody/consumption, Mailbox reentrancy guard, canonical DRC20 boundary, deployment and E2E harness |
-| Dusk base review head | `6a2d7fda8d3f5eea52aa56af910e93c29a167d81` | Tested code plus the decision/evidence record and synchronized trusted CI bootstrap policy |
+| Dusk base review head | Resolve live PR #1 head | Moving review head; tested runtime remains the exact immutable commit above |
 | Stacked withdrawal tested code | `dc8aba07773993878edd81735d59e66beddd66a3` | Beneficiary-authorized dispatch-credit withdrawal and route-owner proxy methods, stacked on the exact tested base code |
-| Stacked withdrawal review head | `d1bb490c469142f154727f0a7aab5476b064eb59` | Tested stack plus the synchronized decision/evidence and trusted CI bootstrap policy |
+| Stacked withdrawal review head | Resolve live PR #10 head | Moving review head; tested runtime remains the exact immutable commit above |
 | Static covered monorepo checkout | `833b77b4436e146a4776a3b35db68525014b3adb` | Rebased equivalent of clean-repro checkout `b4c46ce9bdade2590018facaa51255d497a80db2` |
 | Review-policy boundary anchor | `c35f86405cf8cd83927860aca8b5c38b042ee198` | Rebased equivalent of `dad14dbbea4bbd59f6c6697f89cc245d5c1cf2a0`; adds validator fail-stop source files to the fork boundary |
 | Rusk | `5c6a0bab11c61fb4c81275afdeceb97fb942d85e` | Frozen clean Dusk 1.7.1 dependency, VM, archive API, and live-node boundary |

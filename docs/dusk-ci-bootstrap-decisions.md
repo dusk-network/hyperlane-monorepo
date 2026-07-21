@@ -23,8 +23,10 @@ first publication.
 After that bootstrap is merged, branch protection must require `Dusk review
 policy gate` and `Dusk agent validation` (and may retain `Dusk proposal
 validation`). The trusted gate uses `pull_request_target`, checks out only the
-base commit, fetches the event head as Git data, and waits for both unprivileged
-checks on the exact head SHA. It never checks out or executes proposed code.
+base commit, fetches the event head as Git data, and queries the exact locked
+proposal and agent workflow files for `pull_request` runs on the exact head
+SHA. A same-named job from another workflow is not accepted. The trusted gate
+never checks out or executes proposed code.
 
 The trusted gate locks these files byte-for-byte against the base:
 
