@@ -21,8 +21,9 @@ Current base:
 - Post-rebase validation passes the focused Dusk gate, Dusk crate tests,
   package-scoped formatting, and the expanded affected-package cargo check
   against companion base-contract head
-  `726040440c904ec6adf6616a1963146ee9693fe4` and stacked dispatch-withdrawal
-  head `6b3a17845a3ff206bd830383d7d353ee94a34667`.
+  `62464287dce7472f52dcb11ee92ece6631ac9368` and stacked dispatch-withdrawal
+  head `b16af0c05547a5d8e8687f47895c664b1aa93c00` (tested code boundary
+  `265b7e9b1e47f4feadc4e71644d23df04680661c`).
 - Dusk signer test cleanup evidence commit:
   `b989bbcfbb2a427d3a538c5201f5d7214de6ba84`
 
@@ -146,7 +147,8 @@ height. Merkle insertion records and validator checkpoints come from the
 configured MerkleTreeHook's persisted message/height/root history and exact
 archived event; Mailbox dispatch is not used as a proxy for hook execution.
 The companion contracts carrying this history require a fresh deployment and
-report `state_version() == 1`.
+must match the complete per-contract compatibility-version matrix recorded in
+`dusk-companion-compatibility.md`.
 
 The indexer API also supports canonical transaction-hash lookups. Dusk's
 32-byte transaction ID is represented as a zero-left-padded common `H512`;

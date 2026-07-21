@@ -65,8 +65,9 @@ Earlier observation on 2026-07-20:
   and the expanded affected-package command
   `cargo check -p hyperlane-dusk -p hyperlane-base -p validator -p relayer -p scraper -p lander`
   all pass against companion base head
-  `4d8f5da013d56e5d3fa036ab924de6a6729b5f4f`; the combined contract/withdrawal
-  implementation is `183b56a875e5c2962ef621937258b8e497baef2a`.
+  `62464287dce7472f52dcb11ee92ece6631ac9368`; the combined
+  contract/withdrawal tested implementation is
+  `265b7e9b1e47f4feadc4e71644d23df04680661c`.
 - Fresh-state TestMock run `1784592169` and MessageIdMultisig run `1784592942`
   passed with that implementation set. Both observed successful Rusk process
   simulation and all three route round trips; the latter also consumed real
@@ -345,9 +346,10 @@ Supporting them for Dusk would require:
   IDs, insertion heights, roots, and archived `InsertedIntoTree` events. The
   mailbox wrapper implements the shared trait, but a Mailbox dispatch is not
   accepted as proof that the configured hook ran.
-- The new Merkle history and escrow fields change companion contract storage.
-  This agent head must be paired with freshly deployed `state_version() == 1`
-  contracts; no in-place migration from the older layout is claimed.
+- The Merkle history, escrow/accounting, and required security ABIs define one
+  companion deployment compatibility set. This agent head must be paired with
+  the complete exact version matrix in `dusk-companion-compatibility.md`; no
+  in-place migration from an older layout or ABI is claimed.
 
 ## Runtime Placeholder Scan
 
