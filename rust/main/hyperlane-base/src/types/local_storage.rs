@@ -136,12 +136,16 @@ impl CheckpointSyncer for LocalStorage {
     async fn reorg_status(&self) -> Result<ReorgEventResponse> {
         let data = match tokio::fs::read(self.reorg_flag_path()).await {
             Ok(s) => s,
-            Err(err) => {
-                error!(?err, "Failed to read file");
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(ReorgEventResponse {
                     exists: false,
                     event: None,
                     content: None,
+                });
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("Reading reorg status from {:?}", self.reorg_flag_path())
                 });
             }
         };

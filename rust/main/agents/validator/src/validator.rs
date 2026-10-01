@@ -1,4 +1,4 @@
-use std::{fmt::Debug, sync::Arc, time::Duration};
+use std::{fmt::Debug, path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use axum::Router;
@@ -31,6 +31,7 @@ use hyperlane_ethereum::{Signers, SingletonSigner, SingletonSignerHandle};
 use crate::reorg_reporter::{
     LatestCheckpointReorgReporter, LatestCheckpointReorgReporterWithStorageWriter, ReorgReporter,
 };
+use crate::reorg_tombstone;
 use crate::server::{self as validator_server, merkle_tree_insertions};
 use crate::{
     settings::ValidatorSettings,
@@ -65,6 +66,7 @@ pub struct Validator {
     agent_metadata: ValidatorMetadata,
     max_sign_concurrency: usize,
     reorg_reporter: Arc<dyn ReorgReporter>,
+    reorg_tombstone_path: PathBuf,
 }
 
 /// Metadata for `validator`
@@ -133,6 +135,9 @@ impl BaseAgent for Validator {
                 )
             );
         }
+
+        let reorg_tombstone_path = reorg_tombstone::path_for_database(&settings.db);
+        reorg_tombstone::ensure_absent(&reorg_tombstone_path)?;
 
         let db = DB::from_path(&settings.db)?;
         let msg_db = HyperlaneRocksDB::new(&settings.origin_chain, db);
@@ -220,6 +225,7 @@ impl BaseAgent for Validator {
             agent_metadata,
             max_sign_concurrency: settings.max_sign_concurrency,
             reorg_reporter,
+            reorg_tombstone_path,
         })
     }
 
@@ -398,6 +404,7 @@ impl Validator {
             ValidatorSubmitterMetrics::new(&self.core.metrics, &self.origin_chain),
             self.max_sign_concurrency,
             self.reorg_reporter.clone(),
+            self.reorg_tombstone_path.clone(),
         );
 
         let tip_tree = self

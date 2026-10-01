@@ -30,6 +30,7 @@ env:
 
 jobs:
   rebalancer-e2e-test:
+    if: github.repository_owner == 'hyperlane-xyz'
     runs-on: depot-ubuntu-24.04
     timeout-minutes: 10
     steps:

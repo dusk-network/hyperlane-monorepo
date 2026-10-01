@@ -4,7 +4,6 @@ use aws_config::Region;
 use core::str::FromStr;
 use eyre::{eyre, Report, Result};
 use prometheus::IntGauge;
-use tracing::error;
 use ya_gcp::{AuthFlow, ServiceAccountAuth};
 
 use hyperlane_core::{ChainCommunicationError, ReorgEventResponse};
@@ -131,10 +130,9 @@ impl CheckpointSyncerConf {
                 }
             }
             Err(err) => {
-                error!(
-                    ?err,
-                    "Failed to read reorg status. Assuming no reorg occurred."
-                );
+                return Err(CheckpointSyncerBuildError::Other(
+                    err.wrap_err("Failed to read reorg status; refusing to start without the persisted fail-stop state"),
+                ));
             }
         }
         Ok(syncer)
@@ -280,6 +278,42 @@ mod test {
                 );
             }
             _ => panic!("Expected a reorg event error"),
+        }
+    }
+
+    /// A storage failure must not be interpreted as an absent reorg flag. This
+    /// also models a failed flag write followed by validator restart.
+    #[tokio::test]
+    async fn test_build_and_validate_reorg_storage_error_fails_closed() {
+        use super::*;
+
+        let temp_checkpoint_dir = tempfile::tempdir().unwrap();
+        let checkpoint_path = format!("file://{}", temp_checkpoint_dir.path().to_str().unwrap());
+        let checkpoint_syncer_conf = CheckpointSyncerConf::from_str(&checkpoint_path).unwrap();
+
+        let reorg_flag_path = temp_checkpoint_dir.path().join("reorg_flag.json");
+        std::fs::create_dir(&reorg_flag_path).unwrap();
+
+        let syncer = checkpoint_syncer_conf.build(None).await.unwrap();
+        let reorg_event = ReorgEvent {
+            local_merkle_root: H256::zero(),
+            canonical_merkle_root: H256::repeat_byte(1),
+            checkpoint_index: 1,
+            unix_timestamp: 1,
+            reorg_period: ReorgPeriod::from_blocks(1),
+        };
+        assert!(
+            syncer.write_reorg_status(&reorg_event).await.is_err(),
+            "a directory at the fail-stop path must reject the flag write"
+        );
+
+        let result = checkpoint_syncer_conf.build_and_validate(None).await;
+        match result {
+            Err(CheckpointSyncerBuildError::Other(err)) => assert!(
+                err.to_string().contains("Failed to read reorg status"),
+                "unexpected startup error: {err}"
+            ),
+            _ => panic!("checkpoint storage read failure must stop startup"),
         }
     }
 

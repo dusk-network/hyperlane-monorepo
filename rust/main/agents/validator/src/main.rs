@@ -12,6 +12,7 @@ use hyperlane_base::agent_main;
 use crate::validator::Validator;
 
 mod reorg_reporter;
+mod reorg_tombstone;
 mod server;
 mod settings;
 mod submit;

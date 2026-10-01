@@ -28,6 +28,7 @@ env:
 
 jobs:
   rebalancer-sim-test:
+    if: github.repository_owner == 'hyperlane-xyz'
     runs-on: depot-ubuntu-24.04
     timeout-minutes: 15
     steps:

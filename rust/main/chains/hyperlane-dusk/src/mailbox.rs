@@ -1,0 +1,468 @@
+use std::fmt::Debug;
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use tracing::{info, warn};
+
+use hyperlane_core::{
+    accumulator::incremental::IncrementalMerkle, BatchResult, ChainResult, Checkpoint,
+    CheckpointAtBlock, FixedPointNumber, HyperlaneChain, HyperlaneContract, HyperlaneDomain,
+    HyperlaneMessage, HyperlaneProvider, IncrementalMerkleAtBlock, Mailbox, MerkleTreeHook,
+    Metadata, QueueOperation, ReorgPeriod, TxCostEstimate, TxOutcome, H256, U256,
+};
+
+use crate::rues::rkyv_serialize;
+use crate::{ConnectionConf, DuskProvider, DuskSigner, HyperlaneDuskError, RuesClient};
+
+const TX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(120);
+const MERKLE_HISTORY_PAGE_SIZE: u32 = 256;
+
+/// Dusk Mailbox contract adapter.
+#[derive(Debug, Clone)]
+pub struct DuskMailbox {
+    provider: Arc<DuskProvider>,
+    rues: Arc<RuesClient>,
+    mailbox_id: [u8; 32],
+    merkle_tree_hook_id: [u8; 32],
+    domain: HyperlaneDomain,
+    signer: Option<DuskSigner>,
+    conn: ConnectionConf,
+}
+
+impl DuskMailbox {
+    /// Create a new DuskMailbox.
+    pub fn new(
+        provider: Arc<DuskProvider>,
+        rues: Arc<RuesClient>,
+        mailbox_id: H256,
+        merkle_tree_hook_id: H256,
+        domain: HyperlaneDomain,
+        signer: Option<DuskSigner>,
+        conn: ConnectionConf,
+    ) -> Self {
+        Self {
+            provider,
+            rues,
+            mailbox_id: mailbox_id.into(),
+            merkle_tree_hook_id: merkle_tree_hook_id.into(),
+            domain,
+            signer,
+            conn,
+        }
+    }
+
+    /// Encode a HyperlaneMessage to the Dusk wire format.
+    fn encode_message(message: &HyperlaneMessage) -> Vec<u8> {
+        hyperlane_dusk_types::message::encode(
+            message.version,
+            message.nonce,
+            message.origin,
+            message.sender.into(),
+            message.destination,
+            message.recipient.into(),
+            &message.body,
+        )
+    }
+
+    async fn merkle_tree_count(&self) -> ChainResult<u32> {
+        Ok(self
+            .rues
+            .contract_query(&self.merkle_tree_hook_id, "count", &())
+            .await?)
+    }
+
+    async fn merkle_insertion_height(&self, index: u32) -> ChainResult<u64> {
+        Ok(self
+            .rues
+            .contract_query(
+                &self.merkle_tree_hook_id,
+                "inserted_block_height",
+                &(index,),
+            )
+            .await?)
+    }
+
+    async fn first_merkle_insertion_at_or_after(
+        &self,
+        count: u32,
+        block_height: u64,
+    ) -> ChainResult<u32> {
+        let mut low = 0u32;
+        let mut high = count;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.merkle_insertion_height(middle).await? < block_height {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        Ok(low)
+    }
+
+    async fn merkle_count_at_height(&self, count: u32, block_height: u64) -> ChainResult<u32> {
+        self.first_merkle_insertion_at_or_after(count, block_height.saturating_add(1))
+            .await
+    }
+
+    async fn finalized_merkle_view(&self) -> ChainResult<(u32, u64)> {
+        let finalized_height = self.rues.finalized_block_height().await?;
+        let count = self.merkle_tree_count().await?;
+        let finalized_count = self.merkle_count_at_height(count, finalized_height).await?;
+        Ok((finalized_count, finalized_height))
+    }
+
+    async fn merkle_root_at(&self, index: u32) -> ChainResult<H256> {
+        let root: [u8; 32] = self
+            .rues
+            .contract_query(&self.merkle_tree_hook_id, "root_at", &(index,))
+            .await?;
+        Ok(H256::from_slice(&root))
+    }
+
+    async fn finalized_tree(&self) -> ChainResult<IncrementalMerkleAtBlock> {
+        let (count, finalized_height) = self.finalized_merkle_view().await?;
+        let mut tree = IncrementalMerkle::default();
+        let mut start = 0u32;
+        while start < count {
+            let limit = (count - start).min(MERKLE_HISTORY_PAGE_SIZE);
+            let message_ids: Vec<[u8; 32]> = self
+                .rues
+                .contract_query(&self.merkle_tree_hook_id, "message_ids", &(start, limit))
+                .await?;
+            if message_ids.len() != limit as usize {
+                return Err(HyperlaneDuskError::Other(format!(
+                    "MerkleTreeHook returned {} message IDs for page start={start} limit={limit}",
+                    message_ids.len()
+                ))
+                .into());
+            }
+            for message_id in message_ids {
+                tree.ingest(H256::from_slice(&message_id));
+            }
+            start += limit;
+        }
+
+        if count > 0 {
+            let expected_root = self.merkle_root_at(count - 1).await?;
+            if tree.root() != expected_root {
+                return Err(HyperlaneDuskError::Other(format!(
+                    "Reconstructed finalized merkle root mismatch: on-chain={expected_root:?} local={:?} count={count}",
+                    tree.root()
+                ))
+                .into());
+            }
+        }
+
+        Ok(IncrementalMerkleAtBlock {
+            tree,
+            block_height: Some(finalized_height),
+        })
+    }
+
+    async fn checkpoint_at_height(&self, block_height: u64) -> ChainResult<CheckpointAtBlock> {
+        let finalized_height = self.rues.finalized_block_height().await?;
+        let effective_height = block_height.min(finalized_height);
+        let current_count = self.merkle_tree_count().await?;
+        let count = self
+            .merkle_count_at_height(current_count, effective_height)
+            .await?;
+        if count == 0 {
+            return Err(HyperlaneDuskError::Other(format!(
+                "MerkleTreeHook has no insertion at or before finalized block {effective_height}"
+            ))
+            .into());
+        }
+        let index = count - 1;
+        Ok(CheckpointAtBlock {
+            checkpoint: Checkpoint {
+                merkle_tree_hook_address: H256::from_slice(&self.merkle_tree_hook_id),
+                mailbox_domain: self.domain.id(),
+                root: self.merkle_root_at(index).await?,
+                index,
+            },
+            block_height: Some(effective_height),
+        })
+    }
+}
+
+impl HyperlaneChain for DuskMailbox {
+    fn domain(&self) -> &HyperlaneDomain {
+        &self.domain
+    }
+
+    fn provider(&self) -> Box<dyn HyperlaneProvider> {
+        Box::new((*self.provider).clone())
+    }
+}
+
+impl HyperlaneContract for DuskMailbox {
+    fn address(&self) -> H256 {
+        H256::from_slice(&self.mailbox_id)
+    }
+}
+
+/// Identity-correct MerkleTreeHook adapter.
+///
+/// The Mailbox and hook share query helpers, but Hyperlane checkpoints bind to
+/// the hook contract address. Returning the Mailbox identity here creates a
+/// deterministic false-reorg at validator startup.
+#[derive(Debug, Clone)]
+pub struct DuskMerkleTreeHook {
+    inner: DuskMailbox,
+}
+
+impl DuskMerkleTreeHook {
+    /// Create a hook adapter over the same Dusk connection and topology.
+    pub fn new(inner: DuskMailbox) -> Self {
+        Self { inner }
+    }
+}
+
+impl HyperlaneChain for DuskMerkleTreeHook {
+    fn domain(&self) -> &HyperlaneDomain {
+        self.inner.domain()
+    }
+
+    fn provider(&self) -> Box<dyn HyperlaneProvider> {
+        self.inner.provider()
+    }
+}
+
+impl HyperlaneContract for DuskMerkleTreeHook {
+    fn address(&self) -> H256 {
+        H256::from_slice(&self.inner.merkle_tree_hook_id)
+    }
+}
+
+#[async_trait]
+impl Mailbox for DuskMailbox {
+    fn domain_hash(&self) -> H256 {
+        // Compute domain_hash = keccak256(local_domain || mailbox_address || "HYPERLANE")
+        let mut preimage = Vec::with_capacity(4 + 32 + 9);
+        preimage.extend_from_slice(&self.domain.id().to_be_bytes());
+        preimage.extend_from_slice(&self.mailbox_id);
+        preimage.extend_from_slice(b"HYPERLANE");
+        let hash = hyperlane_dusk_types::message::keccak256(&preimage);
+        H256::from_slice(&hash)
+    }
+
+    async fn count(&self, _reorg_period: &ReorgPeriod) -> ChainResult<u32> {
+        Ok(self.finalized_merkle_view().await?.0)
+    }
+
+    async fn delivered(&self, id: H256) -> ChainResult<bool> {
+        let id_bytes: [u8; 32] = id.into();
+        let delivered: bool = self
+            .rues
+            .contract_query(&self.mailbox_id, "delivered", &(id_bytes,))
+            .await?;
+        Ok(delivered)
+    }
+
+    async fn default_ism(&self) -> ChainResult<H256> {
+        let ism_bytes: [u8; 32] = self
+            .rues
+            .contract_query(&self.mailbox_id, "default_ism", &())
+            .await?;
+        Ok(H256::from_slice(&ism_bytes))
+    }
+
+    async fn recipient_ism(&self, recipient: H256) -> ChainResult<H256> {
+        let recipient_bytes: [u8; 32] = recipient.into();
+        let ism_bytes: [u8; 32] = self
+            .rues
+            .contract_query(&self.mailbox_id, "recipient_ism", &(recipient_bytes,))
+            .await?;
+        Ok(H256::from_slice(&ism_bytes))
+    }
+
+    async fn process(
+        &self,
+        message: &HyperlaneMessage,
+        metadata: &Metadata,
+        tx_gas_limit: Option<U256>,
+    ) -> ChainResult<TxOutcome> {
+        let signer = self
+            .signer
+            .as_ref()
+            .ok_or(HyperlaneDuskError::SignerUnavailable)?;
+
+        let encoded = Self::encode_message(message);
+        info!(
+            message_id = ?message.id(),
+            nonce = message.nonce,
+            "Processing message on Dusk via dusk-tx"
+        );
+
+        let args = crate::tx_sender::process_args(metadata, &encoded)?;
+
+        let gas_limit = tx_gas_limit
+            .map(|limit| {
+                if limit > U256::from(u64::MAX) {
+                    return Err(HyperlaneDuskError::Other(format!(
+                        "Dusk transaction gas limit {limit} exceeds u64"
+                    )));
+                }
+                Ok(limit.low_u64())
+            })
+            .transpose()?;
+
+        let call_result = crate::tx_sender::dusk_tx_call(
+            &self.conn,
+            signer,
+            &self.mailbox_id,
+            "process",
+            &args,
+            gas_limit,
+        )
+        .await;
+
+        let tx_id = match call_result {
+            Ok(response) => response
+                .get("tx_id")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    HyperlaneDuskError::Other(format!(
+                        "dusk-tx response is missing string tx_id: {response}"
+                    ))
+                })?
+                .to_owned(),
+            Err(HyperlaneDuskError::SubmissionOutcomeUnknown { tx_id, detail }) => {
+                warn!(%tx_id, %detail, "Reconciling outcome-unknown Dusk submission by exact hash");
+                tx_id
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let transaction_id = crate::tx_sender::dusk_tx_id_to_h512(&tx_id)?;
+        let confirmed = self
+            .rues
+            .wait_for_tx(&tx_id, TX_CONFIRMATION_TIMEOUT)
+            .await?;
+        let executed = confirmed.error.is_none();
+        if let Some(error) = &confirmed.error {
+            warn!(tx_id, %error, "Dusk mailbox transaction execution failed");
+        }
+
+        Ok(TxOutcome {
+            transaction_id,
+            executed,
+            gas_used: U256::from(confirmed.gas_spent),
+            gas_price: FixedPointNumber::from(self.conn.gas_price),
+        })
+    }
+
+    fn supports_batching(&self) -> bool {
+        false
+    }
+
+    async fn process_batch<'a>(&self, _ops: Vec<&'a QueueOperation>) -> ChainResult<BatchResult> {
+        Err(ChainCommunicationError::BatchingFailed)
+    }
+
+    async fn process_estimate_costs(
+        &self,
+        message: &HyperlaneMessage,
+        metadata: &Metadata,
+    ) -> ChainResult<TxCostEstimate> {
+        // Current Rusk simulation accepts an ordinary signed transaction that
+        // a remote endpoint can replay through propagation. Until consensus
+        // has a non-propagatable simulation envelope, validate the payload
+        // locally and return the configured conservative ceiling.
+        let encoded = Self::encode_message(message);
+        crate::tx_sender::process_args(metadata, &encoded)?;
+        Ok(TxCostEstimate {
+            gas_limit: U256::from(self.conn.gas_limit),
+            gas_price: FixedPointNumber::from(self.conn.gas_price),
+            l2_gas_limit: None,
+        })
+    }
+
+    async fn process_calldata(
+        &self,
+        message: &HyperlaneMessage,
+        metadata: &Metadata,
+    ) -> ChainResult<Vec<u8>> {
+        let encoded = Self::encode_message(message);
+        Ok(crate::tx_sender::process_args(metadata, &encoded)?)
+    }
+
+    fn delivered_calldata(&self, message_id: H256) -> ChainResult<Option<Vec<u8>>> {
+        let id_bytes: [u8; 32] = message_id.into();
+        Ok(Some(rkyv_serialize(&(id_bytes,))?))
+    }
+}
+
+#[async_trait]
+impl MerkleTreeHook for DuskMerkleTreeHook {
+    async fn tree(&self, _reorg_period: &ReorgPeriod) -> ChainResult<IncrementalMerkleAtBlock> {
+        // Rusk does not expose historical contract-state queries. Reconstruct
+        // the one-time validator start tree from hook-owned insertion history,
+        // capped at consensus finality, and verify it against the stored root.
+        self.inner.finalized_tree().await
+    }
+
+    async fn count(&self, _reorg_period: &ReorgPeriod) -> ChainResult<u32> {
+        Ok(self.inner.finalized_merkle_view().await?.0)
+    }
+
+    async fn latest_checkpoint(
+        &self,
+        _reorg_period: &ReorgPeriod,
+    ) -> ChainResult<CheckpointAtBlock> {
+        let finalized_height = self.inner.rues.finalized_block_height().await?;
+        self.inner.checkpoint_at_height(finalized_height).await
+    }
+
+    async fn latest_checkpoint_at_block(&self, height: u64) -> ChainResult<CheckpointAtBlock> {
+        self.inner.checkpoint_at_height(height).await
+    }
+}
+
+// Bring ChainCommunicationError into scope for process_batch
+use hyperlane_core::ChainCommunicationError;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyperlane_core::config::OpSubmissionConfig;
+    use hyperlane_core::{HyperlaneDomainProtocol, HyperlaneDomainTechnicalStack, NativeToken};
+    use url::Url;
+
+    #[test]
+    fn mailbox_and_hook_adapters_report_distinct_contract_identities() {
+        let mailbox_id = H256::from([1u8; 32]);
+        let hook_id = H256::from([2u8; 32]);
+        let rues = Arc::new(RuesClient::new(Url::parse("http://127.0.0.1:1").unwrap()).unwrap());
+        let domain = HyperlaneDomain::from_config(
+            4242,
+            "dusk-test",
+            HyperlaneDomainProtocol::Dusk,
+            HyperlaneDomainTechnicalStack::Other,
+        )
+        .unwrap();
+        let provider = Arc::new(DuskProvider::new(domain.clone(), rues.clone()));
+        let mailbox = DuskMailbox::new(
+            provider,
+            rues,
+            mailbox_id,
+            hook_id,
+            domain,
+            None,
+            ConnectionConf {
+                url: Url::parse("http://127.0.0.1:1").unwrap(),
+                chain_id: 1,
+                event_cursor_dir: std::env::temp_dir(),
+                gas_limit: 1,
+                gas_price: 1,
+                native_token: NativeToken::default(),
+                op_submission_config: OpSubmissionConfig::default(),
+            },
+        );
+        let hook = DuskMerkleTreeHook::new(mailbox.clone());
+        assert_eq!(mailbox.address(), mailbox_id);
+        assert_eq!(hook.address(), hook_id);
+        assert_ne!(mailbox.address(), hook.address());
+    }
+}

@@ -4,7 +4,7 @@
 //! and validations it defines are not applied here, we should mirror them.
 //! ANY CHANGES HERE NEED TO BE REFLECTED IN THE TYPESCRIPT SDK.
 
-use std::{collections::HashSet, ops::Add, path::PathBuf, time::Duration};
+use std::{collections::HashSet, fmt, ops::Add, path::PathBuf, time::Duration};
 
 use aws_config::Region;
 use derive_more::{AsMut, AsRef, Deref, DerefMut};
@@ -24,10 +24,20 @@ use serde::Deserialize;
 use serde_json::Value;
 
 /// Settings for RPCs
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RpcConfig {
     pub url: String,
     pub public: bool,
+}
+
+impl fmt::Debug for RpcConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RpcConfig")
+            .field("url", &"<redacted>")
+            .field("public", &self.public)
+            .finish()
+    }
 }
 
 /// Settings for `Validator`
@@ -388,6 +398,26 @@ fn parse_checkpoint_syncer(syncer: ValueParser) -> ConfigResult<CheckpointSyncer
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn rpc_config_debug_never_contains_url_credentials_or_private_components() {
+        let config = RpcConfig {
+            url: "https://debug-user:debug-password@rpc.example/private-path?token=query-sentinel"
+                .to_owned(),
+            public: false,
+        };
+        let rendered = format!("{config:?}");
+
+        assert!(rendered.contains("<redacted>"));
+        for secret in [
+            "debug-user",
+            "debug-password",
+            "private-path",
+            "query-sentinel",
+        ] {
+            assert!(!rendered.contains(secret));
+        }
+    }
 
     #[test]
     fn test_get_rpc_urls_explicit() {

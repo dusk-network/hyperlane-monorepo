@@ -25,6 +25,7 @@ env:
 
 jobs:
   pnpm-install:
+    if: github.repository_owner == 'hyperlane-xyz'
     runs-on: depot-ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
@@ -49,7 +50,7 @@ jobs:
   lint-prettier-run:
     runs-on: depot-ubuntu-24.04-8
     needs: [change-detection]
-    if: needs.change-detection.outputs.run_lint_prettier == 'true'
+    if: github.repository_owner == 'hyperlane-xyz' && needs.change-detection.outputs.run_lint_prettier == 'true'
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
@@ -325,7 +326,7 @@ jobs:
     runs-on: depot-ubuntu-24.04
     needs: [change-detection]
     timeout-minutes: 20
-    if: needs.change-detection.outputs.skip_ts != 'true'
+    if: github.repository_owner == 'hyperlane-xyz' && needs.change-detection.outputs.skip_ts != 'true'
     steps:
       - uses: actions/checkout@v6
         with:
@@ -356,7 +357,7 @@ jobs:
   infra-test:
     runs-on: depot-ubuntu-24.04
     needs: [set-base-sha, change-detection]
-    if: needs.change-detection.outputs.skip_ts != 'true'
+    if: github.repository_owner == 'hyperlane-xyz' && needs.change-detection.outputs.skip_ts != 'true'
     env:
       GRAFANA_SERVICE_ACCOUNT_TOKEN: ${{ secrets.GRAFANA_SERVICE_ACCOUNT_TOKEN }}
       BALANCE_CHANGES: false
@@ -408,7 +409,7 @@ jobs:
   cli-install-test-run:
     runs-on: depot-ubuntu-24.04
     needs: [change-detection]
-    if: needs.change-detection.outputs.skip_ts != 'true'
+    if: github.repository_owner == 'hyperlane-xyz' && needs.change-detection.outputs.skip_ts != 'true'
     steps:
       - uses: actions/checkout@v6
         with:
@@ -439,6 +440,7 @@ jobs:
 
   cli-e2e-tests:
     needs: [change-detection]
+    if: github.repository_owner == 'hyperlane-xyz'
     uses: ./.github/workflows/test-cli-e2e.yml
     secrets: inherit
     with:
@@ -467,6 +469,7 @@ jobs:
 
   sdk-e2e-tests:
     needs: [change-detection]
+    if: github.repository_owner == 'hyperlane-xyz'
     uses: ./.github/workflows/test-sdk-e2e.yml
     secrets: inherit
     with:
@@ -490,6 +493,7 @@ jobs:
           result: ${{ needs.sdk-e2e-tests.result }}
 
   rust-e2e-tests:
+    if: github.repository_owner == 'hyperlane-xyz'
     uses: ./.github/workflows/test-rust-e2e.yml
     secrets: inherit
     with:
@@ -498,6 +502,7 @@ jobs:
 
   coverage-tests:
     needs: [set-base-sha]
+    if: github.repository_owner == 'hyperlane-xyz'
     uses: ./.github/workflows/test-coverage.yml
     secrets: inherit
     with:
@@ -507,7 +512,7 @@ jobs:
   agent-configs:
     runs-on: depot-ubuntu-24.04
     needs: [change-detection]
-    if: needs.change-detection.outputs.skip_ts != 'true'
+    if: github.repository_owner == 'hyperlane-xyz' && needs.change-detection.outputs.skip_ts != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -551,6 +556,7 @@ jobs:
 
   env-tests:
     needs: [change-detection]
+    if: github.repository_owner == 'hyperlane-xyz'
     uses: ./.github/workflows/test-env.yml
     secrets: inherit
     with:

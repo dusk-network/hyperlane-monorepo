@@ -27,6 +27,7 @@ import {
   derivedWarpConfigToCheckConfig,
   expandedDeployConfigToAltVmCheckConfig,
   getScaleViolations,
+  normalizeAltVmExpectedTokenType,
 } from './warpCheck.js';
 
 const MAILBOX = '0x000000000000000000000000000000000000b001';
@@ -261,6 +262,36 @@ describe('derivedWarpConfigToCheckConfig', () => {
     expect(result.contractVersion).to.equal('1.2.3');
   });
 
+  it('keeps token for collateral types (a real configured value)', () => {
+    const result = derivedWarpConfigToCheckConfig(
+      buildDerivedCollateralConfig({ token: TOKEN_A }),
+      ProtocolType.Sealevel,
+    );
+
+    expect(result).to.have.property('token');
+  });
+
+  it('drops token for synthetic types, whose mint is a deterministic deployment artifact', () => {
+    const result = derivedWarpConfigToCheckConfig(
+      {
+        decimals: 6,
+        destinationGas: {},
+        hook: MAILBOX,
+        interchainSecurityModule: MAILBOX,
+        mailbox: MAILBOX,
+        name: 'TOKEN',
+        owner: OWNER,
+        remoteRouters: {},
+        symbol: 'TOKEN',
+        token: TOKEN_A,
+        type: TokenType.synthetic,
+      },
+      ProtocolType.Sealevel,
+    );
+
+    expect(result).to.not.have.property('token');
+  });
+
   it('normalizes crossCollateralRouters to lowercased, sorted, chain-keyed lists', () => {
     const result = derivedWarpConfigToCheckConfig(
       {
@@ -407,6 +438,46 @@ describe('expandedDeployConfigToAltVmCheckConfig', () => {
 
     expect(result.hook).to.equal(undefined);
     expect(result.interchainSecurityModule).to.equal(undefined);
+  });
+
+  it('drops token for synthetic types so it mirrors the reader-side exclusion', () => {
+    const result = expandedDeployConfigToAltVmCheckConfig(
+      testSealevelChain.name,
+      {
+        decimals: 6,
+        destinationGas: {},
+        mailbox: MAILBOX,
+        owner: OWNER,
+        token: TOKEN_A,
+        type: TokenType.synthetic,
+      },
+      buildMultiProvider(),
+    );
+
+    expect(result).to.not.have.property('token');
+  });
+});
+
+describe('normalizeAltVmExpectedTokenType', () => {
+  it("maps the paradex-only 'collateralDex' annotation to collateral", () => {
+    // collateralDex is a registry-only annotation with no SDK TokenType; the leg
+    // is a standard collateral router on-chain, so the checker must treat the two
+    // as equivalent instead of false-flagging a `type` ConfigMismatch.
+    expect(normalizeAltVmExpectedTokenType('collateralDex')).to.equal(
+      TokenType.collateral,
+    );
+  });
+
+  it('leaves known token types unchanged', () => {
+    expect(normalizeAltVmExpectedTokenType(TokenType.collateral)).to.equal(
+      TokenType.collateral,
+    );
+    expect(normalizeAltVmExpectedTokenType(TokenType.synthetic)).to.equal(
+      TokenType.synthetic,
+    );
+    expect(normalizeAltVmExpectedTokenType(TokenType.native)).to.equal(
+      TokenType.native,
+    );
   });
 });
 

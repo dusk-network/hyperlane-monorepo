@@ -203,6 +203,14 @@ impl DestinationFactory {
         domain: &HyperlaneDomain,
         chain_conf: &ChainConf,
     ) -> Result<Arc<dyn Mailbox>, FactoryError> {
+        if chain_conf.connection.protocol() == HyperlaneDomainProtocol::Dusk
+            && chain_conf.signer.is_none()
+        {
+            return Err(FactoryError::MissingConfiguration(format!(
+                "Dusk destination {} requires a signer for submission",
+                domain.name()
+            )));
+        }
         let start_entity_init = Instant::now();
         let mailbox = chain_conf
             .build_mailbox(self.core_metrics.as_ref())
