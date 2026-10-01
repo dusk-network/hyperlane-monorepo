@@ -106,8 +106,8 @@ impl DuskMailbox {
             .await
     }
 
-    async fn finalized_merkle_view(&self) -> ChainResult<(u32, u64)> {
-        let finalized_height = self.rues.finalized_block_height().await?;
+    async fn finalized_merkle_view(&self, reorg_period: &ReorgPeriod) -> ChainResult<(u32, u64)> {
+        let finalized_height = self.rues.checkpoint_block_height(reorg_period).await?;
         let count = self.merkle_tree_count().await?;
         let finalized_count = self.merkle_count_at_height(count, finalized_height).await?;
         Ok((finalized_count, finalized_height))
@@ -121,8 +121,11 @@ impl DuskMailbox {
         Ok(H256::from_slice(&root))
     }
 
-    async fn finalized_tree(&self) -> ChainResult<IncrementalMerkleAtBlock> {
-        let (count, finalized_height) = self.finalized_merkle_view().await?;
+    async fn finalized_tree(
+        &self,
+        reorg_period: &ReorgPeriod,
+    ) -> ChainResult<IncrementalMerkleAtBlock> {
+        let (count, finalized_height) = self.finalized_merkle_view(reorg_period).await?;
         let mut tree = IncrementalMerkle::default();
         let mut start = 0u32;
         while start < count {
@@ -248,8 +251,8 @@ impl Mailbox for DuskMailbox {
         H256::from_slice(&hash)
     }
 
-    async fn count(&self, _reorg_period: &ReorgPeriod) -> ChainResult<u32> {
-        Ok(self.finalized_merkle_view().await?.0)
+    async fn count(&self, reorg_period: &ReorgPeriod) -> ChainResult<u32> {
+        Ok(self.finalized_merkle_view(reorg_period).await?.0)
     }
 
     async fn delivered(&self, id: H256) -> ChainResult<bool> {
@@ -396,22 +399,26 @@ impl Mailbox for DuskMailbox {
 
 #[async_trait]
 impl MerkleTreeHook for DuskMerkleTreeHook {
-    async fn tree(&self, _reorg_period: &ReorgPeriod) -> ChainResult<IncrementalMerkleAtBlock> {
+    async fn tree(&self, reorg_period: &ReorgPeriod) -> ChainResult<IncrementalMerkleAtBlock> {
         // Rusk does not expose historical contract-state queries. Reconstruct
         // the one-time validator start tree from hook-owned insertion history,
         // capped at consensus finality, and verify it against the stored root.
-        self.inner.finalized_tree().await
+        self.inner.finalized_tree(reorg_period).await
     }
 
-    async fn count(&self, _reorg_period: &ReorgPeriod) -> ChainResult<u32> {
-        Ok(self.inner.finalized_merkle_view().await?.0)
+    async fn count(&self, reorg_period: &ReorgPeriod) -> ChainResult<u32> {
+        Ok(self.inner.finalized_merkle_view(reorg_period).await?.0)
     }
 
     async fn latest_checkpoint(
         &self,
-        _reorg_period: &ReorgPeriod,
+        reorg_period: &ReorgPeriod,
     ) -> ChainResult<CheckpointAtBlock> {
-        let finalized_height = self.inner.rues.finalized_block_height().await?;
+        let finalized_height = self
+            .inner
+            .rues
+            .checkpoint_block_height(reorg_period)
+            .await?;
         self.inner.checkpoint_at_height(finalized_height).await
     }
 

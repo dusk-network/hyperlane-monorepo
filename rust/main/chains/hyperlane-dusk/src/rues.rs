@@ -16,7 +16,7 @@ use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 use serde_json::Value as JsonValue;
 use url::Url;
 
-use hyperlane_core::{H256, H512};
+use hyperlane_core::{ReorgPeriod, H256, H512};
 
 use crate::HyperlaneDuskError;
 
@@ -764,10 +764,30 @@ impl RuesClient {
 
     /// Return the latest block height finalized by the node's consensus view.
     pub(crate) async fn finalized_block_height(&self) -> Result<u64, HyperlaneDuskError> {
+        self.checkpoint_block_height(&ReorgPeriod::None).await
+    }
+
+    /// Apply the configured block delay while retaining consensus finality as
+    /// an upper bound. Both heights come from one archive snapshot.
+    pub(crate) async fn checkpoint_block_height(
+        &self,
+        reorg_period: &ReorgPeriod,
+    ) -> Result<u64, HyperlaneDuskError> {
+        let delay = match reorg_period {
+            ReorgPeriod::None => 0,
+            ReorgPeriod::Blocks(blocks) => u64::from(blocks.get()),
+            ReorgPeriod::Tag(tag) if tag == "finalized" => 0,
+            ReorgPeriod::Tag(tag) => {
+                return Err(HyperlaneDuskError::Other(format!(
+                    "Dusk supports a numeric reorgPeriod or the finalized tag, got {tag:?}"
+                )));
+            }
+        };
         let data = self
             .graphql_query("query { lastBlockPair { json } }")
             .await?;
-        parse_finalized_block_height(&data)
+        let (latest, finalized) = parse_block_heights(&data)?;
+        Ok(finalized.min(latest.saturating_sub(delay)))
     }
 
     /// Return the finalized height in Hyperlane's shared u32 cursor range.
@@ -997,7 +1017,7 @@ fn parse_confirmed_transaction(
     Ok(ConfirmedTransaction { gas_spent, error })
 }
 
-fn parse_finalized_block_height(data: &JsonValue) -> Result<u64, HyperlaneDuskError> {
+fn parse_block_heights(data: &JsonValue) -> Result<(u64, u64), HyperlaneDuskError> {
     let pair = data
         .get("lastBlockPair")
         .and_then(|value| value.get("json"))
@@ -1031,7 +1051,7 @@ fn parse_finalized_block_height(data: &JsonValue) -> Result<u64, HyperlaneDuskEr
             "Rusk finalized height {finalized} exceeds latest height {latest}"
         )));
     }
-    Ok(finalized)
+    Ok((latest, finalized))
 }
 
 fn validate_finalized_event_page(
@@ -1428,7 +1448,7 @@ mod tests {
     #[test]
     fn finalized_height_is_parsed_fail_closed() {
         assert_eq!(
-            parse_finalized_block_height(&serde_json::json!({
+            parse_block_heights(&serde_json::json!({
                 "lastBlockPair": {
                     "json": {
                         "last_block": [46, "latest"],
@@ -1437,9 +1457,9 @@ mod tests {
                 }
             }))
             .unwrap(),
-            45
+            (46, 45)
         );
-        assert!(parse_finalized_block_height(&serde_json::json!({
+        assert!(parse_block_heights(&serde_json::json!({
             "lastBlockPair": {
                 "json": {
                     "last_block": [45, "latest"],
@@ -1448,7 +1468,7 @@ mod tests {
             }
         }))
         .is_err());
-        assert!(parse_finalized_block_height(&serde_json::json!({})).is_err());
+        assert!(parse_block_heights(&serde_json::json!({})).is_err());
     }
 
     #[tokio::test]

@@ -253,6 +253,13 @@ The follow-up raw-artifact triage added these compatibility decisions:
 - Same-block ordinal reconstruction now uses logarithmic boundary searches
   over monotonic contract-record heights rather than scanning the entire prior
   same-block prefix for every record.
+- Dusk checkpoint reads honor numeric `blocks.reorgPeriod` delays: the query
+  height is `min(consensus_finalized_height, latest_height - delay)`, with
+  subtraction saturating at genesis. A zero delay and the `finalized` tag use
+  consensus finality; unsupported tags return an error. Tree reconstruction,
+  counts, and latest checkpoints apply the same bound. Public-adapter tests use
+  a binary RUES archive fixture to verify a delay longer than finality, a delay
+  shorter than finality, an empty historical tree, and unsupported tags.
 - Sequence state is visible to agents only through the node's consensus-finalized
   height. Dispatch, delivery, IGP payment, and Merkle insertion indexers stop
   before unfinalized records, transaction-hash lookups exclude unfinalized
