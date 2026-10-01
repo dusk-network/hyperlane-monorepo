@@ -20,6 +20,9 @@ env:
   RUST_BACKTRACE: full
   MIN_LANDERCOVERAGE_PERCENTAGE: 15
   RUSTC_WRAPPER: sccache
+  # Backtraces keep file:line; full variable debuginfo only bloats test binaries.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
   ts-only:
@@ -27,7 +30,7 @@ jobs:
     outputs:
       skip_rust: ${{ steps.decide.outputs.skip_rust }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -64,8 +67,8 @@ jobs:
             exit 0
           fi
 
-          # Filter out sealevel deployment config paths that don't affect build/tests
-          RUST_CODE_CHANGES=$(echo "$CHANGED_FILES" | grep -vE '^rust/sealevel/(environments/(mainnet3|testnet4)/|\.vscode/)' || true)
+          # Filter out deployment paths that don't affect Rust build/tests
+          RUST_CODE_CHANGES=$(echo "$CHANGED_FILES" | grep -vE '^rust/(main/helm/|sealevel/(environments/(mainnet3|testnet4)/|\.vscode/))' || true)
           if echo "$RUST_CODE_CHANGES" | grep -qE '^(rust/|\.github/workflows/(rust\.|test\.yml|test-rust)|\.github/actions/)'; then
             echo "skip_rust=false" >> $GITHUB_OUTPUT
           else
@@ -77,7 +80,7 @@ jobs:
     if: github.repository_owner == 'hyperlane-xyz' && needs.ts-only.outputs.skip_rust != 'true'
     runs-on: depot-ubuntu-24.04-8
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
@@ -122,7 +125,54 @@ jobs:
     if: github.repository_owner == 'hyperlane-xyz' && needs.ts-only.outputs.skip_rust != 'true'
     runs-on: depot-ubuntu-24.04-8
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+      - name: Install mold linker
+        uses: rui314/setup-mold@v1
+      - name: Setup sccache
+        uses: ./.github/actions/setup-sccache
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9
+      # Scraper tests start many testcontainers Postgres instances in parallel; pull
+      # the images once up front so a Docker Hub hiccup cannot fail a test mid-run.
+      # Tags must match the scraper tests: testcontainers' default and `with_tag`.
+      - name: Pre-pull testcontainers images
+        run: |
+          for image in postgres:11-alpine postgres:16-alpine; do
+            for attempt in 1 2 3; do
+              if docker pull "$image"; then
+                break
+              fi
+              if [[ "$attempt" == "3" ]]; then
+                echo "Failed to pull $image after $attempt attempts"
+                exit 1
+              fi
+              echo "$image pull failed; retrying in $((attempt * 10)) seconds"
+              sleep $((attempt * 10))
+            done
+          done
+      - name: Run tests for main workspace
+        run: cargo nextest run --profile ci --features aleo,integration_test --all-targets
+        working-directory: ./rust/main
+
+  test-rs-sealevel-run:
+    needs: [ts-only]
+    if: github.repository_owner == 'hyperlane-xyz' && needs.ts-only.outputs.skip_rust != 'true'
+    runs-on: depot-ubuntu-24.04-8
+    steps:
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
@@ -142,9 +192,26 @@ jobs:
         run: |
           sh -c "$(curl -sSfL https://release.anza.xyz/v3.0.14/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
-      - name: Run tests for main workspace
-        run: cargo test --all-targets --features aleo,integration_test
-        working-directory: ./rust/main
+      # cargo-build-sbf keeps its pinned toolchain outside Cargo's target cache.
+      - name: Cache SBF platform tools
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/solana
+          key: sbf-platform-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust/main/utils/run-locally/src/sealevel/solana.rs') }}
+      - name: Install SBF platform tools
+        run: |
+          for attempt in 1 2 3; do
+            if cargo build-sbf --install-only; then
+              exit 0
+            fi
+            if [[ "$attempt" == "3" ]]; then
+              echo "Failed to install SBF platform tools after $attempt attempts"
+              exit 1
+            fi
+            echo "SBF platform-tools download failed; retrying in $((attempt * 10)) seconds"
+            sleep $((attempt * 10))
+          done
+        working-directory: ./rust/sealevel
       - name: Build sealevel SBF programs
         run: cargo build-sbf --manifest-path programs/ism/composite-ism/Cargo.toml
         working-directory: ./rust/sealevel
@@ -157,7 +224,7 @@ jobs:
     if: github.repository_owner == 'hyperlane-xyz' && needs.ts-only.outputs.skip_rust != 'true'
     runs-on: depot-ubuntu-24.04-8
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
@@ -227,7 +294,7 @@ jobs:
     needs: [lander-coverage-run]
     if: always()
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Check lander-coverage status
         uses: ./.github/actions/check-job-status
         with:
@@ -236,22 +303,27 @@ jobs:
 
   test-rs:
     runs-on: ubuntu-latest
-    needs: [test-rs-run]
+    needs: [test-rs-run, test-rs-sealevel-run]
     if: always()
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Check test-rs status
         uses: ./.github/actions/check-job-status
         with:
           job_name: 'Rust Tests'
           result: ${{ needs.test-rs-run.result }}
+      - name: Check test-rs sealevel status
+        uses: ./.github/actions/check-job-status
+        with:
+          job_name: 'Rust Sealevel Tests'
+          result: ${{ needs.test-rs-sealevel-run.result }}
 
   lint-rs:
     runs-on: ubuntu-latest
     needs: [lint-rs-run]
     if: always()
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Check lint-rs status
         uses: ./.github/actions/check-job-status
         with:

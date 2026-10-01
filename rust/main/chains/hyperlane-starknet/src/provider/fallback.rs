@@ -83,8 +83,8 @@ impl JsonRpcTransport for FallbackHttpTransport {
         params: P,
     ) -> Result<JsonRpcResponse<R>, Self::Error>
     where
-        P: Serialize + Send,
-        R: DeserializeOwned,
+        P: Serialize + Send + Sync,
+        R: DeserializeOwned + Send,
     {
         let params_json = serde_json::to_value(params).map_err(Self::Error::Json)?;
         let mut errors = vec![];
@@ -100,7 +100,7 @@ impl JsonRpcTransport for FallbackHttpTransport {
                 // Create log span
                 let provider = &self.inner.providers[priority.index];
 
-                tracing::debug!(
+                tracing::trace!(
                     fallback_count = idx,
                     provider_index = priority.index,
                     "fallback_request"

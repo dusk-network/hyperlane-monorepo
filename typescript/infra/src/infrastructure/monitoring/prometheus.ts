@@ -107,9 +107,12 @@ async function getPrometheusConfig(
                 'prometheus_remote_storage_samples_failed_total',
                 'prometheus_remote_storage_samples_pending',
                 'prometheus_remote_storage_samples_total',
+                // PushGateway job freshness
+                'push_time_seconds',
                 // Application metrics
                 'ethereum.*',
                 'hyperlane.*',
+                'tollkeeper.*',
                 // Kubernetes metrics
                 'kube_pod_status_phase',
                 'kube_pod_container_status_restarts_total',
@@ -129,7 +132,29 @@ async function getPrometheusConfig(
       resources: {
         requests: {
           cpu: '200m',
-          memory: '3Gi',
+          memory: '8Gi',
+        },
+        limits: {
+          memory: '12Gi',
+        },
+      },
+    },
+    'prometheus-pushgateway': {
+      extraArgs: [
+        '--persistence.file=/data/pushgateway.data',
+        '--persistence.interval=5m',
+      ],
+      persistentVolume: {
+        enabled: true,
+        size: '2Gi',
+      },
+      resources: {
+        requests: {
+          cpu: '50m',
+          memory: '64Mi',
+        },
+        limits: {
+          memory: '128Mi',
         },
       },
     },

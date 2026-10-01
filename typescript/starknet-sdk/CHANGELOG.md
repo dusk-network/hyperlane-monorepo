@@ -1,5 +1,137 @@
 # @hyperlane-xyz/starknet-sdk
 
+## 30.0.2
+
+### Patch Changes
+
+- @hyperlane-xyz/starknet-core@44.0.2
+- @hyperlane-xyz/utils@44.0.2
+- @hyperlane-xyz/provider-sdk@10.0.2
+
+## 30.0.1
+
+### Patch Changes
+
+- Updated dependencies [f269e03]
+  - @hyperlane-xyz/provider-sdk@10.0.1
+  - @hyperlane-xyz/starknet-core@44.0.1
+  - @hyperlane-xyz/utils@44.0.1
+
+## 30.0.0
+
+### Major Changes
+
+- 6fbe5ad: The Starknet TypeScript stack was upgraded from starknet.js v7 to v8.9.2 to support the JSON-RPC v0.9 endpoints. Account and Contract call sites were migrated to the v8 options-object constructors, fee estimation was updated to the new resourceBounds shape, and dispatch-event parsing now passes the required ABI parser. Starknet wallet dependencies were upgraded for starknet.js v8 compatibility, and the minimum supported Node.js version is now 22 across published runtime dependents.
+
+### Patch Changes
+
+- Updated dependencies [6fbe5ad]
+  - @hyperlane-xyz/starknet-core@44.0.0
+  - @hyperlane-xyz/utils@44.0.0
+  - @hyperlane-xyz/provider-sdk@10.0.0
+
+## 29.1.8
+
+### Patch Changes
+
+- Updated dependencies [8bcc7ab]
+- Updated dependencies [7cf9c01]
+  - @hyperlane-xyz/provider-sdk@9.0.0
+  - @hyperlane-xyz/utils@43.0.0
+  - @hyperlane-xyz/starknet-core@43.0.0
+
+## 29.1.7
+
+### Patch Changes
+
+- @hyperlane-xyz/starknet-core@42.0.0
+- @hyperlane-xyz/utils@42.0.0
+- @hyperlane-xyz/provider-sdk@8.1.3
+
+## 29.1.6
+
+### Patch Changes
+
+- @hyperlane-xyz/starknet-core@41.3.1
+- @hyperlane-xyz/utils@41.3.1
+- @hyperlane-xyz/provider-sdk@8.1.2
+
+## 29.1.5
+
+### Patch Changes
+
+- @hyperlane-xyz/starknet-core@41.3.0
+- @hyperlane-xyz/utils@41.3.0
+- @hyperlane-xyz/provider-sdk@8.1.1
+
+## 29.1.4
+
+### Patch Changes
+
+- Updated dependencies [bd4e5f0]
+  - @hyperlane-xyz/provider-sdk@8.1.0
+  - @hyperlane-xyz/starknet-core@41.2.0
+  - @hyperlane-xyz/utils@41.2.0
+
+## 29.1.3
+
+### Patch Changes
+
+- @hyperlane-xyz/starknet-core@41.1.0
+- @hyperlane-xyz/utils@41.1.0
+- @hyperlane-xyz/provider-sdk@8.0.4
+
+## 29.1.2
+
+### Patch Changes
+
+- Updated dependencies [fa19409]
+  - @hyperlane-xyz/utils@41.0.0
+  - @hyperlane-xyz/provider-sdk@8.0.3
+  - @hyperlane-xyz/starknet-core@41.0.0
+
+## 29.1.1
+
+### Patch Changes
+
+- @hyperlane-xyz/starknet-core@40.0.0
+- @hyperlane-xyz/utils@40.0.0
+- @hyperlane-xyz/provider-sdk@8.0.2
+
+## 29.1.0
+
+### Minor Changes
+
+- 086ec59: Kept Starknet deployment artifacts out of browser runtime paths by publishing ABI and class-hash data through dedicated runtime exports.
+
+### Patch Changes
+
+- Updated dependencies [4976bb1]
+- Updated dependencies [086ec59]
+  - @hyperlane-xyz/utils@39.1.0
+  - @hyperlane-xyz/starknet-core@39.1.0
+  - @hyperlane-xyz/provider-sdk@8.0.1
+
+## 29.0.0
+
+### Major Changes
+
+- 4ef1fde: - `getMinGasForWarpDeploy` now lives on `IProvider` (per-chain) instead of the stateless `ProtocolProvider`. It is `async` and returns a FINAL native-denom amount rather than a mix of gas units and native amounts. It composes the base router deploy cost with additive deltas for detected features (cross-collateral extras, fee program deploy, custom ISM / hook / IGP deploy) driven by the warp config shape, and for gas-metered protocols multiplies gas units by the chain gas price.
+  - `ChainMetadataForAltVM` gained an optional `gasPrice` field.
+  - `ProviderBuilderFn` now takes a full `ChainMetadata` instead of `(rpcUrls, network)`.
+  - The AltVM `IProvider.connect` and `ISigner.connectWithSigner` static factories now take `ChainMetadataForAltVM` as their first argument, replacing the previous `(rpcUrls, chainId, extraParams)` shape and the metadata-through-`extraParams` indirection.
+  - The CLI warp-deploy preflight now sizes AltVM native-balance requirements from the composed per-chain deploy cost, so feature-heavy deploys are no longer silently under-funded, and chains without a gas price are no longer skipped for the warp-deploy path.
+  - The AltVM warp-deploy base gas costs were calibrated from measured deploys (Sealevel from mainnet; Starknet, Aleo, and Radix from devnet base-router floors with safety margin), replacing the previous catastrophically-low placeholder constants that let preflight pass under-funded accounts.
+  - The Starknet test fixture native token was corrected from ETH to STRK to match the production registry and the token the devnet actually charges fees in.
+
+### Patch Changes
+
+- Updated dependencies [4ef1fde]
+- Updated dependencies [735793b]
+  - @hyperlane-xyz/provider-sdk@8.0.0
+  - @hyperlane-xyz/utils@39.0.0
+  - @hyperlane-xyz/starknet-core@39.0.0
+
 ## 28.1.4
 
 ### Patch Changes

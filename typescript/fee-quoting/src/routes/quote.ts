@@ -1,12 +1,13 @@
-import { Request, Response, Router } from 'express';
+import type { FastifyReply, FastifyRequest } from 'fastify';
 import { type Address, isAddress } from 'viem';
 import { z } from 'zod';
 
 import { FeeQuotingCommand } from '@hyperlane-xyz/sdk';
 
+import type { FeeQuotingApp } from '../http.js';
+import type { createApiKeyAuth } from '../middleware/apiKeyAuth.js';
 import type { QuoteService } from '../services/quoteService.js';
 
-import { asyncHandler } from './asyncHandler.js';
 import { bytes32Schema, domainSchema } from './commonSchemas.js';
 import { parseAndValidate } from './parseAndValidate.js';
 
@@ -34,12 +35,22 @@ const IcaQuerySchema = z.object({
   salt: bytes32Schema,
 });
 
-export function createQuoteRouter(quoteService: QuoteService): Router {
-  const router = Router();
+const CompiledWarpQuerySchema = z.compile(WarpQuerySchema);
+const CompiledWarpQueryWithTargetRouterSchema = z.compile(
+  WarpQueryWithTargetRouterSchema,
+);
+const CompiledIcaQuerySchema = z.compile(IcaQuerySchema);
+
+export function registerQuoteRoutes(
+  app: FeeQuotingApp,
+  quoteService: QuoteService,
+  onRequest: ReturnType<typeof createApiKeyAuth>,
+): void {
+  const routeOptions = { onRequest };
 
   function warpHandler(command: FeeQuotingCommand) {
-    return async (req: Request, res: Response) => {
-      const data = parseAndValidate(WarpQuerySchema, req.query);
+    return async (request: FastifyRequest, reply: FastifyReply) => {
+      const data = parseAndValidate(CompiledWarpQuerySchema, request.query);
       const response = await quoteService.getQuote(
         data.origin,
         command,
@@ -48,13 +59,13 @@ export function createQuoteRouter(quoteService: QuoteService): Router {
         data.salt,
         data.recipient,
       );
-      res.json(response);
+      return reply.send(response);
     };
   }
 
   function icaHandler(command: FeeQuotingCommand) {
-    return async (req: Request, res: Response) => {
-      const data = parseAndValidate(IcaQuerySchema, req.query);
+    return async (request: FastifyRequest, reply: FastifyReply) => {
+      const data = parseAndValidate(CompiledIcaQuerySchema, request.query);
       const response = await quoteService.getQuote(
         data.origin,
         command,
@@ -62,38 +73,39 @@ export function createQuoteRouter(quoteService: QuoteService): Router {
         data.destination,
         data.salt,
       );
-      res.json(response);
+      return reply.send(response);
     };
   }
 
-  router.get(
-    '/transferRemote',
-    asyncHandler(warpHandler(FeeQuotingCommand.TransferRemote)),
+  app.get(
+    '/quote/transferRemote',
+    routeOptions,
+    warpHandler(FeeQuotingCommand.TransferRemote),
   );
-  router.get(
-    '/transferRemoteTo',
-    asyncHandler(async (req: Request, res: Response) => {
-      const data = parseAndValidate(WarpQueryWithTargetRouterSchema, req.query);
-      const response = await quoteService.getQuote(
-        data.origin,
-        FeeQuotingCommand.TransferRemoteTo,
-        data.router,
-        data.destination,
-        data.salt,
-        data.recipient,
-        data.targetRouter,
-      );
-      res.json(response);
-    }),
+  app.get('/quote/transferRemoteTo', routeOptions, async (request, reply) => {
+    const data = parseAndValidate(
+      CompiledWarpQueryWithTargetRouterSchema,
+      request.query,
+    );
+    const response = await quoteService.getQuote(
+      data.origin,
+      FeeQuotingCommand.TransferRemoteTo,
+      data.router,
+      data.destination,
+      data.salt,
+      data.recipient,
+      data.targetRouter,
+    );
+    return reply.send(response);
+  });
+  app.get(
+    '/quote/callRemoteWithOverrides',
+    routeOptions,
+    icaHandler(FeeQuotingCommand.CallRemoteWithOverrides),
   );
-  router.get(
-    '/callRemoteWithOverrides',
-    asyncHandler(icaHandler(FeeQuotingCommand.CallRemoteWithOverrides)),
+  app.get(
+    '/quote/callRemoteCommitReveal',
+    routeOptions,
+    icaHandler(FeeQuotingCommand.CallRemoteCommitReveal),
   );
-  router.get(
-    '/callRemoteCommitReveal',
-    asyncHandler(icaHandler(FeeQuotingCommand.CallRemoteCommitReveal)),
-  );
-
-  return router;
 }

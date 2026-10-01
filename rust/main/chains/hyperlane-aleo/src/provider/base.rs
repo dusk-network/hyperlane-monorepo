@@ -4,27 +4,51 @@ use std::{
 };
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderValue, AUTHORIZATION};
+use reqwest::header::{HeaderValue, AUTHORIZATION, CONTENT_LENGTH};
 use reqwest::Client as ReqwestClient;
 use reqwest_utils::parse_custom_rpc_headers;
 use serde::de::DeserializeOwned;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use url::Url;
 
 use hyperlane_core::{ChainCommunicationError, ChainResult};
 
 use crate::provider::{HttpClient, HttpClientBuilder};
-use crate::HyperlaneAleoError;
+use crate::{DelegatedProverAuthError, HyperlaneAleoError};
 
 // Default timeouts
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
+fn append_path(base_url: &Url, path: &str) -> ChainResult<Url> {
+    let mut url = base_url.clone();
+    url.path_segments_mut()
+        .map_err(|_| HyperlaneAleoError::Other(format!("Invalid base URL: {base_url}")))?
+        .pop_if_empty()
+        .extend(path.split('/'));
+
+    // `Url` leaves square brackets unescaped in path segments, but Aleo RPC
+    // gateways reject bracketed plaintext mapping keys unless they are encoded.
+    let encoded_path = url.path().replace('[', "%5B").replace(']', "%5D");
+    url.set_path(&encoded_path);
+    Ok(url)
+}
+
+fn append_network(base_url: Url, network: u16) -> ChainResult<Url> {
+    let network = match network {
+        0 => "mainnet",
+        1 => "testnet",
+        2 => "canary",
+        id => return Err(HyperlaneAleoError::UnknownNetwork(id).into()),
+    };
+    append_path(&base_url, network)
+}
+
 /// Base Http client that performs REST-ful queries
 #[derive(Clone, Debug)]
 pub struct BaseHttpClient {
     client: ReqwestClient,
-    base_url: String,
+    base_url: Url,
 }
 
 impl BaseHttpClient {
@@ -37,15 +61,9 @@ impl BaseHttpClient {
             .default_headers(headers)
             .build()
             .map_err(HyperlaneAleoError::from)?;
-        let suffix = match network {
-            0 => "mainnet",
-            1 => "testnet",
-            2 => "canary",
-            id => return Err(HyperlaneAleoError::UnknownNetwork(id).into()),
-        };
         Ok(Self {
             client,
-            base_url: url.to_string().trim_end_matches("/").to_string() + "/" + suffix,
+            base_url: append_network(url, network)?,
         })
     }
 }
@@ -58,11 +76,11 @@ impl HttpClient for BaseHttpClient {
         path: &str,
         query: impl Into<Option<serde_json::Value>> + Send,
     ) -> ChainResult<T> {
-        let url = format!("{}/{}", self.base_url, path);
+        let url = append_path(&self.base_url, path)?;
         let query: serde_json::Value = query.into().unwrap_or_default();
         let response = self
             .client
-            .get(&url)
+            .get(url)
             .query(&query)
             .send()
             .await
@@ -74,16 +92,41 @@ impl HttpClient for BaseHttpClient {
         Ok(json)
     }
 
+    async fn request_optional<T: DeserializeOwned + Send>(
+        &self,
+        path: &str,
+        query: impl Into<Option<serde_json::Value>> + Send,
+    ) -> ChainResult<Option<T>> {
+        let url = append_path(&self.base_url, path)?;
+        let query: serde_json::Value = query.into().unwrap_or_default();
+        let response = self
+            .client
+            .get(url)
+            .query(&query)
+            .send()
+            .await
+            .map_err(HyperlaneAleoError::from)?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let response = response
+            .error_for_status()
+            .map_err(HyperlaneAleoError::from)?;
+        Ok(Some(
+            response.json().await.map_err(HyperlaneAleoError::from)?,
+        ))
+    }
+
     /// Makes a POST request to the API
     async fn request_post<T: DeserializeOwned + Send>(
         &self,
         path: &str,
         body: &serde_json::Value,
     ) -> ChainResult<T> {
-        let url = format!("{}/{}", self.base_url, path);
+        let url = append_path(&self.base_url, path)?;
         let response = self
             .client
-            .post(&url)
+            .post(url)
             .json(body)
             .send()
             .await
@@ -107,10 +150,10 @@ impl HttpClientBuilder for BaseHttpClient {
 #[derive(Clone, Debug)]
 pub struct JWTBaseHttpClient {
     client: ReqwestClient,
-    base_url: String,
-    suffix: String,
+    base_url: Url,
     auth_url: String,
     auth_token: Arc<RwLock<Option<(HeaderValue, Instant)>>>,
+    auth_refresh: Arc<Mutex<()>>,
 }
 
 impl JWTBaseHttpClient {
@@ -130,38 +173,46 @@ impl JWTBaseHttpClient {
             .cookie_store(true)
             .build()
             .map_err(HyperlaneAleoError::from)?;
-        let suffix = match network {
-            0 => "mainnet",
-            1 => "testnet",
-            2 => "canary",
-            id => return Err(HyperlaneAleoError::UnknownNetwork(id).into()),
-        };
         Ok(Self {
             client,
-            base_url: url.to_string().trim_end_matches("/").to_string(),
+            base_url: append_network(url, network)?,
             auth_token: Default::default(),
-            suffix: suffix.to_string(),
+            auth_refresh: Default::default(),
             auth_url,
         })
     }
 
-    /// Gets the authentication token if it is still valid
-    pub async fn get_auth_token(&self) -> ChainResult<HeaderValue> {
-        {
-            let auth_token = self.auth_token.read().await;
-            if let Some((token, expires_at)) = &*auth_token {
-                if Instant::now() < *expires_at {
-                    return Ok(token.clone());
-                }
+    async fn cached_auth_token(&self) -> Option<HeaderValue> {
+        let auth_token = self.auth_token.read().await;
+        if let Some((token, expires_at)) = &*auth_token {
+            if Instant::now() < *expires_at {
+                return Some(token.clone());
             }
+        }
+        None
+    }
+
+    async fn refresh_auth_token(&self) -> ChainResult<HeaderValue> {
+        // Only serialize token refreshes. Requests with a valid cached token
+        // avoid this lock and unrelated API network work never holds it.
+        let _refresh_guard = self.auth_refresh.lock().await;
+
+        // Another caller may have refreshed the token while this caller waited.
+        if let Some(token) = self.cached_auth_token().await {
+            return Ok(token);
         }
 
         let response = self
             .client
             .post(&self.auth_url)
+            // Provable requires Content-Length even for an empty JWT request.
+            .header(CONTENT_LENGTH, "0")
             .send()
             .await
             .map_err(HyperlaneAleoError::from)?;
+        let response = response
+            .error_for_status()
+            .map_err(|error| HyperlaneAleoError::from(DelegatedProverAuthError::new(error)))?;
         let result = response
             .headers()
             .get(AUTHORIZATION)
@@ -172,12 +223,26 @@ impl JWTBaseHttpClient {
             .unwrap_or(Instant::now()); // Tokens last 15 minutes
         let mut auth_token = self.auth_token.write().await;
         *auth_token = Some((result.clone(), expires));
-        Ok(result.clone())
+        Ok(result)
     }
 
-    async fn clear_auth_token(&self) {
+    /// Gets the authentication token if it is still valid
+    pub async fn get_auth_token(&self) -> ChainResult<HeaderValue> {
+        if let Some(token) = self.cached_auth_token().await {
+            return Ok(token);
+        }
+
+        self.refresh_auth_token().await
+    }
+
+    async fn clear_auth_token(&self, rejected_token: &HeaderValue) {
         let mut auth_token = self.auth_token.write().await;
-        *auth_token = None;
+        if auth_token
+            .as_ref()
+            .is_some_and(|(token, _)| token == rejected_token)
+        {
+            *auth_token = None;
+        }
     }
 }
 
@@ -189,21 +254,21 @@ impl HttpClient for JWTBaseHttpClient {
         path: &str,
         query: impl Into<Option<serde_json::Value>> + Send,
     ) -> ChainResult<T> {
-        let url = format!("{}/{}/{}", self.base_url, self.suffix, path);
+        let url = append_path(&self.base_url, path)?;
         let query: serde_json::Value = query.into().unwrap_or_default();
         let auth = self.get_auth_token().await?;
         let response = self
             .client
-            .get(&url)
-            .header(AUTHORIZATION, auth)
+            .get(url)
+            .header(AUTHORIZATION, auth.clone())
             .query(&query)
             .send()
             .await
             .map_err(HyperlaneAleoError::from)?;
 
-        // Two instances of the relayer might compete for the same JWT, if so clear the token early and request a new one
+        // Do not let a late rejection of an old token evict a token refreshed by another request.
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            self.clear_auth_token().await;
+            self.clear_auth_token(&auth).await;
         }
 
         let response = response
@@ -214,26 +279,57 @@ impl HttpClient for JWTBaseHttpClient {
         Ok(json)
     }
 
+    async fn request_optional<T: DeserializeOwned + Send>(
+        &self,
+        path: &str,
+        query: impl Into<Option<serde_json::Value>> + Send,
+    ) -> ChainResult<Option<T>> {
+        let url = append_path(&self.base_url, path)?;
+        let query: serde_json::Value = query.into().unwrap_or_default();
+        let auth = self.get_auth_token().await?;
+        let response = self
+            .client
+            .get(url)
+            .header(AUTHORIZATION, auth.clone())
+            .query(&query)
+            .send()
+            .await
+            .map_err(HyperlaneAleoError::from)?;
+
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.clear_auth_token(&auth).await;
+        }
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let response = response
+            .error_for_status()
+            .map_err(HyperlaneAleoError::from)?;
+        Ok(Some(
+            response.json().await.map_err(HyperlaneAleoError::from)?,
+        ))
+    }
+
     /// Makes a POST request to the API
     async fn request_post<T: DeserializeOwned + Send>(
         &self,
         path: &str,
         body: &serde_json::Value,
     ) -> ChainResult<T> {
-        let url = format!("{}/{}/{}", self.base_url, self.suffix, path);
+        let url = append_path(&self.base_url, path)?;
         let auth = self.get_auth_token().await?;
         let response = self
             .client
-            .post(&url)
-            .header(AUTHORIZATION, auth)
+            .post(url)
+            .header(AUTHORIZATION, auth.clone())
             .json(body)
             .send()
             .await
             .map_err(HyperlaneAleoError::from)?;
 
-        // Two instances of the relayer might compete for the same JWT, if so clear the token early and request a new one
+        // Do not let a late rejection of an old token evict a token refreshed by another request.
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            self.clear_auth_token().await;
+            self.clear_auth_token(&auth).await;
         }
 
         let response = response
@@ -248,5 +344,322 @@ impl HttpClientBuilder for JWTBaseHttpClient {
 
     fn build(url: Url, network: u16) -> ChainResult<Self::Client> {
         JWTBaseHttpClient::new(url, network)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::{mpsc, Arc},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use reqwest::header::HeaderValue;
+    use serde_json::{json, Value};
+    use tokio::sync::{oneshot, Barrier};
+    use url::Url;
+
+    use super::{append_network, append_path, BaseHttpClient, HttpClient, JWTBaseHttpClient};
+
+    fn auth_server(response: &'static [u8]) -> (JWTBaseHttpClient, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind auth server");
+        let address = listener.local_addr().expect("auth server address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept auth request");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("set read timeout");
+            let mut request = Vec::new();
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let mut buffer = [0; 1024];
+                let length = stream.read(&mut buffer).expect("read auth request");
+                assert!(length > 0, "request ended before its headers");
+                request.extend_from_slice(&buffer[..length]);
+            }
+            stream.write_all(response).expect("respond to auth request");
+            String::from_utf8(request).expect("HTTP headers are UTF-8")
+        });
+        let mut url = Url::parse(&format!("http://{address}/prove")).expect("proving URL");
+        url.query_pairs_mut().append_pair(
+            "custom_rpc_header",
+            &format!("x-auth-url:http://{address}/jwt"),
+        );
+        (JWTBaseHttpClient::new(url, 0).expect("JWT client"), server)
+    }
+
+    #[tokio::test]
+    async fn jwt_request_sends_explicit_zero_content_length() {
+        let (client, server) = auth_server(
+            b"HTTP/1.1 201 Created\r\nAuthorization: Bearer test-token\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let token = client.get_auth_token().await.expect("get JWT");
+        assert_eq!(token, "Bearer test-token");
+        let request = server.join().expect("auth server joined");
+        assert!(request.starts_with("POST /jwt HTTP/1.1\r\n"));
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("\r\ncontent-length: 0\r\n"));
+    }
+
+    #[tokio::test]
+    async fn jwt_request_preserves_http_error_status() {
+        let (client, server) = auth_server(
+            b"HTTP/1.1 411 Length Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let error = client.get_auth_token().await.expect_err("JWT should fail");
+        assert!(
+            error.to_string().contains("411"),
+            "HTTP status must be preserved: {error}"
+        );
+        server.join().expect("auth server joined");
+    }
+
+    #[test]
+    fn appends_and_encodes_path_segments() {
+        let base_url = append_network(
+            Url::parse("https://api.explorer.provable.com/v2/").unwrap(),
+            0,
+        )
+        .unwrap();
+        let url = append_path(
+            &base_url,
+            "program/hyp_validator_announce.aleo/mapping/storage_sequences/{ bytes: [79u8, 151u8] }",
+        )
+        .unwrap();
+
+        assert_eq!(
+            url.as_str(),
+            "https://api.explorer.provable.com/v2/mainnet/program/hyp_validator_announce.aleo/mapping/storage_sequences/%7B%20bytes:%20%5B79u8,%20151u8%5D%20%7D"
+        );
+    }
+
+    #[test]
+    fn appends_path_to_ipv6_base_url() {
+        let base_url = Url::parse("http://[::1]:3030/v2").unwrap();
+        let url = append_path(&base_url, "mapping/{ bytes: [79u8] }").unwrap();
+
+        assert_eq!(
+            url.as_str(),
+            "http://[::1]:3030/v2/mapping/%7B%20bytes:%20%5B79u8%5D%20%7D"
+        );
+    }
+
+    #[tokio::test]
+    async fn standard_client_get_keeps_query_out_of_path() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0; 4096];
+            let length = stream.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..length]);
+            request_tx
+                .send(request.lines().next().unwrap().to_owned())
+                .unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]",
+                )
+                .unwrap();
+        });
+        let client =
+            BaseHttpClient::new(Url::parse(&format!("http://{address}/v2")).unwrap(), 0).unwrap();
+
+        let response: Vec<Value> = client
+            .request("statePaths", json!({ "commitments": "field1,field2" }))
+            .await
+            .unwrap();
+
+        assert!(response.is_empty());
+        assert_eq!(
+            request_rx.recv().unwrap(),
+            "GET /v2/mainnet/statePaths?commitments=field1%2Cfield2 HTTP/1.1"
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn standard_client_post_encodes_bracketed_mapping_keys() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0; 4096];
+            let length = stream.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..length]);
+            request_tx
+                .send(request.lines().next().unwrap().to_owned())
+                .unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+                )
+                .unwrap();
+        });
+        let client =
+            BaseHttpClient::new(Url::parse(&format!("http://{address}/v2")).unwrap(), 0).unwrap();
+
+        let response: Value = client
+            .request_post("mapping/{bytes:[1u8]}", &json!({}))
+            .await
+            .unwrap();
+
+        assert_eq!(response, json!({ "ok": true }));
+        assert_eq!(
+            request_rx.recv().unwrap(),
+            "POST /v2/mainnet/mapping/%7Bbytes:%5B1u8%5D%7D HTTP/1.1"
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn optional_request_returns_none_for_not_found() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0; 4096];
+            stream.read(&mut buffer).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let client =
+            BaseHttpClient::new(Url::parse(&format!("http://{address}/v2")).unwrap(), 0).unwrap();
+
+        let response: Option<Value> = client
+            .request_optional("transaction/confirmed/missing", None)
+            .await
+            .unwrap();
+
+        assert_eq!(response, None);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn jwt_auth_sends_content_length_and_preserves_status_errors() {
+        let (client, server) = auth_server(
+            b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+
+        let error = client.get_auth_token().await.expect_err("JWT should fail");
+
+        assert!(error.to_string().contains("429 Too Many Requests"));
+        assert!(server
+            .join()
+            .expect("auth server joined")
+            .to_ascii_lowercase()
+            .contains("\r\ncontent-length: 0\r\n"));
+    }
+
+    #[tokio::test]
+    async fn jwt_auth_refresh_is_single_flight() {
+        const CALLERS: usize = 16;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+        let (response_tx, response_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0; 4096];
+            stream.read(&mut buffer).unwrap();
+            request_tx.send(()).unwrap();
+            response_rx.recv().unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nAuthorization: Bearer shared-token\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let url = Url::parse(&format!(
+            "http://{address}/v2?custom_rpc_header=x-auth-url:http%3A%2F%2F{address}%2Fauth"
+        ))
+        .unwrap();
+        let client = JWTBaseHttpClient::new(url, 0).unwrap();
+        *client.auth_token.write().await = Some((
+            HeaderValue::from_static("Bearer expired-token"),
+            Instant::now() - Duration::from_secs(1),
+        ));
+        let start = Arc::new(Barrier::new(CALLERS));
+        let callers = (0..CALLERS)
+            .map(|_| {
+                let client = client.clone();
+                let start = start.clone();
+                tokio::spawn(async move {
+                    start.wait().await;
+                    client.get_auth_token().await
+                })
+            })
+            .collect::<Vec<_>>();
+
+        request_rx.await.unwrap();
+        response_tx.send(()).unwrap();
+
+        for caller in callers {
+            let token = caller.await.unwrap().unwrap();
+            assert_eq!(token, HeaderValue::from_static("Bearer shared-token"));
+        }
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn jwt_auth_retries_after_refresh_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for response in [
+                b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .as_slice(),
+                b"HTTP/1.1 200 OK\r\nAuthorization: Bearer retry-token\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .as_slice(),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0; 4096];
+                stream.read(&mut buffer).unwrap();
+                stream.write_all(response).unwrap();
+            }
+        });
+        let url = Url::parse(&format!(
+            "http://{address}/v2?custom_rpc_header=x-auth-url:http%3A%2F%2F{address}%2Fauth"
+        ))
+        .unwrap();
+        let client = JWTBaseHttpClient::new(url, 0).unwrap();
+
+        let error = client.get_auth_token().await.unwrap_err();
+        assert!(error.to_string().contains("429 Too Many Requests"));
+
+        let token = client.get_auth_token().await.unwrap();
+        assert_eq!(token, HeaderValue::from_static("Bearer retry-token"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn jwt_auth_stale_rejection_does_not_clear_refreshed_token() {
+        let client = JWTBaseHttpClient::new(Url::parse("http://localhost/v2").unwrap(), 0).unwrap();
+        let stale_token = HeaderValue::from_static("Bearer stale-token");
+        let refreshed_token = HeaderValue::from_static("Bearer refreshed-token");
+        *client.auth_token.write().await = Some((
+            refreshed_token.clone(),
+            Instant::now() + Duration::from_secs(60),
+        ));
+
+        client.clear_auth_token(&stale_token).await;
+
+        assert_eq!(
+            client.cached_auth_token().await,
+            Some(refreshed_token.clone())
+        );
+
+        client.clear_auth_token(&refreshed_token).await;
+
+        assert_eq!(client.cached_auth_token().await, None);
     }
 }

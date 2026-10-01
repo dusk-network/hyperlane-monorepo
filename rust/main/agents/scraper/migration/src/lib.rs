@@ -2,6 +2,8 @@
 
 extern crate core;
 
+pub mod indexes;
+
 pub use sea_orm_migration::prelude::*;
 
 mod l20230309_types;
@@ -16,6 +18,15 @@ mod m20230309_000005_create_table_message;
 mod m20250224_000006_create_table_raw_message_dispatch;
 mod m20250521_000007_add_cursor_event_type;
 mod m20260613_000008_add_msg_body_to_raw_message_dispatch;
+mod m20260814_000009_compact_cursor_table;
+mod m20260818_000010_create_table_merkle_tree_insertion;
+mod m20260819_000011_nullable_event_tx_ids;
+mod m20260819_000012_notify_scraper_events;
+mod m20260830_000013_gas_payment_stream_cursor;
+
+mod m20260922_000014_near_head;
+mod m20260924_000015_near_head_checkpoints;
+mod m20260924_000016_frontier_publication;
 
 pub struct Migrator;
 
@@ -36,6 +47,14 @@ impl MigratorTrait for Migrator {
             Box::new(m20250224_000006_create_table_raw_message_dispatch::Migration),
             Box::new(m20250521_000007_add_cursor_event_type::Migration),
             Box::new(m20260613_000008_add_msg_body_to_raw_message_dispatch::Migration),
+            Box::new(m20260814_000009_compact_cursor_table::Migration),
+            Box::new(m20260818_000010_create_table_merkle_tree_insertion::Migration),
+            Box::new(m20260819_000011_nullable_event_tx_ids::Migration),
+            Box::new(m20260819_000012_notify_scraper_events::Migration),
+            Box::new(m20260830_000013_gas_payment_stream_cursor::Migration),
+            Box::new(m20260922_000014_near_head::Migration),
+            Box::new(m20260924_000015_near_head_checkpoints::Migration),
+            Box::new(m20260924_000016_frontier_publication::Migration),
         ]
     }
 }

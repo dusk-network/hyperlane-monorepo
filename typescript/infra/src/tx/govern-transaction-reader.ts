@@ -20,6 +20,7 @@ import {
   IXERC20__factory,
   MovableCollateralRouter__factory,
   Ownable__factory,
+  PackageVersioned__factory,
   TokenBridgeCctpV2__factory,
   TokenBridgeDepositAddress__factory,
   TokenBridgeOft__factory,
@@ -39,6 +40,7 @@ import {
   EvmTokenFeeReader,
   InterchainAccount,
   MultiProvider,
+  bridgeApprovalGrantsMaxAllowance,
   TokenFeeType,
   TokenStandard,
   WarpCoreConfig,
@@ -138,6 +140,16 @@ type FeeRouteDetail = {
   bps: number;
   percent: string;
 };
+
+function getFeeBps(config: DerivedTokenFeeConfig): number {
+  switch (config.type) {
+    case TokenFeeType.RoutingFee:
+    case TokenFeeType.CrossCollateralRoutingFee:
+      return 0;
+    default:
+      return config.bps ?? 0;
+  }
+}
 
 type XERC20Metadata = {
   type: TokenStandard.EvmHypXERC20 | TokenStandard.EvmHypVSXERC20;
@@ -1114,6 +1126,8 @@ export class GovernTransactionReader {
     let insight: string | undefined;
     let feeDetails: Record<string, any> | undefined;
 
+    assert(tx.to, 'Warp Module transaction must have a to address');
+
     // setFeeRecipient is special: it reads the fee contract on-chain to
     // produce a richer insight, so it cannot be served by the sync format
     // helpers below.
@@ -1127,11 +1141,39 @@ export class GovernTransactionReader {
       const [recipient] = decoded.args;
       const feeInfo = await this.readFeeContractDetails(
         chain,
-        tx.to!,
+        tx.to,
         recipient,
       );
       insight = feeInfo.insight;
       feeDetails = feeInfo.feeDetails;
+    } else if (
+      matchesFunctionSignature(
+        decoded,
+        movableIface,
+        'approveTokenForBridge(address,address)',
+      )
+    ) {
+      // approveTokenForBridge is special: it is overloaded by impl version -
+      // legacy routers GRANT a max allowance, new routers REVOKE it. Read the
+      // target's version on-chain so the insight describes what actually
+      // executes, so it cannot be served by the sync format helpers below.
+      const [token, bridge] = decoded.args;
+      let contractVersion: string | undefined;
+      try {
+        contractVersion = await PackageVersioned__factory.connect(
+          tx.to,
+          this.multiProvider.getProvider(chain),
+        ).PACKAGE_VERSION();
+      } catch {
+        contractVersion = undefined;
+      }
+      if (contractVersion == null) {
+        insight = `approveTokenForBridge for token ${token} and bridge ${bridge} (could not read router version: grants a max allowance on legacy routers, revokes on newer ones)`;
+      } else if (bridgeApprovalGrantsMaxAllowance(contractVersion)) {
+        insight = `Grant max token approval for ${token} to bridge ${bridge} (legacy router v${contractVersion})`;
+      } else {
+        insight = `Clear legacy token approval for ${token} from bridge ${bridge} (router v${contractVersion})`;
+      }
     } else {
       // Selector collisions exist between adapter ifaces (e.g. addDomain is in
       // both cctpV2 and oft). Try every helper and take the first that
@@ -1151,7 +1193,6 @@ export class GovernTransactionReader {
       ownableTx = await this.readOwnableTransaction(chain, tx);
     }
 
-    assert(tx.to, 'Warp Module transaction must have a to address');
     const tokenAddress = tx.to.toLowerCase();
     const token = this.warpRouteIndex[chain][tokenAddress];
 
@@ -1646,7 +1687,7 @@ export class GovernTransactionReader {
 
     if (feeConfig.type === TokenFeeType.LinearFee) {
       // bps is in basis points (1 bps = 0.01%), convert to percentage
-      const bps = feeConfig.bps ? Number(feeConfig.bps) : 0;
+      const bps = getFeeBps(feeConfig);
       const percentFormatted = (bps / 100).toFixed(2);
 
       const description = `LinearFee contract (${percentFormatted}% fee, owner: ${ownerInsight})`;
@@ -1671,7 +1712,7 @@ export class GovernTransactionReader {
       for (const [chainName, subConfig] of Object.entries(
         feeConfig.feeContracts || {},
       )) {
-        const bps = subConfig.bps ? Number(subConfig.bps) : 0;
+        const bps = getFeeBps(subConfig);
         const percent = (bps / 100).toFixed(2);
 
         routes[chainName] = {
@@ -1718,7 +1759,7 @@ export class GovernTransactionReader {
         const routerEntries = Object.entries(routerConfigs);
         routes[chainName] = Object.fromEntries(
           routerEntries.map(([routerKey, subConfig]) => {
-            const bps = subConfig.bps ? Number(subConfig.bps) : 0;
+            const bps = getFeeBps(subConfig);
             const percent = (bps / 100).toFixed(2);
 
             return [

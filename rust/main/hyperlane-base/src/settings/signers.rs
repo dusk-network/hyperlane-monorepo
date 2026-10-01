@@ -197,6 +197,35 @@ impl DuskSignerKeyConf {
     }
 }
 
+/// Cache of constructed GCP signers, keyed by KMS crypto key version resource name, so
+/// independent call sites needing the same signer share one `GetPublicKey` call instead of
+/// repeating it. Same `try_get_with` coalescing rationale as `AWS_SIGNER_CACHE` above.
+type GcpSignerCache = Cache<String, hyperlane_ethereum::GcpSigner>;
+
+static GCP_SIGNER_CACHE: OnceLock<GcpSignerCache> = OnceLock::new();
+
+fn get_gcp_signer_cache() -> &'static GcpSignerCache {
+    GCP_SIGNER_CACHE.get_or_init(|| Cache::builder().max_capacity(100).build())
+}
+
+/// Builds a `GcpSigner` for the given KMS crypto key version, reusing an already-constructed
+/// signer for the same name rather than making a fresh KMS call. Credentials are ambient
+/// (Application Default Credentials) - nothing credential-related is read from config.
+async fn build_gcp_signer(key_version_name: &str) -> Result<hyperlane_ethereum::GcpSigner, Report> {
+    get_gcp_signer_cache()
+        .try_get_with(key_version_name.to_owned(), async {
+            let client = google_cloud_kms_v1::client::KeyManagementService::builder()
+                .build()
+                .await
+                .map_err(|err| eyre::eyre!(err.to_string()))?;
+            hyperlane_ethereum::GcpSigner::new(client, key_version_name.to_owned())
+                .await
+                .map_err(Report::from)
+        })
+        .await
+        .map_err(|arc_err| eyre::eyre!("{arc_err}"))
+}
+
 /// Signer types
 #[derive(Default, Clone)]
 pub enum SignerConf {
@@ -212,6 +241,13 @@ pub enum SignerConf {
         id: String,
         /// The AWS region
         region: String,
+    },
+    /// A GCP Cloud KMS signer. Credentials are ambient (Application Default
+    /// Credentials) - nothing credential-related is read from this config.
+    Gcp {
+        /// Fully-qualified resource name of the crypto key version, e.g.
+        /// `projects/{p}/locations/{l}/keyRings/{k}/cryptoKeys/{ck}/cryptoKeyVersions/{v}`.
+        key_version_name: String,
     },
     /// Cosmos Specific key
     CosmosKey {
@@ -259,6 +295,10 @@ impl fmt::Debug for SignerConf {
                 .debug_struct("Aws")
                 .field("id", &"<redacted>")
                 .field("region", region)
+                .finish(),
+            Self::Gcp { .. } => f
+                .debug_struct("Gcp")
+                .field("key_version_name", &"<redacted>")
                 .finish(),
             Self::CosmosKey {
                 prefix,
@@ -325,6 +365,9 @@ impl BuildableWithSignerConf for hyperlane_ethereum::Signers {
             SignerConf::Aws { id, region } => {
                 hyperlane_ethereum::Signers::Aws(build_aws_signer(id, region).await?)
             }
+            SignerConf::Gcp { key_version_name } => {
+                hyperlane_ethereum::Signers::Gcp(build_gcp_signer(key_version_name).await?)
+            }
             SignerConf::CosmosKey { .. } => {
                 bail!("cosmosKey signer is not supported by Ethereum")
             }
@@ -363,6 +406,9 @@ impl BuildableWithSignerConf for hyperlane_tron::TronSigner {
             SignerConf::Aws { id, region } => Ok(hyperlane_tron::TronSigner::Aws(
                 build_aws_signer(id, region).await?,
             )),
+            SignerConf::Gcp { key_version_name } => Ok(hyperlane_tron::TronSigner::Gcp(
+                build_gcp_signer(key_version_name).await?,
+            )),
             _ => bail!(format!("{conf:?} key is not supported by tron")),
         }
     }
@@ -386,30 +432,6 @@ impl ChainSigner for hyperlane_tron::TronSigner {
     }
     fn address_h256(&self) -> H256 {
         ethers::types::H256::from(self.address()).into()
-    }
-}
-
-#[async_trait]
-impl BuildableWithSignerConf for fuels::prelude::WalletUnlocked {
-    async fn build(conf: &SignerConf) -> Result<Self, Report> {
-        if let SignerConf::HexKey { key } = conf {
-            let key = fuels::crypto::SecretKey::try_from(key.as_bytes())
-                .context("Invalid fuel signer key")?;
-            Ok(fuels::prelude::WalletUnlocked::new_from_private_key(
-                key, None,
-            ))
-        } else {
-            bail!(format!("{conf:?} key is not supported by fuel"));
-        }
-    }
-}
-
-impl ChainSigner for fuels::prelude::WalletUnlocked {
-    fn address_string(&self) -> String {
-        self.address().to_string()
-    }
-    fn address_h256(&self) -> H256 {
-        H256::from_slice(fuels::types::Address::from(self.address()).as_slice())
     }
 }
 
@@ -731,29 +753,6 @@ mod tests {
 
         let address_h256 = H256::from_slice(
             hex::decode(ADDRESS)
-                .expect("Failed to decode public key")
-                .as_slice(),
-        );
-        assert_eq!(chain_signer.address_h256(), address_h256);
-    }
-
-    #[test]
-    fn address_h256_fuel() {
-        const PRIVATE_KEY: &str =
-            "0a83ee2a87f328704512567198ee25578c27c707b26fdf3be9ea8bf8588f3b65";
-        const PUBLIC_KEY: &str = "b43425b2256e7dcdd61752808b137b23f4f697cfaf21175ed81d0610ebab5a87";
-
-        let private_key = fuels::crypto::SecretKey::try_from(
-            hex::decode(PRIVATE_KEY)
-                .expect("Failed to decode private key")
-                .as_slice(),
-        )
-        .expect("Failed to create secret key");
-
-        let chain_signer = fuels::prelude::WalletUnlocked::new_from_private_key(private_key, None);
-
-        let address_h256 = H256::from_slice(
-            hex::decode(PUBLIC_KEY)
                 .expect("Failed to decode public key")
                 .as_slice(),
         );

@@ -1,5 +1,160 @@
 # @hyperlane-xyz/sealevel-sdk
 
+## 44.0.2
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@44.0.2
+- @hyperlane-xyz/forking-sdk@9.0.2
+- @hyperlane-xyz/provider-sdk@10.0.2
+
+## 44.0.1
+
+### Patch Changes
+
+- f269e03: Zod was updated to 4.5.4 to prevent function-valued default factories from running during schema cycle detection and compilation.
+- Updated dependencies [f269e03]
+  - @hyperlane-xyz/provider-sdk@10.0.1
+  - @hyperlane-xyz/forking-sdk@9.0.1
+  - @hyperlane-xyz/utils@44.0.1
+
+## 44.0.0
+
+### Patch Changes
+
+- Updated dependencies [6fbe5ad]
+  - @hyperlane-xyz/utils@44.0.0
+  - @hyperlane-xyz/forking-sdk@9.0.0
+  - @hyperlane-xyz/provider-sdk@10.0.0
+
+## 43.0.0
+
+### Major Changes
+
+- 8bcc7ab: Zod was upgraded to 4.5.2 across the TypeScript workspace. Public schemas and validation types were migrated to Zod 4, recursive fee configuration types were made explicit, application entrypoints adopted compiled parsing, and validation errors were changed to use Zod 4's built-in formatting.
+
+### Minor Changes
+
+- 60fc463: Added authenticated HTTP registry signers for standard EVM, Safe EIP-712, and Sealevel transactions.
+
+### Patch Changes
+
+- Updated dependencies [8bcc7ab]
+- Updated dependencies [7cf9c01]
+  - @hyperlane-xyz/provider-sdk@9.0.0
+  - @hyperlane-xyz/utils@43.0.0
+  - @hyperlane-xyz/forking-sdk@8.1.5
+
+## 42.0.0
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@42.0.0
+- @hyperlane-xyz/forking-sdk@8.1.4
+- @hyperlane-xyz/provider-sdk@8.1.3
+
+## 41.3.1
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@41.3.1
+- @hyperlane-xyz/forking-sdk@8.1.3
+- @hyperlane-xyz/provider-sdk@8.1.2
+
+## 41.3.0
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@41.3.0
+- @hyperlane-xyz/forking-sdk@8.1.2
+- @hyperlane-xyz/provider-sdk@8.1.1
+
+## 41.2.0
+
+### Minor Changes
+
+- bd4e5f0: Added a VM-agnostic impersonated submitter so `warp apply` can apply owner-authorized governance transactions against a fork without holding the impersonated authority's key. As with the EVM impersonated submitter, `warp apply` still requires an operator signer key — impersonation only removes the need for the impersonated account's own key.
+
+  - Added `SvmImpersonatingSigner` (exported as `SealevelImpersonatingSigner`) to `@hyperlane-xyz/sealevel-sdk`: it pays fees from a fixed public fork-only account and leaves the impersonated account's signature slot empty, which only a skip-signature-verification fork accepts. It is scoped to the configured `userAddress` — every unsigned required-signer slot must belong to that account, so it is not an unrestricted signature bypass. Sealevel signer internals moved to a shared `BaseSvmSigner`; `SvmSigner` behavior is unchanged.
+  - Relocated `AltVMJsonRpcSubmitter` and `AltVMImpersonatedSubmitter` into `@hyperlane-xyz/provider-sdk` (browser-safe) as sibling subclasses of a shared base, and added an `impersonatedAccount` submitter config variant. `@hyperlane-xyz/deploy-sdk` re-exports `AltVMJsonRpcSubmitter` for backwards compatibility.
+  - Implemented `createSubmitter` for Sealevel (`jsonRpc` and `impersonatedAccount`) and wired the `impersonatedAccount` submitter into the CLI AltVM submitter factories.
+
+### Patch Changes
+
+- Updated dependencies [bd4e5f0]
+  - @hyperlane-xyz/provider-sdk@8.1.0
+  - @hyperlane-xyz/forking-sdk@8.1.1
+  - @hyperlane-xyz/utils@41.2.0
+
+## 41.1.0
+
+### Minor Changes
+
+- 0adcbb2: Added local mainnet forking support for Solana (Sealevel) warp routes and made the `warp fork` engine VM-agnostic.
+
+  - Introduced `@hyperlane-xyz/forking-sdk`, a VM-agnostic forking abstraction: the `IForkManager<TConfig>` interface, a `ForkManagerRegistry` keyed by `ProtocolType`, a `buildForkedChainMetadata` orchestration routine, and readiness/port helpers. Depends only on `@hyperlane-xyz/provider-sdk` and `@hyperlane-xyz/utils`.
+  - Added a node-only `@hyperlane-xyz/sealevel-sdk/fork` subpath (isolated from the main entry so browser/edge consumers are unaffected): a mode-typed `SurfpoolNode` controller (fork/network/offline) that runs a locally-installed `surfpool` binary, an `SvmForkManager` that forks a Solana RPC via surfpool and replays `PrintableSvmTransaction[]` governance txs under skip-signature-verification, and an `SvmRawForkConfigSchema` fork-config parser.
+  - Reworked the CLI `warp fork` command to dispatch per protocol through `forking-sdk`: EVM chains fork with anvil (extracted into an `EvmForkManager`, behavior unchanged) and Sealevel chains fork with surfpool, with per-protocol fork-config parsing. A Sealevel warp route can now be forked and its governance transactions replayed and validated with `warp check` before being submitted on-chain or through a Squads multisig.
+  - Hardened the `HttpServer.start()` used to serve the forked registry: it now awaits the `listening` event and rejects on a bind failure (instead of only logging), so a caller can observe the failure and tear down. The CLI `warp fork` command uses this to kill every fork node if the registry server cannot start, and redacts the upstream RPC URL (which may carry credentials) from any surfaced anvil error.
+  - Note: `warp fork` on a Sealevel route requires a locally-installed `surfpool` binary (`>= 1.5.0`) on `PATH` — there is no Docker fallback in the CLI. Install a pinned, checksum-verified `surfpool` release (`>= 1.5.0`) from https://github.com/txtx/surfpool/releases (verify the archive's SHA-256) rather than piping the mutable installer to a shell. The `surfpool/surfpool:1.5.0` Docker image is used only by the SDK's own test suite.
+
+### Patch Changes
+
+- Updated dependencies [0adcbb2]
+  - @hyperlane-xyz/forking-sdk@8.1.0
+  - @hyperlane-xyz/utils@41.1.0
+  - @hyperlane-xyz/provider-sdk@8.0.4
+
+## 41.0.0
+
+### Patch Changes
+
+- Updated dependencies [fa19409]
+  - @hyperlane-xyz/utils@41.0.0
+  - @hyperlane-xyz/provider-sdk@8.0.3
+
+## 40.0.0
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@40.0.0
+- @hyperlane-xyz/provider-sdk@8.0.2
+
+## 39.1.0
+
+### Patch Changes
+
+- Updated dependencies [4976bb1]
+  - @hyperlane-xyz/utils@39.1.0
+  - @hyperlane-xyz/provider-sdk@8.0.1
+
+## 39.0.0
+
+### Major Changes
+
+- 4ef1fde: - `getMinGasForWarpDeploy` now lives on `IProvider` (per-chain) instead of the stateless `ProtocolProvider`. It is `async` and returns a FINAL native-denom amount rather than a mix of gas units and native amounts. It composes the base router deploy cost with additive deltas for detected features (cross-collateral extras, fee program deploy, custom ISM / hook / IGP deploy) driven by the warp config shape, and for gas-metered protocols multiplies gas units by the chain gas price.
+  - `ChainMetadataForAltVM` gained an optional `gasPrice` field.
+  - `ProviderBuilderFn` now takes a full `ChainMetadata` instead of `(rpcUrls, network)`.
+  - The AltVM `IProvider.connect` and `ISigner.connectWithSigner` static factories now take `ChainMetadataForAltVM` as their first argument, replacing the previous `(rpcUrls, chainId, extraParams)` shape and the metadata-through-`extraParams` indirection.
+  - The CLI warp-deploy preflight now sizes AltVM native-balance requirements from the composed per-chain deploy cost, so feature-heavy deploys are no longer silently under-funded, and chains without a gas price are no longer skipped for the warp-deploy path.
+  - The AltVM warp-deploy base gas costs were calibrated from measured deploys (Sealevel from mainnet; Starknet, Aleo, and Radix from devnet base-router floors with safety margin), replacing the previous catastrophically-low placeholder constants that let preflight pass under-funded accounts.
+  - The Starknet test fixture native token was corrected from ETH to STRK to match the production registry and the token the devnet actually charges fees in.
+
+### Patch Changes
+
+- 6793396: Fixed SVM warp-route program upgrades failing transaction simulation on clusters where the `enable_extend_program_checked` feature gate is inactive (e.g. Solana mainnet-beta). `prepareProgramUpgrade` queried the feature gate and emitted the legacy `ExtendProgram` (variant 6) instruction when the checked variant was unavailable, and clamped the program-data extend up to the loader's 10240-byte minimum instead of requesting the exact deficit (which the loader rejects). Added a generic `isFeatureActive` gate checker and a `program-extend-upgrade` e2e that exercised the unchecked extend path end-to-end against a feature-deactivated validator.
+
+  Fixed the extend and upgrade racing the same slot when a `warp apply` both bumped `contractVersion` and set a fee: the loader rejects an Upgrade in the slot its program-data was extended ("Program was deployed in this block already"), and a program is not invocable in the slot it is upgraded. A generic `waitForSlotAdvance` hint was added to `SvmTransaction` and honored in `SvmSigner.send` — it polls until the cluster slot advances past the confirmed transaction's slot before reporting the send done, so the next transaction executes in a strictly later slot. `prepareProgramUpgrade` set the hint on the extend and upgrade transactions, guaranteeing extend → upgrade → config each land in separate slots. The signer stayed protocol-generic (no upgrade-specific logic) and the transactions remained emitted for export/multisig flows.
+
+  `SvmSigner.signAndSend` surfaced the on-chain program logs from a failed preflight simulation (logged at `error` before rethrowing) so a failed apply shows why the transaction reverted (e.g. insufficient lamports, custom program errors) instead of a bare "Transaction simulation failed". `AltVMJsonRpcSubmitter` logged each transaction's annotation at `info` while submitting, matching the EVM `MultiProvider.sendTransaction` output.
+
+  `prepareProgramUpgrade` clamped the program-data extend down to the remaining account headroom when growing to the loader's 10240-byte minimum would exceed Solana's 10 MiB account-data limit — the loader permits a sub-minimum extend that consumes exactly the remaining space — and failed fast with a clear message only when the new binary cannot fit the account at all, instead of letting an over-cap request produce an opaque on-chain loader error. `transactionToPrintableJson` carried the `waitForSlotAdvance` sequencing hint into its exported JSON, so file/Squads flows — where an external executor signs and submits the extend, upgrade, and config transactions — retained the directive to wait for the cluster slot to advance past each hinted transaction's confirmation slot before submitting the next one.
+
+- Updated dependencies [4ef1fde]
+- Updated dependencies [735793b]
+  - @hyperlane-xyz/provider-sdk@8.0.0
+  - @hyperlane-xyz/utils@39.0.0
+
 ## 38.0.0
 
 ### Minor Changes

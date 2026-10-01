@@ -7,7 +7,8 @@ on:
   # Triggers on pull requests
   pull_request:
     branches:
-      - '*'
+      # Include stacked PR bases containing slashes.
+      - '**'
   merge_group:
   workflow_dispatch:
 
@@ -28,12 +29,12 @@ jobs:
     if: github.repository_owner == 'hyperlane-xyz'
     runs-on: depot-ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: recursive
           persist-credentials: false
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version-file: .nvmrc
 
@@ -53,11 +54,11 @@ jobs:
     if: github.repository_owner == 'hyperlane-xyz' && needs.change-detection.outputs.run_lint_prettier == 'true'
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version-file: .nvmrc
 
@@ -123,33 +124,17 @@ jobs:
     needs: [lint-prettier-run]
     if: always()
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Check lint-prettier status
         uses: ./.github/actions/check-job-status
         with:
           job_name: 'Lint Prettier'
           result: ${{ needs.lint-prettier-run.result }}
 
-  set-base-sha:
-    runs-on: ubuntu-latest
+  change-detection:
     outputs:
       base_sha: ${{ steps.determine-sha.outputs.base_sha }}
       current_sha: ${{ steps.determine-sha.outputs.current_sha }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          # Full history needed to compute merge-base for PRs
-          fetch-depth: 0
-
-      - name: Determine BASE_SHA
-        id: determine-sha
-        uses: ./.github/actions/determine-base-sha
-
-  change-detection:
-    needs: [set-base-sha]
-    outputs:
       skip_ts: ${{ steps.decide.outputs.skip_ts }}
       run_lint_prettier: ${{ steps.decide.outputs.run_lint_prettier }}
       run_cli_e2e: ${{ steps.decide.outputs.run_cli_e2e }}
@@ -162,12 +147,17 @@ jobs:
       has_relayer: ${{ steps.decide.outputs.has_relayer }}
       has_rebalancer: ${{ steps.decide.outputs.has_rebalancer }}
       has_svm: ${{ steps.decide.outputs.has_svm }}
-    runs-on: ubuntu-latest
+      has_svm_program_inputs: ${{ steps.decide.outputs.has_svm_program_inputs }}
+    runs-on: ${{ github.repository_owner == 'hyperlane-xyz' && 'depot-ubuntu-24.04' || 'ubuntu-latest' }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
+
+      - name: Determine BASE_SHA
+        id: determine-sha
+        uses: ./.github/actions/determine-base-sha
 
       - name: Check CI context
         id: context
@@ -180,8 +170,8 @@ jobs:
         id: check-skip-ts
         uses: ./.github/actions/check-path-changes
         with:
-          base_sha: ${{ needs.set-base-sha.outputs.base_sha }}
-          head_sha: ${{ needs.set-base-sha.outputs.current_sha }}
+          base_sha: ${{ steps.determine-sha.outputs.base_sha }}
+          head_sha: ${{ steps.determine-sha.outputs.current_sha }}
           path_pattern: '(rust/|\.github/|typescript/Dockerfile|typescript/docker-entrypoint\.sh)'
           path_pattern_only: 'true'
 
@@ -189,15 +179,15 @@ jobs:
         id: check-github
         uses: ./.github/actions/check-path-changes
         with:
-          base_sha: ${{ needs.set-base-sha.outputs.base_sha }}
-          head_sha: ${{ needs.set-base-sha.outputs.current_sha }}
+          base_sha: ${{ steps.determine-sha.outputs.base_sha }}
+          head_sha: ${{ steps.determine-sha.outputs.current_sha }}
           path_pattern: '\.github/'
 
       - name: Categorize changes for CLI e2e and VM detection
         id: check-vm
         run: |
-          BASE_SHA="${{ needs.set-base-sha.outputs.base_sha }}"
-          HEAD_SHA="${{ needs.set-base-sha.outputs.current_sha }}"
+          BASE_SHA="${{ steps.determine-sha.outputs.base_sha }}"
+          HEAD_SHA="${{ steps.determine-sha.outputs.current_sha }}"
 
           if ! CHANGED_FILES=$(git diff --name-only "$BASE_SHA"..."$HEAD_SHA" 2>/dev/null); then
             # Can't determine changes — run everything
@@ -210,6 +200,7 @@ jobs:
             echo "has_relayer=true" >> $GITHUB_OUTPUT
             echo "has_rebalancer=true" >> $GITHUB_OUTPUT
             echo "has_svm=true" >> $GITHUB_OUTPUT
+            echo "has_svm_program_inputs=true" >> $GITHUB_OUTPUT
             exit 0
           fi
 
@@ -223,6 +214,7 @@ jobs:
             echo "has_relayer=false" >> $GITHUB_OUTPUT
             echo "has_rebalancer=false" >> $GITHUB_OUTPUT
             echo "has_svm=false" >> $GITHUB_OUTPUT
+            echo "has_svm_program_inputs=false" >> $GITHUB_OUTPUT
             exit 0
           fi
 
@@ -232,7 +224,10 @@ jobs:
           has_cosmos=$(echo "$CHANGED_FILES" | grep -qE '^typescript/(cosmos-sdk|cosmos-types)/' && echo true || echo false)
           has_starknet=$(echo "$CHANGED_FILES" | grep -qE '^(typescript/(starknet-sdk|provider-sdk|utils)/|starknet/)' && echo true || echo false)
           has_tron=$(echo "$CHANGED_FILES" | grep -qE '^typescript/tron-sdk/' && echo true || echo false)
-          has_svm=$(echo "$CHANGED_FILES" | grep -qE '^(rust/sealevel/|typescript/svm-sdk/)' && echo true || echo false)
+          has_svm=$(echo "$CHANGED_FILES" | grep -qE '^(rust/sealevel/|typescript/(svm-sdk|forking-sdk)/)' && echo true || echo false)
+          # Inputs to SEALEVEL_SOURCE_HASH; sealevel-source-hash.test.mjs keeps this in sync.
+          SVM_PROGRAM_INPUTS='^(rust/sealevel/(Cargo\.(toml|lock)|rust-toolchain|\.cargo/|programs/|libraries/)|rust/main/(Cargo\.toml|hyperlane-core/|applications/)|typescript/svm-sdk/(scripts/|src/hyperlane/program-bytes\.ts))'
+          has_svm_program_inputs=$(echo "$CHANGED_FILES" | grep -qE "$SVM_PROGRAM_INPUTS" && echo true || echo false)
 
           # Package-specific changes (run only their targeted CLI e2e tests)
           has_relayer=$(echo "$CHANGED_FILES" | grep -qE '^typescript/relayer/' && echo true || echo false)
@@ -241,7 +236,7 @@ jobs:
           # Core CLI deps that trigger the smoke/full CLI e2e suite
           # Peripheral deps (relayer, rebalancer, metrics, http-registry-server) have
           # their own unit tests; merge queue runs full suite
-          CLI_DEPS='^(typescript/(cli|sdk|utils|deploy-sdk|provider-sdk)/|solidity/|starknet/)'
+          CLI_DEPS='^(typescript/(cli|sdk|utils|deploy-sdk|provider-sdk|forking-sdk)/|solidity/|starknet/)'
           has_cli_changes=$(echo "$CHANGED_FILES" | grep -qE "$CLI_DEPS" && echo true || echo false)
 
           echo "has_cli_changes=$has_cli_changes" >> $GITHUB_OUTPUT
@@ -257,6 +252,7 @@ jobs:
           echo "VM-specific — radix=$has_radix aleo=$has_aleo cosmos=$has_cosmos starknet=$has_starknet tron=$has_tron"
           echo "Package-specific — relayer=$has_relayer rebalancer=$has_rebalancer"
           echo "has_svm=$has_svm" >> $GITHUB_OUTPUT
+          echo "has_svm_program_inputs=$has_svm_program_inputs" >> $GITHUB_OUTPUT
 
           echo "VM-specific — radix=$has_radix aleo=$has_aleo cosmos=$has_cosmos starknet=$has_starknet tron=$has_tron svm=$has_svm"
 
@@ -284,6 +280,7 @@ jobs:
             echo "has_relayer=false" >> $GITHUB_OUTPUT
             echo "has_rebalancer=false" >> $GITHUB_OUTPUT
             echo "has_svm=false" >> $GITHUB_OUTPUT
+            echo "has_svm_program_inputs=false" >> $GITHUB_OUTPUT
             exit 0
           fi
 
@@ -300,6 +297,7 @@ jobs:
             echo "has_relayer=true" >> $GITHUB_OUTPUT
             echo "has_rebalancer=true" >> $GITHUB_OUTPUT
             echo "has_svm=true" >> $GITHUB_OUTPUT
+            echo "has_svm_program_inputs=true" >> $GITHUB_OUTPUT
             exit 0
           fi
 
@@ -321,6 +319,7 @@ jobs:
           echo "has_relayer=${{ steps.check-vm.outputs.has_relayer }}" >> $GITHUB_OUTPUT
           echo "has_rebalancer=${{ steps.check-vm.outputs.has_rebalancer }}" >> $GITHUB_OUTPUT
           echo "has_svm=${{ steps.check-vm.outputs.has_svm }}" >> $GITHUB_OUTPUT
+          echo "has_svm_program_inputs=${{ steps.check-vm.outputs.has_svm_program_inputs }}" >> $GITHUB_OUTPUT
 
   pnpm-test-run:
     runs-on: depot-ubuntu-24.04
@@ -328,7 +327,7 @@ jobs:
     timeout-minutes: 20
     if: github.repository_owner == 'hyperlane-xyz' && needs.change-detection.outputs.skip_ts != 'true'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: recursive
@@ -347,7 +346,7 @@ jobs:
     needs: [pnpm-test-run]
     if: always()
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Check pnpm-test status
         uses: ./.github/actions/check-job-status
         with:
@@ -356,14 +355,14 @@ jobs:
 
   infra-test:
     runs-on: depot-ubuntu-24.04
-    needs: [set-base-sha, change-detection]
+    needs: [change-detection]
     if: github.repository_owner == 'hyperlane-xyz' && needs.change-detection.outputs.skip_ts != 'true'
     env:
       GRAFANA_SERVICE_ACCOUNT_TOKEN: ${{ secrets.GRAFANA_SERVICE_ACCOUNT_TOKEN }}
       BALANCE_CHANGES: false
       WARP_CONFIG_CHANGES: false
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: recursive
@@ -381,10 +380,10 @@ jobs:
 
       - name: Check for balance/config changes
         run: |
-          if git diff ${{ needs.set-base-sha.outputs.base_sha }}...${{ needs.set-base-sha.outputs.current_sha }} --name-only | grep -qE '^typescript/infra/config/environments/mainnet3/balances|^.registryrc$'; then
+          if git diff ${{ needs.change-detection.outputs.base_sha }}...${{ needs.change-detection.outputs.current_sha }} --name-only | grep -qE '^typescript/infra/config/environments/mainnet3/balances|^.registryrc$'; then
             echo "BALANCE_CHANGES=true" >> $GITHUB_ENV
           fi
-          if git diff ${{ needs.set-base-sha.outputs.base_sha }}...${{ needs.set-base-sha.outputs.current_sha }} --name-only | grep -qE '^typescript/infra/|^.registryrc$'; then
+          if git diff ${{ needs.change-detection.outputs.base_sha }}...${{ needs.change-detection.outputs.current_sha }} --name-only | grep -qE '^typescript/infra/|^.registryrc$'; then
             echo "WARP_CONFIG_CHANGES=true" >> $GITHUB_ENV
           fi
 
@@ -411,7 +410,7 @@ jobs:
     needs: [change-detection]
     if: github.repository_owner == 'hyperlane-xyz' && needs.change-detection.outputs.skip_ts != 'true'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
@@ -429,7 +428,7 @@ jobs:
     needs: [cli-install-test-run]
     if: always()
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Check cli-install-test status
         uses: ./.github/actions/check-job-status
         with:
@@ -460,7 +459,7 @@ jobs:
     needs: [cli-e2e-tests]
     if: always()
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Check CLI E2E status
         uses: ./.github/actions/check-job-status
         with:
@@ -485,7 +484,7 @@ jobs:
     needs: [sdk-e2e-tests]
     if: always()
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Check SDK E2E status
         uses: ./.github/actions/check-job-status
         with:
@@ -501,13 +500,9 @@ jobs:
       base_ref: ${{ github.base_ref }}
 
   coverage-tests:
-    needs: [set-base-sha]
     if: github.repository_owner == 'hyperlane-xyz'
     uses: ./.github/workflows/test-coverage.yml
     secrets: inherit
-    with:
-      base_sha: ${{ needs.set-base-sha.outputs.base_sha }}
-      current_sha: ${{ needs.set-base-sha.outputs.current_sha }}
 
   agent-configs:
     runs-on: depot-ubuntu-24.04
@@ -518,7 +513,7 @@ jobs:
       matrix:
         environment: [mainnet3, testnet4]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
@@ -539,20 +534,38 @@ jobs:
           fi
 
   svm-program-bytes:
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     needs: [change-detection]
-    if: needs.change-detection.outputs.has_svm == 'true'
+    if: needs.change-detection.outputs.has_svm_program_inputs == 'true'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version-file: .nvmrc
 
-      - name: Check program-bytes.ts staleness
-        run: node typescript/svm-sdk/scripts/check-program-bytes-hash.mjs
+      - uses: dtolnay/rust-toolchain@1.86.0
+
+      - name: Install Solana toolchain
+        run: |
+          source rust/sealevel/programs/toolchain.env
+          sh -c "$(curl -sSfL "https://release.anza.xyz/v${SOLANA_CLI_VERSION_FOR_BUILDING_PROGRAMS}/install")"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+
+      - name: Check production source boundary
+        run: node --test typescript/svm-sdk/scripts/sealevel-source-hash.test.mjs
+
+      - name: Rebuild embedded programs
+        run: bash typescript/svm-sdk/scripts/build-program-bytes.sh
+
+      # Rebuilt bytecode is the gate; the source hash can move without it changing.
+      - name: Compare rebuilt ELF hashes with embedded bytes
+        run: node typescript/svm-sdk/scripts/check-program-elf.mjs
+
+      - name: Check program-bytes.ts source hash
+        run: node typescript/svm-sdk/scripts/check-program-bytes-hash.mjs --warn
 
   env-tests:
     needs: [change-detection]

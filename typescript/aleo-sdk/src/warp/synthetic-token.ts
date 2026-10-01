@@ -14,11 +14,8 @@ import { assert } from '@hyperlane-xyz/utils';
 
 import type { AnyAleoNetworkClient } from '../clients/base.js';
 import type { AleoSigner } from '../clients/signer.js';
-import {
-  fromAleoAddress,
-  getProgramSuffix,
-  toAleoAddress,
-} from '../utils/helper.js';
+import { toAleoAddress } from '../utils/helper.crypto.js';
+import { fromAleoAddress, getProgramSuffix } from '../utils/helper.js';
 import {
   type AleoReceipt,
   type AnnotatedAleoTransaction,
@@ -29,6 +26,7 @@ import {
 import { getSyntheticWarpTokenConfig } from './warp-query.js';
 import {
   getCreateSyntheticTokenTx,
+  scaleToRemoteDecimals,
   getPostDeploymentUpdateTxs,
   getWarpTokenUpdateTxs,
 } from './warp-tx.js';
@@ -94,7 +92,8 @@ export class AleoSyntheticTokenReader implements ArtifactReader<
 
 export class AleoSyntheticTokenWriter
   extends AleoSyntheticTokenReader
-  implements ArtifactWriter<RawSyntheticWarpArtifactConfig, DeployedWarpAddress>
+  implements
+    ArtifactWriter<RawSyntheticWarpArtifactConfig, DeployedWarpAddress>
 {
   constructor(
     aleoClient: AnyAleoNetworkClient,
@@ -113,6 +112,7 @@ export class AleoSyntheticTokenWriter
     ]
   > {
     const { config } = artifact;
+    const remoteDecimals = scaleToRemoteDecimals(config.decimals, config.scale);
     const allReceipts: AleoReceipt[] = [];
     const signerAddress = this.signer.getSignerAddress();
 
@@ -145,6 +145,7 @@ export class AleoSyntheticTokenWriter
       config.name,
       config.symbol,
       config.decimals,
+      remoteDecimals,
     );
     const initReceipt = await this.signer
       .sendAndConfirmTransaction(initTx)

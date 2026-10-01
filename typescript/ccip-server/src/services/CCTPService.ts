@@ -1,5 +1,4 @@
 import { ethers } from 'ethers';
-import { Router } from 'express';
 import { Logger } from 'pino';
 import { z } from 'zod';
 
@@ -7,10 +6,15 @@ import {
   CctpService__factory,
   IMessageTransmitter__factory,
 } from '@hyperlane-xyz/core';
-import { MultiProvider } from '@hyperlane-xyz/sdk';
+import type { MultiProvider } from '@hyperlane-xyz/sdk/providers/MultiProvider';
 import { parseMessage } from '@hyperlane-xyz/utils';
 
-import { createAbiHandler } from '../utils/abiHandler.js';
+import type { CcipApp } from '../http.js';
+import {
+  ABI_ROUTE_OPTIONS,
+  type AbiRoute,
+  createAbiHandler,
+} from '../utils/abiHandler.js';
 import {
   PrometheusMetrics,
   UnhandledErrorReason,
@@ -25,15 +29,21 @@ import { CCTPAttestationService } from './CCTPAttestationService.js';
 import { findMatchingCircleMessage } from './cctpMessageMatcher.js';
 import { HyperlaneService } from './HyperlaneService.js';
 
+const messageTransmitterInterface =
+  IMessageTransmitter__factory.createInterface();
+const messageSentEvent =
+  messageTransmitterInterface.getEvent('MessageSent(bytes)');
+const messageSentTopic =
+  messageTransmitterInterface.getEventTopic(messageSentEvent);
+
 const EnvSchema = z.object({
-  HYPERLANE_EXPLORER_URL: z.string().url(),
-  CCTP_ATTESTATION_URL: z.string().url(),
+  HYPERLANE_EXPLORER_URL: z.url(),
+  CCTP_ATTESTATION_URL: z.url(),
   REGISTRY_URI: REGISTRY_URI_SCHEMA,
 });
 
 class CCTPService extends BaseService {
   // External Services
-  public router: Router;
   private hyperlaneService: HyperlaneService;
   private cctpAttestationService: CCTPAttestationService;
   private multiProvider: MultiProvider;
@@ -61,12 +71,13 @@ class CCTPService extends BaseService {
       this.config.serviceName,
       env.CCTP_ATTESTATION_URL,
     );
+  }
 
-    this.router = Router();
-
+  registerRoutes(app: CcipApp, prefix: string): void {
     // CCIP-read spec: GET /getCCTPAttestation/:sender/:callData.json
-    this.router.get(
-      '/getCctpAttestation/:sender/:callData.json',
+    app.get<AbiRoute>(
+      `${prefix}/getCctpAttestation/:sender/:callData.json`,
+      ABI_ROUTE_OPTIONS,
       createAbiHandler(
         CctpService__factory,
         'getCCTPAttestation',
@@ -76,19 +87,24 @@ class CCTPService extends BaseService {
     );
 
     // CCIP-read spec: POST /getCctpAttestation
-    this.router.post('/getCctpAttestation', async (req, res) => {
-      const rawTxHash = req.body?.origin_tx_hash;
-      const originTxHash =
-        typeof rawTxHash === 'string' && ethers.utils.isHexString(rawTxHash, 32)
-          ? rawTxHash
-          : undefined;
-      return createAbiHandler(
-        CctpService__factory,
-        'getCCTPAttestation',
-        (message: string, logger: Logger) =>
-          this.getCCTPAttestation(message, originTxHash, logger),
-      )(req, res);
-    });
+    app.post<AbiRoute>(
+      `${prefix}/getCctpAttestation`,
+      ABI_ROUTE_OPTIONS,
+      async (request, reply) => {
+        const rawTxHash = request.body?.origin_tx_hash;
+        const originTxHash =
+          typeof rawTxHash === 'string' &&
+          ethers.utils.isHexString(rawTxHash, 32)
+            ? rawTxHash
+            : undefined;
+        return createAbiHandler(
+          CctpService__factory,
+          'getCCTPAttestation',
+          (message: string, logger: Logger) =>
+            this.getCCTPAttestation(message, originTxHash, logger),
+        )(request, reply);
+      },
+    );
   }
 
   async getCCTPMessageFromReceipt(
@@ -102,15 +118,15 @@ class CCTPService extends BaseService {
       'Extracting CCTP message from receipt',
     );
 
-    const iface = IMessageTransmitter__factory.createInterface();
-    const event = iface.events['MessageSent(bytes)'];
-
     const allMessages: string[] = [];
     for (const receiptLog of receipt.logs) {
+      // Most receipt logs belong to other contracts. Avoid ABI lookup and
+      // exception allocation for events that cannot contain a CCTP message.
+      if (receiptLog.topics[0]?.toLowerCase() !== messageSentTopic) continue;
       try {
-        const parsedLog = iface.parseLog(receiptLog);
+        const parsedLog = messageTransmitterInterface.parseLog(receiptLog);
         if (
-          parsedLog.name === event.name &&
+          parsedLog.name === messageSentEvent.name &&
           typeof parsedLog.args.message === 'string'
         ) {
           allMessages.push(parsedLog.args.message);

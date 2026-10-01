@@ -164,7 +164,8 @@ pub trait PendingOperation: Send + Sync + Debug + TryBatchAs<HyperlaneMessage> {
 
     /// Reset the number of attempts this operation has made, causing it to be
     /// retried immediately.
-    fn reset_attempts(&mut self);
+    /// Reset attempts durably. Returns false when the reset could not be persisted.
+    fn reset_attempts(&mut self) -> bool;
 
     /// Set the number of times this operation has been retried.
     fn set_retries(&mut self, retries: u32);
@@ -306,6 +307,9 @@ pub enum ReprepareReason {
     #[strum(to_string = "Failed to retrieve payload uuid status by message id")]
     /// Failed to retrieve payload status by message id
     ErrorRetrievingPayloadStatus,
+    #[strum(to_string = "Failed to persist terminal message state")]
+    /// Failed to persist that a message reached a terminal outcome
+    ErrorPersistingTerminalMessage,
     #[strum(to_string = "Failed to create payload success criteria")]
     /// Failed to create payload success criteria
     ErrorCreatingPayloadSuccessCriteria,

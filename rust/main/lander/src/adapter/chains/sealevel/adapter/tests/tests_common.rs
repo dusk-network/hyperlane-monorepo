@@ -18,15 +18,15 @@ use solana_sdk::{
 };
 use solana_transaction_status::{
     option_serializer::OptionSerializer, EncodedConfirmedTransactionWithStatusMeta,
-    EncodedTransaction, EncodedTransactionWithStatusMeta, UiConfirmedBlock,
-    UiTransactionStatusMeta,
+    EncodedTransaction, EncodedTransactionWithStatusMeta,
+    TransactionStatus as SealevelTransactionStatus, UiConfirmedBlock, UiTransactionStatusMeta,
 };
 
 use hyperlane_base::settings::{ChainConf, RawChainConf};
 use hyperlane_core::{ChainResult, H512};
 use hyperlane_sealevel::{
     fallback::SubmitSealevelRpc, PriorityFeeOracle, SealevelKeypair, SealevelProviderForLander,
-    SealevelTxCostEstimate, SealevelTxType, TransactionSubmitter,
+    SealevelTransactionFormat, SealevelTxCostEstimate, SealevelTxType, TransactionSubmitter,
 };
 
 use crate::payload::FullPayload;
@@ -59,6 +59,11 @@ mock! {
             signature: Signature,
             commitment: CommitmentConfig,
         ) -> ChainResult<EncodedConfirmedTransactionWithStatusMeta>;
+
+        async fn get_signature_statuses_with_history(
+            &self,
+            signatures: &[Signature],
+        ) -> Vec<ChainResult<Option<SealevelTransactionStatus>>>;
 
         async fn simulate_transaction(
             &self,
@@ -106,7 +111,7 @@ mock! {
             payer: &'a SealevelKeypair,
             tx_submitter: Arc<dyn TransactionSubmitter>,
             sign: bool,
-            alt_address: Option<Pubkey>,
+            alt_addresses: &SealevelTransactionFormat,
             additional_signers: &'a [&'a SealevelKeypair],
         ) -> ChainResult<SealevelTxType>;
 
@@ -116,7 +121,7 @@ mock! {
             payer: &SealevelKeypair,
             tx_submitter: Arc<dyn TransactionSubmitter>,
             priority_fee_oracle: Arc<dyn PriorityFeeOracle>,
-            alt_address: Option<Pubkey>,
+            alt_addresses: &SealevelTransactionFormat,
         ) -> ChainResult<SealevelTxCostEstimate>;
 
         async fn wait_for_transaction_confirmation(&self, transaction: &SealevelTxType)
@@ -181,6 +186,15 @@ pub fn adapter_with_mock_svm_provider(provider: MockSvmProvider) -> SealevelAdap
         Arc::new(provider),
         Arc::new(oracle),
         Arc::new(submitter),
+    )
+}
+
+pub fn adapter_with_mock_client(client: MockClient) -> SealevelAdapter {
+    SealevelAdapter::new_internal_default(
+        Arc::new(client),
+        Arc::new(create_default_mock_svm_provider()),
+        Arc::new(MockOracle::new()),
+        Arc::new(mock_submitter()),
     )
 }
 
@@ -261,8 +275,8 @@ fn mock_client() -> MockClient {
         .expect_get_block_with_commitment()
         .returning(move |_, _| Ok(svm_block()));
     client
-        .expect_get_transaction_with_commitment()
-        .returning(move |_, _| Ok(encoded_svm_transaction()));
+        .expect_get_signature_statuses_with_history()
+        .returning(move |_| signature_status_response(Some(finalized_signature_status())));
     let result_clone = result.clone();
     client
         .expect_simulate_transaction()
@@ -271,6 +285,38 @@ fn mock_client() -> MockClient {
         .expect_simulate_versioned_transaction()
         .returning(move |_| Ok(result.clone()));
     client
+}
+
+pub fn signature_status_response(
+    status: Option<SealevelTransactionStatus>,
+) -> Vec<ChainResult<Option<SealevelTransactionStatus>>> {
+    signature_statuses_response(vec![status])
+}
+
+pub fn signature_statuses_response(
+    statuses: Vec<Option<SealevelTransactionStatus>>,
+) -> Vec<ChainResult<Option<SealevelTransactionStatus>>> {
+    statuses.into_iter().map(Ok).collect()
+}
+
+pub fn finalized_signature_status() -> SealevelTransactionStatus {
+    signature_status(solana_transaction_status::TransactionConfirmationStatus::Finalized)
+}
+
+pub fn processed_signature_status() -> SealevelTransactionStatus {
+    signature_status(solana_transaction_status::TransactionConfirmationStatus::Processed)
+}
+
+fn signature_status(
+    confirmation_status: solana_transaction_status::TransactionConfirmationStatus,
+) -> SealevelTransactionStatus {
+    SealevelTransactionStatus {
+        slot: 43,
+        confirmations: None,
+        status: Ok(()),
+        err: None,
+        confirmation_status: Some(confirmation_status),
+    }
 }
 
 pub fn svm_block() -> UiConfirmedBlock {
@@ -321,7 +367,7 @@ pub fn instruction() -> SealevelInstruction {
 pub fn payload() -> FullPayload {
     let process_payload = hyperlane_sealevel::SealevelProcessPayload {
         instruction: instruction(),
-        alt_address: None,
+        alt_addresses: SealevelTransactionFormat::Legacy,
     };
     let data = serde_json::to_vec(&process_payload).unwrap();
 
@@ -332,7 +378,7 @@ pub fn payload() -> FullPayload {
 }
 
 pub fn precursor() -> SealevelTxPrecursor {
-    SealevelTxPrecursor::new(instruction(), None, estimate())
+    SealevelTxPrecursor::new(instruction(), SealevelTransactionFormat::Legacy, estimate())
 }
 
 pub fn transaction() -> Transaction {

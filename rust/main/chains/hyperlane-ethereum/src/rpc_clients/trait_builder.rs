@@ -2,15 +2,18 @@ use std::fmt::Debug;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use super::http::StatusAwareHttp;
 use async_trait::async_trait;
 use dashmap::DashMap;
-use ethers::middleware::gas_escalator::{Frequency, GasEscalatorMiddleware, GeometricGasPrice};
+use ethers::middleware::gas_escalator::{
+    Frequency, GasEscalatorMiddleware, GeometricGasPrice, InitialSendFailurePolicy,
+};
 use ethers::middleware::gas_oracle::{
     GasCategory, GasOracle, GasOracleMiddleware, Polygon, ProviderOracle,
 };
 use ethers::prelude::{
-    Http, JsonRpcClient, Middleware, NonceManagerMiddleware, Provider, Quorum, QuorumProvider,
-    SignerMiddleware, WeightedProvider, Ws, WsClientError,
+    JsonRpcClient, Middleware, NonceManagerMiddleware, Provider, Quorum, SignerMiddleware, Ws,
+    WsClientError,
 };
 use ethers::types::Address;
 use ethers_signers::Signer;
@@ -33,7 +36,10 @@ use tracing::instrument;
 
 use crate::signer::Signers;
 use crate::tx::PENDING_TX_TIMEOUT_SECS;
-use crate::{ConnectionConf, EthereumFallbackProvider, RetryingProvider, RpcConnectionConf};
+use crate::{
+    ConnectionConf, DynamicTagQuorumProvider, EthereumFallbackProvider, RetryingProvider,
+    RpcConnectionConf,
+};
 
 // This should be whatever the prometheus scrape interval is
 const HTTP_CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -89,6 +95,23 @@ pub trait BuildableWithProvider {
         true
     }
 
+    /// Controls whether the gas escalator retains a transaction when its initial broadcast
+    /// returned an error and therefore no transaction hash. Most submission paths preserve the
+    /// historical retry behavior; callers with their own bounded retry loop may opt out.
+    fn gas_escalator_initial_send_failure_policy(&self) -> InitialSendFailurePolicy {
+        InitialSendFailurePolicy::Monitor
+    }
+
+    /// Whether to cache and increment transaction nonces locally.
+    fn uses_nonce_manager(&self) -> bool {
+        true
+    }
+
+    /// Whether identical dynamic block-tip reads should be coalesced per concrete endpoint.
+    fn uses_dynamic_block_cache(&self) -> bool {
+        false
+    }
+
     /// Construct a new instance of the associated trait using a connection
     /// config. This is the first step and will wrap the provider with
     /// metrics and a signer as needed.
@@ -102,7 +125,7 @@ pub trait BuildableWithProvider {
     ) -> ChainResult<Self::Output> {
         Ok(match &conn.rpc_connection {
             RpcConnectionConf::HttpQuorum { urls } => {
-                let mut builder = QuorumProvider::builder().quorum(Quorum::Majority);
+                let mut providers = Vec::with_capacity(urls.len());
                 for url in urls {
                     let http_provider = build_http_provider(url.clone())?;
                     // Wrap the inner providers as RetryingProviders rather than the QuorumProvider.
@@ -122,10 +145,9 @@ pub trait BuildableWithProvider {
                     );
                     let retrying_provider =
                         RetryingProvider::new(metrics_provider, Some(5), Some(1000));
-                    let weighted_provider = WeightedProvider::new(retrying_provider);
-                    builder = builder.add_provider(weighted_provider);
+                    providers.push(retrying_provider);
                 }
-                let quorum_provider = builder.build();
+                let quorum_provider = DynamicTagQuorumProvider::new(Quorum::Majority, providers);
                 self.build(quorum_provider, conn, locator, signer).await?
             }
             RpcConnectionConf::HttpFallback { urls } => {
@@ -143,11 +165,12 @@ pub trait BuildableWithProvider {
                 let fallback_provider = builder.build();
                 let ethereum_fallback_provider = EthereumFallbackProvider::<
                     _,
-                    JsonRpcBlockGetter<PrometheusJsonRpcClient<Http>>,
+                    JsonRpcBlockGetter<PrometheusJsonRpcClient<StatusAwareHttp>>,
                 >::new(
                     fallback_provider,
                     conn.consider_null_transaction_receipt,
-                );
+                )
+                .with_hedging(conn.fallback_hedge, client_metrics.clone());
                 self.build(ethereum_fallback_provider, conn, locator, signer)
                     .await?
             }
@@ -180,7 +203,7 @@ pub trait BuildableWithProvider {
         client_metrics: &Option<PrometheusClientMetrics>,
         middleware_metrics: &Option<(MiddlewareMetrics, PrometheusMiddlewareConf)>,
     ) -> PrometheusJsonRpcClient<C> {
-        PrometheusJsonRpcClient::new(
+        let client = PrometheusJsonRpcClient::new(
             client,
             client_metrics.clone().unwrap_or_else(|| {
                 PrometheusClientMetricsBuilder::default()
@@ -192,12 +215,21 @@ pub trait BuildableWithProvider {
                 node: Some(NodeInfo {
                     host: url_to_host_info(&url),
                 }),
-                // steal the chain info from the middleware conf
+                // steal the chain info and rpc role from the middleware conf
                 chain: middleware_metrics
                     .as_ref()
                     .and_then(|(_, v)| v.chain.clone()),
+                rpc_role: middleware_metrics
+                    .as_ref()
+                    .map(|(_, v)| v.rpc_role)
+                    .unwrap_or_default(),
             },
-        )
+        );
+        if self.uses_dynamic_block_cache() {
+            client.with_dynamic_block_cache(url.as_str())
+        } else {
+            client
+        }
     }
 
     /// Create the provider, applying any middlewares (e.g. gas oracle, signer) as needed,
@@ -259,8 +291,19 @@ pub trait BuildableWithProvider {
         // The signing provider is used for sending txs, which may end up stuck in the mempool due to
         // gas pricing issues. We first wrap the provider in a signer middleware, to sign any new txs sent by the gas escalator middleware.
         // We keep nonce manager as the outermost middleware, so that resubmitting a tx with a higher gas price reuses its initial nonce.
-        let gas_escalator_provider = wrap_with_gas_escalator(signing_provider);
+        let gas_escalator_provider = wrap_with_gas_escalator(
+            signing_provider,
+            self.gas_escalator_initial_send_failure_policy(),
+        );
         let gas_oracle_provider = wrap_with_gas_oracle(gas_escalator_provider, locator.domain)?;
+        if !self.uses_nonce_manager() {
+            // Without a nonce manager, the signer/provider refetches the pending nonce for every
+            // outer retry. This is required when initial send failures are not retained by the gas
+            // escalator: a local increment must not leave an unfillable nonce hole.
+            return Ok(self
+                .build_with_provider(gas_oracle_provider, conn, locator)
+                .await);
+        }
         let nonce_manager_provider = wrap_with_nonce_manager(gas_oracle_provider, signer.address())
             .await
             .map_err(ChainCommunicationError::from_other)?;
@@ -329,7 +372,10 @@ where
     Ok(GasOracleMiddleware::new(provider, gas_oracle))
 }
 
-fn wrap_with_gas_escalator<M>(provider: M) -> GasEscalatorMiddleware<M>
+fn wrap_with_gas_escalator<M>(
+    provider: M,
+    initial_send_failure_policy: InitialSendFailurePolicy,
+) -> GasEscalatorMiddleware<M>
 where
     M: Middleware + 'static,
 {
@@ -346,13 +392,20 @@ where
     // Check the status of sent txs every eth block or so. The alternative is to subscribe to new blocks and check then,
     // which adds unnecessary load on the provider.
     const FREQUENCY: Frequency = Frequency::Duration(Duration::from_secs(12).as_millis() as _);
-    GasEscalatorMiddleware::new(provider, escalator, FREQUENCY)
+    GasEscalatorMiddleware::new_with_initial_send_failure_policy(
+        provider,
+        escalator,
+        FREQUENCY,
+        initial_send_failure_policy,
+    )
 }
 
 /// Builds a new HTTP provider with the given URL.
-fn build_http_provider(url: Url) -> ChainResult<Http> {
+fn build_http_provider(url: Url) -> ChainResult<StatusAwareHttp> {
+    // Cache by the original URL so clients with different credentials stay isolated.
     let client = get_reqwest_client(&url)?;
-    Ok(Http::new_with_client(url, client))
+    let (_, url) = parse_custom_rpc_headers(&url).map_err(ChainCommunicationError::from_other)?;
+    Ok(StatusAwareHttp::new(url, client))
 }
 
 /// Gets a cached reqwest client for the given URL, or builds a new one if it doesn't exist.
@@ -364,6 +417,8 @@ fn get_reqwest_client(url: &Url) -> ChainResult<Client> {
     let (headers, _) =
         parse_custom_rpc_headers(url).map_err(ChainCommunicationError::from_other)?;
     let client = Client::builder()
+        // Avoid platform TLS negotiation failures (notably Secure Transport on macOS).
+        .use_rustls_tls()
         .timeout(HTTP_CLIENT_TIMEOUT)
         .default_headers(headers)
         .build()
@@ -385,18 +440,109 @@ fn get_reqwest_client_cache() -> &'static DashMap<Url, Client> {
 mod tests {
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex as StdMutex,
     };
 
+    use ethers::middleware::gas_escalator::GasEscalator;
     use ethers::providers::HttpClientError;
     use ethers::signers::LocalWallet;
+    use ethers::types::{transaction::eip2718::TypedTransaction, TransactionRequest, U256};
     use serde::{de::DeserializeOwned, Serialize};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
 
     use super::*;
+    use crate::tx::fill_tx_nonce;
+
+    #[tokio::test]
+    async fn test_http_provider_custom_headers_and_cached_credentials() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("read test server address");
+        let server = tokio::spawn(async move {
+            for expected_key in [Some("first"), Some("second"), Some("first"), None] {
+                let (stream, _) = listener.accept().await.expect("accept RPC request");
+                let mut stream = BufReader::new(stream);
+                let mut line = String::new();
+                stream
+                    .read_line(&mut line)
+                    .await
+                    .expect("read request line");
+                assert_eq!(line, "POST /rpc?keep=value HTTP/1.1\r\n");
+
+                let mut api_key = None;
+                let mut content_length = 0;
+                loop {
+                    line.clear();
+                    assert_ne!(
+                        stream
+                            .read_line(&mut line)
+                            .await
+                            .expect("read request header"),
+                        0
+                    );
+                    if line == "\r\n" {
+                        break;
+                    }
+                    let (name, value) = line.split_once(':').expect("parse request header");
+                    if name.eq_ignore_ascii_case("x-api-key") {
+                        api_key = Some(value.trim().to_owned());
+                    } else if name.eq_ignore_ascii_case("content-length") {
+                        content_length =
+                            value.trim().parse::<usize>().expect("parse content length");
+                    }
+                }
+                assert_eq!(api_key.as_deref(), expected_key);
+                let mut body = vec![0; content_length];
+                stream
+                    .read_exact(&mut body)
+                    .await
+                    .expect("read request body");
+                let request: serde_json::Value =
+                    serde_json::from_slice(&body).expect("decode RPC request");
+                assert_eq!(request["method"], "eth_chainId");
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": "0xf6a",
+                })
+                .to_string();
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            response.len(),
+                            response
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .expect("write RPC response");
+            }
+        });
+
+        for key in [Some("first"), Some("second"), Some("first"), None] {
+            let mut url =
+                Url::parse(&format!("http://{address}/rpc?keep=value")).expect("parse test URL");
+            if let Some(key) = key {
+                url.query_pairs_mut()
+                    .append_pair("custom_rpc_header", &format!("X-Api-Key:{key}"));
+            }
+            let provider = build_http_provider(url).expect("build HTTP provider");
+            let chain_id: U256 = provider
+                .request("eth_chainId", ())
+                .await
+                .expect("query chain ID");
+            assert_eq!(chain_id, U256::from(3946));
+        }
+        server.await.expect("join test server");
+    }
 
     #[derive(Clone, Debug, Default)]
     struct CountingClient {
         chain_id_requests: Arc<AtomicUsize>,
+        requests: Arc<StdMutex<Vec<String>>>,
     }
 
     #[async_trait]
@@ -408,6 +554,24 @@ mod tests {
             T: Debug + Serialize + Send + Sync,
             R: DeserializeOwned,
         {
+            self.requests
+                .lock()
+                .expect("request log")
+                .push(method.to_owned());
+            if method == "eth_call" {
+                let encoded = ethers::abi::encode(&[ethers::abi::Token::Array(vec![
+                    ethers::abi::Token::Array(vec![ethers::abi::Token::String(
+                        "test-location".to_owned(),
+                    )]),
+                ])]);
+                return serde_json::from_value(serde_json::json!(ethers::types::Bytes::from(
+                    encoded
+                )))
+                .map_err(|err| HttpClientError::SerdeJson {
+                    err,
+                    text: "announcement response".into(),
+                });
+            }
             let response = if method == "eth_chainId" {
                 self.chain_id_requests.fetch_add(1, Ordering::Relaxed);
                 r#""0x1""#
@@ -422,6 +586,71 @@ mod tests {
     }
 
     struct SenderBuilder;
+
+    #[derive(Clone, Debug, Default)]
+    struct SuccessfulSendClient {
+        nonce_requests: Arc<AtomicUsize>,
+        raw_transactions: Arc<StdMutex<Vec<serde_json::Value>>>,
+    }
+
+    #[async_trait]
+    impl JsonRpcClient for SuccessfulSendClient {
+        type Error = HttpClientError;
+
+        async fn request<T, R>(&self, method: &str, params: T) -> Result<R, Self::Error>
+        where
+            T: Debug + Serialize + Send + Sync,
+            R: DeserializeOwned,
+        {
+            let response = match method {
+                "eth_chainId" => r#""0x1""#.to_owned(),
+                "eth_getTransactionCount" => {
+                    self.nonce_requests.fetch_add(1, Ordering::Relaxed);
+                    r#""0x7""#.to_owned()
+                }
+                "eth_sendRawTransaction" => {
+                    let params =
+                        serde_json::to_value(params).map_err(|err| HttpClientError::SerdeJson {
+                            err,
+                            text: "failed to serialize raw transaction parameters".to_owned(),
+                        })?;
+                    let send_index = {
+                        let mut raw_transactions = self
+                            .raw_transactions
+                            .lock()
+                            .expect("raw transaction mutex poisoned");
+                        raw_transactions.push(params);
+                        raw_transactions.len()
+                    };
+                    format!(r#""0x{send_index:064x}""#)
+                }
+                "eth_getBlockByNumber" | "eth_getTransactionReceipt" => "null".to_owned(),
+                "eth_gasPrice" => r#""0x1""#.to_owned(),
+                _ => "not valid json".to_owned(),
+            };
+            serde_json::from_str(&response).map_err(|err| HttpClientError::SerdeJson {
+                err,
+                text: response,
+            })
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct AlwaysBump;
+
+    impl GasEscalator for AlwaysBump {
+        fn get_gas_price(&self, initial_price: U256, _time_elapsed: u64) -> U256 {
+            initial_price.saturating_add(U256::one())
+        }
+    }
+
+    fn decode_raw_transaction(value: &serde_json::Value) -> TypedTransaction {
+        let raw: ethers::types::Bytes =
+            serde_json::from_value(value[0].clone()).expect("raw transaction is bytes");
+        TypedTransaction::decode_signed(&ethers::utils::rlp::Rlp::new(raw.as_ref()))
+            .expect("raw transaction decodes")
+            .0
+    }
 
     #[async_trait]
     impl BuildableWithProvider for SenderBuilder {
@@ -459,6 +688,48 @@ mod tests {
             M: Middleware + 'static,
         {
             provider.default_sender()
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct FailingSendClient {
+        nonce_requests: Arc<AtomicUsize>,
+        raw_transactions: Arc<StdMutex<Vec<serde_json::Value>>>,
+    }
+
+    #[async_trait]
+    impl JsonRpcClient for FailingSendClient {
+        type Error = HttpClientError;
+
+        async fn request<T, R>(&self, method: &str, params: T) -> Result<R, Self::Error>
+        where
+            T: Debug + Serialize + Send + Sync,
+            R: DeserializeOwned,
+        {
+            let response = match method {
+                "eth_chainId" => r#""0x1""#,
+                "eth_getTransactionCount" => {
+                    self.nonce_requests.fetch_add(1, Ordering::Relaxed);
+                    r#""0x7""#
+                }
+                "eth_sendRawTransaction" => {
+                    let params =
+                        serde_json::to_value(params).map_err(|err| HttpClientError::SerdeJson {
+                            err,
+                            text: "failed to serialize raw transaction parameters".to_owned(),
+                        })?;
+                    self.raw_transactions
+                        .lock()
+                        .expect("raw transaction mutex poisoned")
+                        .push(params);
+                    "initial send failed"
+                }
+                _ => "not valid json",
+            };
+            serde_json::from_str(response).map_err(|err| HttpClientError::SerdeJson {
+                err,
+                text: response.to_owned(),
+            })
         }
     }
 
@@ -505,6 +776,38 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn announcement_reader_does_not_start_background_rpc_polling(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let client = CountingClient::default();
+        let (domain, address) = test_locator();
+        let locator = ContractLocator {
+            domain: &domain,
+            address,
+        };
+        let reader = crate::ValidatorAnnounceReaderBuilder {}
+            .build(
+                client.clone(),
+                &ConnectionConf::default(),
+                &locator,
+                Some(test_signer()?),
+            )
+            .await?;
+        assert!(client.requests.lock().expect("requests").is_empty());
+        let locations = reader.get_announced_storage_locations(&[address]).await?;
+        assert_eq!(locations, vec![vec!["test-location".to_owned()]]);
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_secs(12)).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(*client.requests.lock().expect("requests"), vec!["eth_call"]);
+        drop(reader);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(*client.requests.lock().expect("requests"), vec!["eth_call"]);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn legacy_needs_signer_flag_fetches_chain_id() -> Result<(), Box<dyn std::error::Error>> {
         let client = CountingClient::default();
@@ -527,6 +830,87 @@ mod tests {
 
         assert_eq!(sender, Some(expected_sender));
         assert_eq!(client.chain_id_requests.load(Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retries_without_nonce_manager_reuse_pending_nonce_after_initial_send_failure(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let client = FailingSendClient::default();
+        let signer = test_signer()?;
+        let provider = Provider::new(client.clone());
+        let signing_provider = wrap_with_signer(provider, signer).await?;
+        let gas_escalator_provider =
+            wrap_with_gas_escalator(signing_provider, InitialSendFailurePolicy::Drop);
+        let domain = HyperlaneDomain::Known(KnownHyperlaneDomain::Ethereum);
+        let provider = wrap_with_gas_oracle(gas_escalator_provider, &domain)?;
+        let tx = TransactionRequest::new()
+            .to(Address::zero())
+            .gas(21_000_u64)
+            .gas_price(1_u64)
+            .value(1_u64);
+
+        assert!(provider.send_transaction(tx.clone(), None).await.is_err());
+        assert!(provider.send_transaction(tx, None).await.is_err());
+
+        assert_eq!(client.nonce_requests.load(Ordering::Relaxed), 2);
+        let raw_transactions = client
+            .raw_transactions
+            .lock()
+            .expect("raw transaction mutex poisoned");
+        assert_eq!(raw_transactions.len(), 2);
+        assert_eq!(raw_transactions[0], raw_transactions[1]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn successful_broadcast_and_gas_escalation_reuse_explicit_nonce(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let client = SuccessfulSendClient::default();
+        let signer = test_signer()?;
+        let provider = Provider::new(client.clone());
+        let signing_provider = wrap_with_signer(provider, signer).await?;
+        let provider = GasEscalatorMiddleware::new_with_initial_send_failure_policy(
+            signing_provider,
+            AlwaysBump,
+            Frequency::Duration(1),
+            InitialSendFailurePolicy::Drop,
+        );
+        let mut tx: TypedTransaction = TransactionRequest::new()
+            .to(Address::zero())
+            .gas(21_000_u64)
+            .gas_price(1_u64)
+            .value(1_u64)
+            .into();
+        fill_tx_nonce(&mut tx, &provider).await?;
+
+        let _pending = provider.send_transaction(tx, None).await?;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if client
+                    .raw_transactions
+                    .lock()
+                    .expect("raw transaction mutex poisoned")
+                    .len()
+                    >= 2
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+
+        assert_eq!(client.nonce_requests.load(Ordering::Relaxed), 1);
+        let raw_transactions = client
+            .raw_transactions
+            .lock()
+            .expect("raw transaction mutex poisoned");
+        let initial = decode_raw_transaction(&raw_transactions[0]);
+        let replacement = decode_raw_transaction(&raw_transactions[1]);
+        assert_eq!(initial.nonce(), Some(&U256::from(7_u64)));
+        assert_eq!(replacement.nonce(), initial.nonce());
+        assert!(replacement.gas_price() > initial.gas_price());
         Ok(())
     }
 }

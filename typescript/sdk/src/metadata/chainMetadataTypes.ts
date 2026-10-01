@@ -2,7 +2,7 @@
  * The types defined here are the source of truth for chain metadata.
  * ANY CHANGES HERE NEED TO BE REFLECTED IN HYPERLANE-BASE CONFIG PARSING.
  */
-import { SafeParseReturnType, z } from 'zod';
+import { z } from 'zod';
 
 import { ProtocolType, objMerge } from '@hyperlane-xyz/utils';
 
@@ -116,7 +116,7 @@ export type RpcUrl = z.infer<typeof RpcUrlSchema>;
 
 export const BlockExplorerSchema = z.object({
   name: z.string().describe('A human readable name for the explorer.'),
-  url: z.string().url().describe('The base URL for the explorer.'),
+  url: z.url().describe('The base URL for the explorer.'),
   apiUrl: z
     .string()
     .url()
@@ -155,7 +155,7 @@ export const DisabledChainSchema = z.object({
       'The status that represents the chain availability. See ChainStatus for valid values.',
     ),
   reasons: z
-    .array(z.nativeEnum(ChainDisabledReason))
+    .array(z.enum(ChainDisabledReason))
     .min(1)
     .describe('List of reasons explaining why the chain is disabled.'),
 });
@@ -175,6 +175,22 @@ export type NativeToken = z.infer<typeof NativeTokenSchema>;
  * Specified as a Zod schema
  */
 export const ChainMetadataSchemaObject = z.object({
+  maxSupportedTransactionVersion: z
+    .union([z.literal(0), z.literal(1)])
+    .optional()
+    .describe('Highest supported SVM transaction version; defaults to 0.'),
+  sealevelV1TransactionsEnabled: z
+    .boolean()
+    .optional()
+    .describe(
+      'Enable v1 submission only after this SVM activates the feature; defaults to false.',
+    ),
+  sealevelTransactionVersion: z
+    .union([z.literal(0), z.literal(1)])
+    .optional()
+    .describe(
+      'Default Sealevel signer transaction version; defaults to 0. V1 requires sealevelV1TransactionsEnabled and maxSupportedTransactionVersion 1.',
+    ),
   availability: z
     .union([DisabledChainSchema, EnabledChainSchema])
     .optional()
@@ -237,7 +253,7 @@ export const ChainMetadataSchemaObject = z.object({
         .email()
         .optional()
         .describe('The email address of the deployer.'),
-      url: z.string().url().optional().describe('The URL of the deployer.'),
+      url: z.url().optional().describe('The URL of the deployer.'),
     })
     .optional()
     .describe(
@@ -274,6 +290,11 @@ export const ChainMetadataSchemaObject = z.object({
     .string()
     .optional()
     .describe('The API key for the gnosis safe transaction service.'),
+
+  gatewayUrls: z
+    .array(RpcUrlSchema)
+    .describe('For Radix chains, a list of Gateway API URLs.')
+    .optional(),
 
   grpcUrls: z
     .array(RpcUrlSchema)
@@ -336,7 +357,7 @@ export const ChainMetadataSchemaObject = z.object({
     ),
 
   transactionOverrides: z
-    .record(z.any())
+    .record(z.string(), z.unknown())
     .optional()
     .describe('Properties to include when forming transaction requests.'),
 
@@ -346,7 +367,9 @@ export const ChainMetadataSchemaObject = z.object({
 });
 
 // Passthrough allows for extra fields to remain in the object (such as extensions consumers may want like `mailbox`)
-const ChainMetadataSchemaExtensible = ChainMetadataSchemaObject.passthrough();
+const ChainMetadataSchemaExtensible = z.looseObject(
+  ChainMetadataSchemaObject.shape,
+);
 
 // Add refinements to the object schema to conditionally validate certain fields
 export const ChainMetadataSchema = ChainMetadataSchemaExtensible.refine(
@@ -368,6 +391,24 @@ export const ChainMetadataSchema = ChainMetadataSchemaExtensible.refine(
   },
   { message: 'Invalid Chain Id', path: ['chainId'] },
 )
+  .refine(
+    (metadata) =>
+      !metadata.sealevelV1TransactionsEnabled ||
+      metadata.maxSupportedTransactionVersion === 1,
+    {
+      message: 'V1 sending requires maxSupportedTransactionVersion 1',
+      path: ['maxSupportedTransactionVersion'],
+    },
+  )
+  .refine(
+    (metadata) =>
+      metadata.sealevelTransactionVersion !== 1 ||
+      metadata.sealevelV1TransactionsEnabled === true,
+    {
+      message: 'V1 default requires sealevelV1TransactionsEnabled',
+      path: ['sealevelTransactionVersion'],
+    },
+  )
   .refine(
     (metadata) => {
       if (typeof metadata.chainId === 'string' && !metadata.domainId)
@@ -442,14 +483,16 @@ export type ChainMetadata<Ext = object> = z.infer<
 > &
   Ext;
 
+const CompiledChainMetadataSchema = z.compile(ChainMetadataSchema);
+
 export function safeParseChainMetadata(
   c: ChainMetadata,
-): SafeParseReturnType<ChainMetadata, ChainMetadata> {
-  return ChainMetadataSchema.safeParse(c);
+): z.ZodSafeParseResult<ChainMetadata> {
+  return CompiledChainMetadataSchema.safeParse(c);
 }
 
 export function isValidChainMetadata(c: ChainMetadata): boolean {
-  return ChainMetadataSchema.safeParse(c).success;
+  return z.validate(CompiledChainMetadataSchema, c);
 }
 
 export function getDomainId(chainMetadata: ChainMetadata): number {

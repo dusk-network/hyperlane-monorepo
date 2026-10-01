@@ -35,12 +35,14 @@ jobs:
             module: core
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: pnpm-build
         uses: ./.github/actions/pnpm-build-with-cache
+        with:
+          build-filter: '@hyperlane-xyz/infra...'
 
       - name: Checkout registry
         uses: ./.github/actions/checkout-registry
@@ -60,7 +62,7 @@ jobs:
     needs: env-test-matrix
     if: always()
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Check env-test matrix status
         uses: ./.github/actions/check-job-status
         with:

@@ -76,6 +76,7 @@ jobs:
               rust/main/agents/validator/src/main.rs|\
               rust/main/agents/validator/src/reorg_reporter.rs|\
               rust/main/agents/validator/src/reorg_tombstone.rs|\
+              rust/main/agents/validator/src/rpc.rs|\
               rust/main/agents/validator/src/settings.rs|\
               rust/main/agents/validator/src/submit.rs|\
               rust/main/agents/validator/src/submit/tests.rs|\

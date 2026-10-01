@@ -1,7 +1,15 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    fs,
+    io::ErrorKind,
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
-use super::error::DbError;
-use rocksdb::{Options, DB as Rocks};
+use super::error::{DbError, GasPaymentSequenceConflict};
+use rocksdb::{Direction, IteratorMode, Options, WriteBatch, WriteBatchIterator, DB as Rocks};
 use tracing::info;
 
 pub use hyperlane_db::*;
@@ -19,9 +27,129 @@ mod typed_db;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
 
+// Keep enough archived WAL to make rollback detection cheap during the normal
+// deployment rollback window. Sequence continuity checks below make expiration
+// safe by forcing a full derived-index rebuild when history is unavailable.
+const ROLLBACK_WAL_RETENTION_SECONDS: u64 = 7 * 24 * 60 * 60;
+// Cap the retained fast path so a high-write database cannot grow without bound.
+const ROLLBACK_WAL_SIZE_LIMIT_MB: u64 = 1_024;
+
+fn remove_archived_wal_files(db_path: &Path) -> Result<()> {
+    let archive_path = db_path.join("archive");
+    let entries = match fs::read_dir(&archive_path) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(DbError::Other(format!(
+                "Failed to inspect archived RocksDB WAL at {}: {err}",
+                archive_path.display()
+            )))
+        }
+    };
+    let mut removed = 0_u64;
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            DbError::Other(format!(
+                "Failed to inspect archived RocksDB WAL entry at {}: {err}",
+                archive_path.display()
+            ))
+        })?;
+        let file_type = entry.file_type().map_err(|err| {
+            DbError::Other(format!(
+                "Failed to inspect archived RocksDB WAL file {}: {err}",
+                entry.path().display()
+            ))
+        })?;
+        let is_wal = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.strip_suffix(".log"))
+            .is_some_and(|stem| !stem.is_empty() && stem.bytes().all(|byte| byte.is_ascii_digit()));
+        if file_type.is_file() && is_wal {
+            fs::remove_file(entry.path()).map_err(|err| {
+                DbError::Other(format!(
+                    "Failed to remove archived RocksDB WAL file {}: {err}",
+                    entry.path().display()
+                ))
+            })?;
+            removed = removed.saturating_add(1);
+        }
+    }
+    if removed > 0 {
+        info!(path=%archive_path.display(), removed, "Removed archived RocksDB WAL after disabling rollback retention");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 /// A KV Store
 pub struct DB(Arc<Rocks>);
+
+/// A set of writes committed atomically to RocksDB.
+pub struct DbBatch {
+    db: DB,
+    writes: WriteBatch,
+}
+
+struct PrefixWriteDetector<'a> {
+    source_prefix: &'a [u8],
+    marker_prefixes: &'a [&'a [u8]],
+    deletions_only: bool,
+    source_written: bool,
+    marker_written: bool,
+}
+
+struct PendingIndexWriteDetector<'a> {
+    source_prefixes: &'a [&'a [u8]],
+    marker_prefix: &'a [u8],
+    source_written: bool,
+    marker_written: bool,
+    marker_deleted: bool,
+}
+
+impl PrefixWriteDetector<'_> {
+    fn record(&mut self, key: &[u8], deletion: bool) {
+        self.source_written |=
+            (!self.deletions_only || deletion) && key.starts_with(self.source_prefix);
+        self.marker_written |= self
+            .marker_prefixes
+            .iter()
+            .any(|prefix| key.starts_with(prefix));
+    }
+}
+
+impl WriteBatchIterator for PrefixWriteDetector<'_> {
+    fn put(&mut self, key: &[u8], _value: &[u8]) {
+        self.record(key, false);
+    }
+
+    fn delete(&mut self, key: &[u8]) {
+        self.record(key, true);
+    }
+}
+
+impl PendingIndexWriteDetector<'_> {
+    fn record(&mut self, key: &[u8], deletion: bool) {
+        self.source_written |= self
+            .source_prefixes
+            .iter()
+            .any(|prefix| key.starts_with(prefix));
+        if key.starts_with(self.marker_prefix) {
+            self.marker_written = true;
+            self.marker_deleted |= deletion;
+        }
+    }
+}
+
+impl WriteBatchIterator for PendingIndexWriteDetector<'_> {
+    fn put(&mut self, key: &[u8], _value: &[u8]) {
+        self.record(key, false);
+    }
+
+    fn delete(&mut self, key: &[u8]) {
+        self.record(key, true);
+    }
+}
 
 impl From<Rocks> for DB {
     fn from(rocks: Rocks) -> Self {
@@ -31,10 +159,50 @@ impl From<Rocks> for DB {
 
 type Result<T> = std::result::Result<T, DbError>;
 
+// RocksDB keeps 1,000 archived info logs by default and does not roll the current
+// log by size. Agent databases live on persistent volumes, so routine restarts can
+// otherwise retain years of diagnostics alongside a comparatively small database.
+const ROCKSDB_INFO_LOG_FILE_COUNT: usize = 10;
+const ROCKSDB_INFO_LOG_FILE_SIZE: usize = 16 * 1024 * 1024;
+
 impl DB {
     /// Opens db at `db_path` and creates if missing
     #[tracing::instrument(err)]
     pub fn from_path(db_path: &Path) -> Result<DB> {
+        Self::from_path_with_options(
+            db_path,
+            false,
+            ROCKSDB_INFO_LOG_FILE_COUNT,
+            ROCKSDB_INFO_LOG_FILE_SIZE,
+        )
+    }
+
+    /// Opens a DB with archived WAL retained for rollback-derived index recovery.
+    #[tracing::instrument(err)]
+    pub fn from_path_with_rollback_wal(db_path: &Path) -> Result<DB> {
+        Self::from_path_with_options(
+            db_path,
+            true,
+            ROCKSDB_INFO_LOG_FILE_COUNT,
+            ROCKSDB_INFO_LOG_FILE_SIZE,
+        )
+    }
+
+    #[cfg(test)]
+    fn from_path_with_info_log_limits(
+        db_path: &Path,
+        info_log_file_count: usize,
+        info_log_file_size: usize,
+    ) -> Result<DB> {
+        Self::from_path_with_options(db_path, false, info_log_file_count, info_log_file_size)
+    }
+
+    fn from_path_with_options(
+        db_path: &Path,
+        retain_rollback_wal: bool,
+        info_log_file_count: usize,
+        info_log_file_size: usize,
+    ) -> Result<DB> {
         let path = {
             let mut path = db_path
                 .parent()
@@ -55,14 +223,22 @@ impl DB {
 
         let mut opts = Options::default();
         opts.create_if_missing(true);
+        if retain_rollback_wal {
+            opts.set_wal_ttl_seconds(ROLLBACK_WAL_RETENTION_SECONDS);
+            opts.set_wal_size_limit_mb(ROLLBACK_WAL_SIZE_LIMIT_MB);
+        }
+        opts.set_keep_log_file_num(info_log_file_count);
+        opts.set_max_log_file_size(info_log_file_size);
 
-        Rocks::open(&opts, &path)
-            .map_err(|e| DbError::OpeningError {
-                source: Box::new(e),
-                path: db_path.into(),
-                canonicalized: path,
-            })
-            .map(Into::into)
+        let rocks = Rocks::open(&opts, &path).map_err(|e| DbError::OpeningError {
+            source: Box::new(e),
+            path: db_path.into(),
+            canonicalized: path.clone(),
+        })?;
+        if !retain_rollback_wal {
+            remove_archived_wal_files(&path)?;
+        }
+        Ok(rocks.into())
     }
 
     /// Store a value in the DB
@@ -70,8 +246,406 @@ impl DB {
         Ok(self.0.put(key, value)?)
     }
 
+    /// Atomically store multiple key-value pairs in the DB.
+    pub fn store_batch(&self, entries: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>) -> Result<()> {
+        let mut batch = WriteBatch::default();
+        for (key, value) in entries {
+            batch.put(key, value);
+        }
+        Ok(self.0.write(batch)?)
+    }
+
+    /// Atomically store and delete multiple keys.
+    pub fn store_and_delete_batch(
+        &self,
+        entries: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>,
+        deletions: impl IntoIterator<Item = Vec<u8>>,
+    ) -> Result<()> {
+        let mut batch = WriteBatch::default();
+        for (key, value) in entries {
+            batch.put(key, value);
+        }
+        for key in deletions {
+            batch.delete(key);
+        }
+        Ok(self.0.write(batch)?)
+    }
+
+    pub(crate) fn retrieve_at_or_after(&self, key: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let mut iterator = self.0.raw_iterator();
+        iterator.seek(key);
+        iterator.status()?;
+        Ok(iterator
+            .key()
+            .zip(iterator.value())
+            .map(|(key, value)| (key.to_vec(), value.to_vec())))
+    }
+
+    pub(crate) fn retrieve_at_or_before(&self, key: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let mut iterator = self.0.raw_iterator();
+        iterator.seek_for_prev(key);
+        iterator.status()?;
+        Ok(iterator
+            .key()
+            .zip(iterator.value())
+            .map(|(key, value)| (key.to_vec(), value.to_vec())))
+    }
+
+    /// Retrieve the greatest fixed-width key under a prefix, without decoding its value.
+    pub(crate) fn retrieve_last_key_by_prefix<const N: usize>(
+        &self,
+        prefix: &[u8],
+    ) -> Result<Option<[u8; N]>> {
+        let mut start = prefix.to_vec();
+        start.extend_from_slice(&[u8::MAX; N]);
+        let mut iterator = self.0.raw_iterator();
+        iterator.seek_for_prev(&start);
+        loop {
+            iterator.status()?;
+            let Some(suffix) = iterator.key().and_then(|key| key.strip_prefix(prefix)) else {
+                return Ok(None);
+            };
+            // Other tables can overlap this prefix through their binary keys.
+            if let Ok(key) = suffix.try_into() {
+                return Ok(Some(key));
+            }
+            iterator.prev();
+        }
+    }
+
     /// Retrieve a value from the DB
     pub fn retrieve(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         Ok(self.0.get(key)?)
+    }
+
+    // Keep the native value pinned only while the typed layer decodes it.
+    fn retrieve_pinned(&self, key: &[u8]) -> Result<Option<rocksdb::DBPinnableSlice<'_>>> {
+        Ok(self.0.get_pinned(key)?)
+    }
+
+    /// Delete a value from the DB
+    pub fn delete(&self, key: &[u8]) -> Result<()> {
+        Ok(self.0.delete(key)?)
+    }
+
+    /// Retrieve all values stored under a key prefix.
+    pub fn retrieve_values_by_prefix(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let mut values = Vec::new();
+        for item in self
+            .0
+            .iterator(IteratorMode::From(prefix, Direction::Forward))
+        {
+            let (key, value) = item?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            values.push(value.into_vec());
+        }
+        Ok(values)
+    }
+
+    /// Return the latest RocksDB sequence number.
+    pub fn latest_sequence_number(&self) -> u64 {
+        self.0.latest_sequence_number()
+    }
+
+    /// Detect source-prefix writes not accompanied by a marker-prefix write in
+    /// the same atomic batch. This lets derived indexes detect writes from an
+    /// older binary which does not maintain them.
+    pub fn has_unmarked_writes_since(
+        &self,
+        sequence: u64,
+        source_prefix: &[u8],
+        marker_prefix: &[u8],
+    ) -> Result<bool> {
+        self.has_unmarked_updates_since(sequence, source_prefix, &[marker_prefix], false)
+    }
+
+    /// Detect source deletions without any of the supplied atomic markers.
+    pub fn has_unmarked_deletions_since(
+        &self,
+        sequence: u64,
+        source_prefix: &[u8],
+        marker_prefixes: &[&[u8]],
+    ) -> Result<bool> {
+        self.has_unmarked_updates_since(sequence, source_prefix, marker_prefixes, true)
+    }
+
+    /// Detect legacy source writes or standalone derived-index deletions in one WAL pass.
+    pub fn has_unmarked_pending_index_updates_since(
+        &self,
+        sequence: u64,
+        source_prefixes: &[&[u8]],
+        marker_prefix: &[u8],
+        cancellation: &AtomicBool,
+    ) -> Result<bool> {
+        self.has_matching_updates_since(sequence, Some(cancellation), |batch| {
+            let mut detector = PendingIndexWriteDetector {
+                source_prefixes,
+                marker_prefix,
+                source_written: false,
+                marker_written: false,
+                marker_deleted: false,
+            };
+            batch.iterate(&mut detector);
+            (detector.source_written && !detector.marker_written)
+                || (detector.marker_deleted && !detector.source_written)
+        })
+    }
+
+    fn has_unmarked_updates_since(
+        &self,
+        sequence: u64,
+        source_prefix: &[u8],
+        marker_prefixes: &[&[u8]],
+        deletions_only: bool,
+    ) -> Result<bool> {
+        self.has_matching_updates_since(sequence, None, |batch| {
+            let mut detector = PrefixWriteDetector {
+                source_prefix,
+                marker_prefixes,
+                deletions_only,
+                source_written: false,
+                marker_written: false,
+            };
+            batch.iterate(&mut detector);
+            detector.source_written && !detector.marker_written
+        })
+    }
+
+    fn has_matching_updates_since(
+        &self,
+        sequence: u64,
+        cancellation: Option<&AtomicBool>,
+        mut matches: impl FnMut(&WriteBatch) -> bool,
+    ) -> Result<bool> {
+        let latest_sequence = self.0.latest_sequence_number();
+        let mut expected_sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| DbError::Other("RocksDB sequence number overflowed".to_string()))?;
+
+        for update in self.0.get_updates_since(sequence)? {
+            if cancellation.is_some_and(|cancelled| cancelled.load(Ordering::Relaxed)) {
+                return Err(DbError::Other(
+                    "RocksDB WAL validation cancelled".to_string(),
+                ));
+            }
+            let (batch_sequence, batch) = update?;
+            if batch_sequence != expected_sequence {
+                return Err(DbError::Other(format!(
+                    "RocksDB WAL history is incomplete: expected sequence {expected_sequence}, found {batch_sequence}"
+                )));
+            }
+            expected_sequence = batch_sequence
+                .checked_add(batch.len() as u64)
+                .ok_or_else(|| DbError::Other("RocksDB sequence number overflowed".to_string()))?;
+            if matches(&batch) {
+                return Ok(true);
+            }
+        }
+
+        let sequence_after_latest = latest_sequence
+            .checked_add(1)
+            .ok_or_else(|| DbError::Other("RocksDB sequence number overflowed".to_string()))?;
+        if expected_sequence < sequence_after_latest {
+            return Err(DbError::Other(format!(
+                "RocksDB WAL history ended at sequence {}, before latest sequence {latest_sequence}",
+                expected_sequence.saturating_sub(1)
+            )));
+        }
+        Ok(false)
+    }
+
+    /// Start an atomic write batch.
+    pub fn batch(&self) -> DbBatch {
+        DbBatch {
+            db: self.clone(),
+            writes: WriteBatch::default(),
+        }
+    }
+}
+
+impl DbBatch {
+    /// Store a raw key/value pair in this batch.
+    pub fn store(&mut self, key: &[u8], value: &[u8]) {
+        self.writes.put(key, value);
+    }
+
+    /// Delete a raw key in this batch.
+    pub fn delete(&mut self, key: &[u8]) {
+        self.writes.delete(key);
+    }
+
+    /// Delete a raw key range in this batch.
+    pub fn delete_range(&mut self, start: &[u8], end: &[u8]) {
+        self.writes.delete_range(start, end);
+    }
+
+    /// Atomically commit this batch.
+    pub fn commit(self) -> Result<()> {
+        Ok(self.db.0.write(self.writes)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use rocksdb::{Options, WriteBatch, DB as Rocks};
+
+    use super::{DB, ROCKSDB_INFO_LOG_FILE_COUNT};
+
+    #[test]
+    fn rejects_incomplete_wal_history() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut options = Options::default();
+        options.create_if_missing(true);
+
+        let checkpoint;
+        {
+            let db = Rocks::open(&options, temp_dir.path()).unwrap();
+            db.put(b"checkpoint", b"1").unwrap();
+            checkpoint = db.latest_sequence_number();
+            db.put(b"source_old", b"ready").unwrap();
+            db.flush().unwrap();
+
+            let mut batch = WriteBatch::default();
+            batch.put(b"source_new", b"ready");
+            batch.put(b"marker", b"1");
+            db.write(batch).unwrap();
+        }
+
+        let db = DB::from(Rocks::open(&options, temp_dir.path()).unwrap());
+        assert!(db
+            .has_unmarked_writes_since(checkpoint, b"source_", b"marker")
+            .is_err());
+    }
+
+    #[test]
+    fn accepts_contiguous_marked_batches() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = DB::from(Rocks::open_default(temp_dir.path()).unwrap());
+        db.store(b"checkpoint", b"1").unwrap();
+        let checkpoint = db.latest_sequence_number();
+
+        let mut batch = db.batch();
+        batch.store(b"source_one", b"ready");
+        batch.store(b"marker", b"1");
+        batch.commit().unwrap();
+        let mut batch = db.batch();
+        batch.store(b"source_two", b"ready");
+        batch.store(b"marker", b"1");
+        batch.commit().unwrap();
+
+        assert!(!db
+            .has_unmarked_writes_since(checkpoint, b"source_", b"marker")
+            .unwrap());
+    }
+
+    #[test]
+    fn failed_batch_preserves_all_old_values() {
+        let temp_dir = tempfile::tempdir().expect("temp db directory");
+        let mut options = Options::default();
+        options.create_if_missing(true);
+        let writable = Rocks::open(&options, temp_dir.path()).expect("initialize db");
+        writable
+            .put(b"retry-state", b"old-state")
+            .expect("store old state");
+        writable
+            .put(b"retry-count", b"old-count")
+            .expect("store old count");
+        drop(writable);
+
+        let rocks =
+            Rocks::open_for_read_only(&options, temp_dir.path(), false).expect("open read-only db");
+        let db = DB::from(rocks);
+        assert!(db
+            .store_batch([
+                (b"retry-state".to_vec(), b"new-state".to_vec()),
+                (b"retry-count".to_vec(), b"new-count".to_vec()),
+                (b"status".to_vec(), b"manual".to_vec()),
+            ])
+            .is_err());
+        assert_eq!(
+            db.retrieve(b"retry-state").expect("read state"),
+            Some(b"old-state".to_vec())
+        );
+        assert_eq!(
+            db.retrieve(b"retry-count").expect("read count"),
+            Some(b"old-count".to_vec())
+        );
+        assert_eq!(db.retrieve(b"status").expect("read status"), None);
+    }
+
+    #[test]
+    fn default_reopen_removes_wal_archived_under_retention() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("db");
+        drop(DB::from_path_with_rollback_wal(&db_path).unwrap());
+
+        let archive_path = db_path.join("archive");
+        fs::create_dir_all(&archive_path).unwrap();
+        fs::write(archive_path.join("000001.log"), b"retained wal").unwrap();
+        fs::write(archive_path.join("keep.txt"), b"unrelated").unwrap();
+
+        drop(DB::from_path(&db_path).unwrap());
+
+        assert!(!archive_path.join("000001.log").exists());
+        assert!(archive_path.join("keep.txt").exists());
+    }
+
+    #[test]
+    fn bounds_info_logs() {
+        const TEST_INFO_LOG_FILE_SIZE: usize = 4 * 1024;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("db");
+
+        let db = DB::from_path_with_info_log_limits(
+            &db_path,
+            ROCKSDB_INFO_LOG_FILE_COUNT,
+            TEST_INFO_LOG_FILE_SIZE,
+        )
+        .unwrap();
+        for iteration in 0_u64..128 {
+            db.store(&iteration.to_be_bytes(), &iteration.to_be_bytes())
+                .unwrap();
+            db.0.flush().unwrap();
+        }
+        assert_eq!(
+            db.retrieve(&127_u64.to_be_bytes()).unwrap(),
+            Some(127_u64.to_be_bytes().to_vec())
+        );
+        drop(db);
+
+        let info_logs = fs::read_dir(db_path)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("LOG"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            info_logs.len(),
+            ROCKSDB_INFO_LOG_FILE_COUNT,
+            "expected enough rotations to exercise the {ROCKSDB_INFO_LOG_FILE_COUNT}-file retention limit"
+        );
+
+        let rotated_log_sizes = info_logs
+            .iter()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("LOG.old."))
+            .map(|entry| entry.metadata().unwrap().len())
+            .collect::<Vec<_>>();
+        assert!(
+            !rotated_log_sizes.is_empty(),
+            "expected the {TEST_INFO_LOG_FILE_SIZE}-byte test limit to rotate the info log"
+        );
+        let test_info_log_file_size = u64::try_from(TEST_INFO_LOG_FILE_SIZE)
+            .expect("TEST_INFO_LOG_FILE_SIZE must fit in u64");
+        assert!(
+            rotated_log_sizes
+                .iter()
+                .all(|size| *size >= test_info_log_file_size),
+            "expected rotated logs to reach the configured {TEST_INFO_LOG_FILE_SIZE}-byte limit; sizes: {rotated_log_sizes:?}"
+        );
     }
 }

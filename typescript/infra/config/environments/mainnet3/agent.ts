@@ -40,9 +40,10 @@ import {
 } from '../../../src/config/agent/relayer.js';
 import { BaseScraperConfig } from '../../../src/config/agent/scraper.js';
 import { ALL_KEY_ROLES, Role } from '../../../src/roles.js';
-import { Contexts } from '../../contexts.js';
+import { Contexts, RELEASE_CANDIDATE_INDEX_FROM } from '../../contexts.js';
 import { DockerImageRepos, mainnetDockerTags } from '../../docker.js';
 import { getDomainId, getWarpAddresses } from '../../registry.js';
+import { fallbackHedgeConfig } from '../utils.js';
 
 import { environment, ethereumChainNames } from './chains.js';
 import { blacklistedMessageIds } from './customBlacklist.js';
@@ -71,21 +72,16 @@ export const hyperlaneContextAgentChainConfig: AgentChainConfig<
   // Generally, we run all production validators in the Hyperlane context.
   [Role.Validator]: {
     abstract: true,
-    // acala: true,
     adichain: true,
     aleo: true,
     apechain: true,
-    appchain: true,
     arbitrum: true,
-    arcadia: true,
+    arc: true,
     avalanche: true,
     base: true,
     berachain: true,
-    bitlayer: true,
     blast: true,
     bob: true,
-    boba: true,
-    botanix: true,
     bsc: true,
     carrchain: true,
     celestia: true,
@@ -98,16 +94,12 @@ export const hyperlaneContextAgentChainConfig: AgentChainConfig<
     eni: true,
     ethereum: true,
     fluent: true,
-    flowmainnet: true,
     forma: false, // relayer + scraper only
     fraxtal: true,
     galactica: true,
     gnosis: true,
-    hashkey: true,
-    hemi: true,
     hyperevm: true,
     igra: true,
-    immutablezkevmmainnet: true,
     ink: true,
     katana: true,
     kiichain: true,
@@ -117,10 +109,8 @@ export const hyperlaneContextAgentChainConfig: AgentChainConfig<
     linea: true,
     lisk: true,
     lukso: true,
-    lumiaprism: true,
     mantle: true,
     mantra: true,
-    matchain: true,
     megaeth: true,
     metal: true,
     metis: true,
@@ -128,24 +118,16 @@ export const hyperlaneContextAgentChainConfig: AgentChainConfig<
     mocachain: true,
     mode: true,
     monad: true,
-    morph: true,
-    nesa: true,
+    nesa: false, // disabled — superseded by nesachain after the Nesa incident
+    nesachain: true,
     nexus: true,
-    nibiru: true,
-    noble: true,
-    oortmainnet: true,
     optimism: true,
     paradex: true,
-    peaq: true,
     plasma: true,
-    plume: true,
     polygon: true,
-    prom: true,
     pulsechain: true,
-    radix: true,
-    reactive: true,
+    radix: false, // disabled — removed from agent operations per request
     robinhood: true,
-    ronin: true,
     sei: true,
     solanamainnet: true,
     solaxy: true,
@@ -153,17 +135,15 @@ export const hyperlaneContextAgentChainConfig: AgentChainConfig<
     soneium: true,
     sonic: true,
     sonicsvm: true,
-    soon: false, // disabled — RPC unavailable
     stable: true,
     starknet: true,
     subtensor: true,
-    superseed: true,
-    tac: true,
+
+    tac: true, // re-enabled 2026-09-07 — block production resumed
     taiko: false, // temporarily disabled out of caution (Taiko network incident)
     tea: true,
     tron: true,
     unichain: true,
-    vana: true,
     viction: true,
     worldchain: true,
     xlayer: true,
@@ -172,21 +152,16 @@ export const hyperlaneContextAgentChainConfig: AgentChainConfig<
   },
   [Role.Relayer]: {
     abstract: true,
-    // acala: true,
     adichain: true,
     aleo: true,
     apechain: true,
-    appchain: true,
     arbitrum: true,
-    arcadia: true,
+    arc: true,
     avalanche: true,
     base: true,
     berachain: true,
-    bitlayer: true,
     blast: true,
     bob: true,
-    boba: true,
-    botanix: true,
     bsc: true,
     carrchain: true,
     celestia: true,
@@ -199,16 +174,12 @@ export const hyperlaneContextAgentChainConfig: AgentChainConfig<
     eni: true,
     ethereum: true,
     fluent: true,
-    flowmainnet: true,
     forma: true,
     fraxtal: true,
     galactica: true,
     gnosis: true,
-    hashkey: true,
-    hemi: true,
     hyperevm: true,
     igra: true,
-    immutablezkevmmainnet: true,
     ink: true,
     katana: true,
     kiichain: true,
@@ -218,10 +189,8 @@ export const hyperlaneContextAgentChainConfig: AgentChainConfig<
     linea: true,
     lisk: true,
     lukso: true,
-    lumiaprism: true,
     mantle: true,
     mantra: true,
-    matchain: true,
     megaeth: true,
     metal: true,
     metis: true,
@@ -229,24 +198,16 @@ export const hyperlaneContextAgentChainConfig: AgentChainConfig<
     mocachain: true,
     mode: true,
     monad: true,
-    morph: true,
-    nesa: true,
+    nesa: false, // disabled — superseded by nesachain after the Nesa incident
+    nesachain: true,
     nexus: true,
-    nibiru: true,
-    noble: true,
-    oortmainnet: true,
     optimism: true,
     paradex: true,
-    peaq: true,
     plasma: true,
-    plume: true,
     polygon: true,
-    prom: true,
     pulsechain: true,
-    radix: true,
-    reactive: true,
+    radix: false, // disabled — removed from agent operations per request
     robinhood: true,
-    ronin: true,
     sei: true,
     solanamainnet: true,
     solaxy: true,
@@ -254,17 +215,15 @@ export const hyperlaneContextAgentChainConfig: AgentChainConfig<
     soneium: true,
     sonic: true,
     sonicsvm: true,
-    soon: false, // disabled — RPC unavailable
     stable: true,
     starknet: true,
     subtensor: true,
-    superseed: true,
-    tac: true,
+
+    tac: true, // re-enabled 2026-09-07 — block production resumed
     taiko: false, // temporarily disabled out of caution (Taiko network incident)
     tea: true,
     tron: true,
     unichain: true,
-    vana: true,
     viction: true,
     worldchain: true,
     xlayer: true,
@@ -273,21 +232,16 @@ export const hyperlaneContextAgentChainConfig: AgentChainConfig<
   },
   [Role.Scraper]: {
     abstract: true,
-    // acala: true,
     adichain: true,
     aleo: true,
     apechain: true,
-    appchain: true,
     arbitrum: true,
-    arcadia: true,
+    arc: true,
     avalanche: true,
     base: true,
     berachain: true,
-    bitlayer: true,
     blast: true,
     bob: true,
-    boba: true,
-    botanix: true,
     bsc: true,
     carrchain: true,
     celestia: true,
@@ -300,16 +254,12 @@ export const hyperlaneContextAgentChainConfig: AgentChainConfig<
     eni: true,
     ethereum: true,
     fluent: true,
-    flowmainnet: true,
     forma: true,
     fraxtal: true,
     galactica: true,
     gnosis: true,
-    hashkey: true,
-    hemi: true,
     hyperevm: true,
     igra: true,
-    immutablezkevmmainnet: true,
     ink: true,
     katana: true,
     kiichain: true,
@@ -319,10 +269,8 @@ export const hyperlaneContextAgentChainConfig: AgentChainConfig<
     linea: true,
     lisk: true,
     lukso: true,
-    lumiaprism: true,
     mantle: true,
     mantra: true,
-    matchain: true,
     megaeth: true,
     metal: true,
     metis: true,
@@ -330,24 +278,16 @@ export const hyperlaneContextAgentChainConfig: AgentChainConfig<
     mocachain: true,
     mode: true,
     monad: true,
-    morph: true,
-    nesa: true,
+    nesa: false, // disabled — superseded by nesachain after the Nesa incident
+    nesachain: true,
     nexus: true,
-    nibiru: true,
-    noble: true,
-    oortmainnet: true,
     optimism: true,
     paradex: true,
-    peaq: true,
     plasma: true,
-    plume: true,
     polygon: true,
-    prom: true,
     pulsechain: true,
-    radix: true,
-    reactive: true,
+    radix: false, // disabled — removed from agent operations per request
     robinhood: true,
-    ronin: true,
     sei: true,
     solanamainnet: true,
     solaxy: true,
@@ -355,17 +295,15 @@ export const hyperlaneContextAgentChainConfig: AgentChainConfig<
     soneium: true,
     sonic: true,
     sonicsvm: true,
-    soon: false, // disabled — RPC unavailable
     stable: true,
     starknet: true,
     subtensor: true,
-    superseed: true,
-    tac: true,
+
+    tac: true, // re-enabled 2026-09-07 — block production resumed
     taiko: true,
     tea: true,
     tron: true,
     unichain: true,
-    vana: true,
     // Note: default rpc.viction.xyz endpoint can't be used for scraping (returns 429s).
     viction: true,
     worldchain: true,
@@ -454,12 +392,21 @@ const contextBase = {
   aws: {
     region: 'us-east-1',
   },
+  gcp: {
+    project: 'abacus-labs-dev',
+    location: 'us-east1',
+  },
   sealevel: {
+    maxSupportedTransactionVersionGetter: (chain: ChainName): 0 | 1 =>
+      chain === 'solanamainnet' ? 1 : 0,
     priorityFeeOracleConfigGetter: sealevelPriorityFeeOracleConfigGetter,
     transactionSubmitterConfigGetter: sealevelTransactionSubmitterConfigGetter,
     urRevealConfigGetter: sealevelUrRevealConfigGetter,
   },
 } as const;
+
+const scraperWebsocketUrl =
+  'ws://scraper-proxy.mainnet3.svc.cluster.local:8383/agents';
 
 const veloMessageModuleMatchingList = consistentSenderRecipientMatchingList(
   '0x2BbA7515F7cF114B45186274981888D8C2fBA15E',
@@ -480,7 +427,6 @@ const velodromeUniversalRouters: ChainMap<Address> = {
   mode: velodromeUniversalRouterOwner,
   optimism: velodromeUniversalRouterOwner,
   soneium: velodromeUniversalRouterOwner,
-  superseed: velodromeUniversalRouterOwner,
   unichain: velodromeUniversalRouterOwner,
 };
 
@@ -501,7 +447,6 @@ const gasPaymentEnforcement: GasPaymentEnforcement[] = [
   {
     type: GasPaymentEnforcementPolicyType.None,
     matchingList: [
-      { originDomain: getDomainId('noble') },
       { originDomain: getDomainId('starknet') },
       { originDomain: getDomainId('paradex') },
       // Not a core chain
@@ -658,45 +603,57 @@ const metricAppContextsGetter = (): MetricAppContext[] => {
 };
 
 // Resource requests are based on observed usage found in https://abacusworks.grafana.net/d/FSR9YWr7k
+// Sized from 30-day observed usage: steady-state CPU ~0.7-1.3 cores, memory
+// working set ~11-12G. Restart/cold-start catch-up bursts (cursor re-sync +
+// backlog drain) reach ~6 cores; these are absorbed by burst since there is no
+// CPU limit. Request covers the burst peak with headroom; memory covers the
+// working set with ~30% headroom.
 const relayerResources = {
   requests: {
-    cpu: '14000m',
-    memory: '24G',
+    cpu: '8000m',
+    memory: '16G',
   },
 };
 
-// Sized from 30-day observed usage: CPU p50 ~0.08 / p99 ~0.24 cores (rare
-// transient spikes to ~5.7, absorbed by burst since there is no CPU limit),
-// memory peak ~2.4Gi. Request covers the memory peak and ~2x the CPU p99.
+// Sized from 30-day observed usage: CPU p50 ~0.08 / p99 ~0.24 cores, memory
+// peak ~2.4Gi. Steady-state is tiny, but restart/cold-start catch-up bursts
+// (cursor re-sync + backlog drain) reach ~6 cores just like the main relayer;
+// with no CPU limit these are absorbed by burst. The prior 500m request made
+// those bursts read as ~12x request and constantly tripped the ratio-based
+// >75% CPU alert. Request raised to 2 cores to give burst headroom and cut
+// that alert noise; memory covers the peak with headroom.
 const fastPathRelayerResources = {
   requests: {
-    cpu: '500m',
-    memory: '3G',
+    cpu: '2000m',
+    memory: '4Gi',
   },
 };
 
-// Validator resource tiers. Sized from 30-day observed peaks
+// Validator resource tiers. Sized from 30-day observed usage
 // (https://abacusworks.grafana.net/d/FSR9YWr7k). Memory must clear each tier's
-// peak to avoid OOM; CPU is compressible. The default (light) covers the ~90
-// low-traffic validators; heavier chains are overridden below, keyed by chain
-// name (applies across the hyperlane, RC, and fastpath validator contexts).
+// peak to avoid OOM, so memory stays tiered. CPU is compressible and there is
+// no CPU limit, so requests are sized to p95 steady-state (all validators sit
+// <0.2 cores at p95; busiest is aleo ~0.17) rather than to the rare
+// checkpoint-signing bursts, which burst absorbs. The default (light) covers
+// the ~90 low-traffic validators; heavier chains are overridden below, keyed by
+// chain name (applies across the hyperlane, RC, and fastpath validator contexts).
 const validatorResources = {
   requests: {
-    cpu: '100m',
+    cpu: '50m',
     memory: '256Mi',
   },
 };
 
 const heavyValidatorResources = {
   requests: {
-    cpu: '1000m',
+    cpu: '300m',
     memory: '1G',
   },
 };
 
 const mediumValidatorResources = {
   requests: {
-    cpu: '500m',
+    cpu: '150m',
     memory: '512Mi',
   },
 };
@@ -722,7 +679,6 @@ const mediumValidatorChains = [
   'unichain',
   'celestia',
   'tron',
-  'superseed',
   'mode',
   'avalanche',
   'blast',
@@ -791,6 +747,10 @@ const blacklist: MatchingList = [
     originDomain: getDomainId('starknet'),
     destinationDomain: getDomainId('starknet'),
   },
+  // Legacy nesa (domain 41443) NES route remains paused on-chain; keep it
+  // blacklisted. The live NES route was cut over to nesachain (NES/bsc), which
+  // is unpaused and must NOT be blacklisted.
+  ...warpRouteMatchingList(WarpRouteIds.NesaLegacyNES),
 ];
 
 const ismCacheConfigs: Array<IsmCacheConfig> = [
@@ -834,6 +794,9 @@ const hyperlane: RootAgentConfig = {
   rolesWithKeys: ALL_KEY_ROLES,
   relayer: {
     rpcConsensusType: RpcConsensusType.Fallback,
+    ...fallbackHedgeConfig,
+    websocketUrl: scraperWebsocketUrl,
+    websocketAuthorityEnabled: true,
     docker: {
       repo: DockerImageRepos.AGENT,
       tag: mainnetDockerTags.relayer,
@@ -867,7 +830,8 @@ const hyperlane: RootAgentConfig = {
       repo: DockerImageRepos.AGENT,
       tag: mainnetDockerTags.validator,
     },
-    rpcConsensusType: RpcConsensusType.Quorum,
+    rpcConsensusType: RpcConsensusType.Majority,
+    websocketUrl: scraperWebsocketUrl,
     chains: validatorChainConfig(Contexts.Hyperlane),
     resources: validatorResources,
     chainResourceOverrides: validatorChainResourceOverrides,
@@ -875,11 +839,25 @@ const hyperlane: RootAgentConfig = {
   scraper: {
     scraperOnlyChains,
     rpcConsensusType: RpcConsensusType.Fallback,
+    ...fallbackHedgeConfig,
     docker: {
       repo: DockerImageRepos.AGENT,
       tag: mainnetDockerTags.scraper,
     },
     resources: scraperResources,
+  },
+  scraperProxy: {
+    docker: {
+      repo: DockerImageRepos.NODE_SERVICES,
+      tag: mainnetDockerTags.scraperProxy,
+    },
+    enabled: true,
+    maxAgentClients: 200,
+    port: 8383,
+    replicas: 1,
+    resources: {
+      requests: { cpu: '500m', memory: '1Gi' },
+    },
   },
 };
 
@@ -890,6 +868,10 @@ const releaseCandidate: RootAgentConfig = {
   rolesWithKeys: [Role.Relayer, Role.Validator],
   relayer: {
     rpcConsensusType: RpcConsensusType.Fallback,
+    ...fallbackHedgeConfig,
+    index: { from: RELEASE_CANDIDATE_INDEX_FROM },
+    websocketUrl: scraperWebsocketUrl,
+    websocketAuthorityEnabled: true,
     docker: {
       repo: DockerImageRepos.AGENT,
       tag: mainnetDockerTags.relayerRC,
@@ -922,7 +904,8 @@ const releaseCandidate: RootAgentConfig = {
       repo: DockerImageRepos.AGENT,
       tag: mainnetDockerTags.validatorRC,
     },
-    rpcConsensusType: RpcConsensusType.Quorum,
+    rpcConsensusType: RpcConsensusType.Majority,
+    websocketUrl: scraperWebsocketUrl,
     chains: validatorChainConfig(Contexts.ReleaseCandidate),
     resources: validatorResources,
     chainResourceOverrides: validatorChainResourceOverrides,
@@ -1028,6 +1011,8 @@ const fastPath: RootAgentConfig = {
   rolesWithKeys: [Role.Relayer, Role.Validator],
   relayer: {
     rpcConsensusType: RpcConsensusType.Fallback,
+    ...fallbackHedgeConfig,
+    // Use RPC indexing until the scraper proxy supports fastpath streaming.
     docker: {
       repo: DockerImageRepos.AGENT,
       tag: mainnetDockerTags.relayerFastPath,
@@ -1045,11 +1030,14 @@ const fastPath: RootAgentConfig = {
     cache: {
       enabled: true,
     },
-    interval: 1,
+    // Halve steady-state index polling RPCs while keeping fastpath detection
+    // within one additional second (0.5s average).
+    interval: 2,
     resources: fastPathRelayerResources,
   },
   validators: {
-    rpcConsensusType: RpcConsensusType.Fallback,
+    rpcConsensusType: RpcConsensusType.Majority,
+    // Use RPC indexing until the scraper proxy supports fastpath streaming.
     docker: {
       repo: DockerImageRepos.AGENT,
       tag: mainnetDockerTags.validatorFastPath,

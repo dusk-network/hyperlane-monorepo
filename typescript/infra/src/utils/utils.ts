@@ -79,7 +79,7 @@ export function execCmd(
               new Error([err, stdout.toString(), stderr.toString()].join('\n')),
             );
           } else {
-            reject(err);
+            reject(new Error(err.message, { cause: err }));
           }
         } else {
           resolve([stdout.toString(), stderr.toString()]);
@@ -226,6 +226,7 @@ export function assertFundableRole(roleStr: string): FundableRole {
     role !== Role.Relayer &&
     role !== Role.Rebalancer &&
     role !== Role.InventoryRebalancer &&
+    role !== Role.QuoteSubmitter &&
     role !== Role.StableswapInventoryRebalancer
   ) {
     throw Error(`Invalid fundable role ${role}`);

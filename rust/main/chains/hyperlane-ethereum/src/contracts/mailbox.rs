@@ -21,9 +21,9 @@ use tracing::{instrument, warn};
 
 use hyperlane_core::{
     rpc_clients::call_and_retry_indefinitely, BatchItem, BatchResult, ChainCommunicationError,
-    ChainResult, ContractLocator, HyperlaneAbi, HyperlaneChain, HyperlaneContract, HyperlaneDomain,
-    HyperlaneMessage, HyperlaneProtocolError, HyperlaneProvider, Indexed, Indexer, LogMeta,
-    Mailbox, QueueOperation, RawHyperlaneMessage, ReorgPeriod, SequenceAwareIndexer,
+    ChainResult, ContractLocator, Decode, HyperlaneAbi, HyperlaneChain, HyperlaneContract,
+    HyperlaneDomain, HyperlaneMessage, HyperlaneProtocolError, HyperlaneProvider, Indexed, Indexer,
+    LogMeta, Mailbox, QueueOperation, RawHyperlaneMessage, ReorgPeriod, SequenceAwareIndexer,
     TxCostEstimate, TxOutcome, H160, H256, H512, U256,
 };
 
@@ -60,6 +60,10 @@ impl BuildableWithProvider for SequenceIndexerBuilder {
     type Output = Box<dyn SequenceAwareIndexer<HyperlaneMessage>>;
     const NEEDS_SIGNER: bool = false;
 
+    fn uses_dynamic_block_cache(&self) -> bool {
+        true
+    }
+
     async fn build_with_provider<M: Middleware + 'static>(
         &self,
         provider: M,
@@ -82,6 +86,10 @@ pub struct DeliveryIndexerBuilder {
 impl BuildableWithProvider for DeliveryIndexerBuilder {
     type Output = Box<dyn SequenceAwareIndexer<H256>>;
     const NEEDS_SIGNER: bool = false;
+
+    fn uses_dynamic_block_cache(&self) -> bool {
+        true
+    }
 
     async fn build_with_provider<M: Middleware + 'static>(
         &self,
@@ -202,13 +210,13 @@ where
             .query_with_meta()
             .await?
             .into_iter()
-            .map(|(event, meta)| {
-                (
-                    HyperlaneMessage::from(event.message.to_vec()).into(),
+            .map(|(event, meta)| -> ChainResult<_> {
+                Ok((
+                    HyperlaneMessage::read_from(&mut event.message.as_ref())?.into(),
                     meta.into(),
-                )
+                ))
             })
-            .collect();
+            .collect::<ChainResult<Vec<_>>>()?;
 
         events.sort_by(|a, b| a.0.inner().nonce.cmp(&b.0.inner().nonce));
         Ok(events)
@@ -234,13 +242,13 @@ where
         .await;
         let logs = raw_logs_and_meta
             .into_iter()
-            .map(|(log, log_meta)| {
-                (
-                    HyperlaneMessage::from(log.message.to_vec()).into(),
+            .map(|(log, log_meta)| -> ChainResult<_> {
+                Ok((
+                    HyperlaneMessage::read_from(&mut log.message.as_ref())?.into(),
                     log_meta,
-                )
+                ))
             })
-            .collect();
+            .collect::<ChainResult<Vec<_>>>()?;
         Ok(logs)
     }
 
@@ -303,8 +311,13 @@ where
 
         let messages = raw_dispatch_logs
             .into_iter()
-            .map(|(log, meta)| (HyperlaneMessage::from(log.message.to_vec()).into(), meta))
-            .collect();
+            .map(|(log, meta)| -> ChainResult<_> {
+                Ok((
+                    HyperlaneMessage::read_from(&mut log.message.as_ref())?.into(),
+                    meta,
+                ))
+            })
+            .collect::<ChainResult<Vec<_>>>()?;
 
         Ok((messages, is_cctp_v2))
     }
@@ -876,6 +889,7 @@ mod test {
             transaction_overrides: Default::default(),
             op_submission_config: Default::default(),
             consider_null_transaction_receipt: false,
+            fallback_hedge: None,
         };
 
         let mailbox = EthereumMailbox::new(
@@ -892,7 +906,7 @@ mod test {
 
     #[tokio::test]
     async fn test_process_estimate_costs_sets_l2_gas_limit_for_arbitrum() {
-        let domain = HyperlaneDomain::Known(KnownHyperlaneDomain::Plume);
+        let domain = HyperlaneDomain::Known(KnownHyperlaneDomain::Arbitrum);
         // An Arbitrum Nitro chain
         let (mailbox, mock_provider) = get_test_mailbox(domain.clone());
 

@@ -6,9 +6,9 @@
 #   SERVICE_VERSION - Image version label
 #
 # Runtime env:
-#   SERVICE_NAME - One of: rebalancer, warp-monitor, ccip-server, keyfunder, relayer, fee-quoting
+#   SERVICE_NAME - One of: rebalancer, warp-monitor, ccip-server, keyfunder, relayer, fee-quoting, scraper-proxy
 
-ARG NODE_VERSION=24
+ARG NODE_VERSION=26
 FROM node:${NODE_VERSION}-slim AS builder
 
 WORKDIR /hyperlane-monorepo
@@ -26,9 +26,9 @@ RUN set -o pipefail && \
     curl --fail -L "https://github.com/foundry-rs/foundry/releases/download/${FOUNDRY_VERSION}/foundry_${FOUNDRY_VERSION}_linux_${ARCH}.tar.gz" | tar -xzC /usr/local/bin forge cast
 SHELL ["/bin/sh", "-c"]
 
-# Copy package.json first for corepack to read packageManager field
+# Copy package.json first for dependency layer caching
 COPY package.json ./
-RUN corepack enable && corepack install
+RUN npm install --global pnpm@12.3.0
 
 # Copy pnpm config files
 COPY pnpm-lock.yaml pnpm-workspace.yaml ./
@@ -43,10 +43,12 @@ COPY typescript/ccip-server/package.json ./typescript/ccip-server/
 COPY typescript/keyfunder/package.json ./typescript/keyfunder/
 COPY typescript/relayer/package.json ./typescript/relayer/
 COPY typescript/fee-quoting/package.json ./typescript/fee-quoting/
+COPY typescript/scraper-proxy/package.json ./typescript/scraper-proxy/package.json
 COPY typescript/metrics/package.json ./typescript/metrics/
 COPY typescript/deploy-sdk/package.json ./typescript/deploy-sdk/
 COPY typescript/sdk/package.json ./typescript/sdk/
 COPY typescript/provider-sdk/package.json ./typescript/provider-sdk/
+COPY typescript/forking-sdk/package.json ./typescript/forking-sdk/
 COPY typescript/utils/package.json ./typescript/utils/
 COPY typescript/cosmos-sdk/package.json ./typescript/cosmos-sdk/
 COPY typescript/cosmos-types/package.json ./typescript/cosmos-types/
@@ -76,8 +78,8 @@ RUN pnpm install --frozen-lockfile
 # To update when changing solidity version in solidity/rootHardhatConfig.cts:
 #   1. Find the commit hash: curl -s "https://binaries.soliditylang.org/linux-amd64/list.json" | jq '.releases["X.Y.Z"]'
 #   2. Update SOLC_VERSION and SOLC_COMMIT below
-ARG SOLC_VERSION=0.8.22
-ARG SOLC_COMMIT=4fc1097e
+ARG SOLC_VERSION=0.8.33
+ARG SOLC_COMMIT=64118f21
 RUN SOLC_BINARY="solc-linux-amd64-v${SOLC_VERSION}+commit.${SOLC_COMMIT}" && \
     SOLC_LIST_URL="https://binaries.soliditylang.org/linux-amd64/list.json" && \
     SOLC_BIN_URL="https://binaries.soliditylang.org/linux-amd64/${SOLC_BINARY}" && \
@@ -100,6 +102,7 @@ COPY typescript/metrics ./typescript/metrics
 COPY typescript/deploy-sdk ./typescript/deploy-sdk
 COPY typescript/cosmos-sdk ./typescript/cosmos-sdk
 COPY typescript/provider-sdk ./typescript/provider-sdk
+COPY typescript/forking-sdk ./typescript/forking-sdk
 COPY typescript/radix-sdk ./typescript/radix-sdk
 COPY typescript/aleo-sdk ./typescript/aleo-sdk
 COPY typescript/starknet-sdk ./typescript/starknet-sdk
@@ -114,29 +117,36 @@ COPY typescript/ccip-server ./typescript/ccip-server
 COPY typescript/keyfunder ./typescript/keyfunder
 COPY typescript/relayer ./typescript/relayer
 COPY typescript/fee-quoting ./typescript/fee-quoting
+COPY typescript/scraper-proxy ./typescript/scraper-proxy
 
 # Bundle all services in a single turbo invocation
-RUN pnpm turbo run bundle \
+ARG TARGETARCH
+RUN --mount=type=cache,id=node-services-turbo-${TARGETARCH},target=/hyperlane-monorepo/.turbo/cache \
+    --mount=type=cache,target=/root/.tron/solc \
+    pnpm turbo run bundle \
     --filter=@hyperlane-xyz/rebalancer \
     --filter=@hyperlane-xyz/warp-monitor \
     --filter=@hyperlane-xyz/ccip-server \
     --filter=@hyperlane-xyz/keyfunder \
     --filter=@hyperlane-xyz/relayer \
-    --filter=@hyperlane-xyz/fee-quoting
+    --filter=@hyperlane-xyz/fee-quoting \
+    --filter=@hyperlane-xyz/scraper-proxy
 
 # Deduplicate identical NCC assets across bundles.
 # NCC produces byte-identical copies of WASM files (~18MB each), workers,
 # and native addons in every bundle. Replace duplicates with symlinks to
 # the rebalancer (canonical) copy. Done in the builder so that only the
-# deduped result is COPY'd into the runner stage.
+# deduped result is COPY'd into the runner stage. WASM also matches across
+# filenames because NCC can swap numeric suffixes when its module graph changes.
+# Keep cross-name matching limited to WASM; JS/native paths can affect resolution.
 RUN SERVICES_DIR=/hyperlane-monorepo/services && \
     mkdir -p $SERVICES_DIR && \
-    for svc in rebalancer warp-monitor ccip-server keyfunder relayer fee-quoting; do \
+    for svc in rebalancer warp-monitor ccip-server keyfunder relayer fee-quoting scraper-proxy; do \
       cp -a typescript/${svc}/bundle $SERVICES_DIR/${svc}; \
     done && \
     CANONICAL=rebalancer && \
     cd $SERVICES_DIR && \
-    for svc in warp-monitor ccip-server keyfunder relayer fee-quoting; do \
+    for svc in warp-monitor ccip-server keyfunder relayer fee-quoting scraper-proxy; do \
       for file in ${CANONICAL}/*; do \
         fname=$(basename "$file") && \
         target="${svc}/${fname}" && \
@@ -147,6 +157,18 @@ RUN SERVICES_DIR=/hyperlane-monorepo/services && \
           rm "$target" && \
           ln -s "../${CANONICAL}/${fname}" "$target"; \
         fi; \
+      done; \
+      for target in "${svc}"/*.wasm; do \
+        [ ! -f "$target" ] && continue; \
+        [ -L "$target" ] && continue; \
+        for file in "${CANONICAL}"/*.wasm; do \
+          [ ! -f "$file" ] && continue; \
+          if cmp -s "$file" "$target"; then \
+            rm "$target" && \
+            ln -s "../${file}" "$target" || exit 1; \
+            break; \
+          fi; \
+        done; \
       done; \
       if [ -d "${CANONICAL}/prebuilds" ]; then \
         for file in ${CANONICAL}/prebuilds/linux-x64/*; do \
@@ -185,7 +207,7 @@ ENV NODE_ENV=production
 ENV LOG_LEVEL=info
 ENV SERVICE_VERSION=${SERVICE_VERSION}
 
-# SERVICE_NAME must be set at runtime (rebalancer, warp-monitor, ccip-server, keyfunder, relayer, fee-quoting)
+# SERVICE_NAME must be set at runtime (rebalancer, warp-monitor, ccip-server, keyfunder, relayer, fee-quoting, scraper-proxy)
 ENV SERVICE_NAME=""
 
 # Expose metrics port (9090) and optional service port (e.g. 3000 for ccip-server)

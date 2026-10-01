@@ -14,8 +14,8 @@ import {
 
 import {
   ContractType,
-  getCompiledContract,
-} from '@hyperlane-xyz/starknet-core';
+  getContractAbi as getPublishedContractAbi,
+} from '@hyperlane-xyz/starknet-core/runtime';
 import {
   ZERO_ADDRESS_HEX_32,
   assert,
@@ -106,6 +106,8 @@ export enum StarknetContractName {
   MESSAGE_ID_MULTISIG_ISM = 'messageid_multisig_ism',
   MERKLE_ROOT_MULTISIG_ISM = 'merkleroot_multisig_ism',
   ROUTING_ISM = 'domain_routing_ism',
+  AGGREGATION_ISM = 'aggregation',
+  PAUSABLE_ISM = 'pausable_ism',
   NOOP_ISM = 'noop_ism',
   HOOK = 'hook',
   MERKLE_TREE_HOOK = 'merkle_tree_hook',
@@ -133,12 +135,11 @@ export function getStarknetContract(
   providerOrAccount?: ProviderInterface | AccountInterface,
   contractType: ContractType = ContractType.CONTRACT,
 ): Contract {
-  const { abi } = getCompiledContract(contractName, contractType);
-  return new Contract(
-    abi,
-    normalizeStarknetAddressSafe(address),
+  return new Contract({
+    abi: getPublishedContractAbi(contractName, contractType),
+    address: normalizeStarknetAddressSafe(address),
     providerOrAccount,
-  );
+  });
 }
 
 export function normalizeStarknetAddressSafe(value: unknown): string {
@@ -350,13 +351,21 @@ export async function getOnChainStarknetContract(
 ): Promise<Contract> {
   const normalized = normalizeStarknetAddressSafe(address);
   const { abi } = await provider.getClassAt(normalized);
-  const contract = new Contract(abi, normalized, provider);
+  const contract = new Contract({
+    abi,
+    address: normalized,
+    providerOrAccount: provider,
+  });
 
   const implHash = await resolveImplementationHash(contract);
   if (isNullish(implHash) || implHash === 0n) return contract;
 
   const implClass = await provider.getClassByHash(`0x${implHash.toString(16)}`);
-  return new Contract(implClass.abi, normalized, provider);
+  return new Contract({
+    abi: implClass.abi,
+    address: normalized,
+    providerOrAccount: provider,
+  });
 }
 
 async function resolveImplementationHash(

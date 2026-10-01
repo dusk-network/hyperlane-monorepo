@@ -3,7 +3,8 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::tests::test_utils::{
-    are_all_txs_in_pool, are_no_txs_in_pool, create_random_txs_and_store_them, tmp_dbs, MockAdapter,
+    are_all_txs_in_pool, are_no_txs_in_pool, create_random_txs_and_store_them, dummy_tx, tmp_dbs,
+    MockAdapter,
 };
 use crate::{
     dispatcher::{metrics::DispatcherMetrics, PayloadDb, TransactionDb},
@@ -290,6 +291,39 @@ async fn test_post_finalized_not_called_when_tx_not_finalized() {
     assert!(are_all_txs_in_pool(txs_created.clone(), &pool).await);
 }
 
+#[tokio::test]
+async fn test_successful_post_finalized_notifies_reprocess_poller() {
+    let mut mock_adapter = MockAdapter::new();
+    mock_adapter.expect_tx_status().times(0);
+    mock_adapter
+        .expect_reverted_payloads()
+        .returning(|_| Ok(Vec::new()));
+    mock_adapter.expect_post_finalized().returning(|| Ok(()));
+
+    let (payload_db, tx_db, _) = tmp_dbs();
+    let state = DispatcherState::new(
+        payload_db,
+        tx_db,
+        Arc::new(mock_adapter),
+        DispatcherMetrics::dummy_instance(),
+        "test".to_string(),
+    );
+    let tx = dummy_tx(Vec::new(), TransactionStatus::Finalized);
+    let pool = FinalityStagePool::new();
+    pool.insert(tx.clone()).await;
+
+    FinalityStage::try_process_tx(tx, pool, BuildingStageQueue::new(), &state)
+        .await
+        .unwrap();
+
+    tokio::time::timeout(
+        Duration::from_millis(10),
+        state.wait_for_reprocess_txs_activity(),
+    )
+    .await
+    .expect("finalization activity notification was not retained");
+}
+
 async fn set_up_test_and_run_stage(
     mock_adapter: MockAdapter,
     txs_to_process: usize,
@@ -425,4 +459,100 @@ async fn assert_payloads_status(
             .unwrap();
         assert_eq!(payload.status, expected_status.clone());
     }
+}
+
+#[tokio::test]
+async fn dropped_transaction_requeues_available_payloads_in_order_and_skips_bad_records() {
+    use hyperlane_base::db::{HyperlaneRocksDB, DB};
+    use hyperlane_core::KnownHyperlaneDomain;
+
+    let directory = tempfile::tempdir().unwrap();
+    let db = Arc::new(HyperlaneRocksDB::new(
+        &KnownHyperlaneDomain::Arbitrum.into(),
+        DB::from_path(directory.path()).unwrap(),
+    ));
+    let payloads: Vec<_> = (0..4)
+        .map(|index| {
+            let mut payload = FullPayload::default();
+            payload.details.uuid = crate::payload::PayloadUuid::random();
+            payload.details.success_criteria = Some(vec![index; 4096]);
+            payload.data = vec![index; 32];
+            payload.status = PayloadStatus::InTransaction(TransactionStatus::Included);
+            payload
+        })
+        .collect();
+    let tx = dummy_tx(payloads.clone(), TransactionStatus::Included);
+    let tx_uuid = tx.uuid.clone();
+    for index in [0, 3] {
+        db.store_payload_by_uuid(&payloads[index]).await.unwrap();
+        db.store_tx_uuid_by_payload_uuid(&payloads[index].details.uuid, &tx_uuid)
+            .await
+            .unwrap();
+    }
+    // Payload1 is missing; payload2 has an invalid stored JSON value.
+    db.store_value_by_key("payload_by_uuid_", &payloads[2].details.uuid, &u32::MAX)
+        .unwrap();
+    let pool = FinalityStagePool::new();
+    pool.insert(tx.clone()).await;
+    let queue = BuildingStageQueue::new();
+    let existing = FullPayload::default();
+    queue.push_front(existing.clone()).await;
+    let state = DispatcherState::new(
+        db.clone(),
+        db.clone(),
+        Arc::new(MockAdapter::new()),
+        DispatcherMetrics::dummy_instance(),
+        "test".to_owned(),
+    );
+    FinalityStage::try_process_tx_with_next_status(
+        tx,
+        TransactionStatus::Dropped(TxDropReason::DroppedByChain),
+        pool.clone(),
+        queue.clone(),
+        &state,
+    )
+    .await
+    .unwrap();
+    assert!(pool.snapshot().await.is_empty());
+    assert_eq!(
+        db.retrieve_transaction_by_uuid(&tx_uuid)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TransactionStatus::Dropped(TxDropReason::DroppedByChain)
+    );
+    // Existing push_front semantics reverse the visited payload order; queued
+    // values were fetched after Dropped persistence, before ReadyToSubmit persistence.
+    let mut expected_queued = vec![payloads[3].clone(), payloads[0].clone()];
+    for payload in &mut expected_queued {
+        payload.status =
+            PayloadStatus::InTransaction(TransactionStatus::Dropped(TxDropReason::DroppedByChain));
+    }
+    expected_queued.push(existing);
+    assert_eq!(queue.pop_n(4).await, expected_queued);
+    for index in [0, 3] {
+        let uuid = &payloads[index].details.uuid;
+        assert_eq!(
+            db.retrieve_payload_by_uuid(uuid)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            PayloadStatus::ReadyToSubmit
+        );
+        assert_eq!(
+            db.retrieve_tx_uuid_by_payload_uuid(uuid).await.unwrap(),
+            Some(TransactionUuid::default())
+        );
+    }
+    assert!(db
+        .retrieve_payload_by_uuid(&payloads[1].details.uuid)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(db
+        .retrieve_payload_by_uuid(&payloads[2].details.uuid)
+        .await
+        .is_err());
 }

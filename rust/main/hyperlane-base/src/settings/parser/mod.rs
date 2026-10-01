@@ -303,6 +303,12 @@ fn parse_chain(
         .get_opt_key("maxBatchSize")
         .parse_u32()
         .unwrap_or(1);
+    if max_batch_size == 0 {
+        err.push(
+            chain.cwp.clone(),
+            eyre!("`maxBatchSize` must be greater than zero"),
+        );
+    }
 
     let bypass_batch_simulation = chain
         .chain(&mut err)
@@ -346,7 +352,16 @@ fn parse_chain(
         .get_opt_key("nativeToken")
         .get_opt_key("decimals")
         .parse_u32()
-        .unwrap_or(18);
+        .unwrap_or_else(|| {
+            if domain
+                .as_ref()
+                .is_some_and(|domain| domain.domain_protocol() == HyperlaneDomainProtocol::Dusk)
+            {
+                9
+            } else {
+                18
+            }
+        });
 
     let native_token_symbol = chain
         .chain(&mut err)
@@ -537,6 +552,15 @@ fn parse_signer(signer: ValueParser) -> ConfigResult<SignerConf> {
                 .to_owned();
             err.into_result(SignerConf::Aws { id, region })
         }};
+        (gcp) => {{
+            let key_version_name = signer
+                .chain(&mut err)
+                .get_key("keyVersionName")
+                .parse_string()
+                .unwrap_or("")
+                .to_owned();
+            err.into_result(SignerConf::Gcp { key_version_name })
+        }};
         (cosmosKey) => {{
             let key = signer
                 .chain(&mut err)
@@ -646,6 +670,7 @@ fn parse_signer(signer: ValueParser) -> ConfigResult<SignerConf> {
     match signer_type {
         Some("hexKey") => parse_signer!(hexKey),
         Some("aws") => parse_signer!(aws),
+        Some("gcp") => parse_signer!(gcp),
         Some("cosmosKey") => parse_signer!(cosmosKey),
         Some("starkKey") => parse_signer!(starkKey),
         Some("radixKey") => parse_signer!(radixKey),
@@ -920,6 +945,54 @@ mod test {
             .unwrap()
             .id(),
             4242
+        );
+    }
+
+    #[test]
+    fn dusk_native_token_defaults_preserve_lux_precision() {
+        let value = json!({
+            "domainid": 1337, "chainid": 7, "name": "test", "protocol": "dusk",
+            "rpcurls": [{"http": "http://localhost:8080"}],
+            "eventcursordir": "/tmp/dusk-parser-events",
+            "mailbox": "0x0000000000000000000000000000000000000001",
+            "interchaingaspaymaster": "0x0000000000000000000000000000000000000002",
+            "validatorannounce": "0x0000000000000000000000000000000000000003",
+            "merkletreehook": "0x0000000000000000000000000000000000000004"
+        });
+        let parser = ValueParser::new(Default::default(), &value);
+        let chain = parse_chain(parser, "test", "fallback").unwrap();
+        assert_eq!(chain.native_token.decimals, 9);
+        let crate::settings::ChainConnectionConf::Dusk(connection) = chain.connection else {
+            panic!("expected Dusk transport");
+        };
+        assert_eq!(
+            chain.native_token.decimals,
+            connection.native_token.decimals
+        );
+    }
+
+    #[test]
+    fn rejects_zero_max_batch_size() {
+        let value = serde_json::json!({
+            "domainid": 1,
+            "name": "test",
+            "protocol": "ethereum",
+            "rpcurls": [{ "http": "http://localhost:8545" }],
+            "mailbox": "0x0000000000000000000000000000000000000001",
+            "interchaingaspaymaster": "0x0000000000000000000000000000000000000002",
+            "validatorannounce": "0x0000000000000000000000000000000000000003",
+            "merkletreehook": "0x0000000000000000000000000000000000000004",
+            "maxbatchsize": 0
+        });
+        let parser = ValueParser::new(Default::default(), &value);
+
+        let error = parse_chain(parser, "test", "fallback")
+            .expect_err("zero maxBatchSize must be rejected")
+            .to_string();
+
+        assert!(
+            error.contains("`maxBatchSize` must be greater than zero"),
+            "unexpected parser error: {error}"
         );
     }
 }

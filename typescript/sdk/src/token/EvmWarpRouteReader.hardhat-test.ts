@@ -2,6 +2,7 @@ import { SignerWithAddress } from '@nomiclabs/hardhat-ethers/signers.js';
 import { expect } from 'chai';
 import hre from 'hardhat';
 import sinon from 'sinon';
+import { ethers } from 'ethers';
 import { zeroAddress } from 'viem';
 
 import {
@@ -809,7 +810,7 @@ describe('EvmWarpRouteReader', async () => {
     isLocalRpcStub.restore();
   });
 
-  it('should return the ownerStatus virtual config for the proxy, implementation, and proxy admin, if they are different', async () => {
+  it('should return the ownerStatus virtual config for the proxy and proxy admin (never the implementation) owners, if they are different', async () => {
     const provider = multiProvider.getProvider(chain);
     const otherChain = TestChainName.test3;
     const config: WarpRouteDeployConfigMailboxRequired = {
@@ -834,7 +835,10 @@ describe('EvmWarpRouteReader', async () => {
       .stub(multiProvider, 'isLocalRpc')
       .returns(false);
 
-    // Derive config and transfer the proxy, implementation, and proxyAdmin over
+    // Transfer the proxyAdmin owner to the router and the implementation owner
+    // to the mailbox, so all three owners are distinct. The implementation
+    // owner (mailbox) must NOT appear in the result: getOwnerStatus recurses
+    // into the proxyAdmin owner but deliberately not the implementation owner.
     const warpRouteAddress = warpRoute[chain].collateral.address;
     const proxyAdminAddress = await proxyAdmin(provider, warpRouteAddress);
     await new ProxyAdmin__factory()
@@ -859,7 +863,6 @@ describe('EvmWarpRouteReader', async () => {
     expect(derivedConfig.ownerStatus).to.deep.equal({
       [signer.address]: OwnerStatus.Active,
       [warpRouteAddress]: OwnerStatus.Active,
-      [mailbox.address]: OwnerStatus.Active,
     });
 
     // Restore stub
@@ -1096,11 +1099,29 @@ describe('EvmWarpRouteReader', async () => {
     const remoteRouter = addressToBytes32(
       '0x4000000000000000000000000000000000000004',
     );
+    const rebalanceTarget = addressToBytes32(
+      '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    );
+    const rebalanceRecipient = addressToBytes32(
+      '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+    );
     const expectedScale = {
       numerator: 1n,
       denominator: 1_000_000_000_000n,
     };
 
+    const rebalanceTargetsStub = sinon
+      .stub()
+      .callsFake(async (domain: number) =>
+        domain === localDomain ? [rebalanceTarget] : [],
+      );
+    const allowedRecipientStub = sinon
+      .stub()
+      .callsFake(async (domain: number) =>
+        domain === localDomain
+          ? rebalanceRecipient
+          : hre.ethers.constants.HashZero,
+      );
     const mcConnectStub = sinon
       .stub(CrossCollateralRouter__factory, 'connect')
       .returns({
@@ -1114,6 +1135,8 @@ describe('EvmWarpRouteReader', async () => {
           .callsFake(async (domain: number) =>
             domain === localDomain ? [localRouter] : [remoteRouter],
           ),
+        rebalanceTargets: rebalanceTargetsStub,
+        allowedRecipient: allowedRecipientStub,
       } as any);
     const tokenRouterConnectStub = sinon
       .stub(TokenRouter__factory, 'connect')
@@ -1131,6 +1154,9 @@ describe('EvmWarpRouteReader', async () => {
     const scaleStub = sinon
       .stub(evmERC20WarpRouteReader, 'fetchScale')
       .resolves(expectedScale);
+    const packageVersionStub = sinon
+      .stub(evmERC20WarpRouteReader, 'fetchPackageVersion')
+      .resolves('12.0.0');
 
     const deriveCrossCollateralTokenConfig = (evmERC20WarpRouteReader as any)
       .deriveCrossCollateralTokenConfig as (address: string) => Promise<any>;
@@ -1147,11 +1173,62 @@ describe('EvmWarpRouteReader', async () => {
         [localDomain.toString()]: [localRouter],
         [remoteDomain.toString()]: [remoteRouter],
       });
+      expect(derivedConfig.rebalanceTargets).to.deep.equal({
+        [localDomain.toString()]: [rebalanceTarget],
+      });
+      expect(derivedConfig.rebalanceRecipients).to.deep.equal({
+        [localDomain.toString()]: rebalanceRecipient,
+      });
+
+      packageVersionStub.resolves('11.3.1');
+      rebalanceTargetsStub.resetHistory();
+      rebalanceTargetsStub.resetBehavior();
+      rebalanceTargetsStub.rejects(new Error('Invalid response from provider'));
+      const legacyConfig = await deriveCrossCollateralTokenConfig.call(
+        evmERC20WarpRouteReader,
+        routerAddress,
+      );
+      expect(legacyConfig.rebalanceTargets).to.equal(undefined);
+      expect(legacyConfig.rebalanceRecipients).to.deep.equal({
+        [localDomain.toString()]: rebalanceRecipient,
+      });
+      sinon.assert.notCalled(rebalanceTargetsStub);
+
+      const missingSelector = Object.assign(new Error('missing selector'), {
+        code: 'CALL_EXCEPTION',
+        data: '0x',
+      });
+      allowedRecipientStub.resetBehavior();
+      allowedRecipientStub.rejects(missingSelector);
+      const legacyRecipientConfig = await deriveCrossCollateralTokenConfig.call(
+        evmERC20WarpRouteReader,
+        routerAddress,
+      );
+      expect(legacyRecipientConfig.rebalanceRecipients).to.equal(undefined);
+
+      packageVersionStub.resolves('12.0.0');
+      rebalanceTargetsStub.resetBehavior();
+      rebalanceTargetsStub.rejects(new Error('RPC unavailable'));
+      let error: unknown;
+      try {
+        await deriveCrossCollateralTokenConfig.call(
+          evmERC20WarpRouteReader,
+          routerAddress,
+        );
+      } catch (caught) {
+        error = caught;
+      }
+      expect(error).to.be.instanceOf(Error);
+      if (!(error instanceof Error)) {
+        throw new Error('Expected RPC error');
+      }
+      expect(error.message).to.include('RPC unavailable');
     } finally {
       mcConnectStub.restore();
       tokenRouterConnectStub.restore();
       metadataStub.restore();
       scaleStub.restore();
+      packageVersionStub.restore();
     }
   });
 
@@ -1213,10 +1290,11 @@ describe('EvmWarpRouteReader', async () => {
     }
   });
 
-  it('deriveWarpRouteConfig includes CCR-only destinations when deriving token fees', async () => {
+  it('deriveWarpRouteConfig includes CCR-only fee destinations and local allowed bridges', async () => {
     const routerAddress = token.address;
     const localDomain = multiProvider.getDomainId(chain);
     const ccrOnlyDomain = localDomain + 100;
+    const localBridge = '0x1000000000000000000000000000000000000003';
 
     const readRouterConfigStub = sinon
       .stub(evmERC20WarpRouteReader, 'readRouterConfig')
@@ -1247,21 +1325,35 @@ describe('EvmWarpRouteReader', async () => {
       .stub(evmERC20WarpRouteReader, 'fetchTokenFee')
       .resolves(undefined);
 
+    const allowedBridgesStub = sinon
+      .stub()
+      .callsFake(async (domain: number | string) =>
+        Number(domain) === localDomain ? [localBridge] : [],
+      );
     const movableConnectStub = sinon
       .stub(MovableCollateralRouter__factory, 'connect')
       .returns({
         allowedRebalancers: sinon.stub().resolves([]),
         domains: sinon.stub().resolves([]),
-        allowedBridges: sinon.stub().resolves([]),
+        allowedBridges: allowedBridgesStub,
       } as any);
 
     try {
-      await evmERC20WarpRouteReader.deriveWarpRouteConfig(routerAddress);
+      const config =
+        await evmERC20WarpRouteReader.deriveWarpRouteConfig(routerAddress);
       expect(fetchTokenFeeStub.calledOnce).to.equal(true);
       expect(fetchTokenFeeStub.firstCall.args[1]).to.deep.equal([
         localDomain,
         ccrOnlyDomain,
       ]);
+      expect(
+        'allowedRebalancingBridges' in config
+          ? config.allowedRebalancingBridges
+          : undefined,
+      ).to.deep.equal({
+        [localDomain]: [{ bridge: localBridge }],
+      });
+      sinon.assert.calledWith(allowedBridgesStub, localDomain.toString());
     } finally {
       readRouterConfigStub.restore();
       fetchTokenConfigStub.restore();
@@ -1417,6 +1509,17 @@ describe('EvmWarpRouteReader', async () => {
     // The legacy path converts a single uint256 scale() return to { numerator: bigint, denominator: 1n }.
 
     describe('fetchScale', () => {
+      // Returns the scale from any call; the trailing (unreachable) selector
+      // makes the reader's bytecode selector check see a scale() getter.
+      function legacyScaleBytecode(encodedScale: string): string {
+        const scaleSelector = new ethers.utils.Interface([
+          'function scale() view returns (uint256)',
+        ])
+          .getSighash('scale()')
+          .slice(2);
+        return `0x7f${encodedScale}60005260206000f3${scaleSelector}`;
+      }
+
       it('should return undefined for contracts before scaling was introduced (< 6.0.0)', async () => {
         const config: WarpRouteDeployConfigMailboxRequired = {
           [chain]: {
@@ -1448,7 +1551,7 @@ describe('EvmWarpRouteReader', async () => {
         // Deploy a minimal contract that returns expectedScale for scale()
         // Bytecode: PUSH32 <value> PUSH1 0x00 MSTORE PUSH1 0x20 PUSH1 0x00 RETURN
         const encodedScale = expectedScale.toString(16).padStart(64, '0');
-        const runtimeBytecode = `0x7f${encodedScale}60005260206000f3`;
+        const runtimeBytecode = legacyScaleBytecode(encodedScale);
         const mockAddress = '0x' + 'ab'.repeat(20);
         await hre.network.provider.send('hardhat_setCode', [
           mockAddress,
@@ -1464,6 +1567,24 @@ describe('EvmWarpRouteReader', async () => {
           numerator: expectedScale,
           denominator: 1n,
         });
+
+        fetchPackageVersionStub.restore();
+      });
+
+      it('should return undefined when legacy scale() is missing on a >= 6.0.0 contract', async () => {
+        // Bytecode: PUSH1 0x00 PUSH1 0x00 REVERT (empty revert data)
+        const mockAddress = '0x' + 'ad'.repeat(20);
+        await hre.network.provider.send('hardhat_setCode', [
+          mockAddress,
+          '0x60006000fd',
+        ]);
+
+        const fetchPackageVersionStub = sinon
+          .stub(evmERC20WarpRouteReader, 'fetchPackageVersion')
+          .resolves('8.0.0');
+
+        const result = await evmERC20WarpRouteReader.fetchScale(mockAddress);
+        expect(result).to.be.undefined;
 
         fetchPackageVersionStub.restore();
       });
@@ -1500,7 +1621,7 @@ describe('EvmWarpRouteReader', async () => {
         const expectedScale = 500n;
 
         const encodedScale = expectedScale.toString(16).padStart(64, '0');
-        const runtimeBytecode = `0x7f${encodedScale}60005260206000f3`;
+        const runtimeBytecode = legacyScaleBytecode(encodedScale);
         const mockAddress = '0x' + 'ac'.repeat(20);
         await hre.network.provider.send('hardhat_setCode', [
           mockAddress,
@@ -1558,7 +1679,7 @@ describe('EvmWarpRouteReader', async () => {
         const identityScale = 1n;
 
         const encodedScale = identityScale.toString(16).padStart(64, '0');
-        const runtimeBytecode = `0x7f${encodedScale}60005260206000f3`;
+        const runtimeBytecode = legacyScaleBytecode(encodedScale);
         const mockAddress = '0x' + 'ad'.repeat(20);
         await hre.network.provider.send('hardhat_setCode', [
           mockAddress,

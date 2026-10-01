@@ -1,7 +1,8 @@
 import { compareVersions } from 'compare-versions';
-import { BigNumber, Contract, constants } from 'ethers';
+import { BigNumber, Contract, constants, utils } from 'ethers';
 
 import {
+  AtomicLocalRebalancingBridge__factory,
   CrossCollateralRouter__factory,
   EverclearTokenBridge,
   EverclearTokenBridge__factory,
@@ -37,6 +38,7 @@ import {
   assert,
   eqAddress,
   getLogLevel,
+  isNullish,
   isZeroish,
   isZeroishAddress,
   objFilter,
@@ -62,18 +64,23 @@ import {
 import { EvmHookReader } from '../hook/EvmHookReader.js';
 import { DerivedHookConfig, HookType, OnchainHookType } from '../hook/types.js';
 import { EvmIsmReader } from '../ism/EvmIsmReader.js';
+import { MultiProtocolProvider } from '../providers/MultiProtocolProvider.js';
 import { MultiProvider } from '../providers/MultiProvider.js';
 import { EvmRouterReader } from '../router/EvmRouterReader.js';
 import { DestinationGas, RemoteRouters } from '../router/types.js';
 import { ChainName, ChainNameOrId, DeployedOwnableConfig } from '../types.js';
 import {
   fetchPackageVersion as fetchContractPackageVersion,
-  isMissingSelectorCallException,
+  isMissingSelectorRevert,
+  isPanicRevert,
   throwIfNotMissingSelector,
+  throwIfNotMissingSelectorRevert,
 } from '../utils/contract.js';
 import { NormalizedScale } from '../utils/decimals.js';
 
 import {
+  EIP1967_BEACON_SLOT,
+  EIP1967_IMPLEMENTATION_SLOT,
   isProxy,
   isStorageEmpty,
   proxyAdmin,
@@ -81,6 +88,7 @@ import {
 } from './../deploy/proxy.js';
 import { NON_ZERO_SENDER_ADDRESS, TokenType } from './config.js';
 import {
+  AtomicLocalRebalancingBridgeTokenConfig,
   CctpTokenConfig,
   CollateralTokenConfig,
   ContractVerificationStatus,
@@ -104,7 +112,16 @@ import {
   isCrossCollateralTokenConfig,
   PredicateWrapperConfig,
 } from './types.js';
-import { getExtraLockBoxConfigs } from './xerc20.js';
+import { readXERC20Limits } from './xerc20-limits.js';
+import {
+  UnknownXERC20TypeError,
+  deriveXERC20TokenType,
+  getExtraLockBoxConfigs,
+} from './xerc20.js';
+
+// EIP-1167 minimal proxy runtime code: prefix, 20-byte implementation, suffix
+const EIP1167_PREFIX = '0x363d3d373d3d3d363d73';
+const EIP1167_ADDRESS_HEX_LENGTH = 40;
 
 const REBALANCING_CONTRACT_VERSION = '8.0.0';
 export const TOKEN_FEE_CONTRACT_VERSION = '10.0.0';
@@ -112,9 +129,16 @@ export const TOKEN_FEE_CONTRACT_VERSION = '10.0.0';
 // version that introduced the fractional scale interface
 const SCALE_FRACTION_VERSION = '11.0.0';
 
-// version that introduced the legacy scale interface
+// public `scale()` getter on FungibleTokenRouter, core 6.0.0 to 10.x (replaced
+// by scaleNumerator/scaleDenominator in 11.0.0)
 // https://github.com/hyperlane-xyz/hyperlane-monorepo/releases/tag/%40hyperlane-xyz%2Fcore%406.0.0
 const SCALE_VERSION = '6.0.0';
+const LEGACY_SCALE_INTERFACE = new utils.Interface([
+  'function scale() external view returns (uint256)',
+]);
+
+// Version that introduced CrossCollateralRouter.rebalanceTargets().
+const REBALANCE_TARGETS_CONTRACT_VERSION = '12.0.0';
 
 // Version that first introduced ppm precision for CCTP V2 fee storage (was bps before)
 export const CCTP_PPM_STORAGE_VERSION = '10.2.0';
@@ -190,6 +214,8 @@ export class EvmWarpRouteReader extends EvmRouterReader {
         this.deriveHypCollateralDepositAddressTokenConfig.bind(this),
       [TokenType.collateralOft]:
         this.deriveHypCollateralOftTokenConfig.bind(this),
+      [TokenType.atomicLocalRebalancing]:
+        this.deriveAtomicLocalRebalancingBridgeTokenConfig.bind(this),
       [TokenType.crossCollateral]:
         this.deriveCrossCollateralTokenConfig.bind(this),
     };
@@ -218,9 +244,11 @@ export class EvmWarpRouteReader extends EvmRouterReader {
     const type = await this.deriveTokenType(warpRouteAddress);
     const tokenConfig = await this.fetchTokenConfig(type, warpRouteAddress);
     const isDepositAddressBridge = type === TokenType.collateralDepositAddress;
-    // OFT and deposit-address bridges don't expose Router/MailboxClient interfaces.
+    // Bare bridges don't expose Router/MailboxClient interfaces.
     const isOft = type === TokenType.collateralOft;
-    const usesSentinelRouterConfig = isDepositAddressBridge || isOft;
+    const isAtomicLocalRebalancing = type === TokenType.atomicLocalRebalancing;
+    const usesSentinelRouterConfig =
+      isDepositAddressBridge || isOft || isAtomicLocalRebalancing;
     const routerConfig = usesSentinelRouterConfig
       ? {
           mailbox: constants.AddressZero,
@@ -233,6 +261,16 @@ export class EvmWarpRouteReader extends EvmRouterReader {
           remoteRouters: {},
         }
       : await this.readRouterConfig(warpRouteAddress);
+    // ALRB is a bare ITokenBridge adapter rather than a TokenRouter. Its full
+    // readable surface is covered by tokenConfig plus the sentinel router
+    // fields above, so avoid probing proxy, fee, hook, and destination-gas
+    // interfaces that it intentionally does not implement.
+    if (isAtomicLocalRebalancing) {
+      return {
+        ...routerConfig,
+        ...tokenConfig,
+      };
+    }
     // if the token has not been deployed as a proxy do not derive the config
     // inevm warp routes are an example
     const proxyAdmin = (await isProxy(this.provider, warpRouteAddress))
@@ -269,6 +307,7 @@ export class EvmWarpRouteReader extends EvmRouterReader {
         tokenConfig.contractVersion,
         REBALANCING_CONTRACT_VERSION,
       ) >= 0;
+    const selfDomainId = this.multiProvider.getDomainId(this.chain);
 
     let allowedRebalancers: Address[] | undefined;
     let allowedRebalancingBridges: MovableTokenConfig['allowedRebalancingBridges'];
@@ -299,9 +338,15 @@ export class EvmWarpRouteReader extends EvmRouterReader {
 
       try {
         domains = await movableToken.domains();
+        // CrossCollateralRouter can enroll a same-domain atomic bridge even
+        // though Router.domains() only returns remote domains. Include the
+        // local domain so warp check/apply observes that bridge and converges.
+        const bridgeDomains = isCrossCollateralTokenConfig(tokenConfig)
+          ? [...new Set([...domains, selfDomainId])]
+          : domains;
         const allowedBridgesByDomain = await promiseObjAll(
           objMap(
-            arrayToObject(domains.map((domain) => domain.toString())),
+            arrayToObject(bridgeDomains.map((domain) => domain.toString())),
             (domain) => movableToken.allowedBridges(domain),
           ),
         );
@@ -334,7 +379,6 @@ export class EvmWarpRouteReader extends EvmRouterReader {
     // fee entry keyed under a normal router and reports false-positive diffs.
     // remoteRouters omits the local domain, so add this router's own address as
     // the key for self-domain (same-chain CCR swap) fee entries.
-    const selfDomainId = this.multiProvider.getDomainId(this.chain);
     const feeRouterKeys = isCrossCollateralTokenConfig(tokenConfig)
       ? mergeCrossCollateralRouters(
           tokenConfig.crossCollateralRouters,
@@ -457,6 +501,17 @@ export class EvmWarpRouteReader extends EvmRouterReader {
   public async fetchFeeHook(
     routerAddress: Address,
   ): Promise<Address | undefined> {
+    if (
+      (await this.implementationHasSelector(
+        routerAddress,
+        TokenRouter__factory.createInterface().getSighash('feeHook()'),
+      )) === false
+    ) {
+      this.logger.debug(
+        `Token at "${routerAddress}" on chain "${this.chain}" has no feeHook() getter; skipping`,
+      );
+      return undefined;
+    }
     try {
       const router = TokenRouter__factory.connect(routerAddress, this.provider);
       const feeHookAddress = await router.feeHook();
@@ -492,18 +547,7 @@ export class EvmWarpRouteReader extends EvmRouterReader {
       this.provider,
     );
 
-    const [packageVersion, tokenFee] = await Promise.all([
-      this.fetchPackageVersion(routerAddress),
-      TokenRouter.feeRecipient().catch((error) => {
-        throwIfNotMissingSelector(error);
-        this.logger.debug(
-          `Failed to read feeRecipient for token at address "${routerAddress}" on chain "${this.chain}", defaulting to AddressZero`,
-          error,
-        );
-        return constants.AddressZero;
-      }),
-    ]);
-
+    const packageVersion = await this.fetchPackageVersion(routerAddress);
     const hasTokenFeeInterface =
       compareVersions(packageVersion, TOKEN_FEE_CONTRACT_VERSION) >= 0;
 
@@ -513,6 +557,15 @@ export class EvmWarpRouteReader extends EvmRouterReader {
       );
       return undefined;
     }
+
+    const tokenFee = await TokenRouter.feeRecipient().catch((error) => {
+      throwIfNotMissingSelector(error);
+      this.logger.debug(
+        `Failed to read feeRecipient for token at address "${routerAddress}" on chain "${this.chain}", defaulting to AddressZero`,
+        error,
+      );
+      return constants.AddressZero;
+    });
 
     if (isZeroishAddress(tokenFee)) {
       this.logger.debug(
@@ -624,22 +677,21 @@ export class EvmWarpRouteReader extends EvmRouterReader {
       this.logger.debug(`${owner} may not be a safe`);
     }
 
-    // Check Proxy admin and implementation recursively
-    const contractType = (await isProxy(this.provider, address))
-      ? VerifyContractTypes.Proxy
-      : VerifyContractTypes.Implementation;
-    if (contractType === VerifyContractTypes.Proxy) {
-      const [proxyStatus, implementationStatus] = await Promise.all([
-        this.getOwnerStatus(chain, await proxyAdmin(provider, address)),
-        this.getOwnerStatus(
-          chain,
-          await proxyImplementation(this.provider, address),
-        ),
-      ]);
+    // Recurse into the proxyAdmin owner only. The proxyAdmin holds upgrade
+    // authority and is an owner we actually manage, so a dead owner there is a
+    // real concern. We deliberately do NOT recurse into the implementation
+    // contract's owner: under the transparent-proxy pattern the impl is inert
+    // (upgrade authority lives in the proxyAdmin, not the impl), we never
+    // configure the impl owner, and the ownerStatus check has no expected value
+    // for it — so a spent deployer EOA there is pure false-positive drift.
+    if (await isProxy(this.provider, address)) {
+      const proxyAdminStatus = await this.getOwnerStatus(
+        chain,
+        await proxyAdmin(provider, address),
+      );
       ownerStatus = {
         ...ownerStatus,
-        ...proxyStatus,
-        ...implementationStatus,
+        ...proxyAdminStatus,
       };
     }
 
@@ -661,6 +713,103 @@ export class EvmWarpRouteReader extends EvmRouterReader {
     };
 
     return virtualConfig;
+  }
+
+  /**
+   * Fetches the bytecode of the contract's implementation.
+   * Read the EIP-1967 impl slot directly so UUPS proxies (which have
+   * an empty admin slot) are resolved correctly alongside TransparentProxy.
+   * EIP-1167 minimal proxies are resolved from their runtime code. A clone
+   * whose target is itself an EIP-1967 proxy or another clone returns the
+   * target's own code without resolving further, so the selector guard can
+   * read false for a selector the final implementation has.
+   *
+   * Returns '0x' when the address has no code (EOAs / bad addresses) so
+   * selector guards fall through to the probes, and undefined when the
+   * bytecode cannot be determined: a failed RPC read, or a beacon proxy whose
+   * implementation lives behind the beacon. Proxies that route through a
+   * diamond facet table or LSP17 extensions are not resolved; their own
+   * bytecode is returned, which does not contain the routed selectors.
+   */
+  private async fetchImplementationBytecode(
+    address: Address,
+  ): Promise<string | undefined> {
+    try {
+      const code = await this.provider.getCode(address);
+      if (isStorageEmpty(code)) return code;
+
+      if (
+        code.toLowerCase().startsWith(EIP1167_PREFIX) &&
+        code.length >= EIP1167_PREFIX.length + EIP1167_ADDRESS_HEX_LENGTH
+      ) {
+        const start = EIP1167_PREFIX.length;
+        return await this.provider.getCode(
+          utils.getAddress(
+            `0x${code.slice(start, start + EIP1167_ADDRESS_HEX_LENGTH)}`,
+          ),
+        );
+      }
+
+      const implSlot = await this.provider.getStorageAt(
+        address,
+        EIP1967_IMPLEMENTATION_SLOT,
+      );
+      if (!isStorageEmpty(implSlot)) {
+        const impl = utils.getAddress(implSlot.slice(26));
+        if (!isZeroishAddress(impl)) return await this.provider.getCode(impl);
+      }
+
+      const beaconSlot = await this.provider.getStorageAt(
+        address,
+        EIP1967_BEACON_SLOT,
+      );
+      if (!isStorageEmpty(beaconSlot) && !isZeroish(beaconSlot))
+        return undefined;
+
+      return code;
+    } catch (error: unknown) {
+      this.logger.debug(
+        `Could not resolve implementation bytecode for "${address}" on chain "${this.chain}"`,
+        error,
+      );
+      return undefined;
+    }
+  }
+
+  private readonly implementationBytecodeCache = new Map<
+    string,
+    Promise<string | undefined>
+  >();
+
+  private fetchImplementationBytecodeCached(
+    address: Address,
+  ): Promise<string | undefined> {
+    const key = address.toLowerCase();
+    const cached = this.implementationBytecodeCache.get(key);
+    if (cached) return cached;
+    const pending = this.fetchImplementationBytecode(address);
+    this.implementationBytecodeCache.set(key, pending);
+    // Only non-empty bytecode is cached; unknown and empty ('0x') results are
+    // retried so a lagging node cannot pin a just-deployed contract as empty.
+    void pending.then((bytecode) => {
+      if (isNullish(bytecode) || isStorageEmpty(bytecode))
+        this.implementationBytecodeCache.delete(key);
+    });
+    return pending;
+  }
+
+  /**
+   * Checks whether the implementation bytecode contains the selector.
+   * Returns undefined when the bytecode is empty/unreadable (unknown), so
+   * callers proceed with the call and its normal error handling.
+   */
+  private async implementationHasSelector(
+    address: Address,
+    selector: string,
+  ): Promise<boolean | undefined> {
+    const bytecode = await this.fetchImplementationBytecodeCached(address);
+    if (isNullish(bytecode) || isStorageEmpty(bytecode)) return undefined;
+    return bytecode.includes(strip0x(selector));
   }
 
   /**
@@ -693,6 +842,10 @@ export class EvmWarpRouteReader extends EvmRouterReader {
         factory: TokenBridgeOft__factory,
         method: 'oft',
       },
+      [TokenType.atomicLocalRebalancing]: {
+        factory: AtomicLocalRebalancingBridge__factory,
+        method: 'allowedSourceRouter',
+      },
       [TokenType.collateralCctp]: {
         factory: TokenBridgeCctpBase__factory,
         method: 'messageTransmitter',
@@ -714,29 +867,21 @@ export class EvmWarpRouteReader extends EvmRouterReader {
     try {
       // Fetch implementation bytecode once; scanning selectors locally avoids
       // reverted eth_calls for methods that don't exist on the contract.
-      // Read the EIP-1967 impl slot directly so UUPS proxies (which have
-      // an empty admin slot) are resolved correctly alongside TransparentProxy.
-      // Wrapped in try/catch so EOAs / bad addresses don't throw here — bytecode
-      // will be '0x' and the selector guard falls through to probes as pre-PR.
-      let implAddress = warpRouteAddress;
-      try {
-        const impl = await proxyImplementation(this.provider, warpRouteAddress);
-        if (!isZeroishAddress(impl)) implAddress = impl;
-      } catch {
-        // not a proxy or address has no code — use warpRouteAddress directly
-      }
-      const bytecode = await this.provider.getCode(implAddress);
+      const bytecode =
+        await this.fetchImplementationBytecodeCached(warpRouteAddress);
+      const hasKnownBytecode =
+        !isNullish(bytecode) && !isStorageEmpty(bytecode);
 
       // First, try checking token specific methods
       for (const [tokenType, { factory, method }] of Object.entries(
         contractTypes,
       )) {
         // Skip if selector absent from bytecode — avoids reverted eth_calls.
-        // When bytecode is unavailable ('0x'), fall through to the probe anyway
-        // to preserve pre-optimization behavior on zero-impl / flaky-RPC paths.
+        // When bytecode is unavailable ('0x' or unknown), fall through to the
+        // probe anyway to preserve pre-optimization behavior on zero-impl /
+        // flaky-RPC paths.
         const selector = factory.createInterface().getSighash(method);
-        if (!isStorageEmpty(bytecode) && !bytecode.includes(strip0x(selector)))
-          continue;
+        if (hasKnownBytecode && !bytecode.includes(strip0x(selector))) continue;
 
         try {
           const warpRoute = factory.connect(warpRouteAddress, this.provider);
@@ -754,7 +899,11 @@ export class EvmWarpRouteReader extends EvmRouterReader {
               await xerc20['mintingCurrentLimitOf(address)'](warpRouteAddress);
               return TokenType.XERC20;
             } catch (error) {
-              throwIfNotMissingSelector(error);
+              // Fluent's universal-token runtime answers an unknown selector
+              // with Panic(uint256). An xERC20 that reverts with Error(string)
+              // or a custom error (paused, bug) must surface rather than be
+              // read as plain collateral.
+              if (!isPanicRevert(error)) throwIfNotMissingSelector(error);
               this.logger.debug(
                 `Warp route token at address "${warpRouteAddress}" on chain "${this.chain}" is not a ${TokenType.XERC20}`,
                 error,
@@ -944,40 +1093,65 @@ export class EvmWarpRouteReader extends EvmRouterReader {
     xERC20Address: Address,
     warpRouteAddress: Address,
   ): Promise<XERC20TokenMetadata> {
-    // fetch the limits if possible
-    const rateLimitsABI = [
-      'function rateLimitPerSecond(address) external view returns (uint128)',
-      'function bufferCap(address) external view returns (uint112)',
-    ];
-    const xERC20 = new Contract(xERC20Address, rateLimitsABI, this.provider);
-    let extraBridgesLimits: XERC20TokenExtraBridgesLimits[] | undefined;
+    // Which getter holds the limits differs between the Standard and the
+    // Velodrome implementation, so the route's own limits are read through the
+    // type rather than through a fixed ABI.
+    let type: XERC20Type;
+    try {
+      type = await deriveXERC20TokenType(
+        this.multiProvider,
+        this.chain,
+        xERC20Address,
+      );
+    } catch (error) {
+      if (!(error instanceof UnknownXERC20TypeError)) throw error;
+      this.logger.warn(
+        `Token at ${xERC20Address} on chain ${this.chain} exposes no known xERC20 limits interface, skipping its xERC20 config`,
+        error,
+      );
+      return {};
+    }
 
+    let extraBridgesLimits: XERC20TokenExtraBridgesLimits[] | undefined;
     try {
       extraBridgesLimits = await getExtraLockBoxConfigs({
         chain: this.chain,
         multiProvider: this.multiProvider,
         xERC20Address,
         logger: this.logger,
+        type,
+        warpRouteAddress,
       });
     } catch (error) {
-      if (!isMissingSelectorCallException(error)) throw error;
+      // Only a contract answering that it does not have the getter is an
+      // answer. Everything else, an unreachable RPC above all, would otherwise
+      // report a token that has extra bridges as having none.
+      throwIfNotMissingSelectorRevert(error);
       this.logger.warn(
-        `Skipping extra xERC20 lockbox configs after missing-selector error for token at ${xERC20Address} on chain ${this.chain}`,
+        `Skipping extra xERC20 bridge configs after missing-selector error for token at ${xERC20Address} on chain ${this.chain}`,
         error,
       );
     }
 
     try {
-      // TODO: fix this such that it fetches from WL's values too
+      const limitsByBridge = await readXERC20Limits({
+        multiProtocolProvider: MultiProtocolProvider.fromMultiProvider(
+          this.multiProvider,
+        ),
+        chain: this.multiProvider.getChainName(this.chain),
+        xERC20Address,
+        bridges: [warpRouteAddress],
+        type,
+      });
+      const warpRouteLimits = limitsByBridge[warpRouteAddress];
+      assert(
+        warpRouteLimits,
+        `Missing xERC20 limits for warp route ${warpRouteAddress} on chain ${this.chain}`,
+      );
+
       return {
         xERC20: {
-          warpRouteLimits: {
-            type: XERC20Type.Velo,
-            rateLimitPerSecond: (
-              await xERC20.rateLimitPerSecond(warpRouteAddress)
-            ).toString(),
-            bufferCap: (await xERC20.bufferCap(warpRouteAddress)).toString(),
-          },
+          warpRouteLimits,
           extraBridges:
             extraBridgesLimits && extraBridgesLimits.length > 0
               ? extraBridgesLimits
@@ -985,7 +1159,7 @@ export class EvmWarpRouteReader extends EvmRouterReader {
         },
       };
     } catch (error) {
-      if (isMissingSelectorCallException(error)) return {};
+      if (isMissingSelectorRevert(error)) return {};
       this.logger.error(
         `Error fetching xERC20 limits for token at ${xERC20Address} on chain ${this.chain}`,
         error,
@@ -1217,6 +1391,35 @@ export class EvmWarpRouteReader extends EvmRouterReader {
       oft,
       domainMappings,
       extraOptions: extraOptions !== '0x' ? extraOptions : undefined,
+    };
+  }
+
+  private async deriveAtomicLocalRebalancingBridgeTokenConfig(
+    bridgeAddress: Address,
+  ): Promise<AtomicLocalRebalancingBridgeTokenConfig> {
+    const bridge = AtomicLocalRebalancingBridge__factory.connect(
+      bridgeAddress,
+      this.provider,
+    );
+    const [sourceRouter, localDomain] = await Promise.all([
+      bridge.allowedSourceRouter(),
+      bridge.localDomain(),
+    ]);
+    const expectedLocalDomain = this.multiProvider.getDomainId(this.chain);
+    assert(
+      BigNumber.from(localDomain).toNumber() === expectedLocalDomain,
+      `AtomicLocalRebalancingBridge localDomain ${localDomain} does not match ${expectedLocalDomain} for ${this.chain}`,
+    );
+    const sourceToken = await MovableCollateralRouter__factory.connect(
+      sourceRouter,
+      this.provider,
+    ).token();
+
+    return {
+      ...(await this.fetchERC20Metadata(sourceToken)),
+      type: TokenType.atomicLocalRebalancing,
+      sourceRouter,
+      scale: await this.fetchScale(sourceRouter),
     };
   }
 
@@ -1548,6 +1751,8 @@ export class EvmWarpRouteReader extends EvmRouterReader {
       ]),
     ];
     const crossCollateralRouters: Record<string, string[]> = {};
+    const rebalanceTargets: Record<string, string[]> = {};
+    const rebalanceRecipients: Record<string, string> = {};
 
     await Promise.all(
       allDomains.map(async (domain) => {
@@ -1559,6 +1764,51 @@ export class EvmWarpRouteReader extends EvmRouterReader {
       }),
     );
 
+    // `rebalanceTargets()` only exists on the #8894+ CrossCollateralRouter.
+    // Gate the read on PACKAGE_VERSION so legacy routers can be read before an
+    // upgrade without relying on how a particular RPC represents empty return
+    // data for a missing selector.
+    const supportsRebalanceTargets =
+      compareVersions(
+        await this.fetchPackageVersion(hypTokenAddress),
+        REBALANCE_TARGETS_CONTRACT_VERSION,
+      ) >= 0;
+
+    if (supportsRebalanceTargets) {
+      await Promise.all(
+        allDomains.map(async (domain) => {
+          const targets = await crossCollateralRouter.rebalanceTargets(domain);
+          if (targets.length > 0) {
+            rebalanceTargets[domain.toString()] = targets.map((target) =>
+              target.toLowerCase(),
+            );
+          }
+        }),
+      );
+    }
+
+    // `allowedRecipient()` may not exist on older deployed implementations.
+    // Probe once so deriving a pre-upgrade router does not fail.
+    let supportsRebalanceRecipients = true;
+    try {
+      await crossCollateralRouter.allowedRecipient(localDomain);
+    } catch (error: unknown) {
+      throwIfNotMissingSelectorRevert(error);
+      supportsRebalanceRecipients = false;
+    }
+
+    if (supportsRebalanceRecipients) {
+      await Promise.all(
+        allDomains.map(async (domain) => {
+          const recipient =
+            await crossCollateralRouter.allowedRecipient(domain);
+          if (!isZeroishAddress(recipient)) {
+            rebalanceRecipients[domain.toString()] = recipient.toLowerCase();
+          }
+        }),
+      );
+    }
+
     return {
       ...erc20TokenMetadata,
       type: TokenType.crossCollateral,
@@ -1567,6 +1817,12 @@ export class EvmWarpRouteReader extends EvmRouterReader {
       crossCollateralRouters:
         Object.keys(crossCollateralRouters).length > 0
           ? crossCollateralRouters
+          : undefined,
+      rebalanceTargets:
+        Object.keys(rebalanceTargets).length > 0 ? rebalanceTargets : undefined,
+      rebalanceRecipients:
+        Object.keys(rebalanceRecipients).length > 0
+          ? rebalanceRecipients
           : undefined,
     };
   }
@@ -1622,12 +1878,21 @@ export class EvmWarpRouteReader extends EvmRouterReader {
       };
     } else {
       // Read old format (single scale value) using low-level call
-      const legacyScaleABI = [
-        'function scale() external view returns (uint256)',
-      ];
+      if (
+        (await this.implementationHasSelector(
+          tokenRouterAddress,
+          LEGACY_SCALE_INTERFACE.getSighash('scale()'),
+        )) === false
+      ) {
+        this.logger.debug(
+          `Router at address "${tokenRouterAddress}" on chain "${this.chain}" reports ${packageVersion} but has no scale() getter; treating as identity`,
+        );
+        return undefined;
+      }
+
       const legacyContract = new Contract(
         tokenRouterAddress,
-        legacyScaleABI,
+        LEGACY_SCALE_INTERFACE,
         this.provider,
       );
       const scale: BigNumber = await legacyContract.scale();

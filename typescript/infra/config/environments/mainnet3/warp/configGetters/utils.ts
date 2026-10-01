@@ -4,9 +4,11 @@ import {
   ChainSubmissionStrategy,
   HypTokenRouterConfig,
   MovableTokenConfig,
+  SubmitterMetadata,
   TokenFeeConfigInput,
   TokenFeeType,
   TokenType,
+  TxSubmitterType,
 } from '@hyperlane-xyz/sdk';
 import {
   Address,
@@ -18,14 +20,16 @@ import {
 } from '@hyperlane-xyz/utils';
 
 import { RouterConfigWithoutOwner } from '../../../../../src/config/warp.js';
-import { getDomainId, getRegistry } from '../../../../registry.js';
+import { getChainAddresses, getRegistry } from '../../../../registry.js';
+import { awSafes } from '../../governance/safe/aw.js';
+import { warpFeesSafes } from '../../governance/safe/warpFees.js';
 import { usdcTokenAddresses } from '../cctp.js';
 import { usdtTokenAddresses } from '../tokens.js';
 import { WarpRouteIds } from '../warpIds.js';
 
-const REBALANCER = '0xa3948a15e1d0778a7d53268b651B2411AF198FE3';
+export const REBALANCER = '0xa3948a15e1d0778a7d53268b651B2411AF198FE3';
 
-type RebalancingConfig = Required<
+export type RebalancingConfig = Required<
   Pick<MovableTokenConfig, 'allowedRebalancingBridges' | 'allowedRebalancers'>
 >;
 
@@ -80,7 +84,7 @@ export function getUSDCRebalancingBridgesConfigFor(
       const allowedRebalancingBridges = Object.fromEntries(
         rebalanceableChains
           .filter((remoteChain) => remoteChain !== currentChain)
-          .map((remoteChain) => [String(getDomainId(remoteChain)), bridges]),
+          .map((remoteChain) => [remoteChain, bridges]),
       );
 
       return {
@@ -164,7 +168,7 @@ export function getRebalancingBridgesConfigFor(
       const allowedRebalancingBridges = Object.fromEntries(
         rebalanceableChains
           .filter((remoteChain) => remoteChain !== currentChain)
-          .map((remoteChain) => {
+          .map((remoteChain): [string, Array<{ bridge: string }>] => {
             const bridges = routeData
               .filter(
                 ({ chainSet }) =>
@@ -175,7 +179,7 @@ export function getRebalancingBridgesConfigFor(
                 assert(bridge, `No bridge found for chain ${currentChain}`);
                 return { bridge };
               });
-            return [String(getDomainId(remoteChain)), bridges] as const;
+            return [remoteChain, bridges];
           })
           .filter(([, bridges]) => bridges.length > 0),
       );
@@ -339,7 +343,10 @@ export function scaleDownConfig(
  * Destinations not included will have no fee (RoutingFee returns 0 for unconfigured destinations).
  * The fee token is auto-derived at deploy time based on the warp route token type.
  *
- * @param owner - The owner address for the fee contract
+ * The `owner` is applied to the top-level RoutingFee contract and to every
+ * nested per-destination sub-fee contract.
+ *
+ * @param owner - The owner of the RoutingFee contract and its sub-fee contracts
  * @param feeDestinations - List of destination chains that should have the fee applied
  * @param bps - The fee in basis points to apply for feeDestinations
  * @param feeParams - Optional pre-deployed fee parameters per chain
@@ -446,4 +453,139 @@ export function getImpersonatedAccountStrategyConfig(
       { submitter: { type: 'impersonatedAccount', userAddress, chain } },
     ]),
   ) as unknown as ChainSubmissionStrategy;
+}
+
+/**
+ * Builds the WarpFees governance submitter for a governance-owned RoutingFee.
+ * Remote chains are reached through the governance safe's interchain account.
+ */
+export function getWarpFeeSubmitter(
+  chain: string,
+  originChain: string,
+  originInterchainAccountRouter: string,
+): SubmitterMetadata {
+  const feeSafeAddress = warpFeesSafes[originChain];
+  assert(feeSafeAddress, `Missing WarpFees governance safe for ${originChain}`);
+
+  const originFeeSafeSubmitter = {
+    type: TxSubmitterType.GNOSIS_TX_BUILDER as const,
+    chain: originChain,
+    safeAddress: feeSafeAddress,
+    version: '1',
+  };
+
+  if (chain === originChain) {
+    return originFeeSafeSubmitter;
+  }
+
+  return {
+    type: TxSubmitterType.INTERCHAIN_ACCOUNT as const,
+    chain: originChain,
+    destinationChain: chain,
+    owner: feeSafeAddress,
+    originInterchainAccountRouter,
+    internalSubmitter: originFeeSafeSubmitter,
+  };
+}
+
+type FileSubmitterMetadata = {
+  type: 'file';
+  chain: string;
+  filepath: string;
+};
+
+type EclipseSubmitterMetadata = SubmitterMetadata | FileSubmitterMetadata;
+
+export type EclipseWarpSubmissionStrategy = Record<
+  string,
+  {
+    submitter: EclipseSubmitterMetadata;
+    feeSubmitter?: EclipseSubmitterMetadata;
+  }
+>;
+
+/**
+ * Builds the shared Eclipse route strategy. Router-owner transactions use the
+ * AbacusWorks Safe/ICAs. Turnkey-owned RoutingFee transactions are written to
+ * a dedicated file for later review and external-signer submission;
+ * governance-owned RoutingFees retain the WarpFees Safe/ICA path.
+ */
+export function getEclipseWarpStrategyConfig({
+  route,
+  evmChains,
+  nonEvmChains,
+  turnkeyFeeChains,
+  originInterchainAccountRouter: configuredInterchainAccountRouter,
+}: {
+  route: 'usdc' | 'usdt';
+  evmChains: readonly string[];
+  nonEvmChains: readonly string[];
+  turnkeyFeeChains: ReadonlySet<string>;
+  originInterchainAccountRouter?: string;
+}): EclipseWarpSubmissionStrategy {
+  const originChain = 'ethereum';
+  const safeAddress = awSafes[originChain];
+  const originSafeSubmitter = {
+    type: TxSubmitterType.GNOSIS_TX_BUILDER as const,
+    chain: originChain,
+    safeAddress,
+    version: '1',
+  };
+
+  const originInterchainAccountRouter =
+    configuredInterchainAccountRouter ??
+    getChainAddresses()[originChain]?.interchainAccountRouter;
+  assert(
+    originInterchainAccountRouter,
+    `Could not fetch originInterchainAccountRouter for ${originChain}`,
+  );
+
+  // One fresh file preserves the complete cross-chain fee batch for review and
+  // a subsequent `hyperlane submit --signer-config` invocation.
+  const turnkeyFeeFilepath = `/tmp/eclipse-${route}-turnkey-fees-${Date.now()}.json`;
+  const getFeeSubmitter = (chain: string): EclipseSubmitterMetadata =>
+    turnkeyFeeChains.has(chain)
+      ? {
+          type: 'file',
+          chain,
+          filepath: turnkeyFeeFilepath,
+        }
+      : getWarpFeeSubmitter(chain, originChain, originInterchainAccountRouter);
+
+  const evmStrategies: [
+    string,
+    {
+      submitter: SubmitterMetadata;
+      feeSubmitter: EclipseSubmitterMetadata;
+    },
+  ][] = evmChains.map((chain) => [
+    chain,
+    {
+      submitter:
+        chain === originChain
+          ? originSafeSubmitter
+          : {
+              type: TxSubmitterType.INTERCHAIN_ACCOUNT as const,
+              chain: originChain,
+              destinationChain: chain,
+              owner: safeAddress,
+              originInterchainAccountRouter,
+              internalSubmitter: originSafeSubmitter,
+            },
+      feeSubmitter: getFeeSubmitter(chain),
+    },
+  ]);
+
+  const nonEvmStrategies = nonEvmChains.map((chain) => [
+    chain,
+    {
+      submitter: {
+        type: 'file' as const,
+        chain,
+        filepath: `/tmp/eclipse-${route}-${chain}.json`,
+      },
+    },
+  ]);
+
+  return Object.fromEntries([...evmStrategies, ...nonEvmStrategies]);
 }

@@ -86,12 +86,21 @@ export const REGISTRY_MODULES = [
   Modules.CCIP,
 ];
 
-export function getArgs() {
-  return yargs(process.argv.slice(2))
+export function withEnvironment<T>(
+  args: Argv<T>,
+  opts?: { defaultEnv?: DeployEnvironment },
+) {
+  const chain = args
     .describe('environment', 'deploy environment')
     .coerce('environment', assertEnvironment)
-    .demandOption('environment')
     .alias('e', 'environment');
+  return opts?.defaultEnv
+    ? chain.default('environment', opts.defaultEnv)
+    : chain.demandOption('environment');
+}
+
+export function getArgs() {
+  return withEnvironment(yargs(process.argv.slice(2)));
 }
 
 export function withBalanceThresholdConfig<T>(args: Argv<T>) {
@@ -500,7 +509,6 @@ export async function getAgentConfigsBasedOnArgs(argv?: {
     const baseConfig = {
       [Contexts.Hyperlane]: [],
       [Contexts.ReleaseCandidate]: [],
-      [Contexts.Neutron]: [],
       [Contexts.FastPath]: [],
     };
     // supplementing with dummy addresses for validator as part of missingChains
@@ -592,7 +600,7 @@ export function ensureValidatorConfigConsistency(
     ]}`;
 
     // So only throw if there are missing chains in the Hyperlane context.
-    // Only a subset of chains will have ephemeral validators in RC/Neutron contexts.
+    // Only a subset of chains will have ephemeral validators in the RC context.
     if (context === Contexts.Hyperlane) {
       throw new Error(
         chalk.bold.red(`Validator config invalid.\n${errorMessage}`),
@@ -601,7 +609,7 @@ export function ensureValidatorConfigConsistency(
       rootLogger.info(chalk.grey(errorMessage));
       rootLogger.info(
         chalk.bold.grey(
-          'This is expected for RC/Neutron contexts, as we only run validators for a subset of chains in them.',
+          'This is expected for the RC context, as we only run validators for a subset of chains in it.',
         ),
       );
     }

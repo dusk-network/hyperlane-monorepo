@@ -75,7 +75,7 @@ impl TransactionDb for HyperlaneRocksDB {
         &self,
         tx_uuid: &TransactionUuid,
     ) -> DbResult<Option<Transaction>> {
-        self.retrieve_value_by_key(TRANSACTION_BY_UUID_STORAGE_PREFIX, tx_uuid)
+        self.retrieve_decodable(TRANSACTION_BY_UUID_STORAGE_PREFIX, tx_uuid.as_bytes())
     }
 
     async fn store_transaction_by_uuid(&self, tx: &Transaction) -> DbResult<()> {
@@ -99,7 +99,7 @@ impl TransactionDb for HyperlaneRocksDB {
         &self,
         tx_uuid: &TransactionUuid,
     ) -> DbResult<Option<u32>> {
-        self.retrieve_value_by_key(TRANSACTION_INDEX_BY_UUID_STORAGE_PREFIX, tx_uuid)
+        self.retrieve_decodable(TRANSACTION_INDEX_BY_UUID_STORAGE_PREFIX, tx_uuid.as_bytes())
     }
 
     async fn store_transaction_index_by_uuid(
@@ -142,6 +142,13 @@ impl TransactionDb for HyperlaneRocksDB {
 }
 
 impl Encode for Transaction {
+    fn to_vec(&self) -> Vec<u8> {
+        // Database writes need the JSON buffer itself, not a copy through write_to.
+        serde_json::to_vec(self)
+            .map_err(|_| std::io::Error::other("Failed to serialize"))
+            .expect("!alloc")
+    }
+
     fn write_to<W>(&self, writer: &mut W) -> std::io::Result<usize>
     where
         W: Write,
@@ -161,6 +168,14 @@ impl Decode for Transaction {
     {
         // Deserialize from JSON and read from the reader, to avoid having to implement the encoding / decoding manually
         serde_json::from_reader(reader).map_err(|err| {
+            HyperlaneProtocolError::IoError(std::io::Error::other(format!(
+                "Failed to deserialize. Error: {err}"
+            )))
+        })
+    }
+
+    fn read_from_slice(bytes: &[u8]) -> Result<Self, HyperlaneProtocolError> {
+        serde_json::from_slice(bytes).map_err(|err| {
             HyperlaneProtocolError::IoError(std::io::Error::other(format!(
                 "Failed to deserialize. Error: {err}"
             )))
@@ -187,6 +202,38 @@ mod tests {
         let domain = KnownHyperlaneDomain::Arbitrum.into();
 
         (Arc::new(HyperlaneRocksDB::new(&domain, db))) as _
+    }
+
+    #[test]
+    fn transaction_owned_encoding_matches_writer_and_roundtrips() {
+        use crate::transaction::{DropReason, Transaction};
+        use hyperlane_core::{Decode, Encode, H512};
+        for length in [0, 1, 4096, 65536] {
+            for status in [
+                TransactionStatus::PendingInclusion,
+                TransactionStatus::Mempool,
+                TransactionStatus::Included,
+                TransactionStatus::Finalized,
+                TransactionStatus::Dropped(DropReason::Other("retry \"quoted\" reason".to_owned())),
+            ] {
+                let mut payload = FullPayload::default();
+                payload.details.metadata = "x".repeat(length);
+                payload.details.success_criteria = Some(vec![0, 255, 1]);
+                let mut tx = dummy_tx(vec![payload], status);
+                tx.tx_hashes = vec![H512::repeat_byte(0x12), H512::repeat_byte(0x34)];
+                tx.submission_attempts = u32::MAX;
+                tx.last_submission_attempt = Some(tx.creation_timestamp);
+                tx.last_status_check = Some(tx.creation_timestamp);
+                let mut legacy = Vec::new();
+                assert_eq!(tx.write_to(&mut legacy).unwrap(), legacy.len());
+                let encoded = tx.to_vec();
+                assert_eq!(encoded, legacy);
+                assert_eq!(Transaction::read_from(&mut encoded.as_slice()).unwrap(), tx);
+                let mut partial = [0; 1];
+                assert_eq!(tx.write_to(&mut partial.as_mut_slice()).unwrap(), 1);
+                assert_eq!(partial[0], encoded[0]);
+            }
+        }
     }
 
     #[tokio::test]

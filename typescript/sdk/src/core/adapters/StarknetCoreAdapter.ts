@@ -2,10 +2,11 @@ import {
   CallData,
   InvokeTransactionReceiptResponse,
   ParsedEvents,
+  createAbiParser,
   events as eventsUtils,
 } from 'starknet';
 
-import { getCompiledContract } from '@hyperlane-xyz/starknet-core';
+import { getContractAbi } from '@hyperlane-xyz/starknet-core/runtime';
 import { Address, HexString, pollAsync } from '@hyperlane-xyz/utils';
 
 import { BaseStarknetAdapter } from '../../app/MultiProtocolApp.js';
@@ -45,7 +46,7 @@ export class StarknetCoreAdapter
 
     let parsedEvents: ParsedEvents = [];
     sourceTx.receipt.match({
-      success: (txR) => {
+      SUCCEEDED: (txR) => {
         const emittedEvents =
           (txR as InvokeTransactionReceiptResponse).events?.map((event) => {
             return {
@@ -57,12 +58,13 @@ export class StarknetCoreAdapter
           }) || [];
 
         if (emittedEvents.length === 0) return;
-        const mailboxAbi = getCompiledContract('mailbox').abi;
+        const mailboxAbi = getContractAbi('mailbox');
         parsedEvents = eventsUtils.parseEvents(
           emittedEvents,
           eventsUtils.getAbiEvents(mailboxAbi),
           CallData.getAbiStruct(mailboxAbi),
           CallData.getAbiEnum(mailboxAbi),
+          createAbiParser(mailboxAbi),
         );
       },
       _: () => {

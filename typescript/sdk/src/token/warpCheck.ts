@@ -1,11 +1,14 @@
 import { zeroAddress } from 'viem';
+import type { BigNumber } from 'ethers';
 
 import {
   CrossCollateralRouter__factory,
+  DelayedFlowRouterHookIsm__factory,
   IERC4626__factory,
   IXERC20Lockbox__factory,
   Ownable__factory,
   ProxyAdmin__factory,
+  TimelockController__factory,
 } from '@hyperlane-xyz/core';
 import {
   createWarpTokenReader,
@@ -36,15 +39,23 @@ import {
 } from '@hyperlane-xyz/utils';
 
 import { isProxy, proxyAdmin } from '../deploy/proxy.js';
+import { IsmType } from '../ism/types.js';
 import { altVmChainLookup } from '../metadata/ChainMetadataManager.js';
 import { MultiProvider } from '../providers/MultiProvider.js';
 import { resolveRouterMapConfig } from '../router/types.js';
+import {
+  CANCELLER_ROLE,
+  EXECUTOR_ROLE,
+  PROPOSER_ROLE,
+} from '../timelock/evm/constants.js';
+import { isDeterministicTimelockReadError } from '../timelock/evm/errors.js';
 import { ChainName } from '../types.js';
 import {
   type ScaleInput,
   scalesEqual,
   verifyScale,
 } from '../utils/decimals.js';
+import { collectHybridIsmNodes } from '../utils/ism.js';
 import { WarpCoreConfig } from '../warp/types.js';
 
 import { EvmWarpRouteReader } from './EvmWarpRouteReader.js';
@@ -59,8 +70,10 @@ import {
 import {
   DerivedWarpRouteDeployConfig,
   HypTokenRouterVirtualConfig,
+  OwnerStatus,
   TokenMetadata,
   WarpRouteDeployConfigMailboxRequired,
+  assertTimelockConfigHasNoProxyAdminOwnerOverride,
   derivedHookAddress,
   derivedIsmAddress,
   isCollateralTokenConfig,
@@ -86,6 +99,19 @@ const ALTVM_CHECK_PROTOCOLS: ReadonlySet<ProtocolType> = new Set([
 
 function isSupportedAltVmProtocol(protocol: ProtocolType | null): boolean {
   return protocol !== null && ALTVM_CHECK_PROTOCOLS.has(protocol);
+}
+
+// Protocols with no interchain gas paymaster: their routers never consume a
+// per-destination gas, so the on-chain `destination_gas` is always 0 and the
+// EVM-derived expected default is meaningless. Only these origins get the
+// zero-destinationGas normalization (see normalizeAltVmDestinationGas).
+// IGP-capable altVM protocols (e.g. Sealevel, CosmosNative) keep the drift.
+const NO_IGP_ALTVM_PROTOCOLS: ReadonlySet<ProtocolType> = new Set([
+  ProtocolType.Starknet,
+]);
+
+function isNoIgpAltVmProtocol(protocol: ProtocolType | null): boolean {
+  return protocol !== null && NO_IGP_ALTVM_PROTOCOLS.has(protocol);
 }
 
 type ObjectDiffMap = Exclude<ObjectDiff, ObjectDiff[] | undefined>;
@@ -284,16 +310,6 @@ function normalizeCrossCollateralRouters(
   return Object.keys(normalized).length > 0 ? normalized : undefined;
 }
 
-// `collateralDex` is a paradex-only registry annotation for a collateral route
-// that performs a DEX conversion (see registry ETH/paradex & DIME/paradex). It has
-// no matching SDK TokenType, and on-chain the leg is a standard collateral router,
-// so the deriver reports `collateral`. Treat the annotation as its underlying
-// collateral type so the generic altVM diff doesn't false-flag a `type` mismatch.
-const COLLATERAL_DEX_TYPE_ALIAS = 'collateralDex';
-export function normalizeAltVmExpectedTokenType(type: string): string {
-  return type === COLLATERAL_DEX_TYPE_ALIAS ? TokenType.collateral : type;
-}
-
 export function expandedDeployConfigToAltVmCheckConfig(
   chain: ChainName,
   config: WarpRouteDeployConfigMailboxRequired[string],
@@ -351,7 +367,7 @@ export function expandedDeployConfigToAltVmCheckConfig(
   // altVmScaleMismatch (exact bigint fraction compare against the raw expected
   // config.scale), not through this generic diff. See checkWarpRouteDeployConfig.
   const result: AltVmCheckConfig = {
-    type: normalizeAltVmExpectedTokenType(config.type),
+    type: config.type,
     owner: normalizeAddress(config.owner, protocol),
     mailbox: normalizeAddress(config.mailbox, protocol),
     interchainSecurityModule: ismAddress,
@@ -367,7 +383,14 @@ export function expandedDeployConfigToAltVmCheckConfig(
   // positives from unresolved metadata on the expected side. Cosmos SDK's
   // decimals=0 placeholder is excluded on the actual side (see
   // derivedWarpConfigToCheckConfig), so it's excluded here too for symmetry.
-  if (protocol !== ProtocolType.CosmosNative && !isNullish(config.decimals)) {
+  // AltVM native tokens (e.g. Aleo AleoHypNative) never carry decimals on the
+  // actual side -- DerivedNativeWarpConfig has no decimals field -- so their
+  // core-config decimals is excluded here to keep both sides symmetric.
+  if (
+    protocol !== ProtocolType.CosmosNative &&
+    config.type !== TokenType.native &&
+    !isNullish(config.decimals)
+  ) {
     result.decimals = config.decimals;
   }
 
@@ -469,9 +492,69 @@ async function getAltVmOnChainDerivedConfigs({
   );
 }
 
+// On no-IGP altVM origins (Starknet/paradex) a per-destination gas that was never
+// set on-chain reads back as 0 from the contract's `destination_gas` entrypoint.
+// The expected side derives a non-zero EVM `gasOverhead` default for every remote
+// (see getGasConfig in configUtils.ts), so comparing the two would false-flag every
+// route that never set per-domain gas on-chain -- and these chains have no IGP that
+// consumes the value anyway. Mirror the ISM/hook zero-address normalization below:
+// treat a 0 on-chain gas as "unset" and drop that destination from both sides. A
+// genuinely-configured (non-zero) on-chain gas still diffs normally.
+//
+// This is applied ONLY to no-IGP origins (see isNoIgpAltVmProtocol). IGP-capable
+// altVM protocols (Sealevel, CosmosNative, ...) consume destination_gas, so a
+// zero-vs-nonzero drift there is a real regression and must still be flagged.
+export function normalizeAltVmDestinationGas(
+  actual: Record<string, string>,
+  expected: Record<string, string>,
+): { actual: Record<string, string>; expected: Record<string, string> } {
+  const normalizedActual: Record<string, string> = {};
+  const normalizedExpected: Record<string, string> = { ...expected };
+  for (const [chain, gas] of Object.entries(actual)) {
+    if (BigInt(gas) === 0n) {
+      delete normalizedExpected[chain];
+      continue;
+    }
+    normalizedActual[chain] = gas;
+  }
+  return { actual: normalizedActual, expected: normalizedExpected };
+}
+
+export function filterDestinationGasToEnrolledDomains(
+  destinationGas: Record<string, string>,
+  chain: string,
+  enrollmentSources: ReadonlyArray<
+    Pick<AltVmCheckConfig, 'crossCollateralRouters' | 'remoteRouters'>
+  >,
+): Record<string, string> {
+  const enrolledChains = new Set<string>();
+  for (const { crossCollateralRouters, remoteRouters } of enrollmentSources) {
+    for (const remoteRouterChain of Object.keys(remoteRouters)) {
+      enrolledChains.add(remoteRouterChain);
+    }
+    for (const ccrChain of Object.keys(crossCollateralRouters ?? {})) {
+      if (ccrChain !== chain) {
+        enrolledChains.add(ccrChain);
+      }
+    }
+  }
+  const filteredDestinationGas: Record<string, string> = {};
+
+  // Gas for domains without an enrolled router or CCR has no effect, but can
+  // remain on-chain after unenrollment.
+  for (const [destinationChain, gas] of Object.entries(destinationGas)) {
+    if (enrolledChains.has(destinationChain)) {
+      filteredDestinationGas[destinationChain] = gas;
+    }
+  }
+
+  return filteredDestinationGas;
+}
+
 export function buildAltVmWarpRouteDiff(
   onChainConfigs: Record<string, AltVmCheckConfig>,
   expectedConfigs: Record<string, AltVmCheckConfig>,
+  noIgpChains: ReadonlySet<string> = new Set(),
 ): Record<string, ObjectDiff> {
   const diff: Record<string, ObjectDiff> = {};
 
@@ -493,8 +576,26 @@ export function buildAltVmWarpRouteDiff(
     // EVM path (buildWarpRouteDiff) and only compare when both sides opt in.
     // contractVersion is excluded the same way (mirrors buildWarpRouteDiff): it's
     // rarely set explicitly, so only compare when the deploy config opts in.
+    // decimals is excluded the same way: the expected side omits it for altVM
+    // native tokens (expandedDeployConfigToAltVmCheckConfig), but the derived
+    // side resolves a concrete value for some protocols (e.g. Sealevel native =
+    // 9) and omits it for others (e.g. Aleo native). Only compare when the
+    // deploy config opts in, otherwise every Sealevel native leg reports a
+    // false-positive decimals mismatch.
     // scale is excluded entirely here -- it needs an exact rational comparison
     // (see altVmScaleMismatch) rather than the plain `number` diffObjMerge does.
+    const enrolledActualGas = filterDestinationGasToEnrolledDomains(
+      actual.destinationGas,
+      chain,
+      [actual, expected],
+    );
+    const { actual: normalizedActualGas, expected: normalizedExpectedGas } =
+      noIgpChains.has(chain)
+        ? normalizeAltVmDestinationGas(
+            enrolledActualGas,
+            expected.destinationGas,
+          )
+        : { actual: enrolledActualGas, expected: expected.destinationGas };
     const normalizedActual: AltVmCheckConfig = {
       ...actual,
       interchainSecurityModule: isNullish(expected.interchainSecurityModule)
@@ -504,11 +605,14 @@ export function buildAltVmWarpRouteDiff(
       contractVersion: isNullish(expected.contractVersion)
         ? undefined
         : actual.contractVersion,
+      decimals: isNullish(expected.decimals) ? undefined : actual.decimals,
       scale: undefined,
+      destinationGas: normalizedActualGas,
     };
     const normalizedExpected: AltVmCheckConfig = {
       ...expected,
       scale: undefined,
+      destinationGas: normalizedExpectedGas,
     };
 
     const { mergedObject, isInvalid } = diffObjMerge(
@@ -583,18 +687,81 @@ export function altVmScaleMismatch(
   };
 }
 
+// An owner the caller vetted and decided to accept in an Inactive on-chain
+// state. `chain`/`owner` identify the exact ownerStatus entry to accept; a
+// chain may appear more than once with different owners.
+export interface AcceptedInactiveOwner {
+  chain: ChainName;
+  owner: Address;
+}
+
+// Re-accepts caller-vetted Inactive owners by overriding the expected
+// ownerStatus back to Inactive, but ONLY where the owner is Inactive on-chain.
+// Mutates `expandedWarpDeployConfig` in place. Exported for unit testing.
+export function applyAcceptedInactiveOwnerStatus({
+  expandedWarpDeployConfig,
+  onChainWarpConfig,
+  acceptedInactiveOwners,
+}: {
+  expandedWarpDeployConfig: WarpRouteDeployConfigMailboxRequired;
+  onChainWarpConfig: Record<
+    string,
+    { ownerStatus?: Record<string, OwnerStatus> }
+  >;
+  acceptedInactiveOwners?: readonly AcceptedInactiveOwner[];
+}): void {
+  if (!acceptedInactiveOwners?.length) {
+    return;
+  }
+
+  // Group accepted owners per chain into lowercased sets for case-insensitive
+  // address matching.
+  const acceptedByChain = new Map<ChainName, Set<string>>();
+  for (const { chain, owner } of acceptedInactiveOwners) {
+    const owners = acceptedByChain.get(chain) ?? new Set<string>();
+    owners.add(owner.toLowerCase());
+    acceptedByChain.set(chain, owners);
+  }
+
+  for (const [chain, acceptedOwners] of acceptedByChain) {
+    const observedOwnerStatus = onChainWarpConfig[chain]?.ownerStatus;
+    const expectedOwnerStatus = expandedWarpDeployConfig[chain]?.ownerStatus;
+    if (!observedOwnerStatus || !expectedOwnerStatus) {
+      continue;
+    }
+
+    for (const [owner, status] of Object.entries(observedOwnerStatus)) {
+      if (
+        status === OwnerStatus.Inactive &&
+        acceptedOwners.has(owner.toLowerCase())
+      ) {
+        expectedOwnerStatus[owner] = OwnerStatus.Inactive;
+      }
+    }
+  }
+}
+
 export async function checkWarpRouteDeployConfig({
   multiProvider,
   warpCoreConfig,
   warpDeployConfig,
+  acceptedInactiveOwners,
 }: {
   multiProvider: MultiProvider;
   warpCoreConfig: WarpCoreConfig;
   warpDeployConfig: WarpRouteDeployConfigMailboxRequired;
+  // Owners the caller has decided to accept in an Inactive on-chain state
+  // (e.g. a nonce-less governance ICA on Tron/AltVM that a multisig controls).
+  // The caller owns the decision — including deriving and verifying the ICA and
+  // its origin Safe threshold. Here we only pass Inactive through as the
+  // expected control when the observed status is Inactive AND the exact
+  // {chain, owner} pair is present. A chain may list multiple accepted owners.
+  acceptedInactiveOwners?: readonly AcceptedInactiveOwner[];
 }): Promise<WarpRouteCheckResult> {
   const knownWarpCoreTokens = warpCoreConfig.tokens.filter(
     (token) => multiProvider.tryGetProtocol(token.chainName) !== null,
   );
+  assertTimelockSupportedByProtocols({ multiProvider, warpDeployConfig });
   const evmWarpCoreConfig = {
     ...warpCoreConfig,
     tokens: knownWarpCoreTokens.filter((token) =>
@@ -700,6 +867,17 @@ export async function checkWarpRouteDeployConfig({
     expandedOnChainWarpConfig,
     validateScale: false,
   });
+
+  // expandWarpDeployConfig deterministically maps every Inactive owner to an
+  // expected Active (a violation). Re-accept the specific owners the caller
+  // vetted, but only where the owner is actually Inactive on-chain, so a
+  // stale/incorrect accept entry can never mask a real status change.
+  applyAcceptedInactiveOwnerStatus({
+    expandedWarpDeployConfig,
+    onChainWarpConfig: expandedOnChainWarpConfig,
+    acceptedInactiveOwners,
+  });
+
   const normalizedWarpDeployConfig = normalizeWarpDeployConfigForCheck({
     multiProvider,
     warpDeployConfig: expandedWarpDeployConfig,
@@ -715,9 +893,22 @@ export async function checkWarpRouteDeployConfig({
     warpRouteConfig: evmExpandedWarpDeployConfig,
   });
 
+  await addUnknownDelayedFlowDomainDiffs({
+    multiProvider,
+    diff: rawEvmDiff,
+    onChainWarpConfig: expandedOnChainWarpConfig,
+    warpRouteConfig: evmExpandedWarpDeployConfig,
+  });
+
   await addOwnerOverrideDiffs({
     multiProvider,
     diff: rawEvmDiff,
+    warpRouteConfig: evmExpandedWarpDeployConfig,
+  });
+  await addTimelockDiffs({
+    multiProvider,
+    diff: rawEvmDiff,
+    onChainWarpConfig: expandedOnChainWarpConfig,
     warpRouteConfig: evmExpandedWarpDeployConfig,
   });
 
@@ -740,9 +931,16 @@ export async function checkWarpRouteDeployConfig({
     }
   }
 
+  const noIgpAltVmChains = new Set(
+    Object.keys(altVmExpectedConfigs).filter((chain) =>
+      isNoIgpAltVmProtocol(multiProvider.tryGetProtocol(chain)),
+    ),
+  );
+
   const rawAltVmDiff = buildAltVmWarpRouteDiff(
     altVmOnChainConfigs,
     altVmExpectedConfigs,
+    noIgpAltVmChains,
   );
 
   for (const chain of Object.keys(altVmExpectedConfigs)) {
@@ -776,6 +974,77 @@ export async function checkWarpRouteDeployConfig({
     scaleViolations,
     violations: [...diffViolations, ...scaleViolations],
   };
+}
+
+async function addUnknownDelayedFlowDomainDiffs({
+  multiProvider,
+  diff,
+  onChainWarpConfig,
+  warpRouteConfig,
+}: {
+  multiProvider: MultiProvider;
+  diff: Record<string, ObjectDiff>;
+  onChainWarpConfig: DerivedWarpRouteDeployConfig &
+    Record<string, Partial<HypTokenRouterVirtualConfig>>;
+  warpRouteConfig: WarpRouteDeployConfigMailboxRequired &
+    Record<string, Partial<HypTokenRouterVirtualConfig>>;
+}): Promise<void> {
+  for (const [chain, expectedConfig] of Object.entries(warpRouteConfig)) {
+    if (
+      typeof expectedConfig.interchainSecurityModule !== 'object' ||
+      !collectHybridIsmNodes(expectedConfig.interchainSecurityModule).some(
+        (node) =>
+          node.type === IsmType.DELAYED_FLOW_ROUTER &&
+          node.remoteIsms !== undefined,
+      )
+    ) {
+      continue;
+    }
+
+    const actualIsm = onChainWarpConfig[chain]?.interchainSecurityModule;
+    if (typeof actualIsm !== 'object') continue;
+
+    const actualNodes = collectHybridIsmNodes(actualIsm).filter(
+      (node) => node.type === IsmType.DELAYED_FLOW_ROUTER,
+    );
+    for (const node of actualNodes) {
+      if (!('address' in node) || typeof node.address !== 'string') continue;
+      const delayedIsm = DelayedFlowRouterHookIsm__factory.connect(
+        node.address,
+        multiProvider.getProvider(chain),
+      );
+      for (const domainValue of await delayedIsm.domains()) {
+        const domain = Number(domainValue);
+        if (multiProvider.tryGetChainName(domain) !== null) continue;
+        addNestedDiff(
+          diff,
+          chain,
+          ['interchainSecurityModule', 'remoteIsms', String(domain)],
+          {
+            actual: (await delayedIsm.routers(domain)).toLowerCase(),
+            expected: 'not enrolled',
+          },
+        );
+      }
+    }
+  }
+}
+
+function assertTimelockSupportedByProtocols({
+  multiProvider,
+  warpDeployConfig,
+}: {
+  multiProvider: MultiProvider;
+  warpDeployConfig: WarpRouteDeployConfigMailboxRequired;
+}) {
+  for (const [chain, config] of Object.entries(warpDeployConfig)) {
+    assertTimelockConfigHasNoProxyAdminOwnerOverride(config, chain);
+    const protocol = multiProvider.tryGetProtocol(chain);
+    assert(
+      !config.timelock || (protocol && isEVMLike(protocol)),
+      `Timelock config is not supported on Alt-VM chain '${chain}'.`,
+    );
+  }
 }
 
 export function buildWarpRouteDiff({
@@ -827,6 +1096,13 @@ export function buildWarpRouteDiff({
         currentDeployedConfig.contractVersion = undefined;
       }
 
+      if (expectedDeployedConfig.timelock && currentDeployedConfig.proxyAdmin) {
+        expectedDeployedConfig.proxyAdmin = {
+          ...expectedDeployedConfig.proxyAdmin,
+          owner: currentDeployedConfig.proxyAdmin.owner,
+        };
+      }
+
       if (!expectedDeployedConfig.proxyAdmin?.address) {
         currentDeployedConfig.proxyAdmin = currentDeployedConfig.proxyAdmin
           ? {
@@ -834,6 +1110,19 @@ export function buildWarpRouteDiff({
               address: undefined,
             }
           : undefined;
+      }
+
+      if (expectedDeployedConfig.type === TokenType.atomicLocalRebalancing) {
+        // ALRBs are bare local bridge adapters. The deploy config still carries
+        // a mailbox because the shared warp schema requires one, but the
+        // contract neither stores nor uses mailbox-client or gas-router state.
+        // Keep checking the operational surface (owner, source, token metadata,
+        // scale, targets, and recipients) without reporting those schema-only
+        // fields as on-chain drift.
+        expectedDeployedConfig.mailbox = undefined;
+        currentDeployedConfig.mailbox = undefined;
+        expectedDeployedConfig.destinationGas = undefined;
+        currentDeployedConfig.destinationGas = undefined;
       }
 
       const { mergedObject, isInvalid } = diffObjMerge(
@@ -849,6 +1138,89 @@ export function buildWarpRouteDiff({
     },
     {} as Record<string, ObjectDiff>, // CAST: reduce incrementally populates chain-keyed ObjectDiff entries
   );
+}
+
+async function addTimelockDiffs({
+  multiProvider,
+  diff,
+  onChainWarpConfig,
+  warpRouteConfig,
+}: {
+  multiProvider: MultiProvider;
+  diff: Record<string, ObjectDiff>;
+  onChainWarpConfig: DerivedWarpRouteDeployConfig &
+    Record<string, Partial<HypTokenRouterVirtualConfig>>;
+  warpRouteConfig: WarpRouteDeployConfigMailboxRequired &
+    Record<string, Partial<HypTokenRouterVirtualConfig>>;
+}) {
+  for (const [chain, config] of Object.entries(warpRouteConfig)) {
+    if (!config.timelock || !isEVMLike(multiProvider.getProtocol(chain))) {
+      continue;
+    }
+
+    const proxyAdminOwner = onChainWarpConfig[chain]?.proxyAdmin?.owner;
+    if (!proxyAdminOwner) {
+      addNestedDiff(diff, chain, ['timelock'], {
+        actual: 'missing',
+        expected: 'present',
+      });
+      continue;
+    }
+
+    let delay: BigNumber;
+    let hasProposer: boolean;
+    let hasExecutor: boolean;
+    let hasCanceller: boolean;
+    let hasAdminSelf: boolean;
+    try {
+      const timelock = TimelockController__factory.connect(
+        proxyAdminOwner,
+        multiProvider.getProvider(chain),
+      );
+      const [timelockDelay, adminRole, proposer, executor, canceller] =
+        await Promise.all([
+          timelock.getMinDelay(),
+          timelock.TIMELOCK_ADMIN_ROLE(),
+          timelock.hasRole(PROPOSER_ROLE, config.timelock.roles.proposer),
+          timelock.hasRole(EXECUTOR_ROLE, config.timelock.roles.executor),
+          timelock.hasRole(CANCELLER_ROLE, config.timelock.roles.proposer),
+        ]);
+      delay = timelockDelay;
+      hasProposer = proposer;
+      hasExecutor = executor;
+      hasCanceller = canceller;
+      hasAdminSelf = await timelock.hasRole(adminRole, proxyAdminOwner);
+    } catch (error) {
+      if (!isDeterministicTimelockReadError(error)) throw error;
+      addNestedDiff(diff, chain, ['timelock', 'address'], {
+        actual: proxyAdminOwner,
+        expected: 'TimelockController',
+      });
+      continue;
+    }
+
+    if (!delay.eq(config.timelock.delay)) {
+      addNestedDiff(diff, chain, ['timelock', 'delay'], {
+        actual: delay.toString(),
+        expected: config.timelock.delay.toString(),
+      });
+    }
+
+    const roleChecks = {
+      proposer: hasProposer,
+      executor: hasExecutor,
+      canceller: hasCanceller,
+      admin: hasAdminSelf,
+    };
+    for (const [role, hasRole] of Object.entries(roleChecks)) {
+      if (!hasRole) {
+        addNestedDiff(diff, chain, ['timelock', 'roles', role], {
+          actual: false,
+          expected: true,
+        });
+      }
+    }
+  }
 }
 
 async function addOwnerOverrideDiffs({

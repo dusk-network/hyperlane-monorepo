@@ -1,5 +1,327 @@
 # @hyperlane-xyz/infra
 
+## 44.0.2
+
+### Patch Changes
+
+- Updated dependencies [16df6ee]
+  - @hyperlane-xyz/tron-sdk@25.0.2
+  - @hyperlane-xyz/deploy-sdk@10.0.2
+  - @hyperlane-xyz/sdk@44.0.2
+  - @hyperlane-xyz/keyfunder@0.1.50
+  - @hyperlane-xyz/http-registry-server@44.0.2
+  - @hyperlane-xyz/metrics@1.0.2
+  - @hyperlane-xyz/rebalancer@29.0.2
+  - @hyperlane-xyz/relayer@4.0.2
+  - @hyperlane-xyz/sealevel-sdk@44.0.2
+  - @hyperlane-xyz/utils@44.0.2
+  - @hyperlane-xyz/core@12.1.0
+  - @hyperlane-xyz/provider-sdk@10.0.2
+
+## 44.0.1
+
+### Patch Changes
+
+- Updated dependencies [f269e03]
+  - @hyperlane-xyz/deploy-sdk@10.0.1
+  - @hyperlane-xyz/provider-sdk@10.0.1
+  - @hyperlane-xyz/rebalancer@29.0.1
+  - @hyperlane-xyz/relayer@4.0.1
+  - @hyperlane-xyz/sdk@44.0.1
+  - @hyperlane-xyz/sealevel-sdk@44.0.1
+  - @hyperlane-xyz/tron-sdk@25.0.1
+  - @hyperlane-xyz/http-registry-server@44.0.1
+  - @hyperlane-xyz/keyfunder@0.1.49
+  - @hyperlane-xyz/metrics@1.0.1
+  - @hyperlane-xyz/utils@44.0.1
+  - @hyperlane-xyz/core@12.1.0
+
+## 44.0.0
+
+### Patch Changes
+
+- Updated dependencies [85c44af]
+- Updated dependencies [6fbe5ad]
+  - @hyperlane-xyz/http-registry-server@44.0.0
+  - @hyperlane-xyz/sdk@44.0.0
+  - @hyperlane-xyz/utils@44.0.0
+  - @hyperlane-xyz/deploy-sdk@10.0.0
+  - @hyperlane-xyz/metrics@1.0.0
+  - @hyperlane-xyz/provider-sdk@10.0.0
+  - @hyperlane-xyz/rebalancer@29.0.0
+  - @hyperlane-xyz/relayer@4.0.0
+  - @hyperlane-xyz/tron-sdk@25.0.0
+  - @hyperlane-xyz/keyfunder@0.1.48
+  - @hyperlane-xyz/core@12.1.0
+  - @hyperlane-xyz/sealevel-sdk@44.0.0
+
+## 43.0.0
+
+### Patch Changes
+
+- Updated dependencies [0848474]
+- Updated dependencies [e76189e]
+- Updated dependencies [3ced099]
+- Updated dependencies [a00b342]
+- Updated dependencies [b58c7eb]
+- Updated dependencies [3c65f58]
+- Updated dependencies [60fc463]
+- Updated dependencies [8bcc7ab]
+- Updated dependencies [7cf9c01]
+- Updated dependencies [8d91ef8]
+- Updated dependencies [11f2dee]
+  - @hyperlane-xyz/sdk@43.0.0
+  - @hyperlane-xyz/relayer@3.0.0
+  - @hyperlane-xyz/sealevel-sdk@43.0.0
+  - @hyperlane-xyz/deploy-sdk@9.0.0
+  - @hyperlane-xyz/provider-sdk@9.0.0
+  - @hyperlane-xyz/rebalancer@28.0.0
+  - @hyperlane-xyz/utils@43.0.0
+  - @hyperlane-xyz/http-registry-server@43.0.0
+  - @hyperlane-xyz/keyfunder@0.1.47
+  - @hyperlane-xyz/metrics@0.2.40
+  - @hyperlane-xyz/tron-sdk@24.2.1
+  - @hyperlane-xyz/core@12.1.0
+
+## 42.0.0
+
+### Patch Changes
+
+- Updated dependencies [1713edd]
+- Updated dependencies [9003bab]
+- Updated dependencies [aa29187]
+- Updated dependencies [f0f8a56]
+- Updated dependencies [1b136e1]
+- Updated dependencies [1b136e1]
+- Updated dependencies [1b136e1]
+- Updated dependencies [9a8bb17]
+  - @hyperlane-xyz/sdk@42.0.0
+  - @hyperlane-xyz/tron-sdk@24.2.0
+  - @hyperlane-xyz/relayer@2.0.0
+  - @hyperlane-xyz/http-registry-server@42.0.0
+  - @hyperlane-xyz/keyfunder@0.1.46
+  - @hyperlane-xyz/metrics@0.2.39
+  - @hyperlane-xyz/rebalancer@27.3.18
+  - @hyperlane-xyz/deploy-sdk@8.1.3
+  - @hyperlane-xyz/sealevel-sdk@42.0.0
+  - @hyperlane-xyz/utils@42.0.0
+  - @hyperlane-xyz/core@12.1.0
+  - @hyperlane-xyz/provider-sdk@8.1.3
+
+## 41.3.1
+
+### Patch Changes
+
+- Updated dependencies [c201794]
+  - @hyperlane-xyz/sdk@41.3.1
+  - @hyperlane-xyz/http-registry-server@41.3.1
+  - @hyperlane-xyz/keyfunder@0.1.45
+  - @hyperlane-xyz/metrics@0.2.38
+  - @hyperlane-xyz/rebalancer@27.3.17
+  - @hyperlane-xyz/relayer@1.1.45
+  - @hyperlane-xyz/sealevel-sdk@41.3.1
+  - @hyperlane-xyz/utils@41.3.1
+  - @hyperlane-xyz/deploy-sdk@8.1.2
+  - @hyperlane-xyz/core@12.1.0
+  - @hyperlane-xyz/provider-sdk@8.1.2
+  - @hyperlane-xyz/tron-sdk@24.1.5
+
+## 41.3.0
+
+### Patch Changes
+
+- Updated dependencies [4a21153]
+- Updated dependencies [c328efa]
+- Updated dependencies [4a21153]
+- Updated dependencies [4a21153]
+- Updated dependencies [322a418]
+- Updated dependencies [d5d7d1a]
+  - @hyperlane-xyz/sdk@41.3.0
+  - @hyperlane-xyz/http-registry-server@41.3.0
+  - @hyperlane-xyz/keyfunder@0.1.44
+  - @hyperlane-xyz/metrics@0.2.37
+  - @hyperlane-xyz/rebalancer@27.3.16
+  - @hyperlane-xyz/relayer@1.1.44
+  - @hyperlane-xyz/sealevel-sdk@41.3.0
+  - @hyperlane-xyz/utils@41.3.0
+  - @hyperlane-xyz/deploy-sdk@8.1.1
+  - @hyperlane-xyz/core@12.1.0
+  - @hyperlane-xyz/provider-sdk@8.1.1
+  - @hyperlane-xyz/tron-sdk@24.1.4
+
+## 41.2.0
+
+### Patch Changes
+
+- Updated dependencies [bd4e5f0]
+- Updated dependencies [e7666ef]
+- Updated dependencies [5fac94d]
+- Updated dependencies [5899416]
+- Updated dependencies [5fac94d]
+  - @hyperlane-xyz/provider-sdk@8.1.0
+  - @hyperlane-xyz/sealevel-sdk@41.2.0
+  - @hyperlane-xyz/deploy-sdk@8.1.0
+  - @hyperlane-xyz/sdk@41.2.0
+  - @hyperlane-xyz/core@12.1.0
+  - @hyperlane-xyz/rebalancer@27.3.15
+  - @hyperlane-xyz/tron-sdk@24.1.3
+  - @hyperlane-xyz/http-registry-server@41.2.0
+  - @hyperlane-xyz/keyfunder@0.1.43
+  - @hyperlane-xyz/metrics@0.2.36
+  - @hyperlane-xyz/relayer@1.1.43
+  - @hyperlane-xyz/utils@41.2.0
+
+## 41.1.0
+
+### Patch Changes
+
+- Updated dependencies [0adcbb2]
+  - @hyperlane-xyz/sealevel-sdk@41.1.0
+  - @hyperlane-xyz/http-registry-server@41.1.0
+  - @hyperlane-xyz/deploy-sdk@8.0.4
+  - @hyperlane-xyz/sdk@41.1.0
+  - @hyperlane-xyz/keyfunder@0.1.42
+  - @hyperlane-xyz/metrics@0.2.35
+  - @hyperlane-xyz/rebalancer@27.3.14
+  - @hyperlane-xyz/relayer@1.1.42
+  - @hyperlane-xyz/utils@41.1.0
+  - @hyperlane-xyz/core@12.0.0
+  - @hyperlane-xyz/provider-sdk@8.0.4
+  - @hyperlane-xyz/tron-sdk@24.1.2
+
+## 41.0.0
+
+### Patch Changes
+
+- Updated dependencies [0057c5d]
+- Updated dependencies [fa19409]
+- Updated dependencies [1a32515]
+- Updated dependencies [1ba623d]
+- Updated dependencies [fcb4331]
+- Updated dependencies [eb24243]
+- Updated dependencies [72738e2]
+- Updated dependencies [fa19409]
+- Updated dependencies [7846658]
+- Updated dependencies [0765fe0]
+- Updated dependencies [b1c6b7e]
+- Updated dependencies [a09ba71]
+- Updated dependencies [d9426bc]
+  - @hyperlane-xyz/sdk@41.0.0
+  - @hyperlane-xyz/utils@41.0.0
+  - @hyperlane-xyz/relayer@1.1.41
+  - @hyperlane-xyz/deploy-sdk@8.0.3
+  - @hyperlane-xyz/http-registry-server@41.0.0
+  - @hyperlane-xyz/keyfunder@0.1.41
+  - @hyperlane-xyz/metrics@0.2.34
+  - @hyperlane-xyz/rebalancer@27.3.13
+  - @hyperlane-xyz/core@12.0.0
+  - @hyperlane-xyz/provider-sdk@8.0.3
+  - @hyperlane-xyz/sealevel-sdk@41.0.0
+  - @hyperlane-xyz/tron-sdk@24.1.1
+
+## 40.0.0
+
+### Patch Changes
+
+- Updated dependencies [745fb77]
+- Updated dependencies [745fb77]
+- Updated dependencies [469da6d]
+- Updated dependencies [745fb77]
+- Updated dependencies [74f3760]
+- Updated dependencies [abeeb52]
+- Updated dependencies [8944dd2]
+- Updated dependencies [eb9c37c]
+- Updated dependencies [3a74600]
+- Updated dependencies [57b1e14]
+- Updated dependencies [f3a6a4e]
+- Updated dependencies [d6e923f]
+- Updated dependencies [4c4f3f9]
+- Updated dependencies [4c4f3f9]
+- Updated dependencies [5830b8e]
+- Updated dependencies [d3bbedf]
+- Updated dependencies [e5908e9]
+- Updated dependencies [8944dd2]
+- Updated dependencies [89e6a8e]
+- Updated dependencies [c2301b2]
+- Updated dependencies [de37b68]
+- Updated dependencies [1cac66f]
+- Updated dependencies [c0ca851]
+- Updated dependencies [a7f757b]
+- Updated dependencies [745fb77]
+- Updated dependencies [4acd9a6]
+- Updated dependencies [c6a2f61]
+  - @hyperlane-xyz/core@12.0.0
+  - @hyperlane-xyz/sdk@40.0.0
+  - @hyperlane-xyz/tron-sdk@24.1.0
+  - @hyperlane-xyz/keyfunder@0.1.40
+  - @hyperlane-xyz/metrics@0.2.33
+  - @hyperlane-xyz/rebalancer@27.3.12
+  - @hyperlane-xyz/relayer@1.1.40
+  - @hyperlane-xyz/http-registry-server@40.0.0
+  - @hyperlane-xyz/deploy-sdk@8.0.2
+  - @hyperlane-xyz/sealevel-sdk@40.0.0
+  - @hyperlane-xyz/utils@40.0.0
+  - @hyperlane-xyz/provider-sdk@8.0.2
+
+## 39.1.0
+
+### Patch Changes
+
+- Updated dependencies [4976bb1]
+- Updated dependencies [6c9210b]
+- Updated dependencies [086ec59]
+  - @hyperlane-xyz/sdk@39.1.0
+  - @hyperlane-xyz/utils@39.1.0
+  - @hyperlane-xyz/deploy-sdk@8.0.1
+  - @hyperlane-xyz/http-registry-server@39.1.0
+  - @hyperlane-xyz/keyfunder@0.1.39
+  - @hyperlane-xyz/metrics@0.2.32
+  - @hyperlane-xyz/rebalancer@27.3.11
+  - @hyperlane-xyz/relayer@1.1.39
+  - @hyperlane-xyz/core@11.3.1
+  - @hyperlane-xyz/provider-sdk@8.0.1
+  - @hyperlane-xyz/sealevel-sdk@39.1.0
+  - @hyperlane-xyz/tron-sdk@24.0.1
+
+## 39.0.0
+
+### Patch Changes
+
+- Updated dependencies [f41f9fd]
+- Updated dependencies [ba0e9c1]
+- Updated dependencies [4ef1fde]
+- Updated dependencies [43eb24a]
+- Updated dependencies [406b5c7]
+- Updated dependencies [11e215e]
+- Updated dependencies [bf7c658]
+- Updated dependencies [7e40466]
+- Updated dependencies [496198d]
+- Updated dependencies [4bebbbf]
+- Updated dependencies [6f61265]
+- Updated dependencies [6793396]
+- Updated dependencies [1a31d04]
+- Updated dependencies [735793b]
+- Updated dependencies [2d398b9]
+- Updated dependencies [15b249c]
+- Updated dependencies [6967bef]
+- Updated dependencies [213f626]
+- Updated dependencies [3811ba9]
+- Updated dependencies [6c2ca1d]
+- Updated dependencies [1a31d04]
+- Updated dependencies [9997aee]
+  - @hyperlane-xyz/sdk@39.0.0
+  - @hyperlane-xyz/provider-sdk@8.0.0
+  - @hyperlane-xyz/sealevel-sdk@39.0.0
+  - @hyperlane-xyz/tron-sdk@24.0.0
+  - @hyperlane-xyz/metrics@0.2.31
+  - @hyperlane-xyz/deploy-sdk@8.0.0
+  - @hyperlane-xyz/utils@39.0.0
+  - @hyperlane-xyz/http-registry-server@39.0.0
+  - @hyperlane-xyz/keyfunder@0.1.38
+  - @hyperlane-xyz/rebalancer@27.3.10
+  - @hyperlane-xyz/relayer@1.1.38
+  - @hyperlane-xyz/core@11.3.1
+
 ## 38.0.0
 
 ### Patch Changes

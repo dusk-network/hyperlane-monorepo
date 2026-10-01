@@ -64,17 +64,27 @@ impl IncrementalMerkle {
 
     /// Calculate the current tree root
     pub fn root(&self) -> H256 {
-        let mut node: H256 = Default::default();
-        let mut size = self.count;
+        // Each low zero count bit hashes the empty subtree with itself. Those
+        // nodes are already precomputed, independently of the stored branch.
+        let skip = self.count.trailing_zeros() as usize;
+        if skip >= TREE_DEPTH {
+            return ZERO_HASHES[TREE_DEPTH];
+        }
+        let mut node = ZERO_HASHES[skip];
+        let mut size = self.count >> skip;
 
-        self.branch.iter().enumerate().for_each(|(i, elem)| {
-            node = if (size & 1) == 1 {
-                hash_concat(elem, node)
-            } else {
-                hash_concat(node, ZERO_HASHES[i])
-            };
-            size /= 2;
-        });
+        self.branch
+            .iter()
+            .enumerate()
+            .skip(skip)
+            .for_each(|(i, elem)| {
+                node = if (size & 1) == 1 {
+                    hash_concat(elem, node)
+                } else {
+                    hash_concat(node, ZERO_HASHES[i])
+                };
+                size /= 2;
+            });
 
         node
     }
@@ -107,9 +117,155 @@ impl IncrementalMerkle {
     }
 }
 
+/// A persisted snapshot of an `IncrementalMerkle`: just the O(depth) frontier
+/// plus the leaf count (about a kilobyte), not the full tree. A validator
+/// restart can restore this instead of re-ingesting every historical leaf from
+/// the local database, then replay only the tail and let the usual
+/// root-equality check against the correctness checkpoint prove the result.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MerkleTreeSnapshot {
+    /// Index of the last leaf covered by the snapshot (`count - 1`).
+    pub index: u32,
+    /// Tree root at the snapshot index.
+    pub root: H256,
+    /// Borsh-serialized `IncrementalMerkle`.
+    pub tree: Vec<u8>,
+}
+
+impl MerkleTreeSnapshot {
+    /// Capture the current tree state. Fails on an empty tree, which has no
+    /// meaningful index.
+    pub fn capture(tree: &IncrementalMerkle) -> eyre::Result<Self> {
+        if tree.count() == 0 {
+            eyre::bail!("Cannot snapshot an empty merkle tree");
+        }
+        Ok(Self {
+            index: tree.index(),
+            root: tree.root(),
+            tree: borsh::to_vec(tree)?,
+        })
+    }
+
+    /// Restore the tree, verifying the bytes actually decode to the claimed
+    /// index and root. Callers must additionally check the root against a
+    /// trusted checkpoint before replaying onto the restored tree.
+    pub fn restore(&self) -> eyre::Result<IncrementalMerkle> {
+        let tree: IncrementalMerkle = borsh::from_slice(&self.tree)?;
+        let decoded_index = u32::try_from(tree.count())
+            .ok()
+            .and_then(|count| count.checked_sub(1));
+        if decoded_index != Some(self.index) {
+            eyre::bail!(
+                "Snapshot index {} does not match decoded tree count {}",
+                self.index,
+                tree.count(),
+            );
+        }
+        if tree.root() != self.root {
+            eyre::bail!("Snapshot root does not match decoded tree root");
+        }
+        Ok(tree)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    #[ignore = "Local replay CPU benchmark; run with --ignored --nocapture"]
+    fn benchmark_snapshot_replay_cpu() {
+        use std::time::Instant;
+        const LEAVES: u32 = 100_000;
+        const TAIL: u32 = 1_000;
+        fn replay(tree: &mut IncrementalMerkle, first: u32, end: u32) {
+            for index in first..end {
+                tree.ingest(H256::from_low_u64_be(u64::from(index)));
+                std::hint::black_box(tree.root());
+            }
+        }
+        let mut fixture = IncrementalMerkle::default();
+        replay(&mut fixture, 0, LEAVES - TAIL);
+        let stale = serde_json::to_vec(&MerkleTreeSnapshot::capture(&fixture).unwrap()).unwrap();
+        replay(&mut fixture, LEAVES - TAIL, LEAVES);
+        let current = serde_json::to_vec(&MerkleTreeSnapshot::capture(&fixture).unwrap()).unwrap();
+        let expected_root = fixture.root();
+        for (name, snapshot, first) in [
+            ("cold", None, 0),
+            ("current", Some(&current), LEAVES),
+            ("tail_1000", Some(&stale), LEAVES - TAIL),
+        ] {
+            let started = Instant::now();
+            let mut tree = snapshot
+                .map(|bytes| {
+                    serde_json::from_slice::<MerkleTreeSnapshot>(bytes)
+                        .unwrap()
+                        .restore()
+                        .unwrap()
+                })
+                .unwrap_or_default();
+            replay(&mut tree, first, LEAVES);
+            assert_eq!(tree.root(), expected_root);
+            println!(
+                "{name}: leaves={LEAVES} replayed={} elapsed={:?} snapshot_bytes={}",
+                LEAVES - first,
+                started.elapsed(),
+                snapshot.map_or(0, |bytes| bytes.len())
+            );
+        }
+    }
+
+    fn legacy_root(tree: &IncrementalMerkle) -> H256 {
+        let mut node: H256 = Default::default();
+        let mut size = tree.count;
+        for (i, elem) in tree.branch.iter().enumerate() {
+            node = if (size & 1) == 1 {
+                hash_concat(elem, node)
+            } else {
+                hash_concat(node, ZERO_HASHES[i])
+            };
+            size /= 2;
+        }
+        node
+    }
+
+    #[test]
+    fn root_zero_prefix_matches_legacy_for_arbitrary_branches_and_counts() {
+        let mut seed = 0x0123_4567_89ab_cdefu64;
+        let mut random = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let counts = (0..2048)
+            .chain((0..usize::BITS).flat_map(|bit| {
+                let count = 1usize << bit;
+                [count, count.saturating_sub(1), count.saturating_add(1)]
+            }))
+            .chain([usize::MAX, usize::MAX - 1]);
+        for count in counts {
+            let branch = std::array::from_fn(|_| {
+                let mut bytes = [0; 32];
+                for chunk in bytes.chunks_mut(8) {
+                    chunk.copy_from_slice(&random().to_be_bytes());
+                }
+                H256::from(bytes)
+            });
+            let tree = IncrementalMerkle { branch, count };
+            assert_eq!(tree.root(), legacy_root(&tree), "count={count}");
+        }
+    }
+
+    #[test]
+    fn root_zero_prefix_matches_legacy_through_sequential_ingestion() {
+        let mut tree = IncrementalMerkle::default();
+        for leaf in 0..8192 {
+            assert_eq!(tree.root(), legacy_root(&tree), "leaf count={leaf}");
+            tree.ingest(H256::from_low_u64_be(leaf));
+        }
+        assert_eq!(tree.root(), legacy_root(&tree));
+    }
 
     #[test]
     fn borsh_roundtrip() {
@@ -140,6 +296,45 @@ mod test {
         let serialized = borsh::to_vec(&tree).unwrap();
         let deserialized: IncrementalMerkle = borsh::from_slice(&serialized).unwrap();
         assert_eq!(tree, deserialized);
+    }
+
+    #[test]
+    fn snapshot_capture_restore_round_trip() {
+        let mut tree = IncrementalMerkle::default();
+        assert!(MerkleTreeSnapshot::capture(&tree).is_err());
+        for i in 0..17u64 {
+            tree.ingest(H256::from_low_u64_be(i));
+        }
+        let snapshot = MerkleTreeSnapshot::capture(&tree).unwrap();
+        assert_eq!(snapshot.index, 16);
+        assert_eq!(snapshot.root, tree.root());
+        // ~1 KiB frontier, not the full tree.
+        assert!(snapshot.tree.len() < 2048);
+        let restored = snapshot.restore().unwrap();
+        assert_eq!(restored, tree);
+
+        let mut tampered = snapshot.clone();
+        tampered.root = H256::from_low_u64_be(0xdead);
+        assert!(tampered.restore().is_err());
+        let mut misindexed = snapshot.clone();
+        misindexed.index += 1;
+        assert!(misindexed.restore().is_err());
+
+        // `IncrementalMerkle` is limited to a 32-bit leaf count. On 64-bit
+        // hosts, a malformed count with the same low 32 bits produces the same
+        // root; reject it instead of allowing the index conversion to wrap.
+        #[cfg(target_pointer_width = "64")]
+        {
+            let mut oversized_tree = tree.clone();
+            oversized_tree.count += (u32::MAX as usize) + 1;
+            assert_eq!(oversized_tree.root(), tree.root());
+            let oversized = MerkleTreeSnapshot {
+                index: snapshot.index,
+                root: snapshot.root,
+                tree: borsh::to_vec(&oversized_tree).expect("oversized test tree should serialize"),
+            };
+            assert!(oversized.restore().is_err());
+        }
     }
 }
 

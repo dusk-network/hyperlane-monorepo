@@ -1,6 +1,6 @@
 {
   "name": "@hyperlane-xyz/starknet-core",
-  "version": "38.0.0",
+  "version": "44.0.2",
   "description": "Core cairo contracts for Hyperlane",
   "keywords": [
     "Cairo",
@@ -19,9 +19,14 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./runtime": {
+      "types": "./dist/runtime.d.ts",
+      "default": "./dist/runtime.js"
     }
   },
   "scripts": {
+    "test:ci": "tsx --test scripts/generate-artifacts.test.ts",
     "fetch-contracts": "./scripts/fetch-contracts-release.sh",
     "generate-artifacts": "tsx ./scripts/generate-artifacts.ts",
     "build": "tsc && pnpm fetch-contracts && pnpm generate-artifacts",
@@ -38,5 +43,8 @@
     "globby": "^14.1.0",
     "tsx": "catalog:",
     "typescript": "catalog:"
+  },
+  "engines": {
+    "node": ">=22"
   }
 }

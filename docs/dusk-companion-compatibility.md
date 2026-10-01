@@ -1,5 +1,35 @@
 # Dusk companion compatibility manifest
 
+Date: 2026-10-01
+
+## October integration inputs
+
+| Component | Exact reference | Role |
+| --- | --- | --- |
+| Hyperlane upstream | `0ba2eb34de748d2b2ae31bdcadb5fb0267e9a7ee` | Upstream main merged by the October fork sync |
+| Dusk agent merged baseline | `47954778f2398dd3b6debfb4455c2588dedc4e22` | Merged monorepo PR #1, including prepared-transaction identity retention on helper timeout |
+| Dusk contracts and helper | `08552b14ebe2b423ed8cb598f184009c66c0f482` | Merged Dusk PRs #1, #3, and #10, including withdrawal and manual reproduction workflows |
+| Companion types pin | `f6be24a411f2a0a247b8d1b798106c37449f7dcf` | Unchanged immutable public dependency; an ancestor of merged Dusk main |
+| Rusk | `5c6a0bab11c61fb4c81275afdeceb97fb942d85e` | Unchanged Dusk 1.7.1 VM and node boundary |
+
+The October sync adapts the agent baseline to upstream's checkpoint quorum,
+reorg cancellation, chain metrics, and native-token configuration changes.
+Its exact candidate is the sync PR's tested commit, not the baseline SHA above.
+See [`dusk-upstream-compatibility-review.md`](dusk-upstream-compatibility-review.md)
+for those integration decisions.
+
+Fresh Mac validation of merged Dusk source covered 124 VM tests, 29 type tests,
+three ABI tests, 26 helper tests, eight E2E driver tests, and operator compilation.
+The helper-timeout regression failed against the prior agent implementation
+and passed after retaining the prepared transaction hash.
+
+No fresh live cross-chain E2E or production deployment was performed in October.
+The protected manual reproduction still requires its trusted runner and private
+source access. The July live-run receipts below remain historical evidence for
+those exact earlier source sets; they do not certify the October sync.
+
+## Historical July candidate and receipts
+
 Date: 2026-07-21
 
 This manifest is the cross-repository authority for the reopened Hyperlane/Dusk

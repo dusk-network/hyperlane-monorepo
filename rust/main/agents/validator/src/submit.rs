@@ -1,31 +1,152 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 use std::vec;
 
-use futures::future::join_all;
+use futures::{future::join_all, FutureExt, StreamExt};
 use prometheus::IntGauge;
-use tokio::time::sleep;
+use tokio::{
+    sync::{watch, Notify},
+    time::sleep,
+};
 use tracing::{debug, error, info, warn};
 
 use hyperlane_base::db::HyperlaneDb;
 use hyperlane_base::{CheckpointSyncer, CoreMetrics};
 use hyperlane_core::rpc_clients::call_and_retry_indefinitely;
 use hyperlane_core::{
-    accumulator::incremental::IncrementalMerkle, Checkpoint, CheckpointAtBlock,
-    CheckpointWithMessageId, HyperlaneChain, HyperlaneContract, HyperlaneDomain,
-    HyperlaneSignerExt, IncrementalMerkleAtBlock,
+    accumulator::incremental::{IncrementalMerkle, MerkleTreeSnapshot},
+    Checkpoint, CheckpointAtBlock, CheckpointWithMessageId, HyperlaneChain, HyperlaneContract,
+    HyperlaneDomain, HyperlaneSignerExt, IncrementalMerkleAtBlock, H256,
 };
 use hyperlane_core::{
     ChainResult, HyperlaneSigner, MerkleTreeHook, ReorgEvent, ReorgPeriod, SignedType,
 };
 use hyperlane_ethereum::{Signers, SingletonSignerHandle};
 
+use crate::checkpoint_consensus::{CheckpointConsensus, CheckpointReader};
+use crate::merkle_tree_hook_sync::{MerkleTreeRpcRecovery, RecoveryProgress};
 use crate::reorg_reporter::ReorgReporter;
 use crate::reorg_tombstone;
+use crate::server::ValidatorReadiness;
+
+const IDLE_CHECKPOINT_AUDIT_INTERVAL: Duration = Duration::from_secs(60);
+
+const CHECKPOINT_SAMPLE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+const CHECKPOINT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(120);
+
+const REORG_STATUS_WRITE_TIMEOUT: Duration = Duration::from_secs(20);
+
+const REORG_STATUS_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+const REORG_REPORT_TIMEOUT: Duration = Duration::from_secs(20);
 
 const CHECKPOINT_SUBMISSION_CHUNK_INTERVAL: Duration = Duration::from_millis(100);
+
+const MERKLE_REPLAY_YIELD_INTERVAL: usize = 256;
+
+// All queued checkpoints share the hook address and domain of the final verified
+// checkpoint. Retain only the fields that vary until that correctness gate passes.
+struct QueuedCheckpoint {
+    root: H256,
+    index: u32,
+    message_id: H256,
+}
+
+impl QueuedCheckpoint {
+    fn into_checkpoint(self, verified_checkpoint: Checkpoint) -> CheckpointWithMessageId {
+        CheckpointWithMessageId {
+            checkpoint: Checkpoint {
+                root: self.root,
+                index: self.index,
+                ..verified_checkpoint
+            },
+            message_id: self.message_id,
+        }
+    }
+}
+
+// Keep frontiers only at sampled endpoint indices. Historical publication replays
+// the DB separately, so live verification must not retain a per-message queue.
+struct CheckpointTree {
+    committed: IncrementalMerkle,
+    accumulated: IncrementalMerkle,
+    sampled: BTreeMap<u32, (IncrementalMerkle, H256)>,
+}
+
+impl CheckpointTree {
+    fn new(tree: IncrementalMerkle) -> Self {
+        Self {
+            accumulated: tree.clone(),
+            committed: tree,
+            sampled: BTreeMap::new(),
+        }
+    }
+
+    fn prepare_samples(&mut self, indices: &BTreeSet<u32>) {
+        self.sampled.retain(|index, _| indices.contains(index));
+        // A refreshed endpoint can retreat to an index we did not capture.
+        // Reconstruct it from the last committed frontier, using cached DB leaves.
+        if indices.iter().any(|index| {
+            usize::try_from(*index).expect("leaf index fits in usize") >= self.committed.count()
+                && usize::try_from(*index).expect("leaf index fits in usize")
+                    < self.accumulated.count()
+                && !self.sampled.contains_key(index)
+        }) {
+            self.accumulated = self.committed.clone();
+            self.sampled.clear();
+        }
+    }
+
+    fn root_at(&self, index: u32) -> Option<H256> {
+        if self.committed.count() > 0 && index == self.committed.index() {
+            return Some(self.committed.root());
+        }
+        self.sampled.get(&index).map(|(tree, _)| tree.root())
+    }
+
+    fn ingest(&mut self, message_id: H256, capture: bool) {
+        self.accumulated.ingest(message_id);
+        if capture {
+            self.sampled.insert(
+                self.accumulated.index(),
+                (self.accumulated.clone(), message_id),
+            );
+        }
+    }
+
+    fn commit(&mut self, index: u32) -> Option<QueuedCheckpoint> {
+        if self.committed.count() > 0 && self.committed.index() == index {
+            return None;
+        }
+        let (tree, message_id) = self
+            .sampled
+            .remove(&index)
+            .expect("verified sampled frontier");
+        let latest = QueuedCheckpoint {
+            root: tree.root(),
+            index,
+            message_id,
+        };
+        self.committed = tree;
+        self.sampled.retain(|sample_index, _| *sample_index > index);
+        Some(latest)
+    }
+}
+
+enum CheckpointBatch {
+    WaitingForInsertions,
+    WaitingForRpc,
+    Verified {
+        checkpoint: CheckpointAtBlock,
+        latest: Option<QueuedCheckpoint>,
+    },
+}
 
 #[derive(Clone)]
 pub(crate) struct ValidatorSubmitter {
@@ -39,12 +160,16 @@ pub(crate) struct ValidatorSubmitter {
     db: Arc<dyn HyperlaneDb>,
     metrics: ValidatorSubmitterMetrics,
     max_sign_concurrency: usize,
-    reorg_reporter: Arc<dyn ReorgReporter>,
+    reorg_reporter: Option<Arc<dyn ReorgReporter>>,
+    readiness: Arc<ValidatorReadiness>,
     reorg_tombstone_path: PathBuf,
-    /// Process-wide live fail-stop shared by the backfill and tip clones.
-    reorg_fail_stop: Arc<AtomicBool>,
-    #[cfg(test)]
-    sign_attempts: Arc<std::sync::atomic::AtomicUsize>,
+    reorg_halt: watch::Sender<bool>,
+    checkpoint_wake: Option<Arc<Notify>>,
+    websocket_healthy: Option<Arc<AtomicBool>>,
+    rpc_recovery: Option<MerkleTreeRpcRecovery>,
+    recovery_progress: Arc<tokio::sync::Mutex<RecoveryProgress>>,
+    historical_publication: bool,
+    checkpoint_consensus: CheckpointConsensus,
 }
 
 impl ValidatorSubmitter {
@@ -59,9 +184,14 @@ impl ValidatorSubmitter {
         db: Arc<dyn HyperlaneDb>,
         metrics: ValidatorSubmitterMetrics,
         max_sign_concurrency: usize,
-        reorg_reporter: Arc<dyn ReorgReporter>,
+        reorg_reporter: Option<Arc<dyn ReorgReporter>>,
+        readiness: Arc<ValidatorReadiness>,
         reorg_tombstone_path: PathBuf,
     ) -> Self {
+        assert!(
+            max_sign_concurrency > 0,
+            "maxSignConcurrency must be greater than zero"
+        );
         Self {
             reorg_period,
             interval,
@@ -73,10 +203,15 @@ impl ValidatorSubmitter {
             metrics,
             max_sign_concurrency,
             reorg_reporter,
+            readiness,
             reorg_tombstone_path,
-            reorg_fail_stop: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
-            sign_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            reorg_halt: watch::channel(false).0,
+            checkpoint_wake: None,
+            websocket_healthy: None,
+            rpc_recovery: None,
+            recovery_progress: Arc::default(),
+            historical_publication: false,
+            checkpoint_consensus: CheckpointConsensus::Majority,
         }
     }
 
@@ -92,10 +227,11 @@ impl ValidatorSubmitter {
         db: Arc<dyn HyperlaneDb>,
         metrics: ValidatorSubmitterMetrics,
         max_sign_concurrency: usize,
-        reorg_reporter: Arc<dyn ReorgReporter>,
+        reorg_reporter: Option<Arc<dyn ReorgReporter>>,
+        readiness: Arc<ValidatorReadiness>,
     ) -> Self {
         static NEXT_PATH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let unique = NEXT_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let unique = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
             "hyperlane-validator-test-{}-{unique}.reorg-fail-stop",
             std::process::id()
@@ -111,21 +247,54 @@ impl ValidatorSubmitter {
             metrics,
             max_sign_concurrency,
             reorg_reporter,
+            readiness,
             path,
         )
     }
 
-    pub(crate) fn checkpoint(&self, tree: &IncrementalMerkle) -> Checkpoint {
+    pub(crate) fn with_checkpoint_wake(mut self, checkpoint_wake: Option<Arc<Notify>>) -> Self {
+        self.checkpoint_wake = checkpoint_wake;
+        self
+    }
+
+    pub(crate) fn with_websocket_health(mut self, health: Option<Arc<AtomicBool>>) -> Self {
+        self.websocket_healthy = health;
+        self
+    }
+
+    fn websocket_is_healthy(&self) -> bool {
+        self.websocket_healthy
+            .as_ref()
+            .is_some_and(|health| health.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn with_rpc_recovery(mut self, recovery: MerkleTreeRpcRecovery) -> Self {
+        self.rpc_recovery = Some(recovery);
+        self
+    }
+
+    async fn wait_for_checkpoint_check(&self) {
+        if let Some(checkpoint_wake) = &self.checkpoint_wake {
+            tokio::select! {
+                _ = sleep(self.interval) => {}
+                _ = checkpoint_wake.notified() => {}
+            }
+        } else {
+            sleep(self.interval).await;
+        }
+    }
+
+    fn checkpoint(&self, root: H256, index: u32) -> Checkpoint {
         Checkpoint {
             merkle_tree_hook_address: self.merkle_tree_hook.address(),
             mailbox_domain: self.merkle_tree_hook.domain().id(),
-            root: tree.root(),
-            index: tree.index(),
+            root,
+            index,
         }
     }
 
     pub(crate) fn checkpoint_at_block(&self, tree: &IncrementalMerkleAtBlock) -> CheckpointAtBlock {
-        let checkpoint = self.checkpoint(&tree.tree);
+        let checkpoint = self.checkpoint(tree.tree.root(), tree.tree.index());
 
         CheckpointAtBlock {
             checkpoint,
@@ -135,11 +304,32 @@ impl ValidatorSubmitter {
 
     /// Submits signed checkpoints from index 0 until the target checkpoint (inclusive).
     /// Runs idly forever once the target checkpoint is reached to avoid exiting the task.
-    pub(crate) async fn backfill_checkpoint_submitter(self, target_checkpoint: CheckpointAtBlock) {
-        self.assert_reorg_fail_stop_inactive();
-        let mut tree = IncrementalMerkle::default();
+    pub(crate) async fn backfill_checkpoint_submitter(
+        mut self,
+        target_checkpoint: CheckpointAtBlock,
+        mut tree: IncrementalMerkle,
+    ) {
+        self.start_historical_publication(&tree);
         self.submit_checkpoints_until_correctness_checkpoint(&mut tree, &target_checkpoint)
             .await;
+
+        match MerkleTreeSnapshot::capture(&tree) {
+            Ok(snapshot) => {
+                if let Err(err) = self
+                    .unless_reorg(self.checkpoint_syncer.write_merkle_snapshot(&snapshot))
+                    .await
+                {
+                    warn!(
+                        ?err,
+                        index = snapshot.index,
+                        "Failed to write merkle snapshot"
+                    );
+                }
+            }
+            Err(err) => {
+                warn!(?err, "Failed to capture merkle snapshot");
+            }
+        }
 
         info!(
             ?target_checkpoint,
@@ -150,8 +340,520 @@ impl ValidatorSubmitter {
         self.metrics.backfill_complete.set(1);
     }
 
+    /// Authenticate the replay frontier before starting indexing.
+    pub(crate) async fn restore_consensus_tree(&self) -> IncrementalMerkle {
+        let restored = self.restored_snapshot_tree(u32::MAX).await;
+        if restored.is_some() {
+            self.readiness.mark_operation_ready("checkpoint_snapshot");
+            self.metrics.backfill_complete.set(1);
+        }
+        restored.unwrap_or_default()
+    }
+
+    /// Authenticate indexed insertions against the configured endpoint threshold. Historical
+    /// publication cannot block new verified messages.
+    pub(crate) async fn consensus_checkpoint_submitter(
+        mut self,
+        reader: Arc<CheckpointReader>,
+        restored_tree: IncrementalMerkle,
+    ) {
+        self.checkpoint_consensus = reader.consensus;
+        let started = Instant::now();
+        let mut initial_verification_complete = false;
+        self.record_tree_progress(&restored_tree).await;
+        let (history_target, history_targets) = watch::channel(None);
+        let mut history = tokio::task::JoinSet::new();
+        history.spawn(
+            self.clone()
+                .checkpoint_history_submitter(restored_tree.clone(), history_targets),
+        );
+        let mut tree = CheckpointTree::new(restored_tree);
+        let mut samples: Option<Vec<Option<CheckpointAtBlock>>> = None;
+        let mut sampled_at = tokio::time::Instant::now();
+        let mut next_rpc_attempt = sampled_at;
+        let mut sampled_batch = None;
+        let mut last_rpc_audit = tokio::time::Instant::now();
+        loop {
+            // The single worker is cancelled when the signing task exits.
+            if let Some(result) = history.try_join_next() {
+                result.expect("Historical checkpoint publication failed");
+                panic!("Historical checkpoint publication stopped unexpectedly");
+            }
+            let next_index =
+                u32::try_from(tree.committed.count()).expect("Merkle leaf count fits in u32");
+            // Count/progress probes cannot detect a same-count reorg. Retain a
+            // bounded authenticated root audit even while the stream is healthy.
+            let idle_audit_due = tree.committed.count() > 0
+                && last_rpc_audit.elapsed() >= IDLE_CHECKPOINT_AUDIT_INTERVAL;
+            if (self.rpc_recovery.is_none() || self.websocket_is_healthy())
+                && !idle_audit_due
+                && samples.is_none()
+                && self
+                    .db
+                    .retrieve_merkle_tree_insertion_by_leaf_index(&next_index)
+                    .expect("Failed to fetch merkle tree insertion")
+                    .is_none()
+            {
+                self.wait_for_checkpoint_check().await;
+                continue;
+            }
+            if samples.is_none() || sampled_at.elapsed() >= CHECKPOINT_SAMPLE_REFRESH_INTERVAL {
+                // Notifications may wake insertion processing immediately, but may
+                // never accelerate checkpoint reads, including after RPC errors.
+                tokio::time::sleep_until(next_rpc_attempt).await;
+                let mut responses = reader.checkpoint_stream(&self.reorg_period);
+                let mut received = vec![None; reader.endpoint_count()];
+                let mut verified = None;
+                let merge_response =
+                    |tree: &CheckpointTree,
+                     received: &mut [Option<CheckpointAtBlock>],
+                     slot: usize,
+                     checkpoint: Option<CheckpointAtBlock>| {
+                        let old = samples.as_ref().and_then(|samples| samples[slot].as_ref());
+                        received[slot] = match (old, checkpoint) {
+                            (Some(old), Some(new))
+                                if new.index > old.index
+                                    && !tree_exceeds_checkpoint(old, &tree.committed)
+                                    && tree.root_at(old.index).is_none_or(|root| {
+                                        self.checkpoint(root, old.index) == old.checkpoint
+                                    }) =>
+                            {
+                                Some(old.clone())
+                            }
+                            (_, new) => new,
+                        };
+                    };
+                let mut responses_done = false;
+                loop {
+                    // Drain ready votes before replaying a potentially distant sample.
+                    while !responses_done {
+                        match responses.next().now_or_never() {
+                            Some(Some((slot, checkpoint))) => {
+                                merge_response(&tree, &mut received, slot, checkpoint);
+                            }
+                            Some(None) => responses_done = true,
+                            None => break,
+                        }
+                    }
+                    if received.iter().flatten().count()
+                        >= reader.consensus.required(received.len())
+                    {
+                        match self
+                            .verify_checkpoint_batch_step(
+                                &mut tree,
+                                &received,
+                                MERKLE_REPLAY_YIELD_INTERVAL,
+                            )
+                            .await
+                        {
+                            Some(
+                                batch @ CheckpointBatch::Verified {
+                                    latest: Some(_), ..
+                                },
+                            ) => {
+                                verified = Some(batch);
+                                break;
+                            }
+                            None => {
+                                // Keep replay progress, but let pending RPCs run and consume
+                                // their responses before the next bounded replay step.
+                                tokio::task::yield_now().await;
+                                continue;
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                    if responses_done {
+                        break;
+                    }
+                    match responses.next().await {
+                        Some((slot, checkpoint)) => {
+                            merge_response(&tree, &mut received, slot, checkpoint)
+                        }
+                        None => responses_done = true,
+                    }
+                }
+                last_rpc_audit = tokio::time::Instant::now();
+                next_rpc_attempt = last_rpc_audit
+                    .checked_add(self.interval)
+                    .expect("checkpoint interval fits in Instant");
+                if received.iter().flatten().count() < reader.consensus.required(received.len()) {
+                    self.readiness
+                        .mark_operation_blocked("checkpoint_consensus_reads");
+                    continue;
+                }
+                self.readiness
+                    .mark_operation_ready("checkpoint_consensus_reads");
+                samples = Some(received);
+                sampled_at = tokio::time::Instant::now();
+                sampled_batch = verified;
+            }
+            let checkpoints = samples.as_ref().expect("checkpoint samples");
+            let mut batch = match sampled_batch.take() {
+                Some(batch) => batch,
+                None => self.verify_checkpoint_batch(&mut tree, checkpoints).await,
+            };
+            if matches!(batch, CheckpointBatch::WaitingForRpc) {
+                if let Some(recovered) = self.recover_checkpoint_batch(&mut tree, checkpoints).await
+                {
+                    batch = recovered;
+                }
+            }
+            match batch {
+                CheckpointBatch::WaitingForInsertions => {}
+                CheckpointBatch::WaitingForRpc => samples = None,
+                CheckpointBatch::Verified { checkpoint, latest } => {
+                    self.readiness.mark_operation_ready("checkpoint_recovery");
+                    if !initial_verification_complete {
+                        info!(
+                            domain = checkpoint.mailbox_domain,
+                            verified_index = checkpoint.index,
+                            root = ?checkpoint.root,
+                            rpc_endpoints = samples.as_ref().expect("verified checkpoint samples").len(),
+                            elapsed = ?started.elapsed(),
+                            "Initial consensus backfill verified: local roots match the configured RPC threshold"
+                        );
+                        initial_verification_complete = true;
+                    }
+                    samples = None;
+                    if let Some(latest) = latest {
+                        // Older indices are reconstructed by one worker from the DB.
+                        self.sign_and_submit_checkpoints(std::iter::once(
+                            latest.into_checkpoint(checkpoint.checkpoint),
+                        ))
+                        .await;
+                        history_target
+                            .send(Some(checkpoint.clone()))
+                            .expect("Historical checkpoint worker is running");
+                    }
+                    self.metrics
+                        .latest_checkpoint_processed
+                        .set(i64::from(checkpoint.index));
+                    self.metrics.reached_initial_consistency.set(1);
+                }
+            }
+            self.wait_for_checkpoint_check().await;
+        }
+    }
+
+    /// Coalesce newer targets while retrying old uploads. There is one worker
+    /// and one pending target, regardless of how long checkpoint storage stalls.
+    async fn checkpoint_history_submitter(
+        mut self,
+        mut tree: IncrementalMerkle,
+        mut targets: watch::Receiver<Option<CheckpointAtBlock>>,
+    ) {
+        self.start_historical_publication(&tree);
+        let started = Instant::now();
+        let mut initial_publication_complete = false;
+        while targets.changed().await.is_ok() {
+            let target = targets
+                .borrow_and_update()
+                .clone()
+                .expect("verified target");
+            if !initial_publication_complete {
+                info!(
+                    domain = target.mailbox_domain,
+                    reconstructed_leaf_count = tree.count(),
+                    target_leaf_count = u64::from(target.index).saturating_add(1),
+                    "Reconstructing historical checkpoints from cached insertions before publication"
+                );
+            }
+            let mut queue = self.verified_checkpoints(&mut tree, &target).await;
+            // The live submitter published this target before notifying us.
+            if queue.pop().is_some() {
+                self.metrics.backfill_merkle_tree_leaf_count.inc();
+            }
+            self.submit_checkpoints(
+                queue
+                    .into_iter()
+                    .map(|queued| queued.into_checkpoint(target.checkpoint)),
+                false,
+            )
+            .await;
+            // Only this worker writes snapshots, after every covered checkpoint
+            // is durable. Never snapshot the main loop's newer committed tree.
+            self.persist_consensus_snapshot(&tree).await;
+            self.metrics.backfill_complete.set(1);
+            if !initial_publication_complete {
+                info!(
+                    domain = target.mailbox_domain,
+                    through_index = target.index,
+                    root = ?tree.root(),
+                    elapsed = ?started.elapsed(),
+                    "Initial historical checkpoint publication complete"
+                );
+                initial_publication_complete = true;
+            }
+        }
+    }
+
+    async fn persist_consensus_snapshot(&self, tree: &IncrementalMerkle) {
+        let snapshot = MerkleTreeSnapshot::capture(tree).expect("verified nonempty tree");
+        match self
+            .unless_reorg(tokio::time::timeout(
+                REORG_STATUS_WRITE_TIMEOUT,
+                self.checkpoint_syncer.write_merkle_snapshot(&snapshot),
+            ))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => warn!(?err, "Failed to persist consensus snapshot"),
+            Err(_) => warn!("Timed out persisting consensus snapshot"),
+        }
+    }
+
+    async fn verify_checkpoint_batch(
+        &self,
+        tree: &mut CheckpointTree,
+        checkpoints: &[Option<CheckpointAtBlock>],
+    ) -> CheckpointBatch {
+        self.verify_checkpoint_batch_step(tree, checkpoints, usize::MAX)
+            .await
+            .expect("unbounded replay completes")
+    }
+
+    /// None means more cached leaves remain; callers may incorporate newly arrived
+    /// votes before continuing. Tree frontiers survive between bounded steps.
+    async fn verify_checkpoint_batch_step(
+        &self,
+        tree: &mut CheckpointTree,
+        checkpoints: &[Option<CheckpointAtBlock>],
+        limit: usize,
+    ) -> Option<CheckpointBatch> {
+        if tree.committed.count() > 0 {
+            let local = self.checkpoint(tree.committed.root(), tree.committed.index());
+            let required = self.checkpoint_consensus.required(checkpoints.len());
+            for observed in checkpoints.iter().flatten() {
+                if observed.index == local.index
+                    && observed.mailbox_domain == local.mailbox_domain
+                    && observed.merkle_tree_hook_address == local.merkle_tree_hook_address
+                    && observed.root != local.root
+                    && checkpoints
+                        .iter()
+                        .flatten()
+                        .filter(|other| other.checkpoint == observed.checkpoint)
+                        .count()
+                        >= required
+                {
+                    // The vote authenticates a conflicting committed root. Persist the
+                    // relayer safety flag before halting; extra diagnostic RPCs must not delay it.
+                    self.verify_checkpoint(local, observed, false).await;
+                }
+            }
+        }
+        self.record_tree_progress(&tree.accumulated).await;
+        let indices: BTreeSet<_> = checkpoints
+            .iter()
+            .flatten()
+            .map(|checkpoint| checkpoint.index)
+            .collect();
+        tree.prepare_samples(&indices);
+        let Some(max_index) = indices.last().copied() else {
+            self.readiness
+                .mark_operation_blocked("checkpoint_consensus_progress");
+            return Some(CheckpointBatch::WaitingForRpc);
+        };
+        if self.replay_cannot_improve_vote(tree, checkpoints) {
+            return Some(self.evaluate_checkpoint_batch(tree, checkpoints));
+        }
+        let stop_count = tree.accumulated.count().saturating_add(limit);
+        while tree.accumulated.count() <= max_index as usize {
+            if tree.accumulated.count() >= stop_count {
+                return None;
+            }
+            let index =
+                u32::try_from(tree.accumulated.count()).expect("Merkle leaf count fits in u32");
+            let Some(insertion) = self
+                .db
+                .retrieve_merkle_tree_insertion_by_leaf_index(&index)
+                .expect("Failed to fetch merkle tree insertion")
+            else {
+                break;
+            };
+            tree.ingest(insertion.message_id(), indices.contains(&index));
+            self.record_tree_progress(&tree.accumulated).await;
+            if indices.contains(&index) && self.replay_cannot_improve_vote(tree, checkpoints) {
+                break;
+            }
+        }
+        Some(self.evaluate_checkpoint_batch(tree, checkpoints))
+    }
+
+    fn replay_cannot_improve_vote(
+        &self,
+        tree: &CheckpointTree,
+        checkpoints: &[Option<CheckpointAtBlock>],
+    ) -> bool {
+        let required = self.checkpoint_consensus.required(checkpoints.len());
+        let mut matching = Vec::new();
+        let mut possible = Vec::new();
+        for checkpoint in checkpoints.iter().flatten() {
+            if tree_exceeds_checkpoint(checkpoint, &tree.committed) {
+                continue;
+            }
+            match tree.root_at(checkpoint.index) {
+                Some(root) if self.checkpoint(root, checkpoint.index) == checkpoint.checkpoint => {
+                    matching.push(checkpoint.index);
+                    possible.push(checkpoint.index);
+                }
+                None => possible.push(checkpoint.index),
+                _ => {}
+            }
+        }
+        if matching.len() < required {
+            return false;
+        }
+        matching.sort_unstable_by(|a, b| b.cmp(a));
+        possible.sort_unstable_by(|a, b| b.cmp(a));
+        let position = required
+            .checked_sub(1)
+            .expect("nonempty endpoint threshold");
+        matching[position] == possible[position]
+    }
+
+    fn evaluate_checkpoint_batch(
+        &self,
+        tree: &mut CheckpointTree,
+        checkpoints: &[Option<CheckpointAtBlock>],
+    ) -> CheckpointBatch {
+        let required = self.checkpoint_consensus.required(checkpoints.len());
+        let mut matching = Vec::new();
+        let mut missing: usize = 0;
+        for (endpoint_index, observed) in checkpoints.iter().enumerate() {
+            let Some(observed) = observed else { continue };
+            if tree_exceeds_checkpoint(observed, &tree.committed) {
+                continue;
+            }
+            if let Some(root) = tree.root_at(observed.index) {
+                if self.checkpoint(root, observed.index) == observed.checkpoint {
+                    matching.push(observed);
+                } else {
+                    warn!(
+                        endpoint_index,
+                        index = observed.index,
+                        "RPC checkpoint does not match local history"
+                    );
+                }
+            } else {
+                missing = missing.saturating_add(1);
+            }
+        }
+        if matching.len() < required {
+            self.readiness
+                .mark_operation_blocked("checkpoint_consensus_progress");
+            if matching.len().saturating_add(missing) >= required {
+                self.readiness
+                    .mark_operation_blocked("checkpoint_consensus_insertions");
+                return CheckpointBatch::WaitingForInsertions;
+            }
+            self.readiness
+                .mark_operation_ready("checkpoint_consensus_insertions");
+            warn!(
+                matching = matching.len(),
+                required, "Waiting for configured RPC agreement with local history"
+            );
+            return CheckpointBatch::WaitingForRpc;
+        }
+        // A matching later root authenticates every earlier insertion. The
+        // required-th highest matching index is therefore the signing boundary.
+        matching.sort_unstable_by_key(|checkpoint| std::cmp::Reverse(checkpoint.index));
+        let target = matching[required.saturating_sub(1)];
+        self.metrics.set_latest_checkpoint_observed(target);
+        self.readiness
+            .mark_operation_ready("checkpoint_consensus_insertions");
+        self.readiness
+            .mark_operation_ready("checkpoint_consensus_progress");
+        let latest = tree.commit(target.index);
+        CheckpointBatch::Verified {
+            checkpoint: target.clone(),
+            latest,
+        }
+    }
+
+    /// Recover a mismatching uncommitted suffix, then apply the same endpoint vote
+    /// before repairing storage. A single RPC root can never authorize recovery.
+    async fn recover_checkpoint_batch(
+        &self,
+        tree: &mut CheckpointTree,
+        checkpoints: &[Option<CheckpointAtBlock>],
+    ) -> Option<CheckpointBatch> {
+        let recovery = self.rpc_recovery.as_ref()?;
+        // Ignore samples beyond the locally available suffix; a minority's invented
+        // high index must not make recovery wait for nonexistent insertions.
+        let mut target = checkpoints
+            .iter()
+            .flatten()
+            .filter(|checkpoint| {
+                let index = usize::try_from(checkpoint.index).expect("leaf index fits in usize");
+                index >= tree.committed.count() && index < tree.accumulated.count()
+            })
+            .max_by_key(|checkpoint| checkpoint.index)?
+            .clone();
+        // Checkpoint agreement authenticates roots and indices, not block metadata.
+        target.block_height = None;
+        self.readiness.mark_operation_blocked("checkpoint_recovery");
+        let first = u32::try_from(tree.committed.count()).expect("leaf count fits in u32");
+        let mut progress = self.recovery_progress.lock().await;
+        let leaves = match tokio::time::timeout(
+            CHECKPOINT_RECOVERY_TIMEOUT,
+            recovery.fetch_insertions_with_progress(first, &target, &mut progress),
+        )
+        .await
+        {
+            Ok(Ok(leaves)) => leaves,
+            Ok(Err(err)) => {
+                warn!(
+                    ?err,
+                    "Consensus checkpoint recovery failed; signing remains blocked"
+                );
+                *progress = RecoveryProgress::default();
+                return None;
+            }
+            Err(_) => {
+                warn!("Consensus checkpoint recovery timed out; resampling endpoints");
+                return None;
+            }
+        };
+        *progress = RecoveryProgress::default();
+        let indices: BTreeSet<_> = checkpoints.iter().flatten().map(|c| c.index).collect();
+        let mut recovered = CheckpointTree::new(tree.committed.clone());
+        for (insertion, _) in &leaves {
+            recovered.ingest(
+                insertion.inner().message_id(),
+                indices.contains(&insertion.inner().index()),
+            );
+            self.record_tree_progress(&recovered.accumulated).await;
+        }
+        let batch = self.evaluate_checkpoint_batch(&mut recovered, checkpoints);
+        let CheckpointBatch::Verified {
+            latest: Some(_), ..
+        } = &batch
+        else {
+            return None;
+        };
+        let count = recovered
+            .committed
+            .count()
+            .checked_sub(tree.committed.count())
+            .expect("verified recovery advances the committed frontier");
+        if let Err(err) = recovery.store_verified_insertions(&leaves[..count]) {
+            warn!(
+                ?err,
+                "Persisting consensus-verified recovery failed; signing remains blocked"
+            );
+            return None;
+        }
+        // Discard the unauthenticated suffix, including cached roots from the bad batch.
+        recovered.accumulated = recovered.committed.clone();
+        recovered.sampled.clear();
+        *tree = recovered;
+        Some(batch)
+    }
+
     /// Submits signed checkpoints indefinitely, starting from the `tree`.
-    pub(crate) async fn checkpoint_submitter(self, mut tree: IncrementalMerkle) {
+    pub(crate) async fn checkpoint_submitter(mut self, mut tree: IncrementalMerkle) {
+        self.record_tree_progress(&tree).await;
         // How often to log checkpoint info - once every minute
         let checkpoint_info_log_period = Duration::from_secs(60);
         // The instant in which we last logged checkpoint info, if at all
@@ -169,8 +871,26 @@ impl ValidatorSubmitter {
             true
         };
 
+        let mut next_rpc_attempt = tokio::time::Instant::now();
+        let mut last_rpc_audit = next_rpc_attempt;
         loop {
-            self.assert_reorg_fail_stop_inactive();
+            // A healthy stream wakes us for new insertions. Keep RPC verification
+            // pending until those insertions reach the configured reorg depth.
+            if self.websocket_is_healthy()
+                && last_rpc_audit.elapsed() < IDLE_CHECKPOINT_AUDIT_INTERVAL
+                && self
+                    .db
+                    .retrieve_merkle_tree_insertion_by_leaf_index(
+                        &u32::try_from(tree.count()).expect("Merkle leaf count fits in u32"),
+                    )
+                    .expect("Failed to fetch merkle tree insertion")
+                    .is_none()
+            {
+                self.wait_for_checkpoint_check().await;
+                continue;
+            }
+            // WebSocket notifications may wake pending work, but cannot accelerate RPC reads.
+            tokio::time::sleep_until(next_rpc_attempt).await;
             // Lag by reorg period because this is our correctness checkpoint.
             let latest_checkpoint = call_and_retry_indefinitely(|| {
                 let merkle_tree_hook = self.merkle_tree_hook.clone();
@@ -178,7 +898,11 @@ impl ValidatorSubmitter {
                 Box::pin(async move { merkle_tree_hook.latest_checkpoint(&reorg_period).await })
             })
             .await;
-            self.assert_reorg_fail_stop_inactive();
+
+            last_rpc_audit = tokio::time::Instant::now();
+            next_rpc_attempt = last_rpc_audit
+                .checked_add(self.interval)
+                .expect("checkpoint interval fits in Instant");
 
             self.metrics
                 .set_latest_checkpoint_observed(&latest_checkpoint);
@@ -202,11 +926,16 @@ impl ValidatorSubmitter {
                     tree_count = tree.count(),
                     "Latest checkpoint is behind tree, sleeping briefly"
                 );
-                sleep(self.interval).await;
+                self.wait_for_checkpoint_check().await;
                 continue;
             }
             self.submit_checkpoints_until_correctness_checkpoint(&mut tree, &latest_checkpoint)
                 .await;
+            if let Some(recovery) = &mut self.rpc_recovery {
+                if let Some(height) = latest_checkpoint.block_height {
+                    recovery.from_block = Some(height);
+                }
+            }
 
             self.metrics
                 .latest_checkpoint_processed
@@ -215,7 +944,7 @@ impl ValidatorSubmitter {
             // Set that initial consistency has been reached on first loop run. Subsequent runs are idempotent.
             self.metrics.reached_initial_consistency.set(1);
 
-            sleep(self.interval).await;
+            self.wait_for_checkpoint_check().await;
         }
     }
 
@@ -226,7 +955,24 @@ impl ValidatorSubmitter {
         tree: &mut IncrementalMerkle,
         correctness_checkpoint: &CheckpointAtBlock,
     ) {
-        self.assert_reorg_fail_stop_inactive();
+        let queue = self
+            .verified_checkpoints(tree, correctness_checkpoint)
+            .await;
+        self.sign_and_submit_checkpoints(
+            queue
+                .into_iter()
+                .map(|queued| queued.into_checkpoint(correctness_checkpoint.checkpoint)),
+        )
+        .await;
+    }
+
+    /// Reconstruct a complete prefix and verify it before exposing checkpoints to signing.
+    async fn verified_checkpoints(
+        &self,
+        tree: &mut IncrementalMerkle,
+        correctness_checkpoint: &CheckpointAtBlock,
+    ) -> Vec<QueuedCheckpoint> {
+        self.record_tree_progress(tree).await;
         let start = Instant::now();
         // This should never be called with a tree that is ahead of the correctness checkpoint.
         assert!(
@@ -239,6 +985,10 @@ impl ValidatorSubmitter {
         // All intermediate checkpoints will be stored here and signed once the correctness
         // checkpoint is reached.
         let mut checkpoint_queue = vec![];
+        // Retain the last verified tree so untrusted websocket leaves can be
+        // replaced by RPC fallback without advancing the signing boundary.
+        let verified_tree = self.rpc_recovery.as_ref().map(|_| tree.clone());
+        let mut blocked_insertion_operation: Option<String> = None;
 
         // If the correctness checkpoint is ahead of the tree, we need to ingest more messages.
         //
@@ -251,8 +1001,25 @@ impl ValidatorSubmitter {
                 .expect("Failed to fetch merkle tree insertion");
 
             let insertion = match res {
-                Some(insertion) => insertion,
+                Some(insertion) => {
+                    if let Some(operation) = blocked_insertion_operation.take() {
+                        self.readiness.mark_operation_ready(&operation);
+                    }
+                    insertion
+                }
                 None => {
+                    if blocked_insertion_operation.is_none() {
+                        let operation = format!("merkle_tree_insertion[{}]", tree.count());
+                        let snapshot = self.readiness.mark_operation_blocked(&operation);
+                        warn!(
+                            operation,
+                            consecutive_failures = snapshot.consecutive_failures,
+                            failure_duration_ms = snapshot.failure_duration_ms,
+                            signing_blocked = snapshot.signing_blocked,
+                            "Validator checkpoint production is waiting for an indexed merkle tree insertion"
+                        );
+                        blocked_insertion_operation = Some(operation);
+                    }
                     // If we haven't yet indexed the next merkle tree insertion but know that
                     // it will soon exist (because we know the correctness checkpoint), wait a bit and
                     // try again.
@@ -264,19 +1031,79 @@ impl ValidatorSubmitter {
             let message_id = insertion.message_id();
             tree.ingest(message_id);
 
-            let checkpoint = self.checkpoint(tree);
-
-            checkpoint_queue.push(CheckpointWithMessageId {
-                checkpoint,
+            checkpoint_queue.push(QueuedCheckpoint {
+                root: tree.root(),
+                index: tree.index(),
                 message_id,
             });
+            self.record_tree_progress(tree).await;
         }
 
-        info!(
-            root = ?tree.root(),
-            queue_length = checkpoint_queue.len(),
-            "Ingested leaves into in-memory merkle tree"
-        );
+        if let (Some(recovery), Some(verified_tree)) = (&self.rpc_recovery, verified_tree) {
+            if !checkpoint_queue.is_empty()
+                && self.checkpoint(tree.root(), tree.index()) != correctness_checkpoint.checkpoint
+            {
+                let operation = format!(
+                    "websocket_checkpoint_recovery[{}]",
+                    correctness_checkpoint.index
+                );
+                self.readiness.mark_operation_blocked(&operation);
+                warn!(
+                    first_sequence = verified_tree.count(),
+                    last_sequence = correctness_checkpoint.index,
+                    "WebSocket batch failed root verification; falling back to RPC indexing"
+                );
+                let first_sequence = u32::try_from(verified_tree.count())
+                    .expect("Merkle tree count fits in u32 before the target checkpoint");
+                let leaves = loop {
+                    match recovery
+                        .fetch_insertions(first_sequence, correctness_checkpoint)
+                        .await
+                    {
+                        Ok(leaves) => break leaves,
+                        Err(err) => {
+                            warn!(
+                                ?err,
+                                "RPC fallback batch recovery failed; signing remains blocked"
+                            );
+                            sleep(self.interval).await;
+                        }
+                    }
+                };
+                *tree = verified_tree;
+                self.record_tree_progress(tree).await;
+                checkpoint_queue.clear();
+                for (insertion, _) in &leaves {
+                    let message_id = insertion.inner().message_id();
+                    tree.ingest(message_id);
+                    checkpoint_queue.push(QueuedCheckpoint {
+                        root: tree.root(),
+                        index: tree.index(),
+                        message_id,
+                    });
+                    self.record_tree_progress(tree).await;
+                }
+                // Only repair durable rows after the recovered batch passes the
+                // same checkpoint gate. Persistent disagreement still halts below.
+                if self.checkpoint(tree.root(), tree.index()) == correctness_checkpoint.checkpoint {
+                    loop {
+                        match recovery.store_verified_insertions(&leaves) {
+                            Ok(()) => break,
+                            Err(err) => {
+                                warn!(?err, "Persisting verified RPC recovery failed; signing remains blocked");
+                                sleep(self.interval).await;
+                            }
+                        }
+                    }
+                    self.readiness.mark_operation_ready(&operation);
+                }
+            }
+        }
+
+        let root = checkpoint_queue
+            .last()
+            .map(|checkpoint| checkpoint.root)
+            .unwrap_or_else(|| tree.root());
 
         // At this point we know that correctness_checkpoint.index == tree.index().
         assert_eq!(
@@ -287,17 +1114,60 @@ impl ValidatorSubmitter {
             tree.index(),
         );
 
-        let checkpoint = self.checkpoint(tree);
+        let checkpoint = self.checkpoint(root, tree.index());
 
+        self.verify_checkpoint(
+            checkpoint,
+            correctness_checkpoint,
+            self.reorg_reporter.is_some(),
+        )
+        .await;
+
+        if !checkpoint_queue.is_empty() {
+            info!(
+                ?root,
+                queue_length = checkpoint_queue.len(),
+                elapsed = ?start.elapsed(),
+                "Checkpoint submitter reached correctness checkpoint"
+            );
+        }
+        checkpoint_queue
+    }
+
+    fn start_historical_publication(&mut self, tree: &IncrementalMerkle) {
+        self.historical_publication = true;
+        // Restored snapshots cover checkpoints already published by this worker.
+        self.metrics
+            .backfill_merkle_tree_leaf_count
+            .set(i64::try_from(tree.count()).expect("Merkle leaf count fits in i64"));
+        self.metrics
+            .historical_reconstruction_leaf_count
+            .set(i64::try_from(tree.count()).expect("Merkle leaf count fits in i64"));
+    }
+
+    async fn record_tree_progress(&self, tree: &IncrementalMerkle) {
+        let metric = if self.historical_publication {
+            &self.metrics.historical_reconstruction_leaf_count
+        } else {
+            &self.metrics.merkle_tree_leaf_count
+        };
+        metric.set(i64::try_from(tree.count()).expect("Merkle leaf count fits in i64"));
+        yield_during_merkle_replay(tree.count()).await;
+    }
+
+    async fn verify_checkpoint(
+        &self,
+        checkpoint: Checkpoint,
+        correctness_checkpoint: &CheckpointAtBlock,
+        report_rpc: bool,
+    ) {
         // If the tree's checkpoint doesn't match the correctness checkpoint, something went wrong
         // and we bail loudly.
         if checkpoint != correctness_checkpoint.checkpoint {
-            // This is deliberately the first mismatch action and contains no
-            // await: every submitter clone observes it before diagnostics or
-            // remote marker I/O can delay the fail-stop path.
-            self.reorg_fail_stop.store(true, Ordering::SeqCst);
+            self.reorg_halt.send_replace(true);
+            self.readiness.mark_operation_blocked("checkpoint_reorg");
             let reorg_event = ReorgEvent::new(
-                tree.root(),
+                checkpoint.root,
                 correctness_checkpoint.root,
                 checkpoint.index,
                 chrono::Utc::now().timestamp() as u64,
@@ -310,57 +1180,153 @@ impl ValidatorSubmitter {
                 "Incorrect tree root. Most likely a reorg has occurred. Please reach out for help, this is a potentially serious error impacting signed messages. Do NOT forcefully resume operation of this validator. Keep it crashlooping or shut down until you receive support."
             );
 
-            // Persist the fail-stop flag before any best-effort network
-            // diagnostics. A dead or malicious RPC must never make a restart
-            // forget that this validator observed a conflicting root.
-            let mut panic_message = "Incorrect tree root. Most likely a reorg has occurred. Please reach out for help, this is a potentially serious error impacting signed messages. Do NOT forcefully resume operation of this validator. Keep it crashlooping or shut down until you receive support.".to_owned();
-            reorg_tombstone::persist(&self.reorg_tombstone_path, &reorg_event).unwrap_or_else(
-                |error| {
-                    panic!(
-                        "Failed to persist mandatory local reorg fail-stop tombstone at {:?}: {error}",
-                        self.reorg_tombstone_path
-                    );
-                },
-            );
-            if let Err(e) = self
-                .checkpoint_syncer
-                .write_reorg_status(&reorg_event)
-                .await
-            {
-                panic_message.push_str(&format!(
-                    " Reorg fail-stop flag couldn't be written to checkpoint storage: {e}"
-                ));
-            }
+            // Persist the restart guard before best-effort diagnostics: an RPC can
+            // stall or retry indefinitely when the requested block was pruned.
+            let panic_message = "Incorrect tree root. Most likely a reorg has occurred. Please reach out for help, this is a potentially serious error impacting signed messages. Do NOT forcefully resume operation of this validator. Keep it crashlooping or shut down until you receive support.";
+            self.persist_reorg_guard(&reorg_event).await;
 
-            if let Some(height) = correctness_checkpoint.block_height {
-                self.reorg_reporter.report_at_block(height).await;
-            } else {
-                info!("Blockchain does not support block height, reporting with reorg period");
-                self.reorg_reporter
-                    .report_with_reorg_period(&self.reorg_period)
-                    .await;
+            // Lightweight/consensus mode uses its own endpoint verification.
+            // Bound the whole report, including optional diagnostic storage writes.
+            if report_rpc {
+                let report = async {
+                    let reporter = self
+                        .reorg_reporter
+                        .as_ref()
+                        .expect("normal-mode reorg reporter");
+                    if let Some(height) = correctness_checkpoint.block_height {
+                        reporter.report_at_block(height).await;
+                    } else {
+                        info!(
+                            "Blockchain does not support block height, reporting with reorg period"
+                        );
+                        reporter.report_with_reorg_period(&self.reorg_period).await;
+                    }
+                };
+                if tokio::time::timeout(REORG_REPORT_TIMEOUT, report)
+                    .await
+                    .is_err()
+                {
+                    warn!("Timed out collecting reorg diagnostics; halting validator");
+                }
             }
             panic!("{panic_message}");
         }
+    }
 
-        tracing::info!(
-            elapsed=?start.elapsed(),
-            checkpoint_queue_len = checkpoint_queue.len(),
-            "Checkpoint submitter reached correctness checkpoint"
-        );
+    /// Stay halted until a durable guard prevents unprotected restarts.
+    async fn persist_reorg_guard(&self, reorg_event: &ReorgEvent) {
+        // The shared halt is already set. Make the local restart guard durable
+        // before remote writes or diagnostics, even when checkpoint storage is
+        // unavailable. Local disk errors must keep this process halted rather
+        // than panic and allow a restart without a persisted guard.
+        loop {
+            match reorg_tombstone::persist(&self.reorg_tombstone_path, reorg_event) {
+                Ok(()) => break,
+                Err(err) => {
+                    error!(?err, "Failed to persist local reorg tombstone; signing remains halted while retrying. Do NOT restart");
+                    sleep(REORG_STATUS_RETRY_INTERVAL).await;
+                }
+            }
+        }
+        loop {
+            let result = tokio::time::timeout(
+                REORG_STATUS_WRITE_TIMEOUT,
+                self.checkpoint_syncer.write_reorg_status(reorg_event),
+            )
+            .await
+            .unwrap_or_else(|_| Err(eyre::eyre!("Timed out writing reorg status")));
+            match result {
+                Ok(()) => return,
+                Err(err) => {
+                    error!(?err, "Failed to persist reorg status; signing remains halted while retrying. Do NOT restart: checkpoint storage has no confirmed restart guard");
+                    // A restart without a durable guard could resume signing.
+                    sleep(REORG_STATUS_RETRY_INTERVAL).await;
+                }
+            }
+        }
+    }
 
-        if !checkpoint_queue.is_empty() {
-            info!(
-                index = checkpoint.index,
-                queue_len = checkpoint_queue.len(),
-                "Reached tree consistency"
+    /// Restores a snapshot after validating it against the signed checkpoint.
+    pub(crate) async fn restored_snapshot_tree(
+        &self,
+        target_index: u32,
+    ) -> Option<IncrementalMerkle> {
+        let snapshot = match self.checkpoint_syncer.read_merkle_snapshot().await {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => return None,
+            Err(err) => {
+                warn!(?err, "Failed to read merkle snapshot, rebuilding tree");
+                return None;
+            }
+        };
+        if snapshot.index > target_index {
+            debug!(
+                snapshot_index = snapshot.index,
+                target_index, "Snapshot is ahead of target, rebuilding tree"
             );
-            self.sign_and_submit_checkpoints(checkpoint_queue).await;
+            return None;
+        }
+        let tree = match snapshot.restore() {
+            Ok(tree) => tree,
+            Err(err) => {
+                warn!(?err, "Stored merkle snapshot is corrupt, rebuilding tree");
+                return None;
+            }
+        };
+        match self
+            .checkpoint_syncer
+            .fetch_checkpoint(snapshot.index)
+            .await
+        {
+            Ok(Some(existing)) => match existing.recover() {
+                Ok(signer)
+                    if signer == self.signer.eth_address()
+                        && existing.value.checkpoint
+                            == self.checkpoint(tree.root(), tree.index()) =>
+                {
+                    info!(
+                        snapshot_index = snapshot.index,
+                        "Restored merkle tree from validated snapshot"
+                    );
+                    Some(tree)
+                }
+                _ => {
+                    warn!(
+                        snapshot_index = snapshot.index,
+                        "Snapshot checkpoint mismatch, rebuilding tree"
+                    );
+                    None
+                }
+            },
+            Ok(None) => {
+                warn!(
+                    snapshot_index = snapshot.index,
+                    "Snapshot checkpoint missing, rebuilding tree"
+                );
+                None
+            }
+            Err(err) => {
+                warn!(
+                    ?err,
+                    snapshot_index = snapshot.index,
+                    "Snapshot checkpoint fetch failed, rebuilding tree"
+                );
+                None
+            }
+        }
+    }
 
-            info!(
-                index = checkpoint.index,
-                "Signed all queued checkpoints until index"
-            );
+    // Every cloned live/historical submitter shares this irreversible halt.
+    // Drop pending signing/publication futures on reorg, then stay halted until
+    // the detecting worker persists the guard and terminates the process.
+    async fn unless_reorg<T>(&self, action: impl std::future::Future<Output = T>) -> T {
+        let mut halted = self.reorg_halt.subscribe();
+        tokio::select! {
+            biased;
+            _ = async {
+                let _ = halted.wait_for(|halted| *halted).await;
+            } => std::future::pending().await,
+            result = action => result,
         }
     }
 
@@ -371,10 +1337,7 @@ impl ValidatorSubmitter {
         let signer_retries = 5;
 
         for i in 0..signer_retries {
-            self.assert_reorg_fail_stop_inactive();
-            #[cfg(test)]
-            self.sign_attempts.fetch_add(1, Ordering::SeqCst);
-            match self.signer.sign(checkpoint).await {
+            match self.unless_reorg(self.signer.sign(checkpoint)).await {
                 Ok(signed_checkpoint) => return Ok(signed_checkpoint),
                 Err(err) => {
                     tracing::warn!(
@@ -396,21 +1359,18 @@ impl ValidatorSubmitter {
         );
 
         // Now try the singleton signer as a last resort
-        self.assert_reorg_fail_stop_inactive();
-        #[cfg(test)]
-        self.sign_attempts.fetch_add(1, Ordering::SeqCst);
-        Ok(self.singleton_signer.sign(checkpoint).await?)
+        Ok(self
+            .unless_reorg(self.singleton_signer.sign(checkpoint))
+            .await?)
     }
 
     async fn sign_and_submit_checkpoint(
         &self,
         checkpoint: CheckpointWithMessageId,
     ) -> ChainResult<bool> {
-        self.assert_reorg_fail_stop_inactive();
         let start = Instant::now();
         let existing = self
-            .checkpoint_syncer
-            .fetch_checkpoint(checkpoint.index)
+            .unless_reorg(self.checkpoint_syncer.fetch_checkpoint(checkpoint.index))
             .await?;
         tracing::trace!(
             elapsed=?start.elapsed(),
@@ -423,6 +1383,32 @@ impl ValidatorSubmitter {
             if existing_signer == signer && existing.value == checkpoint {
                 debug!(index = checkpoint.index, "Checkpoint already submitted");
                 return Ok(false);
+            } else if existing_signer == signer
+                && existing.value.index == checkpoint.index
+                && existing.value.mailbox_domain == checkpoint.mailbox_domain
+                && existing.value.merkle_tree_hook_address == checkpoint.merkle_tree_hook_address
+            {
+                // A restart can replay a different finalized history without a restored
+                // frontier (GCS has no snapshots). Never sign a second value for an
+                // index we already signed, even if current RPCs agree with that value.
+                self.reorg_halt.send_replace(true);
+                self.readiness.mark_operation_blocked("checkpoint_reorg");
+                let reorg_event = ReorgEvent::new(
+                    existing.value.root,
+                    checkpoint.root,
+                    checkpoint.index,
+                    chrono::Utc::now().timestamp() as u64,
+                    self.reorg_period.clone(),
+                );
+                error!(
+                    existing_checkpoint = ?existing.value,
+                    proposed_checkpoint = ?checkpoint,
+                    "Refusing to overwrite a conflicting checkpoint signed by this validator"
+                );
+                self.persist_reorg_guard(&reorg_event).await;
+                panic!(
+                    "Conflicting checkpoint already signed by this validator; publication halted"
+                );
             } else {
                 warn!(
                     index = checkpoint.index,
@@ -435,7 +1421,6 @@ impl ValidatorSubmitter {
             }
         }
 
-        self.assert_reorg_fail_stop_inactive();
         let start = Instant::now();
         let signed_checkpoint = self.sign_checkpoint(checkpoint).await?;
         tracing::trace!(
@@ -444,12 +1429,7 @@ impl ValidatorSubmitter {
         );
 
         let start = Instant::now();
-        // A sibling may have detected the reorg while this task awaited the
-        // signer. Stop before publishing even though an in-flight signer call
-        // itself cannot be revoked.
-        self.assert_reorg_fail_stop_inactive();
-        self.checkpoint_syncer
-            .write_checkpoint(&signed_checkpoint)
+        self.unless_reorg(self.checkpoint_syncer.write_checkpoint(&signed_checkpoint))
             .await?;
         tracing::trace!(
             elapsed=?start.elapsed(),
@@ -459,21 +1439,69 @@ impl ValidatorSubmitter {
         Ok(true)
     }
 
+    /// Publishes availability only after the highest checkpoint itself is durable.
+    async fn publish_latest_checkpoint_index(self: &Arc<Self>, index: u32) {
+        call_and_retry_indefinitely(|| {
+            let self_clone = self.clone();
+            Box::pin(async move {
+                let start = Instant::now();
+                let result = self_clone
+                    .unless_reorg(self_clone.checkpoint_syncer.update_latest_index(index))
+                    .await;
+                match result {
+                    Ok(()) => self_clone
+                        .readiness
+                        .mark_operation_ready("checkpoint_latest_index"),
+                    Err(error) => {
+                        let snapshot = self_clone
+                            .readiness
+                            .mark_operation_blocked("checkpoint_latest_index");
+                        warn!(
+                            operation = "checkpoint_latest_index",
+                            consecutive_failures = snapshot.consecutive_failures,
+                            failure_duration_ms = snapshot.failure_duration_ms,
+                            signing_blocked = snapshot.signing_blocked,
+                            "Validator latest checkpoint index update is blocked"
+                        );
+                        return Err(error.into());
+                    }
+                }
+                tracing::trace!(
+                    elapsed=?start.elapsed(),
+                    "Updated latest index",
+                );
+                Ok(())
+            })
+        })
+        .await;
+    }
+
     /// Signs and submits any previously unsubmitted checkpoints.
-    async fn sign_and_submit_checkpoints(&self, mut checkpoints: Vec<CheckpointWithMessageId>) {
-        self.assert_reorg_fail_stop_inactive();
-        // The checkpoints are ordered by index, so the last one is the highest index.
-        let last_checkpoint_index = match checkpoints.last() {
-            Some(c) => c.index,
+    async fn sign_and_submit_checkpoints<I>(&self, checkpoints: I)
+    where
+        I: IntoIterator<Item = CheckpointWithMessageId>,
+        I::IntoIter: DoubleEndedIterator + ExactSizeIterator,
+    {
+        self.submit_checkpoints(checkpoints, true).await;
+    }
+
+    /// Historical publication must not race the live writer's latest-index update.
+    async fn submit_checkpoints<I>(&self, checkpoints: I, publish_latest: bool)
+    where
+        I: IntoIterator<Item = CheckpointWithMessageId>,
+        I::IntoIter: DoubleEndedIterator + ExactSizeIterator,
+    {
+        // Reconstruct compact queue entries only as their signing chunk is consumed.
+        // The input is ordered by index, so reversing starts with the highest index.
+        let mut checkpoints = checkpoints.into_iter().rev().peekable();
+        let mut latest_index_to_publish = match checkpoints.peek() {
+            Some(c) => publish_latest.then_some(c.index),
             None => return,
         };
 
         let arc_self = Arc::new(self.clone());
 
-        let mut first_chunk = true;
-
-        while !checkpoints.is_empty() {
-            self.assert_reorg_fail_stop_inactive();
+        while checkpoints.len() > 0 {
             let start = Instant::now();
 
             // Take a chunk of checkpoints, starting with the highest index.
@@ -481,95 +1509,97 @@ impl ValidatorSubmitter {
             // since those are the most likely to make messages become processable.
             // A side effect is that new checkpoints will also be submitted in reverse order.
 
-            // This logic is a bit awkward, but we want control over the chunks so we can also
-            // write the latest index to the checkpoint storage after the first chunk is successful.
-            let mut chunk = Vec::with_capacity(self.max_sign_concurrency);
-            for _ in 0..self.max_sign_concurrency {
-                if let Some(cp) = checkpoints.pop() {
-                    chunk.push(cp);
-                } else {
-                    break;
-                }
-            }
-
-            let chunk_len = chunk.len();
-
-            let futures = chunk.into_iter().map(|checkpoint| {
+            // Keep bounded chunks so a storage/signing burst is paced before the next chunk.
+            let chunk_len = checkpoints.len().min(self.max_sign_concurrency);
+            let chunk = checkpoints.by_ref().take(self.max_sign_concurrency);
+            let futures = chunk.map(|checkpoint| {
                 let self_clone = arc_self.clone();
-                call_and_retry_indefinitely(move || {
-                    let self_clone = self_clone.clone();
-                    Box::pin(async move {
-                        let start = Instant::now();
-                        let checkpoint_index = checkpoint.index;
-                        let wrote_checkpoint =
-                            self_clone.sign_and_submit_checkpoint(checkpoint).await?;
-                        tracing::info!(
-                            index = checkpoint_index,
-                            wrote_checkpoint,
-                            elapsed=?start.elapsed(),
-                            "Processed checkpoint",
-                        );
-                        Ok(wrote_checkpoint)
+                // The first popped checkpoint alone owns publication, even if a caller
+                // supplied the same maximum index more than once.
+                let latest_index = latest_index_to_publish.take();
+                async move {
+                    let operation = format!("checkpoint_submission[{}]", checkpoint.index);
+                    let wrote_checkpoint = call_and_retry_indefinitely(|| {
+                        let self_clone = self_clone.clone();
+                        let operation = operation.clone();
+                        Box::pin(async move {
+                            let start = Instant::now();
+                            let checkpoint_index = checkpoint.index;
+                            let result = self_clone.sign_and_submit_checkpoint(checkpoint).await;
+                            let wrote_checkpoint = match result {
+                                Ok(wrote_checkpoint) => {
+                                    self_clone.readiness.mark_operation_ready(&operation);
+                                    wrote_checkpoint
+                                }
+                                Err(error) => {
+                                    let snapshot =
+                                        self_clone.readiness.mark_operation_blocked(&operation);
+                                    warn!(
+                                        operation,
+                                        consecutive_failures = snapshot.consecutive_failures,
+                                        failure_duration_ms = snapshot.failure_duration_ms,
+                                        signing_blocked = snapshot.signing_blocked,
+                                        "Validator checkpoint submission is blocked"
+                                    );
+                                    return Err(error);
+                                }
+                            };
+                            tracing::trace!(
+                                index = checkpoint_index,
+                                wrote_checkpoint,
+                                elapsed=?start.elapsed(),
+                                "Processed checkpoint",
+                            );
+                            Ok(wrote_checkpoint)
+                        })
                     })
-                })
+                    .await;
+                    // Count each checkpoint once, after a successful write or confirmation
+                    // that the matching checkpoint already exists, never on failed attempts.
+                    if self_clone.historical_publication {
+                        self_clone.metrics.backfill_merkle_tree_leaf_count.inc();
+                    }
+                    // Lower checkpoints may still be retrying. The latest index is an upper
+                    // bound, not a claim that every historical checkpoint has been uploaded.
+                    if let Some(index) = latest_index {
+                        self_clone.publish_latest_checkpoint_index(index).await;
+                    }
+                    wrote_checkpoint
+                }
             });
 
             let wrote_checkpoint = join_all(futures).await.into_iter().any(|wrote| wrote);
 
-            tracing::info!(
-                elapsed=?start.elapsed(),
-                chunk_len,
-                remaining_checkpoints = checkpoints.len(),
-                "Signed and submitted checkpoint chunk",
-            );
-
-            // If it's the first chunk, update the latest index
-            if first_chunk {
-                self.assert_reorg_fail_stop_inactive();
-                call_and_retry_indefinitely(|| {
-                    let self_clone = self.clone();
-                    Box::pin(async move {
-                        self_clone.assert_reorg_fail_stop_inactive();
-                        let start = Instant::now();
-                        self_clone
-                            .checkpoint_syncer
-                            .update_latest_index(last_checkpoint_index)
-                            .await?;
-                        tracing::trace!(
-                            elapsed=?start.elapsed(),
-                            "Updated latest index",
-                        );
-                        Ok(())
-                    })
-                })
-                .await;
-                first_chunk = false;
+            if wrote_checkpoint {
+                tracing::info!(
+                    elapsed=?start.elapsed(),
+                    chunk_len,
+                    remaining_checkpoints = checkpoints.len(),
+                    "Signed and submitted checkpoint chunk",
+                );
+            } else {
+                tracing::trace!(
+                    elapsed=?start.elapsed(),
+                    chunk_len,
+                    remaining_checkpoints = checkpoints.len(),
+                    "Checkpoint chunk already existed",
+                );
             }
 
             // Pace storage/signing bursts between chunks without delaying the latest-index
             // update, throttling all-existing backfills, or adding a final-chunk tail.
-            if wrote_checkpoint && !checkpoints.is_empty() {
+            if wrote_checkpoint && checkpoints.len() > 0 {
                 sleep(CHECKPOINT_SUBMISSION_CHUNK_INTERVAL).await;
             }
         }
     }
+}
 
-    /// Panic immediately once any submitter clone has observed a conflicting root.
-    fn assert_reorg_fail_stop_inactive(&self) {
-        assert!(
-            !self.reorg_fail_stop.load(Ordering::SeqCst),
-            "Validator reorg fail-stop is active; checkpoint signing and publication are disabled"
-        );
-    }
-
-    #[cfg(test)]
-    fn trip_reorg_fail_stop_for_test(&self) {
-        self.reorg_fail_stop.store(true, Ordering::SeqCst);
-    }
-
-    #[cfg(test)]
-    fn sign_attempts_for_test(&self) -> usize {
-        self.sign_attempts.load(Ordering::SeqCst)
+// Reconstruction is CPU-bound and reads RocksDB synchronously. Yield so socket
+// heartbeats and metrics scrapes can run while millions of cached leaves replay.
+async fn yield_during_merkle_replay(count: usize) {
+    if count > 0 && count.is_multiple_of(MERKLE_REPLAY_YIELD_INTERVAL) {
+        tokio::task::yield_now().await;
     }
 }
 
@@ -582,6 +1612,9 @@ fn tree_exceeds_checkpoint(checkpoint: &Checkpoint, tree: &IncrementalMerkle) ->
 
 #[derive(Clone)]
 pub(crate) struct ValidatorSubmitterMetrics {
+    merkle_tree_leaf_count: IntGauge,
+    historical_reconstruction_leaf_count: IntGauge,
+    backfill_merkle_tree_leaf_count: IntGauge,
     latest_checkpoint_observed: IntGauge,
     latest_checkpoint_processed: IntGauge,
     backfill_complete: IntGauge,
@@ -592,6 +1625,15 @@ impl ValidatorSubmitterMetrics {
     pub fn new(metrics: &CoreMetrics, mailbox_chain: &HyperlaneDomain) -> Self {
         let chain_name = mailbox_chain.name();
         Self {
+            merkle_tree_leaf_count: metrics
+                .validator_merkle_tree_leaf_count()
+                .with_label_values(&[chain_name, "verification"]),
+            historical_reconstruction_leaf_count: metrics
+                .validator_merkle_tree_leaf_count()
+                .with_label_values(&[chain_name, "historical_reconstruction"]),
+            backfill_merkle_tree_leaf_count: metrics
+                .validator_merkle_tree_leaf_count()
+                .with_label_values(&[chain_name, "historical_publication"]),
             latest_checkpoint_observed: metrics
                 .latest_checkpoint()
                 .with_label_values(&["validator_observed", chain_name]),

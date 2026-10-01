@@ -1,6 +1,6 @@
 {
   "name": "@hyperlane-xyz/sdk",
-  "version": "38.0.0",
+  "version": "44.0.2",
   "description": "The official SDK for the Hyperlane Network",
   "keywords": [
     "Hyperlane",
@@ -15,6 +15,10 @@
   ],
   "type": "module",
   "sideEffects": false,
+  "browser": {
+    "./dist/providers/builders/aleo.js": "./dist/providers/builders/aleo.browser.js",
+    "./dist/providers/builders/radix.js": "./dist/providers/builders/radix.browser.js"
+  },
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
@@ -125,6 +129,18 @@
       "types": "./dist/quoted-calls/codec.d.ts",
       "default": "./dist/quoted-calls/codec.js"
     },
+    "./quoted-calls/EvmQuotedTransferProvider": {
+      "types": "./dist/quoted-calls/EvmQuotedTransferProvider.d.ts",
+      "default": "./dist/quoted-calls/EvmQuotedTransferProvider.js"
+    },
+    "./quoted-calls/QuotedTransferProvider": {
+      "types": "./dist/quoted-calls/QuotedTransferProvider.d.ts",
+      "default": "./dist/quoted-calls/QuotedTransferProvider.js"
+    },
+    "./quoted-calls/SealevelQuotedTransferProvider": {
+      "types": "./dist/quoted-calls/SealevelQuotedTransferProvider.d.ts",
+      "default": "./dist/quoted-calls/SealevelQuotedTransferProvider.js"
+    },
     "./quoted-calls/types": {
       "types": "./dist/quoted-calls/types.d.ts",
       "default": "./dist/quoted-calls/types.js"
@@ -154,8 +170,9 @@
     "lint": "oxlint -c ../../oxlint.json",
     "prepublishOnly": "pnpm build",
     "format": "oxfmt --write ./src",
-    "test": "pnpm test:unit && pnpm test:hardhat && pnpm test:foundry",
+    "test": "pnpm test:unit && pnpm test:exports && pnpm test:hardhat && pnpm test:foundry",
     "test:ci": "pnpm test",
+    "test:exports": "pnpm build && mocha --config .mocharc.json './test/**/*.test.ts' --exit",
     "test:unit": "mocha --config .mocharc.json './src/**/*.test.ts' --exit",
     "test:hardhat": "NODE_OPTIONS='--import tsx/esm' hardhat --config hardhat.config.cts test $(find ./src -name \"*.hardhat-test.ts\")",
     "test:foundry": "./scripts/foundry-test.sh"
@@ -198,6 +215,7 @@
     "cross-fetch": "^3.1.5",
     "ethers": "catalog:",
     "pino": "catalog:",
+    "seismic-viem": "3.0.1",
     "starknet": "catalog:",
     "viem": "catalog:",
     "zksync-ethers": "catalog:",
@@ -233,6 +251,6 @@
     "@ethersproject/abi": "*"
   },
   "engines": {
-    "node": ">=16"
+    "node": ">=22"
   }
 }

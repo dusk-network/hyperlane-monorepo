@@ -10,10 +10,7 @@ import {
 
 import { getGovernanceSafes } from '../../../config/environments/mainnet3/governance/utils.js';
 import { supportedChainNames } from '../../../config/environments/mainnet3/supportedChainNames.js';
-import {
-  chainsToSkip,
-  legacyIcaChainRouters,
-} from '../../../src/config/chain.js';
+import { chainsToSkip } from '../../../src/config/chain.js';
 import { SafeMultiSend } from '../../../src/govern/multisend.js';
 import { withGovernanceType } from '../../../src/governance.js';
 import { getEnvironmentConfig, getHyperlaneCore } from '../../core-utils.js';
@@ -63,10 +60,8 @@ async function main() {
 
   for (const chain of chains) {
     if (
-      chain === 'arcadia' ||
       chain === originChain ||
       !icaChainAddresses[chain] ||
-      legacyIcaChainRouters[chain] ||
       chainsToSkip.includes(chain)
     ) {
       continue;

@@ -1,5 +1,117 @@
 # @hyperlane-xyz/aleo-sdk
 
+## 44.0.2
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@44.0.2
+- @hyperlane-xyz/provider-sdk@10.0.2
+
+## 44.0.1
+
+### Patch Changes
+
+- Updated dependencies [f269e03]
+  - @hyperlane-xyz/provider-sdk@10.0.1
+  - @hyperlane-xyz/utils@44.0.1
+
+## 44.0.0
+
+### Patch Changes
+
+- Updated dependencies [6fbe5ad]
+  - @hyperlane-xyz/utils@44.0.0
+  - @hyperlane-xyz/provider-sdk@10.0.0
+
+## 43.0.0
+
+### Patch Changes
+
+- Updated dependencies [8bcc7ab]
+- Updated dependencies [7cf9c01]
+  - @hyperlane-xyz/provider-sdk@9.0.0
+  - @hyperlane-xyz/utils@43.0.0
+
+## 42.0.0
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@42.0.0
+- @hyperlane-xyz/provider-sdk@8.1.3
+
+## 41.3.1
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@41.3.1
+- @hyperlane-xyz/provider-sdk@8.1.2
+
+## 41.3.0
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@41.3.0
+- @hyperlane-xyz/provider-sdk@8.1.1
+
+## 41.2.0
+
+### Patch Changes
+
+- Updated dependencies [bd4e5f0]
+  - @hyperlane-xyz/provider-sdk@8.1.0
+  - @hyperlane-xyz/utils@41.2.0
+
+## 41.1.0
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@41.1.0
+- @hyperlane-xyz/provider-sdk@8.0.4
+
+## 41.0.0
+
+### Patch Changes
+
+- 178614d: The Aleo warp token reader no longer throws when a v1 token is absent from token_registry.aleo. Decimals now fall back to the authoritative app_metadata.local_decimals value and name/symbol degrade to empty strings on a registry miss, so legacy synthetics (e.g. USAD) can be read by check-warp-deploy. The fallback is scoped to a genuine registry miss only; v2 ARC-20 read failures and RPC/transport/decode errors continue to propagate rather than being masked as healthy. The miss stays recoverable so an empty read is retried across the bounded budget — covering a just-registered mapping that has not finalized/indexed yet — and only falls back once those retries are exhausted. The exception boundary is covered by unit tests.
+- Updated dependencies [fa19409]
+  - @hyperlane-xyz/utils@41.0.0
+  - @hyperlane-xyz/provider-sdk@8.0.3
+
+## 40.0.0
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@40.0.0
+- @hyperlane-xyz/provider-sdk@8.0.2
+
+## 39.1.0
+
+### Patch Changes
+
+- Updated dependencies [4976bb1]
+  - @hyperlane-xyz/utils@39.1.0
+  - @hyperlane-xyz/provider-sdk@8.0.1
+
+## 39.0.0
+
+### Major Changes
+
+- 4ef1fde: - `getMinGasForWarpDeploy` now lives on `IProvider` (per-chain) instead of the stateless `ProtocolProvider`. It is `async` and returns a FINAL native-denom amount rather than a mix of gas units and native amounts. It composes the base router deploy cost with additive deltas for detected features (cross-collateral extras, fee program deploy, custom ISM / hook / IGP deploy) driven by the warp config shape, and for gas-metered protocols multiplies gas units by the chain gas price.
+  - `ChainMetadataForAltVM` gained an optional `gasPrice` field.
+  - `ProviderBuilderFn` now takes a full `ChainMetadata` instead of `(rpcUrls, network)`.
+  - The AltVM `IProvider.connect` and `ISigner.connectWithSigner` static factories now take `ChainMetadataForAltVM` as their first argument, replacing the previous `(rpcUrls, chainId, extraParams)` shape and the metadata-through-`extraParams` indirection.
+  - The CLI warp-deploy preflight now sizes AltVM native-balance requirements from the composed per-chain deploy cost, so feature-heavy deploys are no longer silently under-funded, and chains without a gas price are no longer skipped for the warp-deploy path.
+  - The AltVM warp-deploy base gas costs were calibrated from measured deploys (Sealevel from mainnet; Starknet, Aleo, and Radix from devnet base-router floors with safety margin), replacing the previous catastrophically-low placeholder constants that let preflight pass under-funded accounts.
+  - The Starknet test fixture native token was corrected from ETH to STRK to match the production registry and the token the devnet actually charges fees in.
+
+### Patch Changes
+
+- f41f9fd: Removed Aleo deployment artifacts, the Provable runtime, and the Shield wallet adapter from eager browser bundles. Lightweight constants and program metadata stayed synchronous, while browser providers and wallet integrations loaded their protocol runtimes on first use. Aleo mainnet and testnet runtimes were split so browser providers only downloaded the configured network.
+- Updated dependencies [4ef1fde]
+- Updated dependencies [735793b]
+  - @hyperlane-xyz/provider-sdk@8.0.0
+  - @hyperlane-xyz/utils@39.0.0
+
 ## 38.0.0
 
 ### Patch Changes

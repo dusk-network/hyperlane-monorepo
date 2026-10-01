@@ -1,5 +1,105 @@
 # @hyperlane-xyz/cli
 
+## 44.0.2
+
+## 44.0.1
+
+### Patch Changes
+
+- f269e03: Zod was updated to 4.5.4 to prevent function-valued default factories from running during schema cycle detection and compilation.
+
+## 44.0.0
+
+### Major Changes
+
+- 6fbe5ad: The Starknet TypeScript stack was upgraded from starknet.js v7 to v8.9.2 to support the JSON-RPC v0.9 endpoints. Account and Contract call sites were migrated to the v8 options-object constructors, fee estimation was updated to the new resourceBounds shape, and dispatch-event parsing now passes the required ABI parser. Starknet wallet dependencies were upgraded for starknet.js v8 compatibility, and the minimum supported Node.js version is now 22 across published runtime dependents.
+
+### Patch Changes
+
+- 85c44af: The temporary Zod 3 registry compatibility layer was removed after adopting the registry's Zod 4 schemas. Repeated server and config validators are now compiled once, and boolean-only checks use Zod's allocation-free validation path.
+
+## 43.0.0
+
+### Major Changes
+
+- 8bcc7ab: Zod was upgraded to 4.5.2 across the TypeScript workspace. Public schemas and validation types were migrated to Zod 4, recursive fee configuration types were made explicit, application entrypoints adopted compiled parsing, and validation errors were changed to use Zod 4's built-in formatting.
+
+### Minor Changes
+
+- 60fc463: Added authenticated HTTP registry signers for standard EVM, Safe EIP-712, and Sealevel transactions.
+
+## 42.0.0
+
+### Minor Changes
+
+- 9003bab: External EVM signer configs were added to transaction-file submission, and JSON-RPC submitters were extended with explicit signer injection and partial submission results.
+- 1b136e1: Extended DelayedFlowRouterHookIsm auto-enrollment from `warp deploy` to `warp apply`:
+
+  - `warp apply` now resolves one shared hybrid leaf from the paired hook and ISM trees, enrolls delayed-flow counterparts, and uses the same ordinary per-chain submitter path as other non-fee warp updates.
+  - Each chain receives one ordered batch: upgrades, delayed-flow enrollment, hook installation, ISM installation, then router updates. Removal reverses the shared-instance operations so the ISM is removed before the hook. Operators must quiesce and drain the route because batches cannot execute atomically across chains.
+  - Adding, replacing, removing, extending, and resuming interrupted hybrid updates were covered. Safe, ICA, timelock, file, and distinct fee submitters keep their existing behavior.
+  - Preflight validation rejects partial delayed-flow routes, foreign legs, nonce-zero mailboxes, conflicting hybrid declarations, predicate wrappers, unsupported token types, zero peers, and delayed-flow routes with a non-zero ERC20 fee hook before deploying contracts.
+  - Route-derived peers override stale read-derived in-route `remoteIsms`; configured external peers are retained. Unknown on-chain domains are surfaced by `warp check` and removed by `warp apply`.
+  - Route-scoped CLI relaying was extended to discover installed delayed-flow instances from each EVM router's active hook tree, so `--warp-route-id` admits both token transfers and DFR preverification messages.
+  - EVM update planning is no longer automatically retried because planning can deploy contracts before later reads fail. AltVM planning retains its existing retry behavior.
+
+## 41.3.1
+
+## 41.3.0
+
+### Minor Changes
+
+- 4a21153: Added deploy, read, check, and artifact support for `AtomicLocalRebalancingBridge`. ALRB artifacts used a dedicated non-transferable token standard and were excluded from ordinary Warp connections.
+
+## 41.2.0
+
+### Minor Changes
+
+- bd4e5f0: Added a VM-agnostic impersonated submitter so `warp apply` can apply owner-authorized governance transactions against a fork without holding the impersonated authority's key. As with the EVM impersonated submitter, `warp apply` still requires an operator signer key — impersonation only removes the need for the impersonated account's own key.
+
+  - Added `SvmImpersonatingSigner` (exported as `SealevelImpersonatingSigner`) to `@hyperlane-xyz/sealevel-sdk`: it pays fees from a fixed public fork-only account and leaves the impersonated account's signature slot empty, which only a skip-signature-verification fork accepts. It is scoped to the configured `userAddress` — every unsigned required-signer slot must belong to that account, so it is not an unrestricted signature bypass. Sealevel signer internals moved to a shared `BaseSvmSigner`; `SvmSigner` behavior is unchanged.
+  - Relocated `AltVMJsonRpcSubmitter` and `AltVMImpersonatedSubmitter` into `@hyperlane-xyz/provider-sdk` (browser-safe) as sibling subclasses of a shared base, and added an `impersonatedAccount` submitter config variant. `@hyperlane-xyz/deploy-sdk` re-exports `AltVMJsonRpcSubmitter` for backwards compatibility.
+  - Implemented `createSubmitter` for Sealevel (`jsonRpc` and `impersonatedAccount`) and wired the `impersonatedAccount` submitter into the CLI AltVM submitter factories.
+
+## 41.1.0
+
+### Minor Changes
+
+- 0adcbb2: Added local mainnet forking support for Solana (Sealevel) warp routes and made the `warp fork` engine VM-agnostic.
+
+  - Introduced `@hyperlane-xyz/forking-sdk`, a VM-agnostic forking abstraction: the `IForkManager<TConfig>` interface, a `ForkManagerRegistry` keyed by `ProtocolType`, a `buildForkedChainMetadata` orchestration routine, and readiness/port helpers. Depends only on `@hyperlane-xyz/provider-sdk` and `@hyperlane-xyz/utils`.
+  - Added a node-only `@hyperlane-xyz/sealevel-sdk/fork` subpath (isolated from the main entry so browser/edge consumers are unaffected): a mode-typed `SurfpoolNode` controller (fork/network/offline) that runs a locally-installed `surfpool` binary, an `SvmForkManager` that forks a Solana RPC via surfpool and replays `PrintableSvmTransaction[]` governance txs under skip-signature-verification, and an `SvmRawForkConfigSchema` fork-config parser.
+  - Reworked the CLI `warp fork` command to dispatch per protocol through `forking-sdk`: EVM chains fork with anvil (extracted into an `EvmForkManager`, behavior unchanged) and Sealevel chains fork with surfpool, with per-protocol fork-config parsing. A Sealevel warp route can now be forked and its governance transactions replayed and validated with `warp check` before being submitted on-chain or through a Squads multisig.
+  - Hardened the `HttpServer.start()` used to serve the forked registry: it now awaits the `listening` event and rejects on a bind failure (instead of only logging), so a caller can observe the failure and tear down. The CLI `warp fork` command uses this to kill every fork node if the registry server cannot start, and redacts the upstream RPC URL (which may carry credentials) from any surfaced anvil error.
+  - Note: `warp fork` on a Sealevel route requires a locally-installed `surfpool` binary (`>= 1.5.0`) on `PATH` — there is no Docker fallback in the CLI. Install a pinned, checksum-verified `surfpool` release (`>= 1.5.0`) from https://github.com/txtx/surfpool/releases (verify the archive's SHA-256) rather than piping the mutable installer to a shell. The `surfpool/surfpool:1.5.0` Docker image is used only by the SDK's own test suite.
+
+## 41.0.0
+
+## 40.0.0
+
+## 39.1.0
+
+## 39.0.0
+
+### Minor Changes
+
+- 4ef1fde: - `getMinGasForWarpDeploy` now lives on `IProvider` (per-chain) instead of the stateless `ProtocolProvider`. It is `async` and returns a FINAL native-denom amount rather than a mix of gas units and native amounts. It composes the base router deploy cost with additive deltas for detected features (cross-collateral extras, fee program deploy, custom ISM / hook / IGP deploy) driven by the warp config shape, and for gas-metered protocols multiplies gas units by the chain gas price.
+  - `ChainMetadataForAltVM` gained an optional `gasPrice` field.
+  - `ProviderBuilderFn` now takes a full `ChainMetadata` instead of `(rpcUrls, network)`.
+  - The AltVM `IProvider.connect` and `ISigner.connectWithSigner` static factories now take `ChainMetadataForAltVM` as their first argument, replacing the previous `(rpcUrls, chainId, extraParams)` shape and the metadata-through-`extraParams` indirection.
+  - The CLI warp-deploy preflight now sizes AltVM native-balance requirements from the composed per-chain deploy cost, so feature-heavy deploys are no longer silently under-funded, and chains without a gas price are no longer skipped for the warp-deploy path.
+  - The AltVM warp-deploy base gas costs were calibrated from measured deploys (Sealevel from mainnet; Starknet, Aleo, and Radix from devnet base-router floors with safety margin), replacing the previous catastrophically-low placeholder constants that let preflight pass under-funded accounts.
+  - The Starknet test fixture native token was corrected from ETH to STRK to match the production registry and the token the devnet actually charges fees in.
+
+### Patch Changes
+
+- 0573f57: `hyperlane warp alt create` was hardened after review:
+  - Frozen ALTs are now persisted under the resolved warp route ID, so symbol-shorthand inputs no longer write to an ID that later `read`/`check` cannot find.
+  - Token selection was made consistent with `warp alt check` (first entry per chain), so multi-token chains no longer produce false drift.
+  - Successfully-frozen ALTs are persisted even when a sibling chain fails.
+  - Re-running a fully-registered route without flags now exits cleanly instead of erroring.
+  - A `--chain` that is not part of the warp route is now rejected instead of silently exiting 0.
+
 ## 38.0.0
 
 ### Minor Changes

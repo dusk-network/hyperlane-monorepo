@@ -1,7 +1,7 @@
 // TODO: Re-enable clippy warnings
 #![allow(dead_code)]
 
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 use hyperlane_core::U256;
 use prometheus::{
@@ -29,6 +29,17 @@ pub struct DispatcherMetrics {
     pub building_stage_queue_length: IntGaugeVec,
     pub inclusion_stage_pool_length: IntGaugeVec,
     pub finality_stage_pool_length: IntGaugeVec,
+
+    /// Time to read statuses and apply a stage's ordered mutations.
+    pub status_scan_duration_milliseconds: IntGaugeVec,
+    /// Age since the least recently checked transaction's last status read.
+    pub oldest_unchecked_transaction_age_seconds: IntGaugeVec,
+    /// Transactions included in scheduled status-read batches.
+    pub status_read_transactions: IntCounterVec,
+    /// Non-empty status-read batches scheduled, excluding retries and provider fanout.
+    pub status_read_requests: IntCounterVec,
+    /// Requests avoided compared with scheduling one request per transaction.
+    pub status_read_requests_avoided: IntCounterVec,
 
     // tracks inclusion stage errors
     pub inclusion_stage_error: IntCounterVec,
@@ -95,6 +106,46 @@ impl DispatcherMetrics {
                 "The number of transactions in the finality stage pool",
             ),
             &["destination",],
+            registry.clone()
+        )?;
+        let status_scan_duration_milliseconds = register_int_gauge_vec_with_registry!(
+            opts!(
+                namespaced("status_scan_duration_milliseconds"),
+                "Duration of the latest transaction status scan",
+            ),
+            &["destination", "stage"],
+            registry.clone()
+        )?;
+        let oldest_unchecked_transaction_age_seconds = register_int_gauge_vec_with_registry!(
+            opts!(
+                namespaced("oldest_unchecked_transaction_age_seconds"),
+                "Age since the oldest transaction status check at scan start",
+            ),
+            &["destination", "stage"],
+            registry.clone()
+        )?;
+        let status_read_transactions = register_int_counter_vec_with_registry!(
+            opts!(
+                namespaced("status_read_transactions"),
+                "Transactions included in scheduled status-read batches",
+            ),
+            &["destination", "stage"],
+            registry.clone()
+        )?;
+        let status_read_requests = register_int_counter_vec_with_registry!(
+            opts!(
+                namespaced("status_read_requests"),
+                "Non-empty status-read batches scheduled, excluding retries and provider fanout",
+            ),
+            &["destination", "stage"],
+            registry.clone()
+        )?;
+        let status_read_requests_avoided = register_int_counter_vec_with_registry!(
+            opts!(
+                namespaced("status_read_requests_avoided"),
+                "Status-read requests avoided compared with scheduling one request per transaction",
+            ),
+            &["destination", "stage"],
             registry.clone()
         )?;
 
@@ -214,6 +265,11 @@ impl DispatcherMetrics {
             building_stage_queue_length,
             inclusion_stage_pool_length,
             finality_stage_pool_length,
+            status_scan_duration_milliseconds,
+            oldest_unchecked_transaction_age_seconds,
+            status_read_transactions,
+            status_read_requests,
+            status_read_requests_avoided,
             batched_transactions,
             dropped_payloads,
             dropped_transactions,
@@ -240,6 +296,15 @@ impl DispatcherMetrics {
         );
     }
 
+    pub fn remove_liveness_metric(&self, stage: &str, domain: &str) {
+        if let Err(error) = self.task_liveness.remove_label_values(&[domain, stage]) {
+            warn!(
+                ?error,
+                stage, domain, "Failed to remove task liveness metric"
+            );
+        }
+    }
+
     pub fn update_queue_length_metric(&self, stage: &str, length: u64, domain: &str) {
         match stage {
             crate::dispatcher::building_stage::STAGE_NAME => self
@@ -256,6 +321,43 @@ impl DispatcherMetrics {
                 .set(length as i64),
             _ => {}
         }
+    }
+
+    pub fn update_status_scan_duration_metric(
+        &self,
+        stage: &str,
+        duration: Duration,
+        domain: &str,
+    ) {
+        self.status_scan_duration_milliseconds
+            .with_label_values(&[domain, stage])
+            .set(i64::try_from(duration.as_millis()).unwrap_or(i64::MAX));
+    }
+
+    pub fn update_oldest_unchecked_transaction_age_metric(
+        &self,
+        stage: &str,
+        oldest_unchecked_age: Duration,
+        domain: &str,
+    ) {
+        self.oldest_unchecked_transaction_age_seconds
+            .with_label_values(&[domain, stage])
+            .set(i64::try_from(oldest_unchecked_age.as_secs()).unwrap_or(i64::MAX));
+    }
+
+    pub fn observe_status_read_batch(&self, stage: &str, transaction_count: usize, domain: &str) {
+        if transaction_count == 0 {
+            return;
+        }
+        let transaction_count = u64::try_from(transaction_count).unwrap_or(u64::MAX);
+        let labels = &[domain, stage];
+        self.status_read_transactions
+            .with_label_values(labels)
+            .inc_by(transaction_count);
+        self.status_read_requests.with_label_values(labels).inc();
+        self.status_read_requests_avoided
+            .with_label_values(labels)
+            .inc_by(transaction_count.saturating_sub(1));
     }
 
     pub fn update_dropped_payloads_metric(&self, reason: &str, domain: &str) {
@@ -380,4 +482,46 @@ pub struct PostInclusionMetricsSource {
     pub priority_fee: Option<u64>,
     // gas limit set for the transaction, if applicable
     pub gas_limit: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::DispatcherMetrics;
+
+    #[test]
+    fn status_scan_and_read_metrics_are_exported() {
+        let metrics = DispatcherMetrics::dummy_instance();
+        metrics.update_status_scan_duration_metric(
+            "InclusionStage",
+            Duration::from_millis(123),
+            "test",
+        );
+        metrics.update_oldest_unchecked_transaction_age_metric(
+            "InclusionStage",
+            Duration::from_secs(45),
+            "test",
+        );
+        metrics.observe_status_read_batch("InclusionStage", 4, "test");
+        metrics.observe_status_read_batch("InclusionStage", 0, "empty");
+        let gathered = String::from_utf8(metrics.gather().unwrap()).unwrap();
+
+        assert!(gathered.contains(
+            "hyperlane_lander_status_scan_duration_milliseconds{destination=\"test\",stage=\"InclusionStage\"} 123"
+        ));
+        assert!(gathered.contains(
+            "hyperlane_lander_oldest_unchecked_transaction_age_seconds{destination=\"test\",stage=\"InclusionStage\"} 45"
+        ));
+        assert!(gathered.contains(
+            "hyperlane_lander_status_read_transactions{destination=\"test\",stage=\"InclusionStage\"} 4"
+        ));
+        assert!(gathered.contains(
+            "hyperlane_lander_status_read_requests{destination=\"test\",stage=\"InclusionStage\"} 1"
+        ));
+        assert!(gathered.contains(
+            "hyperlane_lander_status_read_requests_avoided{destination=\"test\",stage=\"InclusionStage\"} 3"
+        ));
+        assert!(!gathered.contains("destination=\"empty\""));
+    }
 }

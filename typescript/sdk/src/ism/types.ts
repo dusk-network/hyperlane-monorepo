@@ -4,17 +4,21 @@ import {
   AbstractCcipReadIsm,
   ArbL2ToL1Ism,
   CCIPIsm,
+  DefaultIsm,
+  DelayedFlowRouterHookIsm,
   IAggregationIsm,
   IInterchainSecurityModule,
   IMultisigIsm,
   IRoutingIsm,
   IStaticWeightedMultisigIsm,
   InterchainAccountRouter,
+  NetFlowRateLimitedHookIsm,
   OPStackIsm,
   PausableIsm,
   RateLimitedIsm,
   TestIsm,
   TrustedRelayerIsm,
+  BlacklistIsm,
 } from '@hyperlane-xyz/core';
 import type {
   Address,
@@ -23,18 +27,24 @@ import type {
   WithAddress,
 } from '@hyperlane-xyz/utils';
 import {
+  addressToBytes32,
   isEmptyAddress,
   isNullish,
   isValidAddressSealevel,
   rootLogger,
 } from '@hyperlane-xyz/utils';
 
-import { ZHash } from '../metadata/customZodTypes.js';
+import {
+  ZBigNumberish,
+  ZBytes32String,
+  ZHash,
+} from '../metadata/customZodTypes.js';
 import {
   ChainMap,
   OwnableConfig,
   OwnableSchema,
   PausableSchema,
+  RATE_LIMIT_DEFAULT_DURATION_SECONDS,
 } from '../types.js';
 import { isCompliant } from '../utils/schemas.js';
 
@@ -85,6 +95,16 @@ export const IsmType = {
   OFFCHAIN_LOOKUP: 'offchainLookupIsm',
   RATE_LIMITED: 'rateLimitedIsm',
   COMPOSITE: 'compositeIsm',
+  BLACKLIST: 'blacklistIsm',
+  // Ownerless routing ISM that always defers to the mailbox's default ISM.
+  // Distinct from provider-sdk/AltVM's "default ISM" notion (the zero-address
+  // mailbox field): this is a deployed contract with its own address.
+  MAILBOX_DEFAULT: 'defaultIsm',
+  // Hybrid hook/ISM: one contract instance is installed as BOTH the hook and
+  // the ISM of a single warp router (shared bucket state). Deployed via the
+  // ISM config surface; the hook side is referenced by address.
+  NET_FLOW_RATE_LIMITED: 'netFlowRateLimitedHookIsm',
+  DELAYED_FLOW_ROUTER: 'delayedFlowRouterHookIsm',
   UNKNOWN: 'unknownIsm',
 } as const;
 
@@ -106,6 +126,11 @@ export const MUTABLE_ISM_TYPE: IsmType[] = [
   IsmType.OFFCHAIN_LOOKUP,
   IsmType.INCREMENTAL_ROUTING,
   IsmType.RATE_LIMITED,
+  IsmType.BLACKLIST,
+  // owner is the only mutable field; rate params force a redeploy
+  IsmType.NET_FLOW_RATE_LIMITED,
+  // owner + remote router enrollment are mutable; rate params force a redeploy
+  IsmType.DELAYED_FLOW_ROUTER,
 ];
 
 /**
@@ -123,6 +148,8 @@ export const STATIC_ISM_TYPES: IsmType[] = [
 export const DYNAMICALLY_ROUTED_ISM_TYPES = [
   IsmType.AMOUNT_ROUTING,
   IsmType.INTERCHAIN_ACCOUNT_ROUTING,
+  // No static domains table: route() resolves to the mailbox's default ISM
+  IsmType.MAILBOX_DEFAULT,
 ] as const;
 
 /** Type guard for dynamically routed ISM types */
@@ -140,6 +167,7 @@ export function ismTypeToModuleType(ismType: IsmType): ModuleType {
     case IsmType.AMOUNT_ROUTING:
     case IsmType.INTERCHAIN_ACCOUNT_ROUTING:
     case IsmType.INCREMENTAL_ROUTING:
+    case IsmType.MAILBOX_DEFAULT:
       return ModuleType.ROUTING;
     case IsmType.AGGREGATION:
     case IsmType.STORAGE_AGGREGATION:
@@ -157,6 +185,9 @@ export function ismTypeToModuleType(ismType: IsmType): ModuleType {
     case IsmType.TRUSTED_RELAYER:
     case IsmType.CCIP:
     case IsmType.RATE_LIMITED:
+    case IsmType.BLACKLIST:
+    case IsmType.NET_FLOW_RATE_LIMITED:
+    case IsmType.DELAYED_FLOW_ROUTER:
       return ModuleType.NULL;
     case IsmType.ARB_L2_TO_L1:
       return ModuleType.ARB_L2_TO_L1;
@@ -196,9 +227,19 @@ export type TrustedRelayerIsmConfig = z.infer<
 export type CCIPIsmConfig = z.infer<typeof CCIPIsmConfigSchema>;
 export type ArbL2ToL1IsmConfig = z.infer<typeof ArbL2ToL1IsmConfigSchema>;
 export type RateLimitedIsmConfig = z.infer<typeof RateLimitedIsmConfigSchema>;
+export type BlacklistIsmConfig = z.infer<typeof BlacklistIsmConfigSchema>;
 
 export type OffchainLookupIsmConfig = z.infer<
   typeof OffchainLookupIsmConfigSchema
+>;
+export type MailboxDefaultIsmConfig = z.infer<
+  typeof MailboxDefaultIsmConfigSchema
+>;
+export type NetFlowRateLimitedHookIsmConfig = z.infer<
+  typeof NetFlowRateLimitedHookIsmConfigSchema
+>;
+export type DelayedFlowRouterHookIsmConfig = z.infer<
+  typeof DelayedFlowRouterHookIsmConfigSchema
 >;
 
 export type NullIsmConfig =
@@ -207,7 +248,10 @@ export type NullIsmConfig =
   | OpStackIsmConfig
   | TrustedRelayerIsmConfig
   | CCIPIsmConfig
-  | RateLimitedIsmConfig;
+  | RateLimitedIsmConfig
+  | BlacklistIsmConfig
+  | NetFlowRateLimitedHookIsmConfig
+  | DelayedFlowRouterHookIsmConfig;
 
 type BaseRoutingIsmConfig<
   T extends
@@ -229,7 +273,7 @@ export type DomainRoutingIsmConfig = BaseRoutingIsmConfig<
 
 export const InterchainAccountRouterIsmSchema = OwnableSchema.extend({
   type: z.literal(IsmType.INTERCHAIN_ACCOUNT_ROUTING),
-  isms: z.record(ZHash),
+  isms: z.record(z.string(), ZHash),
 });
 export type InterchainAccountRouterIsm = z.infer<
   typeof InterchainAccountRouterIsmSchema
@@ -255,9 +299,9 @@ export type AggregationIsmConfig = {
 };
 
 // Explicit (not z.infer) union: IsmConfigSchema gets annotated with this type
-// below so downstream `.extend()`/`.merge()` chains (MailboxClientConfigSchema
+// below so downstream schema composition (MailboxClientConfigSchema
 // and everything built on it) reference this pre-computed type instead of
-// re-expanding the full union's structure on every merge, which otherwise
+// does not re-expand the full union's structure on every composition, which otherwise
 // risks TS2590 ("union too complex to represent") once the union is large
 // enough — confirmed via a control-group test that any new member (not just
 // compositeIsm) trips this ceiling.
@@ -270,6 +314,10 @@ export type IsmConfig =
   | TrustedRelayerIsmConfig
   | CCIPIsmConfig
   | RateLimitedIsmConfig
+  | BlacklistIsmConfig
+  | NetFlowRateLimitedHookIsmConfig
+  | DelayedFlowRouterHookIsmConfig
+  | MailboxDefaultIsmConfig
   | MultisigIsmConfig
   | WeightedMultisigIsmConfig
   | RoutingIsmConfig
@@ -305,6 +353,10 @@ export type DeployedIsmType = {
   [IsmType.OFFCHAIN_LOOKUP]: AbstractCcipReadIsm;
   [IsmType.INTERCHAIN_ACCOUNT_ROUTING]: InterchainAccountRouter;
   [IsmType.RATE_LIMITED]: RateLimitedIsm;
+  [IsmType.BLACKLIST]: BlacklistIsm;
+  [IsmType.MAILBOX_DEFAULT]: DefaultIsm;
+  [IsmType.NET_FLOW_RATE_LIMITED]: NetFlowRateLimitedHookIsm;
+  [IsmType.DELAYED_FLOW_ROUTER]: DelayedFlowRouterHookIsm;
   [IsmType.UNKNOWN]: IInterchainSecurityModule;
 };
 
@@ -342,30 +394,125 @@ export const TrustedRelayerIsmConfigSchema = z.object({
   relayer: z.string(),
 });
 
+export const BlacklistIsmConfigSchema = OwnableSchema.extend({
+  type: z.literal(IsmType.BLACKLIST),
+  blacklistedIds: z.array(ZBytes32String),
+});
+
 export const RateLimitedIsmConfigSchema = z
   .object({
     type: z.literal(IsmType.RATE_LIMITED),
     maxCapacity: z
       .string()
       .regex(/^\d+$/, 'maxCapacity must be a base-10 integer string'),
+    /**
+     * Refill window in seconds — must match the on-chain immutable
+     * `DURATION`. Defaults to 1 day (86400s) when omitted, matching the
+     * previous hard-coded on-chain window.
+     */
+    duration: ZBigNumberish.default(RATE_LIMIT_DEFAULT_DURATION_SECONDS),
     recipient: ZHash.optional(),
     owner: ZHash.optional(),
   })
-  .refine((val) => BigInt(val.maxCapacity) >= 86400n, {
-    message: 'maxCapacity must be at least 86400',
+  .refine((val) => val.duration > 0n, {
+    message: 'duration must be greater than 0',
+    path: ['duration'],
+  })
+  .refine((val) => BigInt(val.maxCapacity) >= val.duration, {
+    message: 'maxCapacity must be at least duration',
     path: ['maxCapacity'],
   })
   .transform((val) => {
     const capacity = BigInt(val.maxCapacity);
-    if (capacity % 86400n !== 0n) {
-      const rounded = ((capacity / 86400n) * 86400n).toString();
+    const duration = val.duration;
+    if (capacity % duration !== 0n) {
+      const rounded = ((capacity / duration) * duration).toString();
       rootLogger.warn(
-        `RateLimitedIsm maxCapacity ${val.maxCapacity} is not divisible by 86400; rounding down to ${rounded}`,
+        `RateLimitedIsm maxCapacity ${val.maxCapacity} is not divisible by duration ${val.duration}; rounding down to ${rounded}`,
       );
       return { ...val, maxCapacity: rounded };
     }
     return val;
   });
+
+export const MailboxDefaultIsmConfigSchema = z.object({
+  type: z.literal(IsmType.MAILBOX_DEFAULT),
+  // No config fields: the mailbox is chain identity, supplied by the deploy
+  // context (like TRUSTED_RELAYER / RATE_LIMITED), not the declarative config.
+});
+
+/**
+ * Remote counterpart of a DelayedFlowRouterHookIsm, enrolled as a Router
+ * route. Accepts a 20-byte EVM address or a 32-byte hex value; normalized to
+ * lowercase bytes32 (the on-chain `routers(uint32)` representation) at parse
+ * time so config and derived on-chain state compare equal. Shared with the
+ * hook-side view of the same contract (../hook/types.ts).
+ */
+export const ZRouterBytes32 = z
+  .string()
+  .regex(
+    /^0x([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$/,
+    'must be a 20-byte address or 32-byte hex value',
+  )
+  .refine((value) => !isEmptyAddress(value), {
+    message: 'must not be the zero address',
+  })
+  .transform((value) => addressToBytes32(value).toLowerCase());
+
+export const NetFlowRateLimitedHookIsmConfigSchema = z
+  .object({
+    type: z.literal(IsmType.NET_FLOW_RATE_LIMITED),
+    /**
+     * Warp router this contract guards; must have it installed as hook AND
+     * ISM. Optional in warp-route deploy configs (defaults to the containing
+     * warp router, injected at deploy time like RATE_LIMITED's recipient);
+     * required for standalone ISM deploys (asserted in HyperlaneIsmFactory).
+     */
+    warpRouter: ZHash.optional(),
+    /** Net outflow allowed per `duration` window, in bps of live TVL (< 10000). */
+    thresholdBps: z.number().int().min(0).max(9999),
+    /** Refill window in seconds — must match the on-chain immutable `DURATION`. */
+    duration: ZBigNumberish,
+    owner: ZHash.optional(),
+  })
+  .refine((val) => val.duration > 0n, {
+    message: 'duration must be greater than 0',
+    path: ['duration'],
+  });
+
+/**
+ * Operational bound for DelayedFlowRouterHookIsm waits. The contract adds the
+ * delay to a uint48 Unix timestamp; uint32 seconds (~136 years) exceeds any
+ * practical delay while leaving ample timestamp headroom.
+ */
+export const MAX_SAFE_UINT48 = 2 ** 32 - 1;
+
+export const DelayedFlowRouterHookIsmConfigSchema = OwnableSchema.extend({
+  type: z.literal(IsmType.DELAYED_FLOW_ROUTER),
+  /**
+   * Warp router this contract guards; must have it installed as hook AND
+   * ISM. Optional in warp-route deploy configs (defaults to the containing
+   * warp router, injected at deploy time like RATE_LIMITED's recipient);
+   * required for standalone ISM deploys (asserted in HyperlaneIsmFactory).
+   */
+  warpRouter: ZHash.optional(),
+  /** Bucket size per `duration` window, in bps of live TVL (delay mode permits 100%). */
+  thresholdBps: z.number().int().min(0).max(10000),
+  /** Cap on any single message's wait, in seconds. */
+  maxDelay: z.number().int().nonnegative().max(MAX_SAFE_UINT48),
+  /** Refill window in seconds — must match the on-chain immutable `DURATION`. */
+  duration: ZBigNumberish,
+  /**
+   * Enrolled remote counterparts, keyed by chain name; values are the remote
+   * DelayedFlowRouterHookIsm instances (the contract is itself a Router, so
+   * on-chain nomenclature keeps "router": enrollRemoteRouters/routers()).
+   * Omit to leave the current on-chain enrollment untouched.
+   */
+  remoteIsms: z.record(z.string(), ZRouterBytes32).optional(),
+}).refine((val) => val.duration > 0n, {
+  message: 'duration must be greater than 0',
+  path: ['duration'],
+});
 
 export const CCIPIsmConfigSchema = z.object({
   type: z.literal(IsmType.CCIP),
@@ -374,7 +521,7 @@ export const CCIPIsmConfigSchema = z.object({
 
 export const OffchainLookupIsmConfigSchema = OwnableSchema.extend({
   type: z.literal(IsmType.OFFCHAIN_LOOKUP),
-  urls: z.array(z.string().url()),
+  urls: z.array(z.url()),
 });
 
 export const isOffchainLookupIsmConfig = isCompliant(
@@ -426,13 +573,13 @@ export const WeightedMultisigIsmConfigSchema = WeightedMultisigConfigSchema.and(
   }),
 );
 
-export const RoutingIsmConfigSchema: z.ZodSchema<RoutingIsmConfig> = z.lazy(
-  () =>
+export const RoutingIsmConfigSchema: z.ZodType<RoutingIsmConfig, unknown> =
+  z.lazy(() =>
     z.discriminatedUnion('type', [
       z.object({
         type: z.literal(IsmType.AMOUNT_ROUTING),
-        lowerIsm: IsmConfigSchema,
-        upperIsm: IsmConfigSchema,
+        lowerIsm: BaseIsmConfigSchema,
+        upperIsm: BaseIsmConfigSchema,
         threshold: z.number(),
       }),
       OwnableSchema.extend({
@@ -441,20 +588,23 @@ export const RoutingIsmConfigSchema: z.ZodSchema<RoutingIsmConfig> = z.lazy(
           IsmType.FALLBACK_ROUTING,
           IsmType.INCREMENTAL_ROUTING,
         ]),
-        domains: z.record(IsmConfigSchema),
+        domains: z.record(z.string(), BaseIsmConfigSchema),
       }),
       InterchainAccountRouterIsmSchema,
     ]),
-);
+  );
 
-export const AggregationIsmConfigSchema: z.ZodSchema<AggregationIsmConfig> = z
+export const AggregationIsmConfigSchema: z.ZodType<
+  AggregationIsmConfig,
+  unknown
+> = z
   .lazy(() =>
     z.object({
       type: z.union([
         z.literal(IsmType.AGGREGATION),
         z.literal(IsmType.STORAGE_AGGREGATION),
       ]),
-      modules: z.array(IsmConfigSchema),
+      modules: z.array(BaseIsmConfigSchema),
       threshold: z.number(),
     }),
   )
@@ -554,6 +704,13 @@ export interface CompositeAmountRoutingNodeConfig {
   lower: CompositeIsmNodeConfig;
   upper: CompositeIsmNodeConfig;
 }
+/**
+ * Token-bucket node. Only supported inside a warp route's ISM: it meters an
+ * amount read from a fixed offset of the message body, so it is meaningless
+ * against non-warp traffic. `recipient` is the warp router the ISM protects,
+ * resolved by the deploy/apply tooling; supply it only when reproducing the
+ * output of `warp read`.
+ */
 export interface CompositeRateLimitedNodeConfig {
   type: typeof CompositeIsmNodeType.RATE_LIMITED;
   maxCapacity: string;
@@ -581,7 +738,7 @@ export type CompositeIsmNodeConfig =
   | CompositeRoutingNodeConfig
   | CompositeFallbackRoutingNodeConfig;
 
-export const CompositeIsmNodeConfigSchema: z.ZodSchema<CompositeIsmNodeConfig> =
+export const CompositeIsmNodeConfigSchema: z.ZodType<CompositeIsmNodeConfig> =
   z.lazy(() =>
     z.discriminatedUnion('type', [
       z.object({
@@ -620,12 +777,12 @@ export const CompositeIsmNodeConfigSchema: z.ZodSchema<CompositeIsmNodeConfig> =
       }),
       z.object({
         type: z.literal(CompositeIsmNodeType.ROUTING),
-        domains: z.record(CompositeIsmNodeConfigSchema).optional(),
+        domains: z.record(z.string(), CompositeIsmNodeConfigSchema).optional(),
       }),
       z.object({
         type: z.literal(CompositeIsmNodeType.FALLBACK_ROUTING),
         fallbackIsm: ZSealevelPubkey,
-        domains: z.record(CompositeIsmNodeConfigSchema).optional(),
+        domains: z.record(z.string(), CompositeIsmNodeConfigSchema).optional(),
       }),
     ]),
   );
@@ -733,8 +890,11 @@ function validateCompositeIsmTree(
       if (isEmptyAddress(node.mailbox)) {
         addIssue('mailbox must be a non-zero address', [...path, 'mailbox']);
       }
-      if (!node.recipient || isEmptyAddress(node.recipient)) {
-        addIssue('recipient is required and must be a non-zero address', [
+      // Absence is legal: the deploy/apply tooling resolves recipient from
+      // the warp router the ISM protects. A written-out value only ever comes
+      // from round-tripping `warp read` output, and must still be non-zero.
+      if (node.recipient && isEmptyAddress(node.recipient)) {
+        addIssue('recipient must be a non-zero address', [
           ...path,
           'recipient',
         ]);
@@ -800,7 +960,7 @@ function validateCompositeIsmTree(
   }
 }
 
-export const CompositeIsmConfigSchema: z.ZodSchema<CompositeIsmConfig> =
+export const CompositeIsmConfigSchema: z.ZodType<CompositeIsmConfig> =
   OwnableSchema.extend({
     type: z.literal(IsmType.COMPOSITE),
     // Composite ISM is Sealevel-only, so unlike OwnableSchema's generic
@@ -818,11 +978,9 @@ export const CompositeIsmConfigSchema: z.ZodSchema<CompositeIsmConfig> =
     );
   });
 
-export const UnknownIsmConfigSchema = z
-  .object({
-    type: z.literal(IsmType.UNKNOWN),
-  })
-  .passthrough();
+export const UnknownIsmConfigSchema = z.looseObject({
+  type: z.literal(IsmType.UNKNOWN),
+});
 export type UnknownIsmConfig = z.infer<typeof UnknownIsmConfigSchema>;
 
 const KnownIsmTypes: string[] = Object.values(IsmType).filter(
@@ -864,7 +1022,7 @@ export function normalizeUnknownIsmTypes<T>(config: T): T {
   return normalized as T;
 }
 
-export const IsmConfigSchema: z.ZodSchema<IsmConfig> = z.union([
+export const BaseIsmConfigSchema: z.ZodType<IsmConfig, unknown> = z.union([
   ZHash,
   TestIsmConfigSchema,
   OpStackIsmConfigSchema,
@@ -873,6 +1031,10 @@ export const IsmConfigSchema: z.ZodSchema<IsmConfig> = z.union([
   TrustedRelayerIsmConfigSchema,
   CCIPIsmConfigSchema,
   RateLimitedIsmConfigSchema,
+  BlacklistIsmConfigSchema,
+  NetFlowRateLimitedHookIsmConfigSchema,
+  DelayedFlowRouterHookIsmConfigSchema,
+  MailboxDefaultIsmConfigSchema,
   MultisigIsmConfigSchema,
   WeightedMultisigIsmConfigSchema,
   RoutingIsmConfigSchema,
@@ -883,6 +1045,272 @@ export const IsmConfigSchema: z.ZodSchema<IsmConfig> = z.union([
   InterchainAccountRouterIsmSchema,
   UnknownIsmConfigSchema,
 ]);
+
+/**
+ * ISM types that authenticate a message's origin/authorship, as opposed to
+ * gating on local state. Used to satisfy the composition requirement of the
+ * warp-route hybrid hook/ISMs, whose `moduleType()` is NULL and which
+ * therefore verify flow, not authenticity.
+ *
+ * MEMBERSHIP CRITERION — add a type here only if the SDK deploy path
+ * (HyperlaneIsmFactory) yields an instance that provably authenticates the
+ * message in its POST-DEPLOY state, with no window in which a third party can
+ * bind the authority it checks. Being named like a verifier does not qualify a
+ * type, and neither does canonical bytecode: what matters is whether the
+ * authority the contract compares against is fixed by this deploy path itself.
+ * A contract whose authority is installed by a public initializer or setter
+ * that the deploy path neither calls nor verifies is bindable by whoever
+ * reaches it first, and an attacker-bound instance verifies attacker messages.
+ *
+ * Evidence for each member:
+ * - MERKLE_ROOT_MULTISIG / MESSAGE_ID_MULTISIG: validators and threshold are
+ *   MetaProxy metadata (StaticMultisigIsm.sol:21-25) fixed at the deterministic
+ *   address the factory derives from them, so even a front-run deployment is
+ *   the identical contract; verify() requires `threshold` validator signatures
+ *   over the checkpoint digest (AbstractMultisigIsm.sol:97-115). No owner, no
+ *   initializer.
+ * - STORAGE_MERKLE_ROOT_MULTISIG / STORAGE_MESSAGE_ID_MULTISIG: deployed by
+ *   constructor (deployMultisigIsm -> handleDeploy), which sets validators and
+ *   threshold and calls `_disableInitializers()` (StorageMultisigIsm.sol:25-32),
+ *   so `initialize` reverts for everyone and the Ownable2Step owner stays unset
+ *   — `setValidatorsAndThreshold` is onlyOwner and therefore uncallable. This
+ *   membership rests on THAT deploy path, not on the contract alone: the
+ *   on-chain `StorageMultisigIsmFactory.deploy` instead creates a MinimalProxy
+ *   and calls `initialize(msg.sender, ...)` (StorageMultisigIsm.sol:101-112),
+ *   and a proxy runs no constructor, so `_disableInitializers` never applies,
+ *   the owner becomes the caller and `setValidatorsAndThreshold` is callable.
+ *   Moving these two types onto that factory (see the TODO in
+ *   `deployMultisigIsm`) removes the property this membership rests on, so they
+ *   must leave this set in the same change.
+ * - WEIGHTED_MERKLE_ROOT_MULTISIG / WEIGHTED_MESSAGE_ID_MULTISIG: same
+ *   MetaProxy argument, with the validator set and threshold weight in the
+ *   metadata (WeightedMultisigIsm.sol:23-34); verify() accumulates weight from
+ *   recovered signatures (AbstractWeightedMultisigIsm.sol:47-90).
+ * - TRUSTED_RELAYER: mailbox and trustedRelayer are constructor immutables
+ *   passed by this deploy path (TrustedRelayerIsm.sol:14-29); verify() returns
+ *   `mailbox.processor(id) == trustedRelayer`, so only the operator-chosen
+ *   relayer can make a message pass. No initializer, nothing to bind.
+ *
+ * Deliberately absent:
+ * - ARB_L2_TO_L1 and CCIP: both are `AbstractMessageIdAuthorizedIsm`s whose
+ *   `authorizedHook` is set by `setAuthorizedHook`, a PUBLIC one-shot
+ *   `initializer` (AbstractMessageIdAuthorizedIsm.sol:60-66). This deploy path
+ *   neither calls it (ARB is deployed with `[bridge]` alone) nor verifies it
+ *   (CCIP resolves an address out of the CCIP cache), so between deployment
+ *   and the operator's own binding any account can bind the ISM to a sender it
+ *   controls and preverify arbitrary message ids. Canonical bytecode does not
+ *   establish that missing hook identity.
+ * - MAILBOX_DEFAULT: delegates to whatever the mailbox's default ISM happens to
+ *   be at verification time, which cannot be verified statically here.
+ * - OFFCHAIN_LOOKUP: `CCIP_READ` is an extensibility interface, not an
+ *   authentication guarantee — the contract is deployed out of band and its
+ *   `verify` may return true unconditionally (`TestCcipReadIsm`). Such an ISM
+ *   may still be composed beside a hybrid; it just does not stand in as the
+ *   authenticator.
+ * - A bare address string: its type is unknowable at config-parse time, so
+ *   treating it as authenticating would let a NULL-type ISM referenced by
+ *   address satisfy the requirement.
+ */
+const AUTHENTICATING_ISM_TYPES: ReadonlySet<IsmType> = new Set<IsmType>([
+  IsmType.MERKLE_ROOT_MULTISIG,
+  IsmType.MESSAGE_ID_MULTISIG,
+  IsmType.STORAGE_MERKLE_ROOT_MULTISIG,
+  IsmType.STORAGE_MESSAGE_ID_MULTISIG,
+  IsmType.WEIGHTED_MERKLE_ROOT_MULTISIG,
+  IsmType.WEIGHTED_MESSAGE_ID_MULTISIG,
+  IsmType.TRUSTED_RELAYER,
+]);
+
+/**
+ * True if `node` authenticates on its own, or is an aggregation that cannot be
+ * satisfied without one of its authenticating members.
+ *
+ * The threshold is load-bearing. AbstractAggregationIsm.verify runs only the
+ * submodules the relayer-supplied metadata carries an entry for, and requires
+ * exactly `threshold` of them to pass (AbstractAggregationIsm.sol:44-67), so
+ * the relayer picks which `threshold` members are consulted. An aggregation
+ * therefore authenticates only when its non-authenticating members are too few
+ * to reach the threshold by themselves — otherwise the relayer satisfies it
+ * with, say, an unpaused PausableIsm (PausableIsm.sol:28-33, returns true
+ * unconditionally) and the authenticating member never executes.
+ */
+function providesAuthentication(node: IsmConfig): boolean {
+  if (typeof node !== 'object' || node === null) {
+    return false;
+  }
+  if (AUTHENTICATING_ISM_TYPES.has(node.type)) {
+    return true;
+  }
+  if (
+    node.type === IsmType.AGGREGATION ||
+    node.type === IsmType.STORAGE_AGGREGATION
+  ) {
+    const nonAuthenticatingCount = node.modules.filter(
+      (module) => !providesAuthentication(module),
+    ).length;
+    return nonAuthenticatingCount < node.threshold;
+  }
+  return false;
+}
+
+interface IsmCompositionContext {
+  /** Whether every enclosing aggregation is exhaustive. */
+  mandatoryPosition: boolean;
+  underAggregation: boolean;
+  /** Whether some enclosing mandatory aggregation supplies authentication. */
+  authenticated: boolean;
+  /** Whether some enclosing aggregation names a module by bare address. */
+  addressModuleSibling: boolean;
+}
+
+/**
+ * Validates the composition invariants of ISM types that are only safe in a
+ * mandatory position:
+ *
+ * - BLACKLIST must be a member of an aggregation whose threshold equals its
+ *   module count, so its verdict can never be outvoted.
+ * - The warp-route hybrid hook/ISMs (NET_FLOW_RATE_LIMITED,
+ *   DELAYED_FLOW_ROUTER) have the same requirement AND must be accompanied by
+ *   an authenticating ISM. Their `moduleType()` is NULL: they meter flow, not
+ *   message authenticity, so using one as a route's sole ISM lets any caller
+ *   process a forged message subject only to bucket capacity (on a synthetic
+ *   leg, minting arbitrary tokens).
+ */
+function validateIsmComposition(
+  node: IsmConfig,
+  path: (string | number)[],
+  context: IsmCompositionContext,
+  ctx: z.RefinementCtx,
+): void {
+  const {
+    mandatoryPosition,
+    underAggregation,
+    authenticated,
+    addressModuleSibling,
+  } = context;
+
+  if (typeof node === 'string') {
+    return;
+  }
+
+  switch (node.type) {
+    case IsmType.BLACKLIST:
+      if (!(mandatoryPosition && underAggregation)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            'A blacklist ISM must be a member of an aggregation whose threshold equals its module count; it cannot be used standalone, as a routing target, or under a non-exhaustive aggregation.',
+          path,
+        });
+      }
+      break;
+    case IsmType.NET_FLOW_RATE_LIMITED:
+    case IsmType.DELAYED_FLOW_ROUTER:
+      if (!(mandatoryPosition && underAggregation)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `A ${node.type} verifies flow, not message authenticity (moduleType is NULL), so it must be a member of an aggregation whose threshold equals its module count; it cannot be used standalone, as a routing target, or under a non-exhaustive aggregation.`,
+          path,
+        });
+      } else if (!authenticated) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            `A ${node.type} must be composed with an authenticating ISM (e.g. a multisig) in the same mandatory aggregation; on its own it lets any caller process a forged message subject only to bucket capacity.` +
+            (addressModuleSibling
+              ? ` A module given as a bare address does not count — an already-deployed ISM has to be declared by type: re-declaring a static multisig with the same validators and threshold resolves to its existing address.`
+              : ''),
+          path,
+        });
+      }
+      break;
+    case IsmType.AGGREGATION:
+    case IsmType.STORAGE_AGGREGATION: {
+      const childMandatory =
+        mandatoryPosition && node.threshold === node.modules.length;
+      // An authenticating member only guarantees authentication when it cannot
+      // be outvoted, i.e. when this aggregation is itself in a mandatory
+      // position and its own threshold cannot be met without that member.
+      const childAuthenticated =
+        authenticated || (childMandatory && providesAuthentication(node));
+      const childAddressModuleSibling =
+        addressModuleSibling ||
+        node.modules.some((module) => typeof module === 'string');
+      node.modules.forEach((subIsm, i) =>
+        validateIsmComposition(
+          subIsm,
+          [...path, 'modules', i],
+          {
+            mandatoryPosition: childMandatory,
+            underAggregation: true,
+            authenticated: childAuthenticated,
+            addressModuleSibling: childAddressModuleSibling,
+          },
+          ctx,
+        ),
+      );
+      break;
+    }
+    case IsmType.ROUTING:
+    case IsmType.FALLBACK_ROUTING:
+    case IsmType.INCREMENTAL_ROUTING:
+      for (const [chain, domainIsm] of Object.entries(node.domains)) {
+        validateIsmComposition(
+          domainIsm,
+          [...path, 'domains', chain],
+          {
+            mandatoryPosition,
+            underAggregation: false,
+            authenticated,
+            addressModuleSibling,
+          },
+          ctx,
+        );
+      }
+      break;
+    case IsmType.AMOUNT_ROUTING:
+      validateIsmComposition(
+        node.lowerIsm,
+        [...path, 'lowerIsm'],
+        {
+          mandatoryPosition,
+          underAggregation: false,
+          authenticated,
+          addressModuleSibling,
+        },
+        ctx,
+      );
+      validateIsmComposition(
+        node.upperIsm,
+        [...path, 'upperIsm'],
+        {
+          mandatoryPosition,
+          underAggregation: false,
+          authenticated,
+          addressModuleSibling,
+        },
+        ctx,
+      );
+      break;
+    default:
+      break;
+  }
+}
+
+export const IsmConfigSchema: z.ZodType<IsmConfig, unknown> =
+  BaseIsmConfigSchema.superRefine((data, ctx) =>
+    validateIsmComposition(
+      data,
+      [],
+      {
+        mandatoryPosition: true,
+        underAggregation: false,
+        authenticated: false,
+        addressModuleSibling: false,
+      },
+      ctx,
+    ),
+  );
 
 /**
  * Forward-compatible ISM config schema that normalizes unknown ISM types.

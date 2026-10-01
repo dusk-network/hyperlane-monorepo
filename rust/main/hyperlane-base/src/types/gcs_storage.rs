@@ -1,20 +1,22 @@
 use crate::CheckpointSyncer;
 use async_trait::async_trait;
 use derive_new::new;
-use eyre::{bail, Result};
+use eyre::{bail, ensure, Result};
+use hyperlane_core::accumulator::incremental::MerkleTreeSnapshot;
 use hyperlane_core::{
     ReorgEvent, ReorgEventResponse, SignedAnnouncement, SignedCheckpointWithMessageId,
 };
 use std::fmt;
 use tracing::{error, info, instrument};
-use ya_gcp::{
-    storage::{
-        api::{error::HttpStatusError, http::StatusCode, Error},
-        ObjectError, StorageClient,
-    },
-    AuthFlow, ClientBuilder, ClientBuilderConfig,
-};
+use ya_gcp::AuthFlow;
 
+mod client;
+use client::StorageClient;
+
+// A depth-32 frontier serializes to < 5 KiB of JSON even at the largest index.
+// Keep its bound separate from ordinary checkpoint and error responses.
+const MAX_MERKLE_SNAPSHOT_SIZE: usize = 8 * 1024;
+const MERKLE_SNAPSHOT_KEY: &str = "merkle_snapshot.json";
 const LATEST_INDEX_KEY: &str = "gcsLatestIndexKey";
 const METADATA_KEY: &str = "gcsMetadataKey";
 const ANNOUNCEMENT_KEY: &str = "gcsAnnouncementKey";
@@ -80,8 +82,7 @@ pub struct GcsStorageClientBuilder {
 /// Enables use of any of service account key OR user secrets to authenticate
 /// For anonymous access to public data provide `(None, None)` to Builder
 pub struct GcsStorageClient {
-    // GCS storage client
-    // # Details: <https://docs.rs/ya-gcp/latest/ya_gcp/storage/struct.StorageClient.html>
+    // Authenticated, bounded GCS storage transport
     inner: StorageClient,
     // bucket name of this client's storage
     bucket: String,
@@ -90,7 +91,7 @@ pub struct GcsStorageClient {
 }
 
 impl GcsStorageClientBuilder {
-    /// Instantiates `ya_gcp:StorageClient` based on provided auth method
+    /// Instantiates the bounded GCS transport with the provided auth method
     /// # Param
     /// * `bucket_name` - String name of target bucket to work with, will be used by all store and get ops
     pub async fn build(
@@ -98,9 +99,7 @@ impl GcsStorageClientBuilder {
         bucket_name: impl Into<String>,
         folder: Option<String>,
     ) -> Result<GcsStorageClient> {
-        let inner = ClientBuilder::new(ClientBuilderConfig::new().auth_flow(self.auth))
-            .await?
-            .build_storage_client();
+        let inner = StorageClient::new(self.auth).await?;
 
         let bucket = bucket_name.into();
         let mut processed_folder = folder;
@@ -161,16 +160,9 @@ impl GcsStorageClient {
             }
             Err(e) => {
                 error!("Failed to upload to '{}': {:?}", object_name, e);
-                Err(e.into())
+                Err(e)
             }
         }
-    }
-
-    // #test only method[s]
-    #[cfg(test)]
-    pub(crate) async fn get_by_path(&self, path: impl AsRef<str>) -> Result<()> {
-        self.inner.get_object(&self.bucket, path).await?;
-        Ok(())
     }
 }
 
@@ -186,45 +178,57 @@ impl fmt::Debug for GcsStorageClient {
 
 #[async_trait]
 impl CheckpointSyncer for GcsStorageClient {
+    async fn read_merkle_snapshot(&self) -> Result<Option<MerkleTreeSnapshot>> {
+        self.inner
+            .get_object_with_limit(
+                &self.bucket,
+                &self.object_path(MERKLE_SNAPSHOT_KEY),
+                MAX_MERKLE_SNAPSHOT_SIZE,
+            )
+            .await?
+            .map(|data| serde_json::from_slice(&data).map_err(Into::into))
+            .transpose()
+    }
+
+    async fn write_merkle_snapshot(&self, snapshot: &MerkleTreeSnapshot) -> Result<()> {
+        let data = serde_json::to_vec(snapshot)?;
+        ensure!(
+            data.len() < MAX_MERKLE_SNAPSHOT_SIZE,
+            "Merkle snapshot exceeds GCS snapshot size limit"
+        );
+        self.upload_and_log(&self.object_path(MERKLE_SNAPSHOT_KEY), data)
+            .await
+    }
+
     /// Read the highest index of this Syncer
     #[instrument(skip(self))]
     async fn latest_index(&self) -> Result<Option<u32>> {
-        match self.inner.get_object(&self.bucket, LATEST_INDEX_KEY).await {
-            Ok(data) => Ok(Some(serde_json::from_slice(data.as_ref())?)),
-            Err(e) => match e {
-                // never written before to this bucket
-                ObjectError::InvalidName(_) => Ok(None),
-                ObjectError::Failure(Error::HttpStatus(HttpStatusError(StatusCode::NOT_FOUND))) => {
-                    Ok(None)
-                }
-                _ => bail!(e),
-            },
-        }
+        self.inner
+            .get_object(&self.bucket, &self.object_path(LATEST_INDEX_KEY))
+            .await?
+            .map(|data| serde_json::from_slice(&data).map_err(Into::into))
+            .transpose()
     }
 
     /// Writes the highest index of this Syncer
     #[instrument(skip(self, index))]
     async fn write_latest_index(&self, index: u32) -> Result<()> {
         let data = serde_json::to_vec(&index)?;
-        self.upload_and_log(LATEST_INDEX_KEY, data).await
+        self.upload_and_log(&self.object_path(LATEST_INDEX_KEY), data)
+            .await
     }
 
     /// Attempt to fetch the signed (checkpoint, messageId) tuple at this index
     #[instrument(skip(self, index))]
     async fn fetch_checkpoint(&self, index: u32) -> Result<Option<SignedCheckpointWithMessageId>> {
-        match self
-            .inner
-            .get_object(&self.bucket, GcsStorageClient::get_checkpoint_key(index))
-            .await
-        {
-            Ok(data) => Ok(Some(serde_json::from_slice(data.as_ref())?)),
-            Err(e) => match e {
-                ObjectError::Failure(Error::HttpStatus(HttpStatusError(StatusCode::NOT_FOUND))) => {
-                    Ok(None)
-                }
-                _ => bail!(e),
-            },
-        }
+        self.inner
+            .get_object(
+                &self.bucket,
+                &self.object_path(&GcsStorageClient::get_checkpoint_key(index)),
+            )
+            .await?
+            .map(|data| serde_json::from_slice(&data).map_err(Into::into))
+            .transpose()
     }
 
     /// Write the signed (checkpoint, messageId) tuple to this syncer
@@ -270,32 +274,45 @@ impl CheckpointSyncer for GcsStorageClient {
     /// Write the reorg status to this syncer
     #[instrument(skip(self, reorg_event))]
     async fn write_reorg_status(&self, reorg_event: &ReorgEvent) -> Result<()> {
-        let object_name = REORG_FLAG_KEY;
+        let object_name = self.object_path(REORG_FLAG_KEY);
         let data = serde_json::to_string_pretty(reorg_event)?.into_bytes();
-        self.upload_and_log(object_name, data).await
+        self.upload_and_log(&object_name, data).await
     }
 
     #[instrument(skip(self, log))]
     async fn write_reorg_rpc_responses(&self, log: String) -> Result<()> {
-        let object_name = REORG_RPC_RESPONSES_KEY;
-        self.upload_and_log(object_name, log.into_bytes()).await
+        let object_name = self.object_path(REORG_RPC_RESPONSES_KEY);
+        self.upload_and_log(&object_name, log.into_bytes()).await
     }
 
     /// Read the reorg status from this syncer
     #[instrument(skip(self))]
     async fn reorg_status(&self) -> Result<ReorgEventResponse> {
-        let object = match self.inner.get_object(&self.bucket, REORG_FLAG_KEY).await {
-            Ok(data) => data,
-            Err(err) => match err {
-                ObjectError::Failure(Error::HttpStatus(HttpStatusError(StatusCode::NOT_FOUND))) => {
-                    return Ok(ReorgEventResponse {
-                        exists: false,
-                        event: None,
-                        content: None,
-                    });
-                }
-                _ => bail!(err),
-            },
+        // A validator run before folder-scoping existed (or one running an
+        // older binary against this same bucket) would have written its
+        // reorg flag at the bucket root regardless of `folder`. Check there
+        // too and treat it as authoritative if present — silently only
+        // checking the folder-scoped path could let a legacy root-level
+        // reorg flag go unseen and signing resume through an unresolved reorg.
+        if self.folder.is_some() {
+            let root_status = self.fetch_reorg_status_at(REORG_FLAG_KEY).await?;
+            if root_status.exists {
+                return Ok(root_status);
+            }
+        }
+        self.fetch_reorg_status_at(&self.object_path(REORG_FLAG_KEY))
+            .await
+    }
+}
+
+impl GcsStorageClient {
+    async fn fetch_reorg_status_at(&self, key: &str) -> Result<ReorgEventResponse> {
+        let Some(object) = self.inner.get_object(&self.bucket, key).await? else {
+            return Ok(ReorgEventResponse {
+                exists: false,
+                event: None,
+                content: None,
+            });
         };
         match serde_json::from_slice(&object) {
             Ok(s) => Ok(ReorgEventResponse {
@@ -316,12 +333,62 @@ impl CheckpointSyncer for GcsStorageClient {
 }
 
 #[tokio::test]
-async fn public_landset_no_auth_works_test() {
-    const LANDSAT_BUCKET: &str = "gcp-public-data-landsat";
-    const LANDSAT_KEY: &str = "LC08/01/001/003/LC08_L1GT_001003_20140812_20170420_01_T2/LC08_L1GT_001003_20140812_20170420_01_T2_B3.TIF";
+async fn object_path_prefixes_every_key_with_the_folder() {
     let client = GcsStorageClientBuilder::new(AuthFlow::NoAuth)
-        .build(LANDSAT_BUCKET, None)
+        .build("test-bucket", Some("sepolia".to_string()))
         .await
         .unwrap();
-    assert!(client.get_by_path(LANDSAT_KEY).await.is_ok());
+
+    // Every syncer key must be scoped under the folder — otherwise validators
+    // sharing a bucket across chains via folder prefixes silently collide,
+    // and a write under the folder is unreadable by a read that isn't scoped.
+    assert_eq!(
+        client.object_path(MERKLE_SNAPSHOT_KEY),
+        "sepolia/merkle_snapshot.json"
+    );
+    assert_eq!(
+        client.object_path(LATEST_INDEX_KEY),
+        "sepolia/gcsLatestIndexKey"
+    );
+    assert_eq!(
+        client.object_path(&GcsStorageClient::get_checkpoint_key(5)),
+        "sepolia/checkpoint_5_with_id.json"
+    );
+    assert_eq!(
+        client.object_path(REORG_FLAG_KEY),
+        "sepolia/gcsReorgFlagKey"
+    );
+    assert_eq!(
+        client.announcement_location(),
+        "gs://test-bucket/sepolia/gcsAnnouncementKey"
+    );
+}
+
+#[tokio::test]
+async fn object_path_is_unprefixed_without_a_folder() {
+    let client = GcsStorageClientBuilder::new(AuthFlow::NoAuth)
+        .build("test-bucket", None)
+        .await
+        .unwrap();
+
+    assert_eq!(client.object_path(LATEST_INDEX_KEY), LATEST_INDEX_KEY);
+    assert_eq!(
+        client.announcement_location(),
+        "gs://test-bucket/gcsAnnouncementKey"
+    );
+}
+
+#[test]
+fn snapshot_frontier_fits_dedicated_cap_at_maximum_supported_count() {
+    use hyperlane_core::{accumulator::incremental::IncrementalMerkle, H256};
+    // All byte values are 255: worst-case JSON width for the fixed frontier.
+    let tree = IncrementalMerkle::new([H256::repeat_byte(255); 32], u32::MAX as usize);
+    let snapshot = MerkleTreeSnapshot::capture(&tree).unwrap();
+    let data = serde_json::to_vec(&snapshot).unwrap();
+    println!(
+        "maximum supported count snapshot JSON bytes: {}",
+        data.len()
+    );
+    assert!(data.len() < MAX_MERKLE_SNAPSHOT_SIZE);
+    assert_eq!(snapshot.restore().unwrap().root(), tree.root());
 }

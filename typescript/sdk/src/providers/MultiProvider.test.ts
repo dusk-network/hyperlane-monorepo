@@ -1,11 +1,17 @@
 import { expect } from 'chai';
-import { ContractFactory } from 'ethers';
+import { BigNumber, Contract, ContractFactory, Wallet } from 'ethers';
+import type { ContractTransaction } from 'ethers';
+import {
+  Provider as ZKSyncProvider,
+  Wallet as ZKSyncWallet,
+} from 'zksync-ethers';
 
 import {
   Mailbox__factory,
   ProxyAdmin__factory,
   TestRecipient__factory,
 } from '@hyperlane-xyz/core';
+import type { ZKSyncArtifact } from '@hyperlane-xyz/core';
 import {
   Mailbox__factory as TronMailbox__factory,
   ProxyAdmin__factory as TronProxyAdmin__factory,
@@ -14,7 +20,10 @@ import {
 } from '@hyperlane-xyz/tron-sdk';
 import { TestChainName, test1, test2 } from '../consts/testChains.js';
 import type { ProtocolTransaction, ProtocolReceipt } from './ProviderType.js';
-import { EthJsonRpcBlockParameterTag } from '../metadata/chainMetadataTypes.js';
+import {
+  ChainTechnicalStack,
+  EthJsonRpcBlockParameterTag,
+} from '../metadata/chainMetadataTypes.js';
 import sinon from 'sinon';
 
 import { MultiProvider } from './MultiProvider.js';
@@ -66,6 +75,72 @@ describe('MultiProvider Tron factory resolution', () => {
 });
 
 describe('MultiProvider', () => {
+  describe('handleDeploy', () => {
+    afterEach(() => sinon.restore());
+
+    it('delegates zkSync deployments through the dynamically loaded deployer', async () => {
+      const zkSyncChain = 'testzksync';
+      const multiProvider = new MultiProvider({
+        [zkSyncChain]: {
+          ...test1,
+          chainId: 260,
+          displayName: 'Test zkSync',
+          domainId: 260,
+          name: zkSyncChain,
+          technicalStack: ChainTechnicalStack.ZkSync,
+        },
+      });
+      const zkSyncSigner = new ZKSyncWallet(
+        Wallet.createRandom().privateKey,
+        new ZKSyncProvider(test1.rpcUrls[0].http),
+      );
+      const connect = sinon.spy(zkSyncSigner, 'connect');
+      multiProvider.setSigner(zkSyncChain, zkSyncSigner);
+
+      const artifact = {
+        _format: 'hh-zksolc-artifact-1',
+        abi: [],
+        bytecode: '0x00',
+        contractName: 'TestContract',
+        deployedBytecode: '0x00',
+        deployedLinkReferences: {},
+        factoryDeps: {},
+        linkReferences: {},
+        sourceName: 'TestContract.sol',
+      } satisfies ZKSyncArtifact;
+      const params = ['constructor-param'];
+      const deployedContract = new Contract(
+        '0x0000000000000000000000000000000000001234',
+        [],
+        zkSyncSigner,
+      );
+      const { ZKSyncDeployer } = await import('../zksync/ZKSyncDeployer.js');
+      const estimateDeployGas = sinon
+        .stub(ZKSyncDeployer.prototype, 'estimateDeployGas')
+        .resolves(BigNumber.from(100_000));
+      const deploy = sinon
+        .stub(ZKSyncDeployer.prototype, 'deploy')
+        .resolves(deployedContract);
+
+      const result = await multiProvider.handleDeploy(
+        zkSyncChain,
+        new ContractFactory([], '0x'),
+        params,
+        artifact,
+      );
+
+      expect(result).to.equal(deployedContract);
+      expect(connect.calledOnceWithExactly(zkSyncSigner.provider)).to.be.true;
+      expect(estimateDeployGas.calledOnceWithExactly(artifact, params)).to.be
+        .true;
+      expect(deploy.calledOnce).to.be.true;
+      expect(deploy.firstCall.args[0]).to.equal(artifact);
+      expect(deploy.firstCall.args[1]).to.equal(params);
+      expect(BigNumber.from(deploy.firstCall.args[2]?.gasLimit).gt(100_000)).to
+        .be.true;
+    });
+  });
+
   describe('handleTx', () => {
     let multiProvider: MultiProvider;
 
@@ -115,19 +190,24 @@ describe('MultiProvider', () => {
       expect(mockTx.wait.calledOnce).to.be.true;
     });
 
-    it('should wait for inclusion when wait(0) returns null', async () => {
+    it('should wait for inclusion when zero confirmations are requested', async () => {
       const mockReceipt = {
         transactionHash: '0xabc123def456',
         blockNumber: 100,
         status: 1,
       } as unknown as ProtocolReceipt<any>;
 
-      const waitStub = sinon
-        .stub()
-        .callsFake(async (confirmations?: number) => {
-          if (confirmations === 0) return null;
-          return mockReceipt;
-        });
+      const waitStub = sinon.stub();
+      waitStub.withArgs(0).resolves(mockReceipt);
+      waitStub.withArgs(1).returns(new Promise(() => {}));
+      const receiptProbe = sinon
+        .stub(
+          multiProvider.getProvider(TestChainName.test1),
+          'getTransactionReceipt',
+        )
+        .onFirstCall()
+        .resolves(undefined);
+      receiptProbe.onSecondCall().resolves(mockReceipt);
 
       const mockTx = {
         hash: '0xabc123def456',
@@ -140,10 +220,60 @@ describe('MultiProvider', () => {
       });
 
       expect(result).to.deep.equal(mockReceipt);
-      expect(waitStub.calledTwice).to.be.true;
-      expect(waitStub.firstCall.args[0]).to.equal(0);
-      expect(waitStub.secondCall.args[0]).to.equal(1);
+      expect(receiptProbe.calledTwice).to.be.true;
+      expect(waitStub.withArgs(0).calledOnce).to.be.true;
+      expect(waitStub.withArgs(1).calledOnce).to.be.true;
     });
+
+    for (const { reason, cancelled } of [
+      { reason: 'cancelled', cancelled: true },
+      { reason: 'repriced', cancelled: false },
+    ] as const) {
+      it(`should propagate ${reason} transaction replacements`, async () => {
+        const replacementReceipt = {
+          transactionHash: '0xreplacement',
+          blockNumber: 101,
+          status: 1,
+        };
+        const replacementError = Object.assign(
+          new Error('transaction was replaced'),
+          {
+            code: 'TRANSACTION_REPLACED',
+            reason,
+            cancelled,
+            receipt: replacementReceipt,
+          },
+        );
+        const waitStub = sinon.stub();
+        waitStub.withArgs(1).rejects(replacementError);
+        const receiptProbe = sinon
+          .stub(
+            multiProvider.getProvider(TestChainName.test1),
+            'getTransactionReceipt',
+          )
+          .resolves(undefined);
+        // CAST: handleTx only reads hash and wait; a complete ethers transaction
+        // would add unrelated fields to this focused replacement-error test.
+        const mockTx = {
+          hash: '0xabc123def456',
+          wait: waitStub,
+        } as unknown as ContractTransaction;
+
+        try {
+          await multiProvider.handleTx(TestChainName.test1, mockTx, {
+            waitConfirmations: 0,
+            timeoutMs: 5000,
+          });
+          expect.fail('Expected transaction replacement error');
+        } catch (error) {
+          expect(error).to.equal(replacementError);
+          expect(replacementError.reason).to.equal(reason);
+          expect(replacementError.receipt).to.equal(replacementReceipt);
+          expect(receiptProbe.called).to.be.true;
+          expect(waitStub.withArgs(0).notCalled).to.be.true;
+        }
+      });
+    }
 
     it('should not timeout when timeoutMs is 0', async () => {
       const mockReceipt = {

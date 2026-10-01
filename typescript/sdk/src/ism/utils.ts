@@ -1,15 +1,19 @@
-import { ethers, utils } from 'ethers';
+import { BigNumber, ethers, utils } from 'ethers';
 
 import {
   AbstractStorageMultisigIsm__factory,
   AmountRoutingIsm__factory,
+  BlacklistIsm__factory,
   CCIPIsm__factory,
+  DefaultIsm__factory,
+  DelayedFlowRouterHookIsm__factory,
   DomainRoutingIsm__factory,
   IAggregationIsm__factory,
   IInterchainSecurityModule__factory,
   IMultisigIsm__factory,
   IRoutingIsm__factory,
   MailboxClient__factory,
+  NetFlowRateLimitedHookIsm__factory,
   OPStackIsm__factory,
   PausableIsm__factory,
   RateLimitedIsm__factory,
@@ -21,19 +25,26 @@ import {
   deepEquals,
   eqAddress,
   formatMessage,
+  messageId,
   normalizeAddress,
   objMap,
   rootLogger,
 } from '@hyperlane-xyz/utils';
 
 import { getChainNameFromCCIPSelector } from '../ccip/utils.js';
+import { DEFAULT_CONTRACT_READ_CONCURRENCY } from '../consts/concurrency.js';
 import { HyperlaneContracts } from '../contracts/types.js';
 import { ProxyFactoryFactories } from '../deploy/contracts.js';
+import { OnchainHookType } from '../hook/types.js';
 import { ChainTechnicalStack } from '../metadata/chainMetadataTypes.js';
 import { MultiProvider } from '../providers/MultiProvider.js';
 import { ChainName } from '../types.js';
-import { normalizeConfig } from '../utils/ism.js';
+import { throwIfNotMissingSelector } from '../utils/contract.js';
+import { canonicalizeRemoteIsms, normalizeConfig } from '../utils/ism.js';
 
+import { EvmIsmReader } from './EvmIsmReader.js';
+import { normalizeBlacklistedIds, readBlacklistedIds } from './blacklist.js';
+import { readDelayedFlowEnrollments } from './delayedFlow.js';
 import {
   DomainRoutingIsmConfig,
   InterchainAccountRouterIsm,
@@ -99,11 +110,17 @@ export function calculateDomainRoutingDelta(
  * -----------------------------------------------------------------------------
  */
 
+// `addressToBytes` rejects the all-zero address, so the sample message used by
+// `moduleCanCertainlyVerify` uses this minimal non-zero placeholder for its
+// sender/recipient.
+export const SAMPLE_VERIFY_ADDRESS =
+  '0x0000000000000000000000000000000000000001';
+
 // Note that this function may return false negatives, but should
 // not return false positives.
 // This can happen if, for example, the module has sender, recipient, or
 // body specific logic, as the sample message used when querying the ISM
-// sets all of these to zero.
+// uses a placeholder sender/recipient and an empty body.
 export async function moduleCanCertainlyVerify(
   destModule: Address | IsmConfig,
   multiProvider: MultiProvider,
@@ -119,9 +136,9 @@ export async function moduleCanCertainlyVerify(
     0,
     0,
     originDomainId,
-    ethers.constants.AddressZero,
+    SAMPLE_VERIFY_ADDRESS,
     destinationDomainId,
-    ethers.constants.AddressZero,
+    SAMPLE_VERIFY_ADDRESS,
     '0x',
   );
   const provider = multiProvider.getSignerOrProvider(destination);
@@ -217,6 +234,29 @@ export async function moduleCanCertainlyVerify(
       case IsmType.TEST_ISM: {
         return true;
       }
+      case IsmType.BLACKLIST: {
+        // BlacklistIsm.verify returns false for a blacklisted message ID, so
+        // this helper can only guarantee verification when the sample message
+        // is not itself blacklisted.
+        const sampleId = messageId(message).toLowerCase();
+        return !destModule.blacklistedIds.some(
+          (id) => id.toLowerCase() === sampleId,
+        );
+      }
+      case IsmType.NET_FLOW_RATE_LIMITED:
+      case IsmType.DELAYED_FLOW_ROUTER:
+        // Verification depends on state this helper cannot read: the flow
+        // bucket's remaining capacity, and for DELAYED_FLOW_ROUTER also
+        // whether `readyAt` has elapsed. This function must never return a
+        // false positive, so both report "cannot verify". Consequence: an
+        // aggregation containing a hybrid also reports false, because an
+        // aggregation counts sub-results against its threshold. That follows
+        // from the no-false-positive contract and is not a regression.
+        return false;
+      case IsmType.MAILBOX_DEFAULT:
+        // The routed-to mailbox default ISM cannot be resolved from the config
+        // alone (no address), so err toward a false negative
+        return false;
       default:
         throw new Error(`Unsupported module type: ${(destModule as any).type}`);
     }
@@ -415,8 +455,15 @@ export async function moduleMatchesConfig(
       break;
     }
     case IsmType.TEST_ISM: {
-      // This is just a TestISM
-      matches = true;
+      // A NULL module type alone does not make this a Test ISM; every other
+      // NULL ISM shares it. Defer to the reader, which reaches TEST_ISM only
+      // after every distinguishing selector has missed, so the checker and the
+      // reader classify a given address the same way.
+      const derived = await new EvmIsmReader(
+        multiProvider,
+        chain,
+      ).deriveNullConfig(moduleAddress);
+      matches &&= derived.type === IsmType.TEST_ISM;
       break;
     }
     case IsmType.TRUSTED_RELAYER: {
@@ -426,7 +473,13 @@ export async function moduleMatchesConfig(
       );
       const type = await trustedRelayerIsm.moduleType();
       matches &&= type === ModuleType.NULL;
-      const relayer = await trustedRelayerIsm.trustedRelayer();
+      let relayer: Address;
+      try {
+        relayer = await trustedRelayerIsm.trustedRelayer();
+      } catch (error) {
+        throwIfNotMissingSelector(error);
+        return false;
+      }
       matches &&= eqAddress(relayer, config.relayer);
       break;
     }
@@ -489,6 +542,153 @@ export async function moduleMatchesConfig(
       if (config.owner) {
         const onChainOwner = await rateLimitedIsm.owner();
         matches &&= eqAddress(onChainOwner, config.owner);
+      }
+      break;
+    }
+    case IsmType.BLACKLIST: {
+      const blacklistIsm = BlacklistIsm__factory.connect(
+        moduleAddress,
+        provider,
+      );
+
+      // Detection before enumeration, the same order the reader uses. Without
+      // it any Ownable NULL-type ISM whose owner happens to match would report
+      // as an empty blacklist, since a missing `values()` selector falls
+      // through to a log replay that finds nothing.
+      let owner: Address;
+      try {
+        await blacklistIsm.blacklistedIds(ethers.constants.HashZero);
+        owner = await blacklistIsm.owner();
+      } catch (error) {
+        throwIfNotMissingSelector(error);
+        return false;
+      }
+      matches &&= eqAddress(owner, config.owner);
+
+      // Same enumeration the reader uses, so a deployment that reads back as
+      // matching here also converges to zero transactions in EvmIsmModule.
+      const onChainIds = await readBlacklistedIds(
+        chain,
+        moduleAddress,
+        multiProvider,
+      );
+
+      // Entries are append-only on-chain, so any on-chain ID missing from the
+      // config makes the config unreachable: require exact set equality.
+      matches &&= deepEquals(
+        onChainIds,
+        normalizeBlacklistedIds(config.blacklistedIds),
+      );
+      break;
+    }
+    case IsmType.MAILBOX_DEFAULT: {
+      // A DefaultIsm matches if it defers to the expected mailbox
+      const defaultIsm = DefaultIsm__factory.connect(moduleAddress, provider);
+      const onChainMailbox = await defaultIsm.mailbox();
+      matches = mailbox !== undefined && eqAddress(onChainMailbox, mailbox);
+      break;
+    }
+    case IsmType.NET_FLOW_RATE_LIMITED: {
+      const netFlowIsm = NetFlowRateLimitedHookIsm__factory.connect(
+        moduleAddress,
+        provider,
+      );
+      let onChainHookType: number;
+      try {
+        onChainHookType = await netFlowIsm.hookType();
+      } catch (error) {
+        throwIfNotMissingSelector(error);
+        return false;
+      }
+      if (onChainHookType !== OnchainHookType.RATE_LIMITED) return false;
+
+      const [onChainWarpRouter, onChainThresholdBps, onChainDuration] =
+        await Promise.all([
+          netFlowIsm.warpRouter(),
+          netFlowIsm.thresholdBps(),
+          netFlowIsm.DURATION(),
+        ]);
+      if (config.warpRouter) {
+        matches &&= eqAddress(onChainWarpRouter, config.warpRouter);
+      }
+      matches &&= onChainThresholdBps.eq(config.thresholdBps);
+      matches &&= onChainDuration.toBigInt() === BigInt(config.duration);
+      if (config.owner) {
+        const onChainOwner = await netFlowIsm.owner();
+        matches &&= eqAddress(onChainOwner, config.owner);
+      }
+      break;
+    }
+    case IsmType.DELAYED_FLOW_ROUTER: {
+      const delayedIsm = DelayedFlowRouterHookIsm__factory.connect(
+        moduleAddress,
+        provider,
+      );
+      let onChainConfig: [Address, BigNumber, number, BigNumber, Address];
+      try {
+        onChainConfig = await Promise.all([
+          delayedIsm.warpRouter(),
+          delayedIsm.thresholdBps(),
+          delayedIsm.maxDelay(),
+          delayedIsm.DURATION(),
+          delayedIsm.owner(),
+        ]);
+      } catch (error) {
+        throwIfNotMissingSelector(error);
+        return false;
+      }
+      const [
+        onChainWarpRouter,
+        onChainThresholdBps,
+        onChainMaxDelay,
+        onChainDuration,
+        onChainOwner,
+      ] = onChainConfig;
+      if (config.warpRouter) {
+        matches &&= eqAddress(onChainWarpRouter, config.warpRouter);
+      }
+      matches &&= onChainThresholdBps.eq(config.thresholdBps);
+      matches &&= onChainMaxDelay === config.maxDelay;
+      matches &&= onChainDuration.toBigInt() === BigInt(config.duration);
+      matches &&= eqAddress(onChainOwner, config.owner);
+      if (matches && config.remoteIsms !== undefined) {
+        // Strict set equality between configured and enrolled counterparts,
+        // scoped by the same chain<->domain resolution the reader uses so that
+        // a derived config always matches the instance it was derived from.
+        const { named, unnamedDomains } = await readDelayedFlowEnrollments(
+          delayedIsm,
+          multiProvider,
+          multiProvider.tryGetRpcConcurrency(chain) ??
+            DEFAULT_CONTRACT_READ_CONCURRENCY,
+          logger,
+        );
+        if (unnamedDomains.length > 0) {
+          // No config can name these, so they can never be an expected
+          // enrollment — and an enrolled counterpart may preverify arbitrary
+          // message ids, so they must not be invisible to `warp check`.
+          logger.warn(
+            `DelayedFlowRouterHookIsm at ${moduleAddress} on ${chain} has enrollments on unnameable domain(s) ${unnamedDomains.join(', ')}, which no config can express`,
+          );
+        }
+        matches &&= unnamedDomains.length === 0;
+        const enrolledByChain = new Map(
+          named.map(({ chainName, router }) => [chainName, router]),
+        );
+        // Same canonical representation the deploy and update paths use, so a
+        // config keyed by domain id compares against the enrollment it
+        // actually describes instead of always reading as drift.
+        const configEntries = Object.entries(
+          canonicalizeRemoteIsms(
+            config.remoteIsms,
+            multiProvider,
+            `DelayedFlowRouterHookIsm at ${moduleAddress} on ${chain}`,
+          ),
+        );
+        matches &&= named.length === configEntries.length;
+        for (const [chainName, router] of configEntries) {
+          if (!matches) break;
+          matches &&= enrolledByChain.get(chainName) === router;
+        }
       }
       break;
     }

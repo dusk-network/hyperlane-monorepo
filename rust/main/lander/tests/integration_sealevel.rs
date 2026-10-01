@@ -25,15 +25,15 @@ use solana_sdk::{
 };
 use solana_transaction_status::{
     option_serializer::OptionSerializer, EncodedConfirmedTransactionWithStatusMeta,
-    EncodedTransaction, EncodedTransactionWithStatusMeta, UiConfirmedBlock,
-    UiTransactionStatusMeta,
+    EncodedTransaction, EncodedTransactionWithStatusMeta,
+    TransactionStatus as SealevelTransactionStatus, UiConfirmedBlock, UiTransactionStatusMeta,
 };
 
 use hyperlane_base::db::{HyperlaneRocksDB, DB};
 use hyperlane_core::{ChainResult, HyperlaneDomain, KnownHyperlaneDomain};
 use hyperlane_sealevel::{
     fallback::SubmitSealevelRpc, PriorityFeeOracle, SealevelKeypair, SealevelProviderForLander,
-    SealevelTxCostEstimate, SealevelTxType, TransactionSubmitter,
+    SealevelTransactionFormat, SealevelTxCostEstimate, SealevelTxType, TransactionSubmitter,
 };
 
 use lander::{
@@ -53,6 +53,7 @@ mock! {
         async fn get_block_with_commitment(&self, slot: u64, commitment: CommitmentConfig) -> ChainResult<UiConfirmedBlock>;
         async fn get_transaction(&self, signature: Signature) -> ChainResult<EncodedConfirmedTransactionWithStatusMeta>;
         async fn get_transaction_with_commitment(&self, signature: Signature, commitment: CommitmentConfig) -> ChainResult<EncodedConfirmedTransactionWithStatusMeta>;
+        async fn get_signature_statuses_with_history(&self, signatures: &[Signature]) -> Vec<ChainResult<Option<SealevelTransactionStatus>>>;
         async fn simulate_transaction(&self, transaction: &SealevelLegacyTransaction) -> ChainResult<RpcSimulateTransactionResult>;
         async fn simulate_versioned_transaction(&self, transaction: &SealevelVersionedTransaction) -> ChainResult<RpcSimulateTransactionResult>;
     }
@@ -92,7 +93,7 @@ mock! {
             payer: &'a SealevelKeypair,
             tx_submitter: Arc<dyn TransactionSubmitter>,
             sign: bool,
-            alt_address: Option<Pubkey>,
+            alt_addresses: &SealevelTransactionFormat,
             additional_signers: &'a [&'a SealevelKeypair],
         ) -> ChainResult<SealevelTxType>;
 
@@ -102,7 +103,7 @@ mock! {
             payer: &SealevelKeypair,
             tx_submitter: Arc<dyn TransactionSubmitter>,
             priority_fee_oracle: Arc<dyn PriorityFeeOracle>,
-            alt_address: Option<Pubkey>,
+            alt_addresses: &SealevelTransactionFormat,
         ) -> ChainResult<SealevelTxCostEstimate>;
 
         async fn wait_for_transaction_confirmation(&self, transaction: &SealevelTxType) -> ChainResult<()>;
@@ -225,8 +226,8 @@ fn create_sealevel_client() -> MockClient {
         .expect_get_block_with_commitment()
         .returning(move |_, _| Ok(svm_block()));
     client
-        .expect_get_transaction_with_commitment()
-        .returning(move |_, _| Ok(encoded_svm_transaction()));
+        .expect_get_signature_statuses_with_history()
+        .returning(move |_| vec![Ok(Some(finalized_signature_status()))]);
     let result_clone = result.clone();
     client
         .expect_simulate_transaction()
@@ -235,6 +236,18 @@ fn create_sealevel_client() -> MockClient {
         .expect_simulate_versioned_transaction()
         .returning(move |_| Ok(result.clone()));
     client
+}
+
+fn finalized_signature_status() -> SealevelTransactionStatus {
+    SealevelTransactionStatus {
+        slot: 43,
+        confirmations: None,
+        status: Ok(()),
+        err: None,
+        confirmation_status: Some(
+            solana_transaction_status::TransactionConfirmationStatus::Finalized,
+        ),
+    }
 }
 
 fn create_sealevel_submitter() -> MockSubmitter {
@@ -295,14 +308,16 @@ fn encoded_svm_transaction() -> EncodedConfirmedTransactionWithStatusMeta {
 }
 
 fn create_sealevel_payload() -> FullPayload {
-    create_sealevel_payload_with_alt(None)
+    create_sealevel_payload_with_alts(vec![])
 }
 
-fn create_sealevel_payload_with_alt(alt_address: Option<Pubkey>) -> FullPayload {
+fn create_sealevel_payload_with_alts(alt_addresses: Vec<Pubkey>) -> FullPayload {
     let instruction = ComputeBudgetInstruction::set_compute_unit_limit(GAS_LIMIT);
     let process_payload = hyperlane_sealevel::SealevelProcessPayload {
         instruction,
-        alt_address,
+        alt_addresses: hyperlane_sealevel::NonEmptyAltAddresses::try_from(alt_addresses)
+            .map(|alt_addresses| SealevelTransactionFormat::V0 { alt_addresses })
+            .unwrap_or_default(),
     };
     let data = serde_json::to_vec(&process_payload).unwrap();
 
@@ -369,7 +384,7 @@ async fn test_sealevel_payload_reaches_finalized_status() {
         lander::create_test_dispatcher(adapter, payload_db, tx_db, "sealevel".to_string()).await;
 
     // Spawn dispatcher
-    let _dispatcher_handle = tokio::spawn(async move { dispatcher.spawn().await.await });
+    let _dispatcher_handle = dispatcher.spawn();
 
     // Send payload
     entrypoint
@@ -407,7 +422,7 @@ async fn test_sealevel_payload_reaches_finalized_status() {
 async fn test_sealevel_versioned_tx_payload_reaches_finalized_status() {
     // Create payload with ALT address to trigger versioned transaction
     let alt_address = Pubkey::new_unique();
-    let payload = create_sealevel_payload_with_alt(Some(alt_address));
+    let payload = create_sealevel_payload_with_alts(vec![alt_address]);
 
     // Create Sealevel adapter with mocked providers for versioned transactions
     let client = create_sealevel_client();
@@ -429,7 +444,7 @@ async fn test_sealevel_versioned_tx_payload_reaches_finalized_status() {
         lander::create_test_dispatcher(adapter, payload_db, tx_db, "sealevel".to_string()).await;
 
     // Spawn dispatcher
-    let _dispatcher_handle = tokio::spawn(async move { dispatcher.spawn().await.await });
+    let _dispatcher_handle = dispatcher.spawn();
 
     // Send payload
     entrypoint
@@ -497,7 +512,7 @@ async fn test_sealevel_payload_simulation_failure_results_in_dropped() {
     let (entrypoint, dispatcher) =
         lander::create_test_dispatcher(adapter, payload_db, tx_db, "sealevel".to_string()).await;
 
-    let _dispatcher_handle = tokio::spawn(async move { dispatcher.spawn().await.await });
+    let _dispatcher_handle = dispatcher.spawn();
 
     // Send payload
     entrypoint
@@ -580,7 +595,7 @@ async fn test_sealevel_payload_estimation_failure_results_in_dropped() {
     let (entrypoint, dispatcher) =
         lander::create_test_dispatcher(adapter, payload_db, tx_db, "sealevel".to_string()).await;
 
-    let _dispatcher_handle = tokio::spawn(async move { dispatcher.spawn().await.await });
+    let _dispatcher_handle = dispatcher.spawn();
 
     // Send payload
     entrypoint
@@ -618,7 +633,7 @@ async fn test_sealevel_payload_estimation_failure_results_in_dropped() {
 async fn test_sealevel_versioned_tx_estimation_failure_results_in_dropped() {
     // Create payload with ALT address to use versioned transaction path
     let alt_address = Pubkey::new_unique();
-    let payload = create_sealevel_payload_with_alt(Some(alt_address));
+    let payload = create_sealevel_payload_with_alts(vec![alt_address]);
 
     // Create Sealevel adapter with estimation failure
     let client = create_sealevel_client();
@@ -669,7 +684,7 @@ async fn test_sealevel_versioned_tx_estimation_failure_results_in_dropped() {
     let (entrypoint, dispatcher) =
         lander::create_test_dispatcher(adapter, payload_db, tx_db, "sealevel".to_string()).await;
 
-    let _dispatcher_handle = tokio::spawn(async move { dispatcher.spawn().await.await });
+    let _dispatcher_handle = dispatcher.spawn();
 
     // Send payload
     entrypoint

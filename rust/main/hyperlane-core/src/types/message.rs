@@ -1,7 +1,7 @@
 use std::fmt::{Debug, Display, Formatter};
 
 use serde::{Deserialize, Serialize};
-use sha3::{digest::Update, Digest, Keccak256};
+use sha3::{Digest, Keccak256};
 
 use crate::{
     utils::{fmt_address_for_domain, fmt_domain},
@@ -18,9 +18,7 @@ pub type RawHyperlaneMessage = Vec<u8>;
 
 impl From<&HyperlaneMessage> for RawHyperlaneMessage {
     fn from(m: &HyperlaneMessage) -> Self {
-        let mut message_vec = vec![];
-        m.write_to(&mut message_vec).expect("!write_to");
-        message_vec
+        m.to_vec()
     }
 }
 
@@ -107,6 +105,13 @@ impl From<&RawHyperlaneMessage> for HyperlaneMessage {
 }
 
 impl Encode for HyperlaneMessage {
+    fn to_vec(&self) -> Vec<u8> {
+        let mut bytes =
+            Vec::with_capacity(HYPERLANE_MESSAGE_PREFIX_LEN.saturating_add(self.body.len()));
+        self.write_to(&mut bytes).expect("!alloc");
+        bytes
+    }
+
     fn write_to<W>(&self, writer: &mut W) -> std::io::Result<usize>
     where
         W: std::io::Write,
@@ -163,13 +168,142 @@ impl Decode for HyperlaneMessage {
 impl HyperlaneMessage {
     /// Convert the message to a message id
     pub fn id(&self) -> H256 {
-        H256::from_slice(Keccak256::new().chain(self.to_vec()).finalize().as_slice())
+        let mut hasher = Keccak256::new();
+        // The digest writer consumes the canonical encoding without allocating
+        // an intermediate message buffer. Its writes are infallible.
+        self.write_to(&mut hasher)
+            .expect("Writing to Keccak256 cannot fail");
+        H256::from_slice(hasher.finalize().as_slice())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::HyperlaneMessage;
+    use super::{HyperlaneMessage, RawHyperlaneMessage, HYPERLANE_MESSAGE_PREFIX_LEN};
+    use crate::{Decode, Encode, H256};
+    use sha3::{Digest, Keccak256};
+
+    #[test]
+    fn id_matches_known_message_vector() {
+        // Existing vectors/message.json fixture, with its independently specified ID.
+        let mut sender = [0; 32];
+        sender[12..].fill(0x11);
+        let mut recipient = [0; 32];
+        recipient[12..].fill(0x22);
+        let message = HyperlaneMessage {
+            version: 3,
+            nonce: 0,
+            origin: 1000,
+            sender: sender.into(),
+            destination: 2000,
+            recipient: recipient.into(),
+            body: vec![0x12, 0x34],
+        };
+        let expected = H256::from([
+            0xf8, 0xa6, 0x6f, 0x8a, 0xad, 0xee, 0x75, 0x1d, 0x84, 0x26, 0x16, 0xfe, 0xe0, 0xed,
+            0x14, 0xa3, 0xad, 0x6d, 0xa1, 0xe1, 0x35, 0x64, 0x92, 0x03, 0x64, 0xee, 0x0a, 0xd3,
+            0x5a, 0x02, 0x70, 0x3f,
+        ]);
+        assert_eq!(message.id(), expected);
+    }
+
+    #[test]
+    fn streamed_id_matches_canonical_encoding_at_hash_block_boundaries() {
+        for length in [0, 1, 58, 59, 60, 135, 136, 137, 271, 272, 4096, 65536] {
+            for version in [0, 3, u8::MAX] {
+                for nonce in [0, 1, u32::MAX] {
+                    let message = HyperlaneMessage {
+                        version,
+                        nonce,
+                        origin: nonce.rotate_left(7),
+                        sender: H256::repeat_byte(version),
+                        destination: nonce ^ 0xa5a5_a5a5,
+                        recipient: H256::repeat_byte(!version),
+                        body: (0..length).map(|i| (i % 256) as u8).collect(),
+                    };
+                    let encoded = message.to_vec();
+                    assert_eq!(encoded.len(), HYPERLANE_MESSAGE_PREFIX_LEN + length);
+                    let expected = H256::from_slice(Keccak256::digest(&encoded).as_slice());
+                    assert_eq!(message.id(), expected);
+                }
+            }
+        }
+    }
+
+    fn sample_message() -> HyperlaneMessage {
+        HyperlaneMessage {
+            version: 3,
+            nonce: 42,
+            origin: 1,
+            sender: H256::repeat_byte(0x11),
+            destination: 2,
+            recipient: H256::repeat_byte(0x22),
+            body: b"payload".to_vec(),
+        }
+    }
+
+    fn valid_message_bytes() -> RawHyperlaneMessage {
+        RawHyperlaneMessage::from(&sample_message())
+    }
+
+    #[test]
+    fn owned_encodings_match_canonical_writer_at_capacity_boundaries() {
+        use crate::Encode;
+
+        for body_len in [0, 1, 4, 5, 31, 32, 63, 64, 127, 128, 4096, 65536] {
+            for nonce in [0, 42, u32::MAX] {
+                let message = HyperlaneMessage {
+                    nonce,
+                    body: (0..body_len).map(|i| i as u8).collect(),
+                    ..sample_message()
+                };
+                let mut canonical = Vec::new();
+                let written = message.write_to(&mut canonical).unwrap();
+                assert_eq!(written, HYPERLANE_MESSAGE_PREFIX_LEN + body_len);
+                assert_eq!(message.to_vec(), canonical);
+                assert_eq!(RawHyperlaneMessage::from(&message), canonical);
+                assert_eq!(
+                    HyperlaneMessage::read_from(&mut canonical.as_slice()).unwrap(),
+                    message
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_from_valid_input_unchanged() {
+        let expected = sample_message();
+        let bytes = valid_message_bytes();
+        assert!(bytes.len() > HYPERLANE_MESSAGE_PREFIX_LEN);
+
+        let decoded = HyperlaneMessage::read_from(&mut bytes.as_slice()).expect("valid message");
+        assert_eq!(decoded, expected);
+        assert_eq!(HyperlaneMessage::from(bytes), decoded);
+    }
+
+    #[test]
+    fn read_from_empty_input_returns_err() {
+        let mut empty: &[u8] = &[];
+        assert!(HyperlaneMessage::read_from(&mut empty).is_err());
+    }
+
+    #[test]
+    fn read_from_truncated_input_returns_err() {
+        let bytes = valid_message_bytes();
+        for len in [1usize, 40, HYPERLANE_MESSAGE_PREFIX_LEN - 1] {
+            let mut truncated = &bytes[..len];
+            assert!(
+                HyperlaneMessage::read_from(&mut truncated).is_err(),
+                "expected Err for truncated len={len}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_from_malformed_short_input_returns_err() {
+        let mut malformed: &[u8] = &[0u8; 50];
+        assert!(HyperlaneMessage::read_from(&mut malformed).is_err());
+    }
 
     #[ignore]
     #[test]

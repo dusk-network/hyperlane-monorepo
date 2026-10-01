@@ -216,7 +216,7 @@ impl HyperlaneProvider for DuskProvider {
             })?;
 
         let height = required_u64(header, "height", "latest block header")?;
-        let timestamp = required_u64(header, "timestamp", "latest block header")?;
+        required_u64(header, "timestamp", "latest block header")?;
         let hash_hex = header.get("hash").and_then(|v| v.as_str()).ok_or_else(|| {
             HyperlaneDuskError::Other(format!("GraphQL latest block header missing hash: {data}"))
         })?;
@@ -230,18 +230,10 @@ impl HyperlaneProvider for DuskProvider {
             ))
             .into());
         }
-        let hash = H256::from_slice(&hash_bytes);
 
         let gas_price = self.rues.gas_price_stats(200).await?.average;
 
-        Ok(Some(ChainInfo::new(
-            BlockInfo {
-                hash,
-                timestamp,
-                number: height,
-            },
-            Some(U256::from(gas_price)),
-        )))
+        Ok(Some(ChainInfo::new(height, Some(U256::from(gas_price)))))
     }
 }
 

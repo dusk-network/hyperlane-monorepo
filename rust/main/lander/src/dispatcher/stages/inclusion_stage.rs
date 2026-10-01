@@ -2,13 +2,13 @@ use std::cmp::max;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use derive_new::new;
 use eyre::{eyre, Result};
-use futures_util::future::try_join_all;
-use futures_util::try_join;
+use futures_util::{future::try_join_all, try_join, StreamExt};
+use hyperlane_metric::rpc_operation::{with_rpc_operation, RpcOperation};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::sleep;
 use tracing::{error, info, info_span, instrument, warn, Instrument};
@@ -20,7 +20,13 @@ use crate::{
     transaction::{DropReason as TxDropReason, Transaction, TransactionStatus, TransactionUuid},
 };
 
-use super::{utils::call_until_success_or_nonretryable_error, DispatcherState};
+use super::{
+    utils::{
+        buffer_ordered_bounded, call_until_success_or_nonretryable_error,
+        read_transaction_status_batch, FinalizedStatusRead,
+    },
+    DispatcherState,
+};
 
 #[cfg(test)]
 pub mod tests;
@@ -30,6 +36,20 @@ pub type InclusionStagePool = Arc<Mutex<HashMap<TransactionUuid, Transaction>>>;
 pub const STAGE_NAME: &str = "InclusionStage";
 
 const MIN_TX_STATUS_CHECK_DELAY: Duration = Duration::from_millis(100);
+// Upper bound on how rarely a long-pending tx is re-checked. Caps the
+// exponential backoff so a tx that never lands on-chain stops spamming the RPC
+// while still being polled occasionally in case it eventually confirms.
+const MAX_TX_STATUS_CHECK_DELAY: Duration = Duration::from_secs(5 * 60);
+const REPROCESS_TXS_LIVENESS_RATE: Duration = Duration::from_secs(5);
+// Bounds idle reorg-detection latency without reducing the liveness heartbeat rate.
+const MAX_REPROCESS_TXS_POLL_RATE: Duration = Duration::from_secs(5 * 60);
+const STATUS_READ_CONCURRENCY: usize = 16;
+
+#[derive(Debug)]
+enum SubmitOutcome {
+    Submitted(Transaction),
+    GasCapReached(Transaction),
+}
 
 pub struct InclusionStage {
     pub(crate) pool: InclusionStagePool,
@@ -145,49 +165,147 @@ impl InclusionStage {
             .metrics
             .update_liveness_metric(format!("{STAGE_NAME}::process_txs").as_str(), domain);
 
+        let scan_started = Instant::now();
         let pool_snapshot = {
             let pool_snapshot = pool.lock().await;
-            let pool_snapshot = pool_snapshot.clone();
             state.metrics.update_queue_length_metric(
                 STAGE_NAME,
                 pool_snapshot.len() as u64,
                 domain,
             );
-            pool_snapshot
+            pool_snapshot.values().cloned().collect::<Vec<_>>()
         };
+        let now = chrono::Utc::now();
+        let oldest_unchecked_age = pool_snapshot
+            .iter()
+            .filter_map(|tx| {
+                now.signed_duration_since(tx.last_status_check.unwrap_or(tx.creation_timestamp))
+                    .to_std()
+                    .ok()
+            })
+            .max()
+            .unwrap_or_default();
+        state
+            .metrics
+            .update_oldest_unchecked_transaction_age_metric(
+                STAGE_NAME,
+                oldest_unchecked_age,
+                domain,
+            );
         if pool_snapshot.is_empty() {
+            state.metrics.update_status_scan_duration_metric(
+                STAGE_NAME,
+                scan_started.elapsed(),
+                domain,
+            );
             return Ok(());
         }
         info!(pool_size=?pool_snapshot.len() , "Processing transactions in inclusion pool");
 
         let base_interval = *state.adapter.estimated_block_time();
-        let now = chrono::Utc::now();
+        let mut eligible_txs = pool_snapshot
+            .into_iter()
+            .filter(|tx| Self::tx_ready_for_processing(base_interval, now, tx))
+            .collect::<Vec<_>>();
+        super::utils::sort_transactions_for_mutation(&mut eligible_txs);
+        let status_batch_size = state
+            .adapter
+            .tx_status_batch_size()
+            .clamp(1, STATUS_READ_CONCURRENCY);
+        let status_batch_concurrency = STATUS_READ_CONCURRENCY.div_ceil(status_batch_size);
+        let batch_count = eligible_txs.len().div_ceil(status_batch_size);
+        let mut remaining_txs = eligible_txs.into_iter();
+        let status_batches = (0..batch_count)
+            .map(|_| {
+                remaining_txs
+                    .by_ref()
+                    .take(status_batch_size)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        drop(remaining_txs);
+        let status_reads = status_batches.into_iter().map(|batch| {
+            read_transaction_status_batch(state, batch, FinalizedStatusRead::Query, STAGE_NAME)
+        });
+        let status_reads = buffer_ordered_bounded(status_reads, status_batch_concurrency);
+        let status_reads = status_reads.flat_map(futures_util::stream::iter);
+        futures_util::pin_mut!(status_reads);
 
-        for (_, mut tx) in pool_snapshot {
-            // Update liveness metric on every tx as well.
-            // This prevents alert misfires when there are many txs to process.
-            state
-                .metrics
-                .update_liveness_metric(format!("{STAGE_NAME}::process_txs").as_str(), domain);
+        let result = async {
+            while let Some((snapshot_tx, mut checked_tx, status)) = status_reads.next().await {
+                // Update liveness metric on every tx as well.
+                // This prevents alert misfires when there are many txs to process.
+                state
+                    .metrics
+                    .update_liveness_metric(format!("{STAGE_NAME}::process_txs").as_str(), domain);
 
-            if !Self::tx_ready_for_processing(base_interval, now, &tx) {
-                continue;
-            }
+                if !Self::replace_if_unchanged(pool, &snapshot_tx, checked_tx.clone()).await {
+                    info!(tx_uuid = ?snapshot_tx.uuid, "Skipping stale transaction status result");
+                    continue;
+                }
 
-            if let Err(err) =
-                Self::try_process_tx(tx.clone(), finality_stage_sender, state, pool).await
-            {
-                error!(?err, ?tx, "Error processing transaction. Dropping it");
-
-                let drop_reason = match &err {
-                    LanderError::TxDropped(reason) => reason.clone(),
-                    _ => TxDropReason::Other(err.to_string()),
+                let tx_status = match status {
+                    Ok(status) => status,
+                    Err(err) if err.is_infra_error() => {
+                        warn!(
+                            ?err,
+                            tx = ?checked_tx,
+                            "Error reading transaction status. Retrying later"
+                        );
+                        Self::update_inclusion_stage_metric(state, domain, &err);
+                        state.store_tx(&checked_tx).await;
+                        continue;
+                    }
+                    Err(err) => {
+                        error!(?err, tx = ?checked_tx, "Error processing transaction. Dropping it");
+                        let drop_reason = match &err {
+                            LanderError::TxDropped(reason) => reason.clone(),
+                            _ => TxDropReason::Other(err.to_string()),
+                        };
+                        Self::drop_tx(state, &mut checked_tx, drop_reason, pool).await?;
+                        Self::update_inclusion_stage_metric(state, domain, &err);
+                        continue;
+                    }
                 };
-                Self::drop_tx(state, &mut tx, drop_reason, pool).await?;
-                Self::update_inclusion_stage_metric(state, domain, &err);
+                info!(tx = ?checked_tx, next_tx_status = ?tx_status, "Transaction status");
+                if let Err(err) = Self::try_process_tx_with_next_status(
+                    checked_tx.clone(),
+                    tx_status,
+                    finality_stage_sender,
+                    state,
+                    pool,
+                    domain,
+                )
+                .await
+                {
+                    if matches!(err, LanderError::ChannelSendFailure(_)) {
+                        error!(
+                            ?err,
+                            tx = ?checked_tx,
+                            "Failed to forward transaction. Retaining it for retry"
+                        );
+                        Self::update_inclusion_stage_metric(state, domain, &err);
+                        continue;
+                    }
+
+                    error!(?err, tx = ?checked_tx, "Error processing transaction. Dropping it");
+                    let drop_reason = match &err {
+                        LanderError::TxDropped(reason) => reason.clone(),
+                        _ => TxDropReason::Other(err.to_string()),
+                    };
+                    Self::drop_tx(state, &mut checked_tx, drop_reason, pool).await?;
+                    Self::update_inclusion_stage_metric(state, domain, &err);
+                }
             }
+            Ok(())
         }
-        Ok(())
+        .await;
+        state.metrics.update_status_scan_duration_metric(
+            STAGE_NAME,
+            scan_started.elapsed(),
+            domain,
+        );
+        result
     }
 
     #[instrument(skip_all, fields(?domain))]
@@ -196,31 +314,61 @@ impl InclusionStage {
         pool: InclusionStagePool,
         state: DispatcherState,
     ) -> Result<(), LanderError> {
-        let poll_rate = match state.adapter.reprocess_txs_poll_rate() {
+        let base_poll_rate = match state.adapter.reprocess_txs_poll_rate() {
             Some(s) => s,
             // if no poll rate, then that means we don't worry about reprocessing txs
             None => return Ok(()),
         };
+        let max_poll_rate = MAX_REPROCESS_TXS_POLL_RATE.max(base_poll_rate);
+        let mut poll_rate = base_poll_rate;
+        let liveness_stage = format!("{STAGE_NAME}::receive_reprocess_txs");
         loop {
-            state.metrics.update_liveness_metric(
-                format!("{STAGE_NAME}::receive_reprocess_txs").as_str(),
-                &domain,
-            );
+            state
+                .metrics
+                .update_liveness_metric(&liveness_stage, &domain);
 
-            tokio::time::sleep(poll_rate).await;
+            let poll_sleep = tokio::time::sleep(poll_rate);
+            tokio::pin!(poll_sleep);
+            let woke_for_activity = loop {
+                tokio::select! {
+                    biased;
+                    _ = state.wait_for_reprocess_txs_activity() => break true,
+                    _ = &mut poll_sleep => break false,
+                    _ = tokio::time::sleep(REPROCESS_TXS_LIVENESS_RATE) => {
+                        state.metrics.update_liveness_metric(&liveness_stage, &domain);
+                    },
+                }
+            };
+            if woke_for_activity {
+                poll_rate = base_poll_rate;
+            }
             tracing::debug!(
                 domain,
                 "Checking for any transactions that needs reprocessing"
             );
 
-            let txs = match state.adapter.get_reprocess_txs().await {
+            let txs = match with_rpc_operation(
+                RpcOperation::TransactionLifecycle,
+                state.adapter.get_reprocess_txs(),
+            )
+            .await
+            {
                 Ok(s) => s,
-                _ => continue,
+                Err(err) => {
+                    poll_rate = base_poll_rate;
+                    warn!(
+                        ?err,
+                        domain, "Failed to check for transactions that need reprocessing"
+                    );
+                    continue;
+                }
             };
             if txs.is_empty() {
+                poll_rate = poll_rate.saturating_mul(2).min(max_poll_rate);
                 continue;
             }
 
+            poll_rate = base_poll_rate;
             tracing::debug!(?txs, "Reprocessing transactions");
             let mut locked_pool = pool.lock().await;
             for tx in txs {
@@ -258,8 +406,22 @@ impl InclusionStage {
                     MIN_TX_STATUS_CHECK_DELAY.div_f64(2.0),
                 )
             } else {
-                // Old transactions: check every full block time
-                max(base_interval, MIN_TX_STATUS_CHECK_DELAY)
+                // Old transactions (likely stuck, e.g. a tx that never landed
+                // on-chain): exponentially back off from one block time, doubling
+                // every 5 minutes of age, capped at MAX_TX_STATUS_CHECK_DELAY.
+                // This stops us from hammering the RPC's confirmation endpoint for
+                // transactions that may never confirm, while still polling them
+                // occasionally in case they eventually do.
+                let base = max(base_interval, MIN_TX_STATUS_CHECK_DELAY);
+                let steps = tx_age
+                    .num_seconds()
+                    .saturating_sub(300)
+                    .checked_div(300)
+                    .unwrap_or_default()
+                    .clamp(0, 16);
+                let steps = u32::try_from(steps).expect("backoff steps are clamped to u32 range");
+                base.saturating_mul(2u32.saturating_pow(steps))
+                    .min(MAX_TX_STATUS_CHECK_DELAY)
             };
 
             // Skip this transaction if we checked it too recently
@@ -274,38 +436,17 @@ impl InclusionStage {
         true
     }
 
-    #[instrument(
-        skip_all,
-        name = "InclusionStage::try_process_tx",
-        fields(tx_uuid = ?tx.uuid, tx_status = ?tx.status, payloads = ?tx.payload_details)
-    )]
-    async fn try_process_tx(
-        mut tx: Transaction,
-        finality_stage_sender: &mpsc::Sender<Transaction>,
-        state: &DispatcherState,
+    async fn replace_if_unchanged(
         pool: &InclusionStagePool,
-    ) -> Result<(), LanderError> {
-        info!(?tx, "Processing inclusion stage transaction");
-
-        // Update the last status check timestamp before querying
-        tx.last_status_check = Some(chrono::Utc::now());
-
-        let tx_status = call_until_success_or_nonretryable_error(
-            || state.adapter.tx_status(&tx),
-            "Querying transaction status",
-            state,
-        )
-        .await?;
-        info!(?tx, next_tx_status = ?tx_status, "Transaction status");
-
-        // Update the transaction in the pool with the new timestamp
-        {
-            let mut pool_lock = pool.lock().await;
-            pool_lock.insert(tx.uuid.clone(), tx.clone());
+        snapshot_tx: &Transaction,
+        checked_tx: Transaction,
+    ) -> bool {
+        let mut pool = pool.lock().await;
+        if pool.get(&snapshot_tx.uuid) != Some(snapshot_tx) {
+            return false;
         }
-
-        Self::try_process_tx_with_next_status(tx, tx_status, finality_stage_sender, state, pool)
-            .await
+        pool.insert(checked_tx.uuid.clone(), checked_tx);
+        true
     }
 
     #[instrument(
@@ -319,20 +460,28 @@ impl InclusionStage {
         finality_stage_sender: &mpsc::Sender<Transaction>,
         state: &DispatcherState,
         pool: &InclusionStagePool,
+        domain: &str,
     ) -> Result<(), LanderError> {
         match tx_status {
             TransactionStatus::PendingInclusion | TransactionStatus::Mempool => {
                 info!(tx_uuid = ?tx.uuid, ?tx_status, "Transaction is pending inclusion");
                 update_tx_status(state, &mut tx, tx_status.clone()).await?;
-                if !state.adapter.tx_ready_for_resubmission(&tx).await {
+                pool.lock().await.insert(tx.uuid.clone(), tx.clone());
+                if !with_rpc_operation(
+                    RpcOperation::TransactionLifecycle,
+                    state.adapter.tx_ready_for_resubmission(&tx),
+                )
+                .await
+                {
                     info!(?tx, "Transaction is not ready for resubmission");
                     return Ok(());
                 }
-                Self::process_pending_tx(tx, state, pool).await
+                Self::process_pending_tx(tx, state, pool, domain).await
             }
             TransactionStatus::Included | TransactionStatus::Finalized => {
                 update_tx_status(state, &mut tx, tx_status.clone()).await?;
                 let tx_uuid = tx.uuid.clone();
+                pool.lock().await.insert(tx_uuid.clone(), tx.clone());
                 finality_stage_sender.send(tx).await.map_err(|err| {
                     tracing::error!(?err, "Failed to send tx to finality stage");
                     LanderError::ChannelSendFailure(Box::new(err))
@@ -357,6 +506,7 @@ impl InclusionStage {
         mut tx: Transaction,
         state: &DispatcherState,
         pool: &InclusionStagePool,
+        domain: &str,
     ) -> Result<(), LanderError> {
         info!(?tx, "Processing pending transaction");
 
@@ -371,7 +521,20 @@ impl InclusionStage {
         tx = Self::estimate_tx(&tx, state).await?;
 
         // Submitting transaction to the node
-        tx = Self::submit_tx(&tx, state).await?;
+        tx = match Self::submit_tx(tx, state).await? {
+            SubmitOutcome::Submitted(tx) => tx,
+            SubmitOutcome::GasCapReached(mut tx) => {
+                warn!(
+                    ?tx,
+                    "Transaction reached the current gas cap; retaining it for a later retry"
+                );
+                Self::update_inclusion_stage_metric(state, domain, &LanderError::TxGasCapReached);
+                let status = tx.status.clone();
+                update_tx_status(state, &mut tx, status).await?;
+                pool.lock().await.insert(tx.uuid.clone(), tx);
+                return Ok(());
+            }
+        };
         info!(?tx, "Transaction submitted to node");
 
         state
@@ -391,36 +554,42 @@ impl InclusionStage {
     }
 
     async fn submit_tx(
-        tx: &Transaction,
+        tx: Transaction,
         state: &DispatcherState,
-    ) -> Result<Transaction, LanderError> {
-        // create a temporary arcmutex so that submission retries are aware of tx fields (e.g. gas price)
-        // set by previous retries when calling `adapter.submit`
-        let tx_shared = Arc::new(Mutex::new(tx.clone()));
+    ) -> Result<SubmitOutcome, LanderError> {
+        // Submission retries retain tx fields (e.g. gas price) set by previous
+        // attempts. The retry future borrows this local mutex until it completes.
+        let tx_shared = Mutex::new(tx);
         // successively calling `submit` will result in escalating gas price until the tx is accepted
         // by the node.
         // at this point, not all VMs return information about whether the tx was reverted.
         // so dropping reverted payloads has to happen in the finality step
-        call_until_success_or_nonretryable_error(
-            || {
-                let tx_shared_clone = tx_shared.clone();
-                async move {
-                    let mut tx_guard = tx_shared_clone.lock().await;
-                    let submit_result = state.adapter.submit(&mut tx_guard).await;
+        let gas_cap_reached = call_until_success_or_nonretryable_error(
+            || async {
+                let mut tx_guard = tx_shared.lock().await;
+                let submit_result = with_rpc_operation(RpcOperation::TransactionLifecycle, state.adapter.submit(&mut tx_guard)).await;
 
-                    match submit_result {
-                        Ok(()) => Ok(tx_guard.clone()),
-                        Err(err) if matches!(err, LanderError::TxAlreadyExists) => {
-                            warn!(tx=?tx_guard, ?err, "Transaction resubmission failed, will check the status of transaction before dropping it");
-                            Ok(tx_guard.clone())
-                        }
-                        Err(err) => Err(err),
+                match submit_result {
+                    Ok(()) => Ok(false),
+                    Err(err) if matches!(err, LanderError::TxAlreadyExists) => {
+                        warn!(tx=?tx_guard, ?err, "Transaction resubmission failed, will check the status of transaction before dropping it");
+                        Ok(false)
                     }
+                    Err(LanderError::TxGasCapReached) => Ok(true),
+                    Err(err) => Err(err),
                 }
             },
             "Submitting transaction",
             state,
-        ).await
+        )
+        .await?;
+        let submitted_tx = tx_shared.into_inner();
+        if gas_cap_reached {
+            Ok(SubmitOutcome::GasCapReached(submitted_tx))
+        } else {
+            state.notify_reprocess_txs_activity();
+            Ok(SubmitOutcome::Submitted(submitted_tx))
+        }
     }
 
     async fn estimate_tx(
@@ -431,8 +600,12 @@ impl InclusionStage {
             || {
                 let tx_clone = tx.clone();
                 async move {
-                    let mut tx_clone_inner = tx_clone.clone();
-                    state.adapter.estimate_tx(&mut tx_clone_inner).await?;
+                    let mut tx_clone_inner = tx_clone;
+                    with_rpc_operation(
+                        RpcOperation::RelayerEstimate,
+                        state.adapter.estimate_tx(&mut tx_clone_inner),
+                    )
+                    .await?;
                     Ok(tx_clone_inner)
                 }
             },
@@ -456,8 +629,12 @@ impl InclusionStage {
             || {
                 let tx_clone = tx.clone();
                 async move {
-                    let mut tx_clone_inner = tx_clone.clone();
-                    let failed_payloads = state.adapter.simulate_tx(&mut tx_clone_inner).await?;
+                    let mut tx_clone_inner = tx_clone;
+                    let failed_payloads = with_rpc_operation(
+                        RpcOperation::RelayerEstimate,
+                        state.adapter.simulate_tx(&mut tx_clone_inner),
+                    )
+                    .await?;
                     Ok((tx_clone_inner, failed_payloads))
                 }
             },

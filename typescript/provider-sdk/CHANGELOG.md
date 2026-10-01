@@ -1,5 +1,115 @@
 # @hyperlane-xyz/provider-sdk
 
+## 10.0.2
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@44.0.2
+
+## 10.0.1
+
+### Patch Changes
+
+- f269e03: Zod was updated to 4.5.4 to prevent function-valued default factories from running during schema cycle detection and compilation.
+  - @hyperlane-xyz/utils@44.0.1
+
+## 10.0.0
+
+### Major Changes
+
+- 6fbe5ad: The Starknet TypeScript stack was upgraded from starknet.js v7 to v8.9.2 to support the JSON-RPC v0.9 endpoints. Account and Contract call sites were migrated to the v8 options-object constructors, fee estimation was updated to the new resourceBounds shape, and dispatch-event parsing now passes the required ABI parser. Starknet wallet dependencies were upgraded for starknet.js v8 compatibility, and the minimum supported Node.js version is now 22 across published runtime dependents.
+
+### Patch Changes
+
+- Updated dependencies [6fbe5ad]
+  - @hyperlane-xyz/utils@44.0.0
+
+## 9.0.0
+
+### Major Changes
+
+- 8bcc7ab: Zod was upgraded to 4.5.2 across the TypeScript workspace. Public schemas and validation types were migrated to Zod 4, recursive fee configuration types were made explicit, application entrypoints adopted compiled parsing, and validation errors were changed to use Zod 4's built-in formatting.
+
+### Patch Changes
+
+- Updated dependencies [7cf9c01]
+  - @hyperlane-xyz/utils@43.0.0
+
+## 8.1.3
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@42.0.0
+
+## 8.1.2
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@41.3.1
+
+## 8.1.1
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@41.3.0
+
+## 8.1.0
+
+### Minor Changes
+
+- bd4e5f0: Added a VM-agnostic impersonated submitter so `warp apply` can apply owner-authorized governance transactions against a fork without holding the impersonated authority's key. As with the EVM impersonated submitter, `warp apply` still requires an operator signer key — impersonation only removes the need for the impersonated account's own key.
+
+  - Added `SvmImpersonatingSigner` (exported as `SealevelImpersonatingSigner`) to `@hyperlane-xyz/sealevel-sdk`: it pays fees from a fixed public fork-only account and leaves the impersonated account's signature slot empty, which only a skip-signature-verification fork accepts. It is scoped to the configured `userAddress` — every unsigned required-signer slot must belong to that account, so it is not an unrestricted signature bypass. Sealevel signer internals moved to a shared `BaseSvmSigner`; `SvmSigner` behavior is unchanged.
+  - Relocated `AltVMJsonRpcSubmitter` and `AltVMImpersonatedSubmitter` into `@hyperlane-xyz/provider-sdk` (browser-safe) as sibling subclasses of a shared base, and added an `impersonatedAccount` submitter config variant. `@hyperlane-xyz/deploy-sdk` re-exports `AltVMJsonRpcSubmitter` for backwards compatibility.
+  - Implemented `createSubmitter` for Sealevel (`jsonRpc` and `impersonatedAccount`) and wired the `impersonatedAccount` submitter into the CLI AltVM submitter factories.
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@41.2.0
+
+## 8.0.4
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@41.1.0
+
+## 8.0.3
+
+### Patch Changes
+
+- Updated dependencies [fa19409]
+  - @hyperlane-xyz/utils@41.0.0
+
+## 8.0.2
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@40.0.0
+
+## 8.0.1
+
+### Patch Changes
+
+- Updated dependencies [4976bb1]
+  - @hyperlane-xyz/utils@39.1.0
+
+## 8.0.0
+
+### Major Changes
+
+- 4ef1fde: - `getMinGasForWarpDeploy` now lives on `IProvider` (per-chain) instead of the stateless `ProtocolProvider`. It is `async` and returns a FINAL native-denom amount rather than a mix of gas units and native amounts. It composes the base router deploy cost with additive deltas for detected features (cross-collateral extras, fee program deploy, custom ISM / hook / IGP deploy) driven by the warp config shape, and for gas-metered protocols multiplies gas units by the chain gas price.
+  - `ChainMetadataForAltVM` gained an optional `gasPrice` field.
+  - `ProviderBuilderFn` now takes a full `ChainMetadata` instead of `(rpcUrls, network)`.
+  - The AltVM `IProvider.connect` and `ISigner.connectWithSigner` static factories now take `ChainMetadataForAltVM` as their first argument, replacing the previous `(rpcUrls, chainId, extraParams)` shape and the metadata-through-`extraParams` indirection.
+  - The CLI warp-deploy preflight now sizes AltVM native-balance requirements from the composed per-chain deploy cost, so feature-heavy deploys are no longer silently under-funded, and chains without a gas price are no longer skipped for the warp-deploy path.
+  - The AltVM warp-deploy base gas costs were calibrated from measured deploys (Sealevel from mainnet; Starknet, Aleo, and Radix from devnet base-router floors with safety margin), replacing the previous catastrophically-low placeholder constants that let preflight pass under-funded accounts.
+  - The Starknet test fixture native token was corrected from ETH to STRK to match the production registry and the token the devnet actually charges fees in.
+
+### Patch Changes
+
+- Updated dependencies [735793b]
+  - @hyperlane-xyz/utils@39.0.0
+
 ## 7.2.0
 
 ### Minor Changes

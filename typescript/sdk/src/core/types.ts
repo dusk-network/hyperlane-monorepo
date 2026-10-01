@@ -17,7 +17,11 @@ import type { DerivedIsmConfig, IsmConfig } from '../ism/types.js';
 import { IsmConfigSchema } from '../ism/types.js';
 import type { ChainName } from '../types.js';
 import { DeployedOwnableSchema, OwnableSchema } from '../types.js';
-import { ismTreeContainsRateLimited } from '../utils/ism.js';
+import {
+  ismTreeContainsCompositeRateLimited,
+  ismTreeContainsMailboxDefaultOrHybrid,
+  ismTreeContainsRateLimited,
+} from '../utils/ism.js';
 
 const CoreConfigBaseSchema = OwnableSchema.extend({
   defaultIsm: IsmConfigSchema,
@@ -34,14 +38,49 @@ const CoreConfigBaseSchema = OwnableSchema.extend({
   contractVersion: z.string().optional(),
 });
 
+/**
+ * DefaultIsm routes to `mailbox.defaultIsm()`. Installed AS the mailbox's
+ * default ISM it routes to itself, so verification recurses until it runs out
+ * of gas and no inbound message can be delivered. The warp-route hybrid
+ * hook/ISMs are equally invalid here: they are bound to a specific warp router
+ * and meter its flow, which is meaningless for chain-wide default verification.
+ */
+const rejectWarpOnlyDefaultIsm = (
+  val: { defaultIsm: IsmConfig },
+  ctx: z.RefinementCtx,
+) => {
+  if (ismTreeContainsMailboxDefaultOrHybrid(val.defaultIsm)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message:
+        'DefaultIsm, NetFlowRateLimitedHookIsm and DelayedFlowRouterHookIsm cannot be used as (or nested inside) a core default ISM',
+      path: ['defaultIsm'],
+    });
+  }
+};
+
+/**
+ * Rate limiting meters an amount read from a fixed offset of the message
+ * body, which only holds for warp-route traffic, whereas a default ISM sees
+ * every message. Both spellings are rejected: the EVM `rateLimitedIsm` and a
+ * `rateLimited` node inside a Sealevel `compositeIsm` tree.
+ */
 const rejectRateLimitedDefaultIsm = (
-  val: { defaultIsm: unknown },
+  val: { defaultIsm: IsmConfig },
   ctx: z.RefinementCtx,
 ) => {
   if (ismTreeContainsRateLimited(val.defaultIsm)) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       message: 'RateLimitedIsm cannot be used as a core default ISM',
+      path: ['defaultIsm'],
+    });
+  }
+  if (ismTreeContainsCompositeRateLimited(val.defaultIsm)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message:
+        "A compositeIsm 'rateLimited' node cannot be used in a core default ISM",
       path: ['defaultIsm'],
     });
   }
@@ -75,15 +114,15 @@ const rejectQuotedCallsWithLegacyIgp = (
 
 export const CoreConfigSchema = CoreConfigBaseSchema.superRefine((val, ctx) => {
   rejectRateLimitedDefaultIsm(val, ctx);
+  rejectWarpOnlyDefaultIsm(val, ctx);
   rejectQuotedCallsWithLegacyIgp(val, ctx);
 });
 
-export const DerivedCoreConfigSchema = CoreConfigBaseSchema.merge(
-  z.object({
-    interchainAccountRouter: DerivedIcaRouterConfigSchema.optional(),
-  }),
-).superRefine((val, ctx) => {
+export const DerivedCoreConfigSchema = CoreConfigBaseSchema.extend({
+  interchainAccountRouter: DerivedIcaRouterConfigSchema.optional(),
+}).superRefine((val, ctx) => {
   rejectRateLimitedDefaultIsm(val, ctx);
+  rejectWarpOnlyDefaultIsm(val, ctx);
   rejectQuotedCallsWithLegacyIgp(val, ctx);
 });
 
@@ -106,6 +145,10 @@ export type CoreConfig = z.infer<typeof CoreConfigSchema> & {
   remove?: boolean;
   upgrade?: UpgradeConfig;
 };
+
+export function getConfiguredMailboxOwner(config: CoreConfig): Address {
+  return config.ownerOverrides?.mailbox ?? config.owner;
+}
 
 export function shouldDeployQuotedCalls(
   config: Pick<CoreConfig, 'deployQuotedCalls'>,

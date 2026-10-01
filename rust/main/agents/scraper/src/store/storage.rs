@@ -7,11 +7,15 @@ use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use eyre::Result;
-use itertools::Itertools;
+use futures::{stream, StreamExt};
 use prometheus::IntCounterVec;
+use tokio::sync::Semaphore;
 use tracing::{trace, warn};
 
-use hyperlane_base::settings::IndexSettings;
+use hyperlane_base::{
+    cursors::{CursorType, Indexable},
+    settings::{CoreContractAddresses, IndexSettings},
+};
 use hyperlane_core::{
     BlockId, BlockInfo, HyperlaneDomain, HyperlaneLogStore, HyperlaneProvider,
     HyperlaneWatermarkedLogStore, LogMeta, H256, H512,
@@ -33,6 +37,7 @@ pub struct HyperlaneDbStore {
     pub(crate) domain: HyperlaneDomain,
     pub(crate) mailbox_address: H256,
     pub(crate) interchain_gas_paymaster_address: H256,
+    pub(crate) merkle_tree_hook_address: H256,
     provider: Arc<dyn HyperlaneProvider>,
     cursor: Arc<BlockCursor>,
     /// Metric for tracking raw message dispatches stored (used for CCTP availability)
@@ -44,8 +49,7 @@ impl HyperlaneDbStore {
     pub async fn new(
         db: ScraperDb,
         domain: HyperlaneDomain,
-        mailbox_address: H256,
-        interchain_gas_paymaster_address: H256,
+        addresses: CoreContractAddresses,
         provider: Arc<dyn HyperlaneProvider>,
         index_settings: &IndexSettings,
         stored_events_metric: Option<IntCounterVec>,
@@ -57,12 +61,39 @@ impl HyperlaneDbStore {
         Ok(Self {
             db,
             domain,
-            mailbox_address,
-            interchain_gas_paymaster_address,
+            mailbox_address: addresses.mailbox,
+            interchain_gas_paymaster_address: addresses.interchain_gas_paymaster,
+            merkle_tree_hook_address: addresses.merkle_tree_hook,
             provider,
             cursor,
             stored_events_metric,
         })
+    }
+
+    /// Give a block-indexed event its own durable checkpoint. The legacy empty
+    /// event type contains the fastest worker's height, so copying it would
+    /// preserve gaps left by slower workers. An absent event checkpoint replays
+    /// from the configured start; existing event checkpoints resume normally.
+    /// Sequence-aware cursors use their existing sequence/backward progress.
+    pub(crate) async fn with_event_watermark<T: Indexable>(
+        mut self,
+        index_settings: &IndexSettings,
+    ) -> Result<Self> {
+        if matches!(
+            T::indexing_cursor(self.domain.domain_protocol()),
+            CursorType::RateLimited
+        ) {
+            self.cursor = Arc::new(
+                self.db
+                    .block_cursor(
+                        self.domain.id(),
+                        T::name(),
+                        index_settings.from.max(0) as u64,
+                    )
+                    .await?,
+            );
+        }
+        Ok(self)
     }
 
     /// Get the stored events metric for incrementing when raw messages are stored.
@@ -70,15 +101,88 @@ impl HyperlaneDbStore {
         self.stored_events_metric.as_ref()
     }
 
+    /// Enrich a confirmed near-head page whose block headers are already retained.
+    /// Look up the page's cache entries together, then persist missing receipts
+    /// independently so one failed or timed-out fetch cannot discard successes.
+    pub(crate) async fn ensure_transactions_for_known_blocks(
+        &self,
+        log_meta: impl Iterator<Item = &LogMeta>,
+        rpc_permits: &Semaphore,
+        domain_rpc_permits: &Semaphore,
+        db_permits: &Semaphore,
+    ) -> Result<bool> {
+        let requested: HashMap<_, _> = log_meta
+            .map(|meta| (meta.transaction_id, meta.block_hash))
+            .collect();
+        if requested.is_empty() {
+            return Ok(true);
+        }
+        let db_permit = db_permits.acquire().await?;
+        let blocks = self.db.get_block_basic(requested.values()).await?;
+        let existing = self.db.get_txn_ids(requested.keys()).await?;
+        drop(db_permit);
+        let blocks: HashMap<_, _> = blocks.into_iter().map(|b| (b.hash, b.id)).collect();
+        eyre::ensure!(
+            requested.values().all(|hash| blocks.contains_key(hash)),
+            "Confirmed receipt page is missing retained block headers"
+        );
+        let missing = requested
+            .into_iter()
+            .filter(|(hash, _)| !existing.contains_key(hash));
+        let mut results = stream::iter(missing)
+            .map(|(hash, block_hash)| {
+                let blocks = &blocks;
+                async move {
+                    let result = async {
+                        let block_id = *blocks
+                            .get(&block_hash)
+                            .ok_or_else(|| eyre::eyre!("Missing retained block"))?;
+                        let domain_rpc_permit = domain_rpc_permits.acquire().await?;
+                        let rpc_permit = rpc_permits.acquire().await?;
+                        let info = self.provider.get_txn_by_hash(&hash).await?;
+                        drop(rpc_permit);
+                        drop(domain_rpc_permit);
+                        let _db_permit = db_permits.acquire().await?;
+                        self.db
+                            .store_txns(std::iter::once(StorableTxn { info, block_id }))
+                            .await?;
+                        Ok::<_, eyre::Report>(())
+                    }
+                    .await;
+                    if let Err(error) = &result {
+                        warn!(
+                            domain = self.domain.id(),
+                            ?hash,
+                            ?error,
+                            "Receipt unavailable; retrying"
+                        );
+                    }
+                    result.is_ok()
+                }
+            })
+            .buffer_unordered(8);
+        let mut complete = true;
+        while let Some(success) = results.next().await {
+            complete &= success;
+        }
+        Ok(complete)
+    }
+
     /// Takes a list of txn and block hashes and ensure they are all in the
     /// database. If any are not it will fetch the data and insert them.
     ///
     /// Returns the relevant transaction info.
+    ///
+    /// Log metas with zero transaction and block hashes (produced by indexers
+    /// that cannot resolve either, e.g. the Sealevel basic log meta fallback)
+    /// carry no fetchable block/transaction data and are skipped here; callers
+    /// must still persist those events with a NULL transaction relation.
     pub(crate) async fn ensure_blocks_and_txns(
         &self,
         log_meta: impl Iterator<Item = &LogMeta>,
-    ) -> Result<impl Iterator<Item = TxnWithId>> {
+    ) -> Result<impl Iterator<Item = (H512, i64)>> {
         let block_id_by_txn_hash: HashMap<H512, BlockId> = log_meta
+            .filter(|meta| !meta.transaction_id.is_zero() && !meta.block_hash.is_zero())
             .map(|meta| {
                 (
                     meta.transaction_id,
@@ -92,18 +196,18 @@ impl HyperlaneDbStore {
         let blocks: HashMap<_, _> = self
             .ensure_blocks(block_id_by_txn_hash.values().copied())
             .await?
-            .map(|block| (block.hash, block))
+            .map(|block| (block.hash, block.id))
             .collect();
         trace!(?blocks, "Ensured blocks");
 
         // We ensure transactions only from blocks which are inserted into database
         let txn_hash_with_block_ids = block_id_by_txn_hash
             .into_iter()
-            .filter_map(move |(txn, block)| blocks.get(&block.hash).map(|b| (txn, b.id)))
+            .filter_map(move |(txn, block)| blocks.get(&block.hash).map(|id| (txn, *id)))
             .map(|(txn_hash, block_id)| TxnWithBlockId { txn_hash, block_id });
         let txns_with_ids = self.ensure_txns(txn_hash_with_block_ids).await?;
 
-        Ok(txns_with_ids.map(move |TxnWithId { hash, id: txn_id }| TxnWithId { hash, id: txn_id }))
+        Ok(txns_with_ids)
     }
 
     /// Takes a list of transaction hashes and the block id the transaction is
@@ -117,7 +221,7 @@ impl HyperlaneDbStore {
     async fn ensure_txns(
         &self,
         txns: impl Iterator<Item = TxnWithBlockId>,
-    ) -> Result<impl Iterator<Item = TxnWithId>> {
+    ) -> Result<impl Iterator<Item = (H512, i64)>> {
         // mapping of txn hash to (txn_id, block_id).
         let mut txns: HashMap<H512, (Option<i64>, i64)> = txns
             .map(|TxnWithBlockId { txn_hash, block_id }| (txn_hash, (None, block_id)))
@@ -154,6 +258,10 @@ impl HyperlaneDbStore {
                         continue;
                     }
                 };
+                if info.hash != **hash {
+                    warn!(requested_hash = ?hash, returned_hash = ?info.hash, "transaction enrichment returned a different hash");
+                    continue;
+                }
                 hashes_to_insert.push(*hash);
                 txns_to_insert.push(StorableTxn {
                     info,
@@ -167,8 +275,18 @@ impl HyperlaneDbStore {
                 continue;
             }
 
-            self.db.store_txns(txns_to_insert.drain(..)).await?;
-            let ids = self.db.get_txn_ids(hashes_to_insert.drain(..)).await?;
+            let mut ids = self.db.store_txns(txns_to_insert.drain(..)).await?;
+            // DO NOTHING can omit concurrent winners. Read those in a fresh statement
+            // after the INSERT, rather than the INSERT's earlier snapshot.
+            let existing = self
+                .db
+                .get_txn_ids(
+                    hashes_to_insert
+                        .drain(..)
+                        .filter(|hash| !ids.contains_key(*hash)),
+                )
+                .await?;
+            ids.extend(existing);
 
             for (hash, (txn_id, _block_id)) in chunk.iter_mut() {
                 *txn_id = ids.get(hash).copied();
@@ -177,8 +295,7 @@ impl HyperlaneDbStore {
 
         let ensured_txns = txns
             .into_iter()
-            .filter_map(|(hash, (txn_id, _))| txn_id.map(|id| (hash, id)))
-            .map(|(hash, id)| TxnWithId { hash, id });
+            .filter_map(|(hash, (txn_id, _))| txn_id.map(|id| (hash, id)));
 
         Ok(ensured_txns)
     }
@@ -195,14 +312,10 @@ impl HyperlaneDbStore {
         &self,
         block_ids: impl Iterator<Item = BlockId>,
     ) -> Result<impl Iterator<Item = BasicBlock>> {
-        // Mapping from block hash to block ids (hash and height)
-        let block_hash_to_block_id_map: HashMap<H256, BlockId> =
-            block_ids.map(|b| (b.hash, b)).collect();
-
-        // Mapping of block hash to `BasicBlock` which contains database block id and block hash.
-        let mut blocks: HashMap<H256, Option<BasicBlock>> = block_hash_to_block_id_map
-            .keys()
-            .map(|hash| (*hash, None))
+        // Keep the requested height beside its enrichment state. Duplicate
+        // hashes retain the last height, matching the input metadata map.
+        let mut blocks: HashMap<H256, (u64, Option<i64>)> = block_ids
+            .map(|block| (block.hash, (block.height, None)))
             .collect();
 
         let db_blocks: Vec<BasicBlock> = if !blocks.is_empty() {
@@ -216,29 +329,25 @@ impl HyperlaneDbStore {
             let _ = blocks
                 .get_mut(&block.hash)
                 .expect("We found a block that we did not request")
-                .insert(block);
+                .1
+                .insert(block.id);
         }
 
         // insert any blocks that were not known and get their IDs
         // use this vec as temporary list of mut refs so we can update their ids once we
         // have inserted them into the database.
-        // Block info is an option so we can move it, must always be Some before
-        // inserted into db.
+        // A temporary -1 id is excluded from the result unless the inserted
+        // block hash resolves to a database id on readback.
         let blocks_to_fetch = blocks
             .iter_mut()
-            .filter(|(_, block_info)| block_info.is_none());
+            .filter(|(_, (_, stored_id))| stored_id.is_none());
 
         for chunk in as_chunks(blocks_to_fetch, CHUNK_SIZE) {
             debug_assert!(!chunk.is_empty());
             let mut block_infos: Vec<BlockInfo> = Vec::with_capacity(CHUNK_SIZE);
-            let mut blocks_to_insert: Vec<&mut BasicBlock> = Vec::with_capacity(CHUNK_SIZE);
-            let mut hashes_to_insert: Vec<&H256> = Vec::with_capacity(CHUNK_SIZE);
-            for (hash, block_info) in chunk {
-                // We should have block_id in this map for every hashes
-                let block_id = block_hash_to_block_id_map
-                    .get(hash)
-                    .expect("Missing block id");
-                let block_height = block_id.height;
+            let mut blocks_to_insert: Vec<(&H256, &mut i64)> = Vec::with_capacity(CHUNK_SIZE);
+            for (hash, (block_height, stored_id)) in chunk {
+                let block_height = *block_height;
 
                 let info = match self.provider.get_block_by_height(block_height).await {
                     Ok(info) => info,
@@ -247,13 +356,15 @@ impl HyperlaneDbStore {
                         continue;
                     }
                 };
-                let basic_info_ref = block_info.insert(BasicBlock {
-                    id: -1,
-                    hash: *hash,
-                });
+                // A mismatched response can occupy the unique (domain, height)
+                // key and prevent a later retry from inserting the correct block.
+                if info.hash != *hash || info.number != block_height {
+                    warn!(requested_hash = ?hash, requested_height = block_height, returned_block = ?info, "block enrichment returned a different block");
+                    continue;
+                }
+                let block_id = stored_id.insert(-1);
                 block_infos.push(info);
-                blocks_to_insert.push(basic_info_ref);
-                hashes_to_insert.push(hash);
+                blocks_to_insert.push((hash, block_id));
             }
 
             // If we have no blocks to insert, we don't store them and we don't update
@@ -262,28 +373,36 @@ impl HyperlaneDbStore {
                 continue;
             }
 
-            self.db
-                .store_blocks(self.domain.id(), block_infos.into_iter())
-                .await?;
-
-            let hashes = self
+            let mut hashes: HashMap<_, _> = self
                 .db
-                .get_block_basic(hashes_to_insert.drain(..))
+                .store_blocks(self.domain.id(), block_infos.into_iter())
                 .await?
                 .into_iter()
-                .map(|b| (b.hash, b.id))
-                .collect::<HashMap<_, _>>();
+                .map(|block| (block.hash, block.id))
+                .collect();
+            // Query only requested hashes omitted by RETURNING, including conflicts
+            // and provider responses carrying a different hash than requested.
+            let existing = self
+                .db
+                .get_block_basic(
+                    blocks_to_insert
+                        .iter()
+                        .map(|(hash, _)| *hash)
+                        .filter(|hash| !hashes.contains_key(*hash)),
+                )
+                .await?;
+            hashes.extend(existing.into_iter().map(|block| (block.hash, block.id)));
 
-            for block_ref in blocks_to_insert {
-                if let Some(id) = hashes.get(&block_ref.hash) {
-                    block_ref.id = *id;
+            for (hash, block_id) in blocks_to_insert {
+                if let Some(id) = hashes.get(hash) {
+                    *block_id = *id;
                 }
             }
         }
 
-        let ensured_blocks = blocks
-            .into_iter()
-            .filter_map(|(hash, block_info)| block_info.filter(|b| b.id != -1));
+        let ensured_blocks = blocks.into_iter().filter_map(|(hash, (_, id))| {
+            id.filter(|id| *id != -1).map(|id| BasicBlock { id, hash })
+        });
 
         Ok(ensured_blocks)
     }
@@ -300,15 +419,48 @@ where
     }
     /// Stores the block number high watermark
     async fn store_high_watermark(&self, block_number: u32) -> Result<()> {
-        self.cursor.update(block_number.into()).await;
+        self.cursor.update(block_number.into()).await?;
         Ok(())
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct TxnWithId {
-    pub hash: H512,
-    pub id: i64,
+/// Check required enrichment to keep incomplete ranges retryable. Delivery and
+/// payment stores persist available siblings first. CCR checks before writes
+/// because its synthetic nonce allocation depends on insertion order.
+/// Zero-tx Cosmos block events retain their existing unsupported handling; the
+/// zero/zero Sealevel sentinel is persisted with a NULL transaction relation.
+pub(crate) fn ensure_event_enrichment_complete<'a>(
+    txns: &HashMap<H512, i64>,
+    log_meta: impl Iterator<Item = &'a LogMeta>,
+) -> Result<()> {
+    for meta in log_meta {
+        eyre::ensure!(
+            meta.transaction_id.is_zero() || txns.contains_key(&meta.transaction_id),
+            "Incomplete event enrichment at block {} ({:?}), transaction {:?}; retrying range",
+            meta.block_number,
+            meta.block_hash,
+            meta.transaction_id,
+        );
+    }
+    Ok(())
+}
+
+/// Resolves the database transaction id for a log's meta.
+///
+/// - `Some(Some(id))` when the transaction was ensured in the database.
+/// - `Some(None)` when the meta carries zero transaction and block hashes,
+///   meaning the indexer could not resolve the on-chain transaction (e.g. the
+///   Sealevel basic log meta fallback); the event must still be persisted with
+///   a NULL transaction relation so it remains retrievable by sequence.
+/// - `None` when enrichment is incomplete. Only callers with a durable raw
+///   event for reconciliation may skip a required nonzero transaction; other
+///   callers must return an error. Zero-tx Cosmos block events remain unsupported.
+pub(crate) fn txn_id_for_meta(txns: &HashMap<H512, i64>, meta: &LogMeta) -> Option<Option<i64>> {
+    if meta.transaction_id.is_zero() && meta.block_hash.is_zero() {
+        Some(None)
+    } else {
+        txns.get(&meta.transaction_id).copied().map(Some)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -317,13 +469,72 @@ struct TxnWithBlockId {
     block_id: i64,
 }
 
-fn as_chunks<T>(iter: impl Iterator<Item = T>, chunk_size: usize) -> impl Iterator<Item = Vec<T>> {
-    // the itertools chunks function uses refcell which cannot be used across an
-    // await so this stabilizes the result by putting it into a vec of vecs and
-    // using that for iteration.
-    iter.chunks(chunk_size)
-        .into_iter()
-        .map(|chunk| chunk.into_iter().collect())
-        .collect_vec()
-        .into_iter()
+fn as_chunks<T>(
+    mut iter: impl Iterator<Item = T>,
+    chunk_size: usize,
+) -> impl Iterator<Item = Vec<T>> {
+    assert!(chunk_size > 0, "chunk size must be positive");
+    // Own just the current chunk across await points. itertools::chunks keeps
+    // a RefCell borrowed by each chunk, which cannot be held across awaits.
+    std::iter::from_fn(move || {
+        let chunk: Vec<_> = iter.by_ref().take(chunk_size).collect();
+        (!chunk.is_empty()).then_some(chunk)
+    })
 }
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::as_chunks;
+
+    #[test]
+    fn enrichment_chunks_only_consume_the_requested_batch() {
+        let consumed = Cell::new(0);
+        let input = (0..1_000).inspect(|_| consumed.set(consumed.get() + 1));
+        let mut chunks = as_chunks(input, 50);
+        assert_eq!(consumed.get(), 0);
+        assert_eq!(chunks.next(), Some((0..50).collect()));
+        assert_eq!(consumed.get(), 50);
+        assert_eq!(chunks.next(), Some((50..100).collect()));
+        assert_eq!(consumed.get(), 100);
+        drop(chunks);
+        assert_eq!(
+            consumed.get(),
+            100,
+            "dropping work must not consume later chunks"
+        );
+    }
+
+    #[test]
+    fn enrichment_chunks_preserve_order_and_partial_tail() {
+        assert_eq!(
+            as_chunks(0..5, 2).collect::<Vec<_>>(),
+            vec![vec![0, 1], vec![2, 3], vec![4]]
+        );
+        assert_eq!(
+            as_chunks(0..4, 2).collect::<Vec<_>>(),
+            vec![vec![0, 1], vec![2, 3]]
+        );
+        assert_eq!(as_chunks(0..1, 2).collect::<Vec<_>>(), vec![vec![0]]);
+        assert_eq!(as_chunks(0..0, 2).next(), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "chunk size must be positive")]
+    fn enrichment_chunks_reject_zero_chunk_size() {
+        let _ = as_chunks(0..1, 0);
+    }
+}
+
+#[cfg(test)]
+mod watermark_tests;
+
+#[cfg(test)]
+mod block_tests;
+
+#[cfg(test)]
+mod returning_tests;
+
+#[cfg(test)]
+mod event_loss_tests;

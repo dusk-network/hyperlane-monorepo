@@ -1,11 +1,14 @@
 use std::time::{Duration, Instant};
 
 use eyre::Result;
-use sea_orm::{prelude::*, ActiveValue, Insert, Order, QueryOrder, QuerySelect};
+use migration::{Alias, Expr, Func, OnConflict};
+use sea_orm::{prelude::*, ActiveValue::*, Insert, Order, QueryOrder, QuerySelect};
 use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, warn};
 
-use crate::db::ScraperDb;
+use hyperlane_core::BackwardCursorProgress;
+
+use crate::{date_time, db::ScraperDb};
 
 use super::generated::cursor;
 
@@ -15,8 +18,11 @@ const MAX_WRITE_BACK_FREQUENCY: Duration = Duration::from_secs(10);
 struct BlockCursorInner {
     /// Block height
     height: u64,
+    /// Last height restored from or successfully written to the database.
+    last_saved_height: u64,
     /// Last time we updated the database with the block height.
-    last_saved_at: Instant,
+    /// None until this process has persisted its first advancing checkpoint.
+    last_saved_at: Option<Instant>,
 }
 
 /// A tool to wrap the logic of fetching and updating the cursor position in the
@@ -66,7 +72,8 @@ impl BlockCursor {
             event_type: event_type.to_owned(),
             inner: RwLock::new(BlockCursorInner {
                 height,
-                last_saved_at: Instant::now(),
+                last_saved_height: height,
+                last_saved_at: None,
             }),
         })
     }
@@ -75,33 +82,25 @@ impl BlockCursor {
         self.inner.read().await.height
     }
 
+    /// Persist the first advancing checkpoint immediately, then throttle writes.
+    /// Failed writes remain dirty and are retried even at the same height.
     #[instrument(skip(self), fields(cursor = ?self.inner))]
-    pub async fn update(&self, height: u64) {
+    pub async fn update(&self, height: u64) -> Result<bool> {
         let mut inner = self.inner.write().await;
 
-        let old_height = inner.height;
         inner.height = inner.height.max(height);
 
-        let now = Instant::now();
-        let time_since_last_save = now.duration_since(inner.last_saved_at);
-        if height > old_height && time_since_last_save > MAX_WRITE_BACK_FREQUENCY {
-            inner.last_saved_at = now;
-            // prevent any more writes to the inner struct until the write is complete.
-            let inner = inner.downgrade();
-            let model = cursor::ActiveModel {
-                id: ActiveValue::NotSet,
-                domain: ActiveValue::Set(self.domain as i32),
-                time_created: ActiveValue::NotSet,
-                height: ActiveValue::Set(height as i64),
-                event_type: ActiveValue::Set(self.event_type.clone()),
-            };
-            debug!(?model, "Inserting cursor");
-            if let Err(e) = Insert::one(model).exec(&self.db).await {
-                warn!(error = ?e, "Failed to update database with new cursor. When you just started this, ensure that the migrations included this domain.")
-            } else {
-                debug!(cursor = ?*inner, "Updated cursor")
-            }
+        let should_flush = inner.height > inner.last_saved_height
+            && inner
+                .last_saved_at
+                .is_none_or(|saved| saved.elapsed() > MAX_WRITE_BACK_FREQUENCY);
+        drop(inner);
+
+        if should_flush {
+            self.flush().await?;
+            return Ok(true);
         }
+        Ok(false)
     }
 
     /// Persist the current height to the database unconditionally, bypassing the
@@ -115,16 +114,37 @@ impl BlockCursor {
     pub async fn flush(&self) -> Result<()> {
         let mut inner = self.inner.write().await;
         let height = inner.height;
+        debug!(
+            height,
+            domain = self.domain,
+            event_type = self.event_type,
+            "Flushing cursor to database"
+        );
         let model = cursor::ActiveModel {
-            id: ActiveValue::NotSet,
-            domain: ActiveValue::Set(self.domain as i32),
-            time_created: ActiveValue::NotSet,
-            height: ActiveValue::Set(height as i64),
-            event_type: ActiveValue::Set(self.event_type.clone()),
+            id: NotSet,
+            domain: Set(self.domain as i32),
+            time_created: Set(date_time::now()),
+            height: Set(height as i64),
+            event_type: Set(self.event_type.clone()),
         };
-        debug!(?model, "Flushing cursor to database");
-        Insert::one(model).exec(&self.db).await?;
-        inner.last_saved_at = Instant::now();
+
+        Insert::one(model)
+            .on_conflict(
+                OnConflict::columns([cursor::Column::Domain, cursor::Column::EventType])
+                    .update_column(cursor::Column::TimeCreated)
+                    .value(
+                        cursor::Column::Height,
+                        Func::greatest([
+                            Expr::col((Alias::new("cursor"), cursor::Column::Height)).into(),
+                            Expr::col((Alias::new("excluded"), cursor::Column::Height)).into(),
+                        ]),
+                    )
+                    .to_owned(),
+            )
+            .exec(&self.db)
+            .await?;
+        inner.last_saved_height = height;
+        inner.last_saved_at = Some(Instant::now());
         let inner = inner.downgrade();
         debug!(cursor = ?*inner, "Flushed cursor");
         Ok(())
@@ -140,4 +160,102 @@ impl ScraperDb {
     ) -> Result<BlockCursor> {
         BlockCursor::new(self.clone_connection(), domain, event_type, default_height).await
     }
+
+    pub async fn retrieve_backward_cursors(
+        &self,
+        domain: u32,
+        event_type: &str,
+    ) -> Result<Vec<BackwardCursorProgress>> {
+        let event_type_prefix = format!("backward_{event_type}_");
+        cursor::Entity::find()
+            .filter(cursor::Column::Domain.eq(domain))
+            .filter(cursor::Column::EventType.starts_with(&event_type_prefix))
+            .all(&self.0)
+            .await?
+            .into_iter()
+            .map(|model| {
+                let sequence = model
+                    .event_type
+                    .strip_prefix(&event_type_prefix)
+                    .ok_or_else(|| eyre::eyre!("Invalid backwards cursor event type"))?
+                    .parse()?;
+                Ok(BackwardCursorProgress {
+                    sequence,
+                    block: model.height.try_into()?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn store_backward_cursor(
+        &self,
+        domain: u32,
+        event_type: &str,
+        progress: BackwardCursorProgress,
+    ) -> Result<()> {
+        let model = cursor::ActiveModel {
+            id: NotSet,
+            domain: Set(domain as i32),
+            time_created: Set(date_time::now()),
+            height: Set(progress.block.into()),
+            event_type: Set(format!("backward_{event_type}_{}", progress.sequence)),
+        };
+        Insert::one(model)
+            .on_conflict(
+                OnConflict::columns([cursor::Column::Domain, cursor::Column::EventType])
+                    .update_column(cursor::Column::TimeCreated)
+                    .value(
+                        cursor::Column::Height,
+                        Func::least([
+                            Expr::col((Alias::new("cursor"), cursor::Column::Height)).into(),
+                            Expr::col((Alias::new("excluded"), cursor::Column::Height)).into(),
+                        ]),
+                    )
+                    .to_owned(),
+            )
+            .exec(&self.0)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn reset_backward_cursor(
+        &self,
+        domain: u32,
+        event_type: &str,
+        progress: BackwardCursorProgress,
+    ) -> Result<()> {
+        let model = cursor::ActiveModel {
+            id: NotSet,
+            domain: Set(domain as i32),
+            time_created: Set(date_time::now()),
+            height: Set(progress.block.into()),
+            event_type: Set(format!("backward_{event_type}_{}", progress.sequence)),
+        };
+        Insert::one(model)
+            .on_conflict(
+                OnConflict::columns([cursor::Column::Domain, cursor::Column::EventType])
+                    .update_columns([cursor::Column::Height, cursor::Column::TimeCreated])
+                    .to_owned(),
+            )
+            .exec(&self.0)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_backward_cursor(
+        &self,
+        domain: u32,
+        event_type: &str,
+        sequence: u32,
+    ) -> Result<()> {
+        cursor::Entity::delete_many()
+            .filter(cursor::Column::Domain.eq(domain))
+            .filter(cursor::Column::EventType.eq(format!("backward_{event_type}_{sequence}")))
+            .exec(&self.0)
+            .await?;
+        Ok(())
+    }
 }
+
+#[cfg(test)]
+mod tests;

@@ -29,6 +29,7 @@ enum MailboxInstructionVariant {
   // OutboxGetRoot = 7,
   // GetOwner = 8,
   TransferOwnership = 9,
+  ClaimProtocolFees = 10,
 }
 
 export interface MailboxInitData {
@@ -58,7 +59,7 @@ function encodeMailboxInit(data: MailboxInitData): Uint8Array {
  * Builds a mailbox Init instruction.
  *
  * Account layout (from Rust init_instruction):
- *  0. [writable]        System program
+ *  0. [readonly]        System program
  *  1. [writable,signer] Payer
  *  2. [writable]        Inbox PDA
  *  3. [writable]        Outbox PDA
@@ -73,7 +74,7 @@ export async function buildInitMailboxInstruction(
   return buildInstruction(
     programId,
     [
-      writableAccount(SYSTEM_PROGRAM_ADDRESS),
+      readonlyAccount(SYSTEM_PROGRAM_ADDRESS),
       writableSigner(payer),
       writableAccount(inboxPda),
       writableAccount(outboxPda),
@@ -135,5 +136,20 @@ export async function buildTransferMailboxOwnershipInstruction(
         option(newOwner, (addr) => ADDRESS_CODEC.encode(addr)),
       ),
     ),
+  );
+}
+
+/** Claims all outbox lamports above the executing chain's rent minimum.
+ * The beneficiary must match the mailbox configuration and need not sign.
+ */
+export async function buildClaimProtocolFeesInstruction(
+  programId: Address,
+  beneficiary: Address,
+): Promise<Instruction> {
+  const { address: outboxPda } = await deriveMailboxOutboxPda(programId);
+  return buildInstruction(
+    programId,
+    [writableAccount(outboxPda), writableAccount(beneficiary)],
+    u8(MailboxInstructionVariant.ClaimProtocolFees),
   );
 }

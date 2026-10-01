@@ -7,12 +7,12 @@ use tracing::{debug, instrument, trace};
 
 use hyperlane_core::{
     address_to_bytes, bytes_to_address, bytes_to_h512, h256_to_bytes, h512_to_bytes,
-    HyperlaneMessage, LogMeta, H256, U256,
+    HyperlaneMessage, LogMeta, H256, H512, U256,
 };
-use migration::OnConflict;
+use migration::{Alias, Expr, OnConflict};
 
 use crate::date_time;
-use crate::db::ScraperDb;
+use crate::db::{confirmed_event, ScraperDb};
 
 use super::{generated::raw_message_dispatch, StorableMessage};
 
@@ -34,7 +34,7 @@ pub struct RawDispatchForEnrichment {
 }
 
 impl RawDispatchForEnrichment {
-    pub fn storable_message(&self, txn_id: i64) -> StorableMessage<'_> {
+    pub fn storable_message(&self, txn_id: Option<i64>) -> StorableMessage<'_> {
         StorableMessage {
             msg: self.msg.clone(),
             meta: &self.meta,
@@ -60,6 +60,11 @@ impl ScraperDb {
         origin_mailbox: Vec<u8>,
     ) -> Result<i64> {
         let result = raw_message_dispatch::Entity::find()
+            .filter(confirmed_event(
+                "raw_message_dispatch",
+                "origin_domain",
+                "origin_block_height",
+            ))
             .select_only()
             .column_as(raw_message_dispatch::Column::Id.max(), "max_id")
             .filter(raw_message_dispatch::Column::OriginDomain.eq(origin_domain))
@@ -76,6 +81,38 @@ impl ScraperDb {
             .unwrap_or(0))
     }
 
+    /// Get the latest raw dispatch that can become a reconciliation candidate.
+    ///
+    /// This snapshots a stable upper bound for a discovery or completeness scan.
+    /// Filtering on `msg_body` also lets Postgres use the reconciliation partial
+    /// index instead of walking raw rows that can never be enriched.
+    pub async fn latest_reconcilable_raw_dispatch_id(
+        &self,
+        origin_domain: u32,
+        origin_mailbox: &H256,
+    ) -> Result<i64> {
+        let result = raw_message_dispatch::Entity::find()
+            .filter(confirmed_event(
+                "raw_message_dispatch",
+                "origin_domain",
+                "origin_block_height",
+            ))
+            .select_only()
+            .column_as(raw_message_dispatch::Column::Id.max(), "max_id")
+            .filter(raw_message_dispatch::Column::OriginDomain.eq(origin_domain))
+            .filter(
+                raw_message_dispatch::Column::OriginMailbox.eq(address_to_bytes(origin_mailbox)),
+            )
+            .filter(raw_message_dispatch::Column::MsgBody.is_not_null())
+            .into_tuple::<Option<i64>>()
+            .one(&self.0)
+            .await?;
+
+        Ok(result
+            .ok_or_else(|| eyre::eyre!("Error getting latest reconcilable raw dispatch id"))?
+            .unwrap_or(0))
+    }
+
     /// Count raw message dispatches with ID greater than the given ID for a specific domain and mailbox.
     async fn raw_dispatch_count_since_id(
         &self,
@@ -84,6 +121,11 @@ impl ScraperDb {
         prev_id: i64,
     ) -> Result<u64> {
         Ok(raw_message_dispatch::Entity::find()
+            .filter(confirmed_event(
+                "raw_message_dispatch",
+                "origin_domain",
+                "origin_block_height",
+            ))
             .filter(raw_message_dispatch::Column::OriginDomain.eq(origin_domain))
             .filter(raw_message_dispatch::Column::OriginMailbox.eq(origin_mailbox))
             .filter(raw_message_dispatch::Column::Id.gt(prev_id))
@@ -134,35 +176,26 @@ impl ScraperDb {
             .latest_raw_dispatch_id(origin_domain, origin_mailbox.clone())
             .await?;
 
-        // Ensure all chunks are inserted or none at all
-        self.0
-            .transaction::<_, (), DbErr>(|txn| {
-                Box::pin(async move {
-                    // Insert raw message dispatches in chunks, to not run into
-                    // "Too many arguments" error
-                    for chunk in models.chunks(Self::STORE_RAW_MESSAGE_DISPATCH_CHUNK_SIZE) {
-                        Insert::many(chunk.to_vec())
-                            .on_conflict(
-                                OnConflict::column(raw_message_dispatch::Column::MsgId)
-                                    .update_columns([
-                                        raw_message_dispatch::Column::TimeUpdated,
-                                        raw_message_dispatch::Column::OriginTxHash,
-                                        raw_message_dispatch::Column::OriginBlockHash,
-                                        raw_message_dispatch::Column::OriginBlockHeight,
-                                        raw_message_dispatch::Column::DestinationDomain,
-                                        raw_message_dispatch::Column::Sender,
-                                        raw_message_dispatch::Column::Recipient,
-                                        raw_message_dispatch::Column::MsgBody,
-                                    ])
-                                    .to_owned(),
-                            )
-                            .exec(txn)
-                            .await?;
-                    }
-                    Ok(())
+        // A single INSERT is atomic; multiple chunks need one shared transaction.
+        if models.len() <= Self::STORE_RAW_MESSAGE_DISPATCH_CHUNK_SIZE {
+            raw_dispatch_insert_query(models).exec(&self.0).await?;
+        } else {
+            self.0
+                .transaction::<_, (), DbErr>(|txn| {
+                    Box::pin(async move {
+                        let mut models = models.into_iter();
+                        while !models.as_slice().is_empty() {
+                            let chunk = models
+                                .by_ref()
+                                .take(Self::STORE_RAW_MESSAGE_DISPATCH_CHUNK_SIZE)
+                                .collect();
+                            raw_dispatch_insert_query(chunk).exec(txn).await?;
+                        }
+                        Ok(())
+                    })
                 })
-            })
-            .await?;
+                .await?;
+        }
 
         let new_dispatch_count = self
             .raw_dispatch_count_since_id(origin_domain, origin_mailbox, latest_id_before)
@@ -181,6 +214,7 @@ impl ScraperDb {
         origin_domain: u32,
         origin_mailbox: &H256,
         after_id: i64,
+        through_id: i64,
         limit: u64,
     ) -> Result<Vec<RawDispatchForEnrichment>> {
         let origin_mailbox = address_to_bytes(origin_mailbox);
@@ -189,7 +223,7 @@ impl ScraperDb {
                 self.0.get_database_backend(),
                 r#"
                 SELECT raw_message_dispatch.*
-                FROM raw_message_dispatch
+                FROM confirmed_raw_message_dispatch AS raw_message_dispatch
                 LEFT JOIN "message"
                   ON "message".origin = raw_message_dispatch.origin_domain
                  AND "message".origin_mailbox = raw_message_dispatch.origin_mailbox
@@ -199,14 +233,60 @@ impl ScraperDb {
                   AND raw_message_dispatch.msg_body IS NOT NULL
                   AND "message".id IS NULL
                   AND raw_message_dispatch.id > $3
+                  AND raw_message_dispatch.id <= $4
                 ORDER BY raw_message_dispatch.id ASC
-                LIMIT $4
+                LIMIT $5
                 "#,
                 [
                     (origin_domain as i32).into(),
                     origin_mailbox.into(),
                     after_id.into(),
+                    through_id.into(),
                     (limit as i64).into(),
+                ],
+            ))
+            .all(&self.0)
+            .await?;
+
+        raw_dispatches
+            .into_iter()
+            .map(raw_dispatch_to_candidate)
+            .collect()
+    }
+
+    /// Re-read known retry rows by primary key while excluding rows that another
+    /// writer has already enriched. The retry batch is bounded by the caller.
+    pub async fn retrieve_unenriched_raw_dispatches_by_ids(
+        &self,
+        origin_domain: u32,
+        origin_mailbox: &H256,
+        raw_ids: &[i64],
+    ) -> Result<Vec<RawDispatchForEnrichment>> {
+        if raw_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let raw_dispatches = raw_message_dispatch::Entity::find()
+            .from_raw_sql(Statement::from_sql_and_values(
+                self.0.get_database_backend(),
+                r#"
+                SELECT raw_message_dispatch.*
+                FROM confirmed_raw_message_dispatch AS raw_message_dispatch
+                LEFT JOIN "message"
+                  ON "message".origin = raw_message_dispatch.origin_domain
+                 AND "message".origin_mailbox = raw_message_dispatch.origin_mailbox
+                 AND "message".nonce = raw_message_dispatch.nonce
+                WHERE raw_message_dispatch.origin_domain = $1
+                  AND raw_message_dispatch.origin_mailbox = $2
+                  AND raw_message_dispatch.msg_body IS NOT NULL
+                  AND "message".id IS NULL
+                  AND raw_message_dispatch.id = ANY($3)
+                ORDER BY raw_message_dispatch.id ASC
+                "#,
+                [
+                    (origin_domain as i32).into(),
+                    address_to_bytes(origin_mailbox).into(),
+                    raw_ids.to_vec().into(),
                 ],
             ))
             .all(&self.0)
@@ -227,6 +307,11 @@ impl ScraperDb {
     ) -> Result<Option<raw_message_dispatch::Model>> {
         let msg_id = h256_to_bytes(message_id);
         Ok(raw_message_dispatch::Entity::find()
+            .filter(confirmed_event(
+                "raw_message_dispatch",
+                "origin_domain",
+                "origin_block_height",
+            ))
             .filter(raw_message_dispatch::Column::MsgId.eq(msg_id))
             .one(&self.0)
             .await?)
@@ -263,12 +348,88 @@ fn raw_dispatch_to_candidate(raw: raw_message_dispatch::Model) -> Result<RawDisp
     })
 }
 
+fn raw_dispatch_insert_query(
+    models: Vec<raw_message_dispatch::ActiveModel>,
+) -> Insert<raw_message_dispatch::ActiveModel> {
+    Insert::many(models).on_conflict(
+        OnConflict::column(raw_message_dispatch::Column::MsgId)
+            .update_columns([
+                raw_message_dispatch::Column::TimeUpdated,
+                raw_message_dispatch::Column::DestinationDomain,
+                raw_message_dispatch::Column::Sender,
+                raw_message_dispatch::Column::Recipient,
+                raw_message_dispatch::Column::MsgBody,
+            ])
+            // Preserve resolved hashes across a later
+            // basic-meta fallback, while still updating
+            // the body and other fields on legacy rows.
+            .value(
+                raw_message_dispatch::Column::OriginTxHash,
+                Expr::case(
+                    Expr::col((
+                        Alias::new("excluded"),
+                        raw_message_dispatch::Column::OriginTxHash,
+                    ))
+                    .ne(h512_to_bytes(&H512::zero())),
+                    Expr::col((
+                        Alias::new("excluded"),
+                        raw_message_dispatch::Column::OriginTxHash,
+                    )),
+                )
+                .finally(Expr::col((
+                    Alias::new("raw_message_dispatch"),
+                    raw_message_dispatch::Column::OriginTxHash,
+                ))),
+            )
+            .value(
+                raw_message_dispatch::Column::OriginBlockHash,
+                Expr::case(
+                    Expr::col((
+                        Alias::new("excluded"),
+                        raw_message_dispatch::Column::OriginBlockHash,
+                    ))
+                    .ne(h256_to_bytes(&H256::zero())),
+                    Expr::col((
+                        Alias::new("excluded"),
+                        raw_message_dispatch::Column::OriginBlockHash,
+                    )),
+                )
+                .finally(Expr::col((
+                    Alias::new("raw_message_dispatch"),
+                    raw_message_dispatch::Column::OriginBlockHash,
+                ))),
+            )
+            .value(
+                raw_message_dispatch::Column::OriginBlockHeight,
+                Expr::case(
+                    Expr::col((
+                        Alias::new("excluded"),
+                        raw_message_dispatch::Column::OriginBlockHash,
+                    ))
+                    .ne(h256_to_bytes(&H256::zero())),
+                    Expr::col((
+                        Alias::new("excluded"),
+                        raw_message_dispatch::Column::OriginBlockHeight,
+                    )),
+                )
+                .finally(Expr::col((
+                    Alias::new("raw_message_dispatch"),
+                    raw_message_dispatch::Column::OriginBlockHeight,
+                ))),
+            )
+            .to_owned(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use migration::MigratorTrait;
     use std::collections::BTreeMap;
 
-    use sea_orm::{Database, DatabaseBackend, DbErr, MockDatabase, RuntimeErr, Value};
+    use sea_orm::{
+        ConnectionTrait, Database, DatabaseBackend, DbErr, MockDatabase, RuntimeErr, Statement,
+        Value,
+    };
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::postgres::Postgres;
     use time::macros::{date, time};
@@ -411,7 +572,7 @@ mod tests {
         };
 
         let candidate = raw_dispatch_to_candidate(raw).unwrap();
-        let storable = candidate.storable_message(7);
+        let storable = candidate.storable_message(Some(7));
 
         assert_eq!(candidate.msg_id, msg_id);
         assert_eq!(candidate.raw_id, 1);
@@ -421,7 +582,7 @@ mod tests {
         assert_eq!(candidate.meta.block_hash, block_hash);
         assert_eq!(candidate.meta.transaction_id, tx_hash);
         assert_eq!(storable.id_override, Some(msg_id));
-        assert_eq!(storable.txn_id, 7);
+        assert_eq!(storable.txn_id, Some(7));
     }
 
     #[tokio::test]
@@ -728,7 +889,7 @@ mod tests {
                 [StorableMessage {
                     msg: messages[1].clone(),
                     meta: &metas[1],
-                    txn_id,
+                    txn_id: Some(txn_id),
                     id_override: None,
                 }]
                 .into_iter(),
@@ -736,17 +897,98 @@ mod tests {
             .await?;
 
         let candidates = scraper_db
-            .retrieve_unenriched_raw_dispatches(1, &H256::from_low_u64_be(999), 0, 100)
+            .retrieve_unenriched_raw_dispatches(1, &H256::from_low_u64_be(999), 0, i64::MAX, 100)
             .await?;
         assert_eq!(candidates.len(), MESSAGE_COUNT - 1);
         assert!(candidates.iter().any(|candidate| candidate.msg.nonce == 0));
         assert!(candidates.iter().all(|candidate| candidate.msg.nonce != 1));
+
+        let raw_zero = scraper_db
+            .retrieve_raw_message_dispatch_by_id(&messages[0].id())
+            .await?
+            .expect("pending raw row should exist");
+        let raw_one = scraper_db
+            .retrieve_raw_message_dispatch_by_id(&messages[1].id())
+            .await?
+            .expect("enriched raw row should exist");
+        let direct_candidates = scraper_db
+            .retrieve_unenriched_raw_dispatches_by_ids(
+                1,
+                &H256::from_low_u64_be(999),
+                &[raw_zero.id, raw_one.id],
+            )
+            .await?;
+        assert_eq!(direct_candidates.len(), 1);
+        assert_eq!(direct_candidates[0].raw_id, raw_zero.id);
+
+        // A completeness page can pass an old row while its body is unavailable. Once an
+        // upsert supplies the body, only a successor sweep from zero can rediscover it.
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE raw_message_dispatch SET msg_body = NULL WHERE id = $1",
+            [raw_zero.id.into()],
+        ))
+        .await?;
+        let sweep_page = scraper_db
+            .retrieve_unenriched_raw_dispatches(1, &H256::from_low_u64_be(999), 0, i64::MAX, 10)
+            .await?;
+        assert_eq!(sweep_page.len(), 10);
+        let passed_id = sweep_page.last().expect("full sweep page").raw_id;
+        assert!(passed_id > raw_zero.id);
+
+        scraper_db
+            .store_raw_message_dispatches(
+                1,
+                &H256::from_low_u64_be(999),
+                [StorableRawMessageDispatch {
+                    msg: &messages[0],
+                    meta: &metas[0],
+                }]
+                .into_iter(),
+            )
+            .await?;
+        let same_sweep = scraper_db
+            .retrieve_unenriched_raw_dispatches(
+                1,
+                &H256::from_low_u64_be(999),
+                passed_id,
+                i64::MAX,
+                100,
+            )
+            .await?;
+        assert!(same_sweep
+            .iter()
+            .all(|candidate| candidate.raw_id != raw_zero.id));
+        let successor_sweep = scraper_db
+            .retrieve_unenriched_raw_dispatches(1, &H256::from_low_u64_be(999), 0, passed_id, 100)
+            .await?;
+        assert!(successor_sweep
+            .iter()
+            .any(|candidate| candidate.raw_id == raw_zero.id));
+
+        let frontier = scraper_db
+            .latest_reconcilable_raw_dispatch_id(1, &H256::from_low_u64_be(999))
+            .await?;
+        assert_eq!(frontier, candidates.last().expect("candidate rows").raw_id);
+
+        let through_id = candidates[1].raw_id;
+        let bounded_candidates = scraper_db
+            .retrieve_unenriched_raw_dispatches(1, &H256::from_low_u64_be(999), 0, through_id, 100)
+            .await?;
+        assert!(bounded_candidates
+            .iter()
+            .all(|candidate| candidate.raw_id <= through_id));
+        assert_eq!(
+            bounded_candidates.last().expect("bounded rows").raw_id,
+            through_id
+        );
 
         let paged_candidates = scraper_db
             .retrieve_unenriched_raw_dispatches(
                 1,
                 &H256::from_low_u64_be(999),
                 candidates[0].raw_id,
+                i64::MAX,
                 1,
             )
             .await?;

@@ -4,10 +4,11 @@ use std::{fmt::Debug, time::Instant};
 
 use derive_builder::Builder;
 use maplit::hashmap;
-use prometheus::{CounterVec, IntCounterVec};
+use prometheus::{CounterVec, HistogramVec, IntCounterVec};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::rpc_operation::current_rpc_operation;
 use crate::utils::url_to_host_info;
 
 /// Expected label names for the metric.
@@ -23,16 +24,49 @@ pub const PROVIDER_DROP_COUNT_HELP: &str =
     "Total number of times this provider was dropped by this client";
 
 /// Expected label names for the metric.
-pub const REQUEST_COUNT_LABELS: &[&str] =
-    &["provider_node", "connection", "chain", "method", "status"];
+pub const REQUEST_COUNT_LABELS: &[&str] = &[
+    "provider_node",
+    "connection",
+    "chain",
+    "method",
+    "status",
+    "rpc_role",
+    "operation",
+];
 /// Help string for the metric.
 pub const REQUEST_COUNT_HELP: &str = "Total number of requests made to this client";
 
 /// Expected label names for the metric.
-pub const REQUEST_DURATION_SECONDS_LABELS: &[&str] =
-    &["provider_node", "connection", "chain", "method", "status"];
+pub const REQUEST_DURATION_SECONDS_LABELS: &[&str] = &[
+    "provider_node",
+    "connection",
+    "chain",
+    "method",
+    "status",
+    "rpc_role",
+    "operation",
+];
 /// Help string for the metric.
 pub const REQUEST_DURATION_SECONDS_HELP: &str = "Total number of seconds spent making requests";
+
+/// Expected labels for fallback hedge lifecycle events.
+pub const FALLBACK_HEDGE_EVENT_LABELS: &[&str] = &["chain", "method", "event"];
+/// Help string for fallback hedge lifecycle events.
+pub const FALLBACK_HEDGE_EVENT_HELP: &str =
+    "Total fallback hedge lifecycle events, including extra requests and cancellations";
+
+/// Expected labels for hedged fallback request latency.
+pub const FALLBACK_HEDGE_DURATION_SECONDS_LABELS: &[&str] = &["chain", "method", "winner"];
+/// Help string for hedged fallback request latency.
+pub const FALLBACK_HEDGE_DURATION_SECONDS_HELP: &str =
+    "End-to-end duration of fallback requests eligible for hedging";
+
+/// Expected label names for the dynamic-block request cache metric.
+pub const REQUEST_CACHE_COUNT_LABELS: &[&str] =
+    &["provider_node", "chain", "method", "result", "rpc_role"];
+/// Help string for the dynamic-block request cache metric.
+pub const REQUEST_CACHE_COUNT_HELP: &str =
+    "Logical reads, cache hits, upstream reads, and upstream errors for cached RPC requests";
 
 /// Container for all the relevant rpc client metrics.
 #[derive(Clone, Builder, Default)]
@@ -70,6 +104,23 @@ pub struct PrometheusClientMetrics {
     ///   might still be an "error" but not one with the transport layer.
     #[builder(setter(into, strip_option), default)]
     pub request_duration_seconds: Option<CounterVec>,
+
+    /// Lifecycle events for allowlisted fallback hedges.
+    #[builder(setter(into, strip_option), default)]
+    pub fallback_hedge_events: Option<IntCounterVec>,
+
+    /// End-to-end latency for requests eligible for fallback hedging.
+    #[builder(setter(into, strip_option), default)]
+    pub fallback_hedge_duration_seconds: Option<HistogramVec>,
+
+    /// Dynamic-block request cache events.
+    /// - `provider_node`: node serving the request.
+    /// - `chain`: chain the request was made on.
+    /// - `method`: JSON-RPC method.
+    /// - `result`: `logical_read`, `cache_hit`, `upstream_read`, or `upstream_error`.
+    /// - `rpc_role`: primary or quorum pool.
+    #[builder(setter(into, strip_option), default)]
+    pub request_cache_count: Option<IntCounterVec>,
 }
 
 impl PrometheusClientMetrics {
@@ -106,6 +157,8 @@ impl PrometheusClientMetrics {
             "chain" => config.chain_name(),
             "method" => method,
             "status" => if success { "success" } else { "failure" },
+            "rpc_role" => config.rpc_role.as_str(),
+            "operation" => current_rpc_operation().as_str(),
         };
         if let Some(counter) = &self.request_count {
             counter.with(&labels).inc()
@@ -115,6 +168,56 @@ impl PrometheusClientMetrics {
                 .with(&labels)
                 .inc_by((Instant::now().saturating_duration_since(start)).as_secs_f64())
         };
+    }
+
+    /// Increment a fallback hedge lifecycle event.
+    pub fn increment_fallback_hedge_event(&self, chain: &str, method: &str, event: &str) {
+        let labels = hashmap! {
+            "chain" => chain,
+            "method" => method,
+            "event" => event,
+        };
+        if let Some(counter) = &self.fallback_hedge_events {
+            counter.with(&labels).inc();
+        }
+    }
+
+    /// Observe end-to-end latency for an eligible fallback request.
+    pub fn observe_fallback_hedge_duration(
+        &self,
+        chain: &str,
+        method: &str,
+        winner: &str,
+        duration: std::time::Duration,
+    ) {
+        let labels = hashmap! {
+            "chain" => chain,
+            "method" => method,
+            "winner" => winner,
+        };
+        if let Some(histogram) = &self.fallback_hedge_duration_seconds {
+            histogram.with(&labels).observe(duration.as_secs_f64());
+        }
+    }
+
+    /// Increment a dynamic-block request cache event.
+    pub fn increment_request_cache_metric(
+        &self,
+        config: &PrometheusConfig,
+        method: &str,
+        result: &str,
+    ) {
+        if let Some(counter) = &self.request_cache_count {
+            counter
+                .with_label_values(&[
+                    config.node_host(),
+                    config.chain_name(),
+                    method,
+                    result,
+                    config.rpc_role.as_str(),
+                ])
+                .inc();
+        }
     }
 }
 
@@ -164,6 +267,28 @@ impl ClientConnectionType {
     }
 }
 
+/// Which pool an RPC connection belongs to. Lets metrics (and downstream alerting)
+/// distinguish a chain's normal RPC pool from verification-only connections.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RpcRole {
+    /// A chain's normal RPC pool (e.g. `rpcUrls`).
+    #[default]
+    Primary,
+    /// A verification-only pool.
+    Quorum,
+}
+
+impl RpcRole {
+    /// as str
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Primary => "primary",
+            Self::Quorum => "quorum",
+        }
+    }
+}
+
 /// Configuration for the prometheus JsonRpcClioent. This can be loaded via
 /// serde.
 #[derive(Default, Clone, Debug, Deserialize)]
@@ -176,6 +301,9 @@ pub struct PrometheusConfig {
 
     /// Information about the chain this client is for.
     pub chain: Option<ChainInfo>,
+
+    /// Which pool this connection belongs to (primary vs. a verification-only pool). Defaults to `Primary`.
+    pub rpc_role: RpcRole,
 }
 
 impl PrometheusConfig {
@@ -191,6 +319,7 @@ impl PrometheusConfig {
                 host: url_to_host_info(url),
             }),
             chain,
+            rpc_role: RpcRole::default(),
         }
     }
 
@@ -228,9 +357,17 @@ impl PrometheusConfigExt for PrometheusConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
+    use prometheus::{IntCounterVec, Opts};
     use url::Url;
 
-    use super::{ChainInfo, ClientConnectionType, PrometheusConfig, PrometheusConfigExt};
+    use crate::rpc_operation::{with_rpc_operation, RpcOperation};
+
+    use super::{
+        ChainInfo, ClientConnectionType, PrometheusClientMetricsBuilder, PrometheusConfig,
+        PrometheusConfigExt, REQUEST_COUNT_LABELS,
+    };
 
     #[test]
     fn test_node_host() {
@@ -267,5 +404,60 @@ mod tests {
             let actual = config.node_host();
             assert_eq!(actual, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn request_metrics_include_operation_scope() {
+        let request_count = IntCounterVec::new(
+            Opts::new("test_request_count", "test request count"),
+            REQUEST_COUNT_LABELS,
+        )
+        .expect("valid request metric");
+        let metrics = PrometheusClientMetricsBuilder::default()
+            .request_count(request_count.clone())
+            .build()
+            .expect("valid client metrics");
+        let config = PrometheusConfig::from_url(
+            &Url::parse("https://rpc.example.com").expect("valid URL"),
+            ClientConnectionType::Rpc,
+            Some(ChainInfo {
+                name: Some("test-chain".to_string()),
+            }),
+        );
+
+        with_rpc_operation(RpcOperation::RelayerDelivery, async {
+            metrics.increment_metrics(&config, "eth_call", Instant::now(), true);
+        })
+        .await;
+        metrics.increment_metrics(&config, "eth_call", Instant::now(), true);
+
+        assert_eq!(
+            request_count
+                .with_label_values(&[
+                    "rpc.example.com:443",
+                    "rpc",
+                    "test-chain",
+                    "eth_call",
+                    "success",
+                    "primary",
+                    "relayer_delivery",
+                ])
+                .get(),
+            1,
+        );
+        assert_eq!(
+            request_count
+                .with_label_values(&[
+                    "rpc.example.com:443",
+                    "rpc",
+                    "test-chain",
+                    "eth_call",
+                    "success",
+                    "primary",
+                    "unattributed",
+                ])
+                .get(),
+            1,
+        );
     }
 }

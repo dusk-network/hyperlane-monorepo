@@ -1,11 +1,19 @@
+import { ProtocolType } from '@hyperlane-xyz/utils';
+import { z } from 'zod';
+
 export enum Role {
   Validator = 'validator',
   Relayer = 'relayer',
   Scraper = 'scraper',
+  ScraperProxy = 'scraper-proxy',
   Deployer = 'deployer',
   Rebalancer = 'rebalancer',
   InventoryRebalancer = 'inventoryrebalancer',
   QuoteSigner = 'quotesigner',
+  // Funding-only role: the CROSS/moonpay standing fee quote submitter.
+  // The key is externally provisioned in GCP; keyfunder only needs its address.
+  // Do NOT add to ALL_KEY_ROLES / ALL_AGENT_ROLES / rolesWithKeys.
+  QuoteSubmitter = 'quotesubmitter',
   // Funding-only role: the stableswap rebalancer's EVM inventory
   // signer. Has no managed agent key — keyfunder only needs the address to
   // send gas to it. Do NOT add to ALL_KEY_ROLES / ALL_AGENT_ROLES / rolesWithKeys.
@@ -16,6 +24,7 @@ export type FundableRole =
   | Role.Relayer
   | Role.Rebalancer
   | Role.InventoryRebalancer
+  | Role.QuoteSubmitter
   | Role.StableswapInventoryRebalancer;
 
 export const ALL_KEY_ROLES = [
@@ -53,4 +62,54 @@ export enum TurnkeyRole {
   EvmRebalancer = 'evm-rebalancer',
   EvmIgpClaimer = 'evm-igp-claimer',
   EvmIgpUpdater = 'evm-igp-updater',
+  EvmWarpFeesOwner = 'evm-warp-fees-owner',
+  EvmPauser = 'evm-pauser',
 }
+
+export const TURNKEY_SIGNER_PROTOCOLS = [
+  ProtocolType.Ethereum,
+  ProtocolType.Sealevel,
+] as const;
+
+export type TurnkeySignerProtocol = (typeof TURNKEY_SIGNER_PROTOCOLS)[number];
+
+export const TURNKEY_ROLE_PROTOCOL: Record<TurnkeyRole, TurnkeySignerProtocol> =
+  {
+    [TurnkeyRole.SealevelDeployer]: ProtocolType.Sealevel,
+    [TurnkeyRole.EvmLegacyDeployer]: ProtocolType.Ethereum,
+    [TurnkeyRole.EvmLegacyRebalancer]: ProtocolType.Ethereum,
+    [TurnkeyRole.EvmDeployer]: ProtocolType.Ethereum,
+    [TurnkeyRole.EvmRebalancer]: ProtocolType.Ethereum,
+    [TurnkeyRole.EvmIgpClaimer]: ProtocolType.Ethereum,
+    [TurnkeyRole.EvmIgpUpdater]: ProtocolType.Ethereum,
+    [TurnkeyRole.EvmWarpFeesOwner]: ProtocolType.Ethereum,
+    [TurnkeyRole.EvmPauser]: ProtocolType.Ethereum,
+  };
+
+export function getTurnkeyRolesForProtocol(
+  protocol: TurnkeySignerProtocol,
+): TurnkeyRole[] {
+  return Object.values(TurnkeyRole).filter(
+    (role) => TURNKEY_ROLE_PROTOCOL[role] === protocol,
+  );
+}
+
+// CLI `--signer.<protocol>` overrides. Protocols are optional: deployments
+// without Turnkey signers pass none. Note z.record() with enum keys requires
+// every key under zod v4, so this must stay a partial record.
+export const signerConfigSchema = z
+  .partialRecord(z.enum(TURNKEY_SIGNER_PROTOCOLS), z.nativeEnum(TurnkeyRole))
+  .superRefine((config, context) => {
+    for (const protocol of TURNKEY_SIGNER_PROTOCOLS) {
+      const role = config[protocol];
+      if (role && TURNKEY_ROLE_PROTOCOL[role] !== protocol) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [protocol],
+          message: `${role} is not a ${protocol} Turnkey role`,
+        });
+      }
+    }
+  });
+
+export type SignerConfig = z.infer<typeof signerConfigSchema>;

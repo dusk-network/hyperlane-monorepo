@@ -1,5 +1,412 @@
 # @hyperlane-xyz/sdk
 
+## 44.0.2
+
+### Patch Changes
+
+- 16df6ee: Bumped the @hyperlane-xyz/registry catalog pin to 26.1.0 and released the exact-pin cascade through tron-sdk, deploy-sdk, sdk, and widgets.
+- Updated dependencies [16df6ee]
+  - @hyperlane-xyz/tron-sdk@25.0.2
+  - @hyperlane-xyz/deploy-sdk@10.0.2
+  - @hyperlane-xyz/aleo-sdk@44.0.2
+  - @hyperlane-xyz/starknet-core@44.0.2
+  - @hyperlane-xyz/cosmos-sdk@44.0.2
+  - @hyperlane-xyz/radix-sdk@44.0.2
+  - @hyperlane-xyz/utils@44.0.2
+  - @hyperlane-xyz/core@12.1.0
+  - @hyperlane-xyz/provider-sdk@10.0.2
+
+## 44.0.1
+
+### Patch Changes
+
+- f269e03: Zod was updated to 4.5.4 to prevent function-valued default factories from running during schema cycle detection and compilation.
+- Updated dependencies [f269e03]
+  - @hyperlane-xyz/deploy-sdk@10.0.1
+  - @hyperlane-xyz/provider-sdk@10.0.1
+  - @hyperlane-xyz/aleo-sdk@44.0.1
+  - @hyperlane-xyz/cosmos-sdk@44.0.1
+  - @hyperlane-xyz/radix-sdk@44.0.1
+  - @hyperlane-xyz/tron-sdk@25.0.1
+  - @hyperlane-xyz/starknet-core@44.0.1
+  - @hyperlane-xyz/utils@44.0.1
+  - @hyperlane-xyz/core@12.1.0
+
+## 44.0.0
+
+### Major Changes
+
+- 6fbe5ad: The Starknet TypeScript stack was upgraded from starknet.js v7 to v8.9.2 to support the JSON-RPC v0.9 endpoints. Account and Contract call sites were migrated to the v8 options-object constructors, fee estimation was updated to the new resourceBounds shape, and dispatch-event parsing now passes the required ABI parser. Starknet wallet dependencies were upgraded for starknet.js v8 compatibility, and the minimum supported Node.js version is now 22 across published runtime dependents.
+
+### Patch Changes
+
+- 85c44af: The temporary Zod 3 registry compatibility layer was removed after adopting the registry's Zod 4 schemas. Repeated server and config validators are now compiled once, and boolean-only checks use Zod's allocation-free validation path.
+- Updated dependencies [6fbe5ad]
+  - @hyperlane-xyz/starknet-core@44.0.0
+  - @hyperlane-xyz/utils@44.0.0
+  - @hyperlane-xyz/deploy-sdk@10.0.0
+  - @hyperlane-xyz/provider-sdk@10.0.0
+  - @hyperlane-xyz/tron-sdk@25.0.0
+  - @hyperlane-xyz/core@12.1.0
+  - @hyperlane-xyz/aleo-sdk@44.0.0
+  - @hyperlane-xyz/cosmos-sdk@44.0.0
+  - @hyperlane-xyz/radix-sdk@44.0.0
+
+## 43.0.0
+
+### Major Changes
+
+- 8bcc7ab: Zod was upgraded to 4.5.2 across the TypeScript workspace. Public schemas and validation types were migrated to Zod 4, recursive fee configuration types were made explicit, application entrypoints adopted compiled parsing, and validation errors were changed to use Zod 4's built-in formatting.
+
+### Minor Changes
+
+- 0848474: Added safe recovery for address-bearing hook trees. Recovered pausable hooks and ISMs can transfer ownership without redeployment, while recovery validates the complete tree before mutation, preserves live pause state, and rejects incorrect contract types or conflicting aliases.
+- 60fc463: Added authenticated HTTP registry signers for standard EVM, Safe EIP-712, and Sealevel transactions.
+- 11f2dee: xERC20 bridge discovery reports the bridges a token actually holds limits for. Addresses are still collected from the token's events, but the limits are read from the token, and a bridge is no longer required to answer the lockbox `XERC20()` getter, which had dropped every configured bridge that is not a lockbox. Standard xERC20 tokens are discovered through `BridgeLimitsSet` and read through `mintingMaxLimitOf`/`burningMaxLimitOf`, where before only the Velodrome event and getters were consulted. A failed read is no longer classified as a missing selector, so a transient RPC failure surfaces instead of reporting a token with bridges as having none.
+
+  `GetExtraLockboxesOptions` gained the optional `warpRouteAddress` and `type`, `EvmEventLogsReader` gained the read-only `getContractDeploymentBlock`, and `deriveXERC20TokenType` throws the new exported `UnknownXERC20TypeError`.
+
+  Operators of Standard (non-Velodrome) xERC20 routes must add the token's current `mint` and `burn` to any deploy config that omits `xERC20.warpRouteLimits`, which are now derived and otherwise report a `warp check` violation. Extra bridges are compared as a set, so listing them in a different order to the token's no longer reports a violation.
+
+### Patch Changes
+
+- e76189e: The default per-chain deploy timeout in `HyperlaneDeployer` was raised from 15 to 45 minutes. `HyperlaneDeployer.deploy` wraps each chain's deployment in a single `runWithTimeout`, so deployments that fan out into many sequential transactions could exceed the old ceiling and abort partway through. `EvmTokenFeeDeployer.deployRoutingFee` is one such case: it deploys one sub-fee contract per destination and sends a `setFeeContract` transaction for each, so a route with many destinations on a chain with multi-block confirmations (oUSDT on ethereum, 16 destinations at 2-block confirmations) took roughly 30 minutes and timed out on every attempt. Because `runWithTimeout` rejects without aborting the underlying callback, the abandoned deploy kept submitting transactions, leaving already-deployed sub-fee contracts stranded on chain and unreferenced. Deployers that pass an explicit `chainTimeoutMs` are unaffected, including `HyperlaneCoreDeployer`, which keeps its own 10 minute default.
+- 3ced099: Pausable hooks were deployed in their configured paused state before ownership was transferred.
+- a00b342: Pausable ISMs now respect the configured `paused` state. Signer-owned changes are applied directly; all others are returned as transactions.
+- b58c7eb: Tron ICA address derivation was moved back to the destination router so its `0x41` CREATE2 prefix is handled correctly, while Ethereum destinations continue to use local derivation.
+- 8d91ef8: Increased multi provider timeout to 5min
+- Updated dependencies [8bcc7ab]
+- Updated dependencies [7cf9c01]
+  - @hyperlane-xyz/deploy-sdk@9.0.0
+  - @hyperlane-xyz/provider-sdk@9.0.0
+  - @hyperlane-xyz/utils@43.0.0
+  - @hyperlane-xyz/aleo-sdk@43.0.0
+  - @hyperlane-xyz/cosmos-sdk@43.0.0
+  - @hyperlane-xyz/radix-sdk@43.0.0
+  - @hyperlane-xyz/tron-sdk@24.2.1
+  - @hyperlane-xyz/core@12.1.0
+  - @hyperlane-xyz/starknet-core@43.0.0
+
+## 42.0.0
+
+### Major Changes
+
+- 1b136e1: Added SDK support for the new EVM warp-route flow-limiting ISM contracts:
+
+  - `DefaultIsm` was modeled as `IsmType.MAILBOX_DEFAULT`, deployed with its mailbox, derived through a contract-specific probe, and matched against that mailbox.
+  - `NetFlowRateLimitedHookIsm` and `DelayedFlowRouterHookIsm` were modeled as shared hook/ISM instances with typed config, deployment, derivation, matching, mutable ownership, and delayed-flow counterpart enrollment support. The hook side remains read-only so only the ISM deployment path creates the shared instance.
+  - Hybrid configs were required to sit in an exhaustive aggregation with a supported authenticating sibling. Core default-ISM configs and random mutable-ISM tests reject the warp-route-only hybrids.
+  - Hook and ISM readers use contract-specific probes so NULL-module hybrids are not mistaken for test ISMs and the net-flow hybrid is not mistaken for a plain rate-limited hook.
+  - Delayed-flow `maxDelay` values were bounded to a conservative operational maximum so adding the delay to the on-chain `uint48` timestamp cannot overflow in practical use.
+  - The relayer gained metadata building and decoding for all three types. `RoutingMetadata['type']` now includes `MAILBOX_DEFAULT`; because that exported union widening is breaking, the relayer package receives a major bump.
+  - `HookConfig` was expressed as an explicit union to avoid downstream TypeScript union-complexity failures.
+
+### Minor Changes
+
+- 1713edd: Added an optional `ignoreSenderBalance` mode to multi-protocol transaction fee estimation, allowing callers to price native max-amount transactions without changing the existing balance-aware default behavior.
+- 9003bab: External EVM signer configs were added to transaction-file submission, and JSON-RPC submitters were extended with explicit signer injection and partial submission results.
+- 1b136e1: Extended DelayedFlowRouterHookIsm auto-enrollment from `warp deploy` to `warp apply`:
+
+  - `warp apply` now resolves one shared hybrid leaf from the paired hook and ISM trees, enrolls delayed-flow counterparts, and uses the same ordinary per-chain submitter path as other non-fee warp updates.
+  - Each chain receives one ordered batch: upgrades, delayed-flow enrollment, hook installation, ISM installation, then router updates. Removal reverses the shared-instance operations so the ISM is removed before the hook. Operators must quiesce and drain the route because batches cannot execute atomically across chains.
+  - Adding, replacing, removing, extending, and resuming interrupted hybrid updates were covered. Safe, ICA, timelock, file, and distinct fee submitters keep their existing behavior.
+  - Preflight validation rejects partial delayed-flow routes, foreign legs, nonce-zero mailboxes, conflicting hybrid declarations, predicate wrappers, unsupported token types, zero peers, and delayed-flow routes with a non-zero ERC20 fee hook before deploying contracts.
+  - Route-derived peers override stale read-derived in-route `remoteIsms`; configured external peers are retained. Unknown on-chain domains are surfaced by `warp check` and removed by `warp apply`.
+  - Route-scoped CLI relaying was extended to discover installed delayed-flow instances from each EVM router's active hook tree, so `--warp-route-id` admits both token transfers and DFR preverification messages.
+  - EVM update planning is no longer automatically retried because planning can deploy contracts before later reads fail. AltVM planning retains its existing retry behavior.
+
+- 1b136e1: Added end-to-end warp deploy support for the warp-route hybrid hook/ISMs:
+
+  - Hook and ISM trees were validated together, token routers were deployed first, and each shared hybrid leaf was then deployed once and installed on both surfaces. Hook installation and readback complete route-wide before ISM installation.
+  - Delayed-flow counterparts were enrolled before router enrollment and final ownership transfer. In-route peers are derived automatically; configured external `remoteIsms` are retained.
+  - `warpRouter` became optional in warp-route configs and is injected after the containing router exists. Explicit mismatches are rejected.
+  - `remoteIsms` keys are canonicalized across deploy, update, read, and check. Route-derived peers override stale configured values for chains in the route, while external configured peers remain authoritative.
+  - Expanded configs include the deployed shared address, router, and delayed-flow peers so `warp check` converges with the installed route.
+
+### Patch Changes
+
+- aa29187: Restored Sonic CCIP constants and default multisig ISM validator configuration.
+- f0f8a56: Tron externally-owned accounts are no longer reported as inactive owners. `TronJsonRpcProvider` gained `isAccountActive`, which reads on-chain activation from the native `wallet/getaccount` endpoint instead of leaving liveness to be inferred from `getTransactionCount` (Tron has no nonces, so that method is hardcoded to 0 and made every Tron EOA look dead). `isAddressActive` now consults that method when the provider offers it and otherwise keeps its existing code-or-nonce behaviour, so `warp check` stops emitting a permanent `ownerStatus` violation for live Tron EOA owners. A failure reaching the Tron node is thrown rather than reported as inactive.
+- 9a8bb17: Updated `expandWarpDeployConfig` to canonicalize `rebalanceTargets` and `rebalanceRecipients` keys to domain IDs on cross-collateral token configs, mirroring the treatment of `allowedRebalancingBridges`, `remoteRouters`, and `destinationGas`. Previously a config keyed by chain name compared unequal to the domain-ID-keyed on-chain state read by `EvmWarpRouteReader`, so the warp config checker reported a permanent false-positive `ConfigMismatch`; now name-keyed and domain-ID-keyed configs compare equal. Keys resolving to the same canonical domain ID have their rebalance targets unioned.
+- Updated dependencies [f0f8a56]
+  - @hyperlane-xyz/tron-sdk@24.2.0
+  - @hyperlane-xyz/deploy-sdk@8.1.3
+  - @hyperlane-xyz/aleo-sdk@42.0.0
+  - @hyperlane-xyz/starknet-core@42.0.0
+  - @hyperlane-xyz/cosmos-sdk@42.0.0
+  - @hyperlane-xyz/radix-sdk@42.0.0
+  - @hyperlane-xyz/utils@42.0.0
+  - @hyperlane-xyz/core@12.1.0
+  - @hyperlane-xyz/provider-sdk@8.1.3
+
+## 41.3.1
+
+### Patch Changes
+
+- c201794: Used the EIP-1559 maximum fee directly as the total gas price cap in transaction fee estimates.
+  - @hyperlane-xyz/aleo-sdk@41.3.1
+  - @hyperlane-xyz/starknet-core@41.3.1
+  - @hyperlane-xyz/cosmos-sdk@41.3.1
+  - @hyperlane-xyz/radix-sdk@41.3.1
+  - @hyperlane-xyz/utils@41.3.1
+  - @hyperlane-xyz/deploy-sdk@8.1.2
+  - @hyperlane-xyz/core@12.1.0
+  - @hyperlane-xyz/provider-sdk@8.1.2
+  - @hyperlane-xyz/tron-sdk@24.1.5
+
+## 41.3.0
+
+### Minor Changes
+
+- 4a21153: Added deploy, read, check, and artifact support for `AtomicLocalRebalancingBridge`. ALRB artifacts used a dedicated non-transferable token standard and were excluded from ordinary Warp connections.
+- 4a21153: Added `rebalanceRecipients` deployment, read, validation, and update support for `CrossCollateralRouter` warp configs.
+- 4a21153: Added first-class `rebalanceTargets` deployment, read, validation, and update support for `CrossCollateralRouter` warp configs.
+
+### Patch Changes
+
+- c328efa: Removed deprecated mainnet chains (arcadia, bitlayer, hashkey, lumiaprism, matchain, oortmainnet, ronin, sonic) from the default multisig ISM validator sets and CCIP chain constants.
+- 322a418: Interchain account address derivation was moved into the shared SDK path, with router metadata reads parallelized and modern addresses derived locally. This reduced the valid modern path from three sequential RPC rounds to one.
+- d5d7d1a: Used authoritative Solana message fees, including signature and priority fees, in transaction fee estimates.
+  - @hyperlane-xyz/aleo-sdk@41.3.0
+  - @hyperlane-xyz/starknet-core@41.3.0
+  - @hyperlane-xyz/cosmos-sdk@41.3.0
+  - @hyperlane-xyz/radix-sdk@41.3.0
+  - @hyperlane-xyz/utils@41.3.0
+  - @hyperlane-xyz/deploy-sdk@8.1.1
+  - @hyperlane-xyz/core@12.1.0
+  - @hyperlane-xyz/provider-sdk@8.1.1
+  - @hyperlane-xyz/tron-sdk@24.1.4
+
+## 41.2.0
+
+### Minor Changes
+
+- e7666ef: EVM event reads were made resilient by trying each compatible configured block explorer before falling back to RPC.
+- 5899416: Support was added for Blacklist ISM deployments that predate on-chain enumeration.
+
+  - `EvmIsmReader` now probes `blacklistedIds(bytes32)` and `values()` separately, so a deployment without `values()` is derived as a `blacklistIsm` rather than falling through to `testIsm`.
+  - Enumeration was shared by the reader and `moduleMatchesConfig` through `readBlacklistedIds`, so both reached the same verdict for the same deployment. When `values()` was unavailable, the set was replayed from `MessageBlacklisted` logs, de-duplicated and sorted; entries are append-only, so a complete log sequence defined the current set.
+  - Reading was made to fail on detectable incompleteness rather than yielding a known partial set, since a Blacklist ISM config without its entries did not describe the deployment it named. Legacy replay required an explorer- or receipt-derived deployment block instead of relying on RPC bisection over historical state. Successful log responses continued to be trusted to describe the exact ranges requested. A deployment that had never blacklisted anything was read as an empty set, which remained a result and not a failure.
+  - Explorer-backed `getLogs` calls were made to page to completion or fail over without returning a prefix, and RPC deployment-block discovery was made to fail rather than start an infeasible scan from genesis when historical state was unavailable.
+  - `EvmIsmModule` redeploys a fresh Blacklist ISM instead of appending in place when the deployed one predates on-chain enumeration, so entries are never appended to a contract that is being phased out.
+  - Blacklist ISM and Test ISM config checks no longer accept a deployment purely on its module type. A Blacklist ISM config is checked against `blacklistedIds(bytes32)` before its entries are read, and a Test ISM config is confirmed by deriving the deployed module rather than matching any address whose module type is NULL. A deployment that cannot be shown to be one of those two configured types is now reported as a mismatch instead of passing. Checks for other ISM types are unchanged.
+  - `TestLegacyBlacklistIsm` was added as a test fixture reproducing the pre-audit contract, renamed from `BlacklistIsm` and compiled with a raised `>=0.8.18` pragma for its named mapping parameters; it is otherwise unchanged.
+
+- 5fac94d: Warp apply support was added for warp route timelock deploy config.
+
+### Patch Changes
+
+- 5fac94d: Warp timelock validation and controller RPC handling were hardened to prevent ignored ownership overrides, invalid ABI probes, and duplicate deployments.
+- Updated dependencies [bd4e5f0]
+- Updated dependencies [5899416]
+  - @hyperlane-xyz/provider-sdk@8.1.0
+  - @hyperlane-xyz/deploy-sdk@8.1.0
+  - @hyperlane-xyz/core@12.1.0
+  - @hyperlane-xyz/aleo-sdk@41.2.0
+  - @hyperlane-xyz/cosmos-sdk@41.2.0
+  - @hyperlane-xyz/radix-sdk@41.2.0
+  - @hyperlane-xyz/tron-sdk@24.1.3
+  - @hyperlane-xyz/starknet-core@41.2.0
+  - @hyperlane-xyz/utils@41.2.0
+
+## 41.1.0
+
+### Patch Changes
+
+- @hyperlane-xyz/deploy-sdk@8.0.4
+- @hyperlane-xyz/aleo-sdk@41.1.0
+- @hyperlane-xyz/starknet-core@41.1.0
+- @hyperlane-xyz/cosmos-sdk@41.1.0
+- @hyperlane-xyz/radix-sdk@41.1.0
+- @hyperlane-xyz/utils@41.1.0
+- @hyperlane-xyz/core@12.0.0
+- @hyperlane-xyz/provider-sdk@8.0.4
+- @hyperlane-xyz/tron-sdk@24.1.2
+
+## 41.0.0
+
+### Major Changes
+
+- 1a32515: The agent config schema is updated as part of migrating validators from AWS to GCP:
+
+  - Added a GCP Cloud KMS signer config surface (`AgentSignerKeyType.Gcp`, `{ type: 'gcp', keyVersionName }`), alongside the existing AWS KMS signer, for validators and other agents that sign with a GCP-managed key.
+  - Renamed the GCS checkpoint syncer's `service_account_key` and `user_secrets` fields to `serviceAccountKey` and `userSecrets`, matching the camelCase convention used by the syncer's other fields, and added `useApplicationDefault` to support ambient GKE Workload Identity credentials. Hand-written agent configs using the old snake_case field names must be updated.
+  - Fixed the Ethereum/Tron protocol-signer refinement, which compared `signerType` against boolean expressions instead of the `AgentSignerKeyType` enum values and therefore never actually validated the AWS or Node signer types.
+  - Reduced the default multisig ISM validator sets for `bsctestnet`, `fuji`, and `sepolia` from 3 validators (threshold 2) to a single GCP-based validator (threshold 1), matching the new default validator agent config for these testnets during the migration rollout.
+
+- eb24243: The SDK fee-token resolution now supports xERC20 and xERC20Lockbox warp routes. Previously `getFeeTokenAddress` threw `Unsupported token type for fee resolution` for these types, which blocked applying a `tokenFee` (including OQLF) to xERC20 routes via `warp deploy`/`warp apply`. Fee-token resolution now reads the router's immutable `wrappedToken()` on-chain for both xERC20 variants so the deployed fee contract's token matches the router's runtime `fee must match token` check (for xERC20Lockbox this is the underlying wrapped ERC20, not the stored lockbox address). `wrappedToken()` is used rather than `token()` because it is an immutable getter present across router versions: on legacy routers (e.g. 6.1.0) `token()` reverts, and fee resolution runs at plan time before the router is upgraded, so a single `warp apply` that both upgrades the contract and adds a fee would otherwise fail. As part of this the exported `resolveTokenFeeAddress` (subpath `@hyperlane-xyz/sdk/token`) is now async and takes an additional `provider` argument, which is a breaking change for downstream callers. Added SDK unit and hardhat tests (including an xERC20Lockbox deploy regression and a legacy-router `token()`-reverts regression) plus CLI e2e tests asserting xERC20 and xERC20Lockbox routes can be deployed with fees and updated.
+- d9426bc: Three things break. The explorerUrl and apiKey fields are dropped from the GetExtraLockboxesOptions type. HyperlaneJsonRpcProvider refuses an eth_getLogs request it cannot serve in full rather than answering it over a narrower window: LogBlockRangeTooLargeError above the sub-queries it issues for one request, and LogBlockHistoryUnavailableError below the pagination.minBlockNumber or pagination.maxBlockAge history floors, where the start block used to be raised, so SmartProvider fails the request on that RPC instead of returning a truncated log set.
+
+  getExtraLockBoxConfigs and EvmXERC20Reader.readOnChainBridges are routed through EvmEventLogsReader, so a chain without a usable explorer scans ConfigurationChanged logs over the RPC instead of reporting no extra bridges, and starts at the xERC20's deployment block, or at genesis where the RPC cannot serve the state of a past block. Both share latestConfigurationPerBridge, which breaks a tie within a block by log index; getExtraLockBoxConfigs kept the first configuration of a bridge instead of the last. The RPC read halves its block range when a provider rejects a chunk and retries one whose failure names no span, and HyperlaneSmartProvider stops retrying a request every provider reported as unrecoverable, taking a block range rejection among those refusals as the combined error's cause so that the read halves its chunk rather than being decided by which provider was tried first.
+
+  The explorer log read pages through a block range instead of stopping at the first 1000 records, retries a page rather than the whole read, and falls back to the RPC for a range it cannot page through in full. Its log fields are parsed rather than read through Number, which reported the bare "0x" of a zero valued field as NaN. The deployment block comes from the explorer's getcontractcreation response where it reports one, rather than from the deployment receipt.
+
+### Minor Changes
+
+- 72738e2: Added SDK support for the Blacklist ISM:
+
+  - Blacklist ISM configs can now be deployed, derived from on-chain state (including the full list of blacklisted message IDs) and matched against existing deployments using exact set equality.
+  - Updates that only add message IDs are applied in-place by submitting a single `blacklist` transaction with the missing IDs.
+  - Updates that drop a currently blacklisted message ID redeploy a fresh ISM, since on-chain entries are append-only and cannot be removed.
+  - Blacklisted message IDs are validated as 32-byte hex strings and normalized to lowercase at config parse time.
+  - The relayer now treats the blacklist ISM as a null-metadata ISM when building message metadata.
+  - `moduleCanCertainlyVerify` reports that a Blacklist ISM cannot certainly verify a message whose ID is in the blacklisted set.
+  - Blacklist ISM configs are validated at parse time to require a mandatory composition: they must be a member of an aggregation whose threshold equals its module count, and are rejected when used standalone, as a routing target, or under a non-exhaustive aggregation.
+
+- b1c6b7e: Added a Turnkey signer (EVM signer + Turnkey client) to the SDK for warp-route propose automation, exported from the package entrypoint. The EVM signer's EIP-712 typed-data signing submitted the full typed-data payload to Turnkey (PAYLOAD_ENCODING_EIP712) so Turnkey policies could inspect the domain and message fields rather than an opaque digest, and resolved ENS names in address-typed fields via the configured provider before encoding, mirroring ethers v5's own signer. The signer assembled Turnkey's raw signature response by accepting r/s as bare 32-byte hex (re-prefixed with 0x) and lifting the recovery-id v ("00"/"01") into the 27/28 space before joining, and rejected an unsupported or malformed recovery id instead of silently producing an unrecoverable signature.
+
+### Patch Changes
+
+- 0057c5d: Removed deprecated mainnet chains (boba, botanix, bsquared, hemi, morph, nibiru, noble, peaq, plume, prom, reactive, vana) from the default multisig ISM validator sets, CCIP chain constants, and the domain routing gas special-cases.
+- 1ba623d: Moved the zkSync contract deployer behind the existing zkSync deployment path. This prevented browser consumers from loading deployment artifacts during startup.
+- fcb4331: `MultiProvider.handleTx` was updated to return an included receipt for successful transactions when zero confirmations are configured, without waiting for ethers' default confirmation polling interval.
+- fa19409: Renounced ownership when a zero address was provided
+- 7846658: The `collateralDex` registry token-type annotation (used by paradex collateral warp routes such as ETH/paradex and DIME/paradex) is now normalized to `TokenType.collateral` in the `HypTokenConfigSchema` preprocessor. Previously it fell through to `TokenType.unknown`, which false-flagged a `type` ConfigMismatch in check-warp-deploy against the on-chain-derived `collateral` type. The now-redundant `normalizeAltVmExpectedTokenType` helper was removed since the schema normalizes the annotation before the altVM diff runs.
+- 0765fe0: The EVM warp route check was updated to ignore nested immutable `LinearFee` sub-fee (per-destination) owners when comparing `tokenFee` configs. `normalizeTokenFeeForCheck` collapses nested `LinearFee` owners to a fixed sentinel on both sides of the diff — their only authority is `setFee`, and `bps` is already compared — so that owner drift no longer produces a `check-warp-deploy` violation. `OffchainQuotedLinearFee` sub-fee owners are still compared, since that owner additionally controls quote-signer management. The top-level RoutingFee owner (which controls `setFeeContract` routing and fee claiming), fee parameters, and `quoteSigners` are still compared normally.
+- a09ba71: CoinGeckoTokenPriceGetter now sends the API key as an `x-cg-pro-api-key` header against the pro host (`pro-api.coingecko.com`) instead of an `x-cg-pro-api-key` query parameter against the public host. The query-parameter form returned 401, and the public host rejects the pro key with HTTP 400; the header-against-pro-host form authenticates correctly and also keeps the secret out of logged URLs. The inter-request delay is now only applied when a request actually hits the network rather than on cache hits. A batched, fault-tolerant prefetchTokenPrices method and a cache-only getCachedTokenPrice reader were added so callers can warm many token prices in one chunked pass and then read individual prices without issuing a request per token.
+- Updated dependencies [178614d]
+- Updated dependencies [fa19409]
+  - @hyperlane-xyz/aleo-sdk@41.0.0
+  - @hyperlane-xyz/utils@41.0.0
+  - @hyperlane-xyz/deploy-sdk@8.0.3
+  - @hyperlane-xyz/core@12.0.0
+  - @hyperlane-xyz/cosmos-sdk@41.0.0
+  - @hyperlane-xyz/provider-sdk@8.0.3
+  - @hyperlane-xyz/radix-sdk@41.0.0
+  - @hyperlane-xyz/tron-sdk@24.1.1
+  - @hyperlane-xyz/starknet-core@41.0.0
+
+## 40.0.0
+
+### Major Changes
+
+- 57b1e14: The `RateLimited` refill window is made configurable per instance. `RateLimited` now takes a `_duration` constructor argument (previously a hardcoded `1 days` constant), and `RateLimitedHook`, `RateLimitedIsm`, and `DelayedFlowRouterHookIsm` thread it through. The `DURATION` getter is preserved as a `public immutable` so existing on-chain reads still work. `RateLimitedHookConfig` and `RateLimitedIsmConfig` gain a `duration` field: parsing a config that omits it applies a default of 1 day (86400s), matching the previous on-chain window, but the field is present on the exported (inferred) config types, so TypeScript callers constructing these configs must supply it. The deploy/read paths surface it. Duration is immutable on-chain, so `EvmHookModule` and `EvmIsmModule` redeploy a fresh `RateLimited` hook/ISM when the desired duration changes.
+
+### Minor Changes
+
+- 469da6d: The core Solidity package adds `AtomicLocalRebalancingBridge` for same-chain local rebalances. The bridge binds its source router at construction so the caller cannot supply an arbitrary router, guards the entire local-rebalance flow (including the user-supplied calls) against reentrancy, funds the destination router only from output produced by those calls, and refunds the token balances accrued during the call to the rebalancer while leaving any pre-existing token balance untouched (unspent native is refunded in full). Its entry point `rebalance(uint32,uint256,ITokenBridge,bytes32,bytes)`, defined by the new `IRebalancingBridge` interface, mirrors the canonical rebalance signature: the source argument is a checked echo of the bound router, the destination recipient is supplied per call and validated against the source's rebalance targets, and the trailing bytes carry the ABI-encoded calls. The bridge is `Ownable`; tokens or native accidentally sent to it are recoverable via `recoverToken`/`recoverNativeBalance`, callable only by its owner.
+
+  `CrossCollateralRouter` implements the new `IRebalanceTargets` interface, allowing multiple local rebalance recipients per domain beyond the enrolled remote router. Owners manage the additional targets with `addRebalanceTarget`/`removeRebalanceTarget`, and `isRebalanceTarget` authorizes a recipient (the zero address is never authorized, even on a domain with no enrolled router). The source of an `AtomicLocalRebalancingBridge` must implement `IRebalanceTargets`; the constructor verifies the source is a contract.
+
+  `MovableCollateralRouter` no longer creates standing bridge token approvals. `addBridge` only allowlists a bridge, `HypERC20Collateral` no longer approves bridges during bridge enrollment, and `rebalance` grants an exact temporary collateral-token approval based on the bridge quote and revokes any unconsumed allowance after `transferRemote`.
+
+  The `approveTokenForBridge(address,address)` helper is deprecated and clears legacy standing approval instead of setting max approval. The selector is retained for upgrade and governance-tooling compatibility.
+
+  The SDK only emits bridge-approval transactions from `allowedRebalancingBridges[].approvedTokens` for routers on a legacy (pre-atomic-rebalancing) contract version, where `approveTokenForBridge` still grants a standing max approval. On newer routers the field is ignored because allowances are granted per rebalance and the same selector revokes. During `warp apply`, the SDK also revokes legacy standing rebalancing-bridge allowances when a route is being upgraded to, or is already on, the revoke-semantics implementation (so a partially-applied upgrade whose revokes did not execute can be retried), covering both the collateral token and any configured `approvedTokens` for every bridge that remains allowlisted, matched by bridge address across all domains (so a bridge moved between domains is still cleaned up), so an upgraded route does not retain the old max approvals. The SDK exports `MAX_LEGACY_BRIDGE_APPROVAL_VERSION` and `bridgeApprovalGrantsMaxAllowance(version)` so callers can determine whether `approveTokenForBridge` grants or revokes for a given contract version; the governance transaction reader uses this to read the target router's version and describe the call as a grant or a revoke accordingly.
+
+- a7f757b: Added provider-safe multi-address log filters with validation, pagination, RPC fallback, and deterministic explorer exclusion.
+- 4acd9a6: Extended `WarpCore` rate-limit validation to cover Tron xERC20 warp-route standards (`TronHypVSXERC20`, `TronHypVSXERC20Lockbox` and `TronHypCollateralFiat`) by matching against the shared `XERC20_STANDARDS` set instead of enumerating EVM standards inline. The destination mint-limit check now compares capacity in message space using each router's `scale` (mirroring `isDestinationCollateralSufficient`) rather than converting decimals only, and the origin burn-limit check now accounts for the origin-token-denominated fees included in the on-chain burn debit.
+
+  Hardened the Tron SDK ethers adapters. Native contract reads and the ethers-to-Tron transaction conversion now share a single `buildTronTriggerRequest` helper for request construction, fixing calldata serialization so `BytesLike` inputs are hex-encoded rather than stringified. Contract reads are now `eth_call`-first (keeping JSON-RPC-only endpoints working and surfacing reverts as `CALL_EXCEPTION` for missing-selector detection), falling back to the raw `wallet/triggerconstantcontract` full-node endpoint only when `eth_call` is unanswered; that raw path returns data only for a successful execution, and for an executed revert throws a `CALL_EXCEPTION` carrying the revert data (`0x` for a reasonless revert) so missing-selector detection still recognizes empty reverts while reverts with data propagate as genuine reverts, mirroring `eth_call`. Provider reads that omit `from` now execute with the Tron zero address as caller instead of the contract itself. Receipt confirmation now follows ethers semantics: `wait(0)` performs a single non-blocking probe (returning the receipt if the tx is already mined, otherwise `null` for a still-pending tx) so `MultiProvider.handleTx` can gate on inclusion, and `wait(n)` polls until the requested confirmation depth is reached before finalizing success or failure, so a reorgable on-chain failure is not rejected prematurely at a single confirmation. The confirmation poll is unbounded by default, leaving preemption to the caller, with an optional injectable timeout retained for bounding. The synthesized ethers `TransactionReceipt` now carries the deployed contract address (for deployments) and the real block hash fetched from the mined block.
+
+### Patch Changes
+
+- 745fb77: Constructor-configured variants were added for directly deployed domain, incremental domain, and default fallback routing ISMs.
+- 745fb77: Mailbox proxy ownership was established atomically during construction before its default ISM and hooks were configured.
+- 1cac66f: Rotated the stalled Merkly validator out of the hyperevm `default_ism` set and reconfigured it to 2-of-3 (AW / Mitosis / Luganodes).
+- c6a2f61: Updated `expandWarpDeployConfig` to canonicalize `allowedRebalancingBridges` keys to domain IDs, mirroring the treatment of `remoteRouters` and `destinationGas`. Previously a config keyed by chain name compared unequal to the domain-ID-keyed on-chain state and read as drift; now name-keyed and domain-ID-keyed configs compared equal. Keys resolving to the same canonical domain ID had their bridges merged by bridge identity — unioning `approvedTokens` — so a bridge listed under both a chain-name key and its domain-ID key no longer expanded to a duplicate that read as permanent drift against the deduplicated on-chain state.
+- Updated dependencies [745fb77]
+- Updated dependencies [745fb77]
+- Updated dependencies [469da6d]
+- Updated dependencies [74f3760]
+- Updated dependencies [abeeb52]
+- Updated dependencies [8944dd2]
+- Updated dependencies [eb9c37c]
+- Updated dependencies [3a74600]
+- Updated dependencies [57b1e14]
+- Updated dependencies [f3a6a4e]
+- Updated dependencies [d6e923f]
+- Updated dependencies [4c4f3f9]
+- Updated dependencies [4c4f3f9]
+- Updated dependencies [5830b8e]
+- Updated dependencies [d3bbedf]
+- Updated dependencies [e5908e9]
+- Updated dependencies [8944dd2]
+- Updated dependencies [89e6a8e]
+- Updated dependencies [c2301b2]
+- Updated dependencies [de37b68]
+- Updated dependencies [c0ca851]
+- Updated dependencies [745fb77]
+- Updated dependencies [4acd9a6]
+  - @hyperlane-xyz/core@12.0.0
+  - @hyperlane-xyz/tron-sdk@24.1.0
+  - @hyperlane-xyz/deploy-sdk@8.0.2
+  - @hyperlane-xyz/aleo-sdk@40.0.0
+  - @hyperlane-xyz/starknet-core@40.0.0
+  - @hyperlane-xyz/cosmos-sdk@40.0.0
+  - @hyperlane-xyz/radix-sdk@40.0.0
+  - @hyperlane-xyz/utils@40.0.0
+  - @hyperlane-xyz/provider-sdk@8.0.2
+
+## 39.1.0
+
+### Minor Changes
+
+- 4976bb1: Renamed the validator quorum RPC verification config fields to make clear they only add to, rather than replace, a chain's `rpcUrls`. `AgentChainMetadataSchema`'s `quorumRpcUrls` and `customQuorumRpcUrls` are now `additionalQuorumRpcUrls` and `customAdditionalQuorumRpcUrls`. `ValidatorMetadata.quorum_rpcs` is now `additional_quorum_rpcs`. This is a breaking rename with no backwards-compatible alias, since these fields shipped very recently and have no known external consumers yet.
+
+### Patch Changes
+
+- 6c9210b: Lazy-loaded the Radix browser provider and exposed token metadata through its public async API so applications without active Radix usage no longer include the Radix Engine Toolkit in their initial bundle.
+- 086ec59: Kept Starknet deployment artifacts out of browser runtime paths by publishing ABI and class-hash data through dedicated runtime exports.
+- Updated dependencies [4976bb1]
+- Updated dependencies [6c9210b]
+- Updated dependencies [086ec59]
+  - @hyperlane-xyz/utils@39.1.0
+  - @hyperlane-xyz/radix-sdk@39.1.0
+  - @hyperlane-xyz/deploy-sdk@8.0.1
+  - @hyperlane-xyz/starknet-core@39.1.0
+  - @hyperlane-xyz/core@11.3.1
+  - @hyperlane-xyz/aleo-sdk@39.1.0
+  - @hyperlane-xyz/cosmos-sdk@39.1.0
+  - @hyperlane-xyz/provider-sdk@8.0.1
+  - @hyperlane-xyz/tron-sdk@24.0.1
+
+## 39.0.0
+
+### Major Changes
+
+- 4ef1fde: - `getMinGasForWarpDeploy` now lives on `IProvider` (per-chain) instead of the stateless `ProtocolProvider`. It is `async` and returns a FINAL native-denom amount rather than a mix of gas units and native amounts. It composes the base router deploy cost with additive deltas for detected features (cross-collateral extras, fee program deploy, custom ISM / hook / IGP deploy) driven by the warp config shape, and for gas-metered protocols multiplies gas units by the chain gas price.
+  - `ChainMetadataForAltVM` gained an optional `gasPrice` field.
+  - `ProviderBuilderFn` now takes a full `ChainMetadata` instead of `(rpcUrls, network)`.
+  - The AltVM `IProvider.connect` and `ISigner.connectWithSigner` static factories now take `ChainMetadataForAltVM` as their first argument, replacing the previous `(rpcUrls, chainId, extraParams)` shape and the metadata-through-`extraParams` indirection.
+  - The CLI warp-deploy preflight now sizes AltVM native-balance requirements from the composed per-chain deploy cost, so feature-heavy deploys are no longer silently under-funded, and chains without a gas price are no longer skipped for the warp-deploy path.
+  - The AltVM warp-deploy base gas costs were calibrated from measured deploys (Sealevel from mainnet; Starknet, Aleo, and Radix from devnet base-router floors with safety margin), replacing the previous catastrophically-low placeholder constants that let preflight pass under-funded accounts.
+  - The Starknet test fixture native token was corrected from ETH to STRK to match the production registry and the token the devnet actually charges fees in.
+
+### Patch Changes
+
+- f41f9fd: Removed Aleo deployment artifacts, the Provable runtime, and the Shield wallet adapter from eager browser bundles. Lightweight constants and program metadata stayed synchronous, while browser providers and wallet integrations loaded their protocol runtimes on first use. Aleo mainnet and testnet runtimes were split so browser providers only downloaded the configured network.
+- ba0e9c1: B² Network SDK constants were restored.
+- 43eb24a: Removed the long-inactive Polkachu validator from the forma default multisig ISM config. Polkachu's forma validator has not signed a checkpoint since Feb 2026 (~5 months) as the chain winds down; this drops it from the source-of-truth validator set. The threshold is left unchanged pending a separate on-chain ISM update.
+- 406b5c7: Legacy IGP upgrades were fixed to recognize missing `PACKAGE_VERSION` selectors after aggregate providers wrap empty responses.
+- 11e215e: The warp-route `ownerStatus` check no longer baked governance-ICA knowledge into the SDK. `expandWarpDeployConfig` became deterministic (an Inactive owner is normalized to Active), and `checkWarpRouteDeployConfig` gained an optional `acceptedInactiveOwners` list of `{ chain, owner }` verdicts. An observed Inactive owner was treated as acceptable only when the exact `{ chain, owner }` pair was present in that list, letting the caller (infra) own the governance decision of deriving and verifying the ICA while the SDK stayed governance-agnostic.
+- bf7c658: `HyperlaneIsmFactory` now asserts the expected owner when a routing ISM deploy finds its target contract already initialized, instead of silently treating any existing initialization as success. This surfaces contention on a routing ISM's one-time `initialize()` call as a loud failure rather than a silent no-op.
+- 4bebbbf: Removed the acquired Imperator validator from the ink default multisig ISM config, where it has been frozen (checkpoint stuck at index 129000), and lowered the ink threshold from 4 to 3 to preserve the minimum majority (`floor(n/2) + 1`). Imperator remains in the other default ISMs pending a planned batch rotation.
+- 735793b: Added validator quorum RPC verification support. `AgentChainMetadataSchema` gained an optional `quorumRpcUrls` array (mirroring `rpcUrls`) alongside the existing `customQuorumRpcUrls` override, so a chain's statically configured quorum pool can be expressed in typed config rather than only via the comma-separated override string. `ValidatorMetadata.rpcs` was widened to `Array<string | ValidatorMetadataRpcEntry>` to cover both the historical (pre-agents-v1.6.0) flat hash-string wire shape and the current `{ url_hash, host_hash }` object shape, since metadata blobs are unversioned and a rolling validator fleet can publish either. A new `validatorMetadataRpcUrlHash` helper narrows an `rpcs` entry to its URL hash regardless of which shape it was serialized in. `ValidatorMetadata` also gained an optional `quorum_rpcs` field, reported separately from `rpcs`.
+- 2d398b9: The warp check no longer emits a spurious `decimals` ConfigMismatch for AltVM native tokens (e.g. Aleo `AleoHypNative`). The derived actual side has no decimals field for native tokens (`DerivedNativeWarpConfig` omits it), while the deploy-config-derived expected side carries decimals from the warp core config, so the field is now excluded from the diff on the expected side for AltVM native token types to keep both sides symmetric.
+- 15b249c: The altVM warp check no longer reports a false-positive `decimals` ConfigMismatch on native legs whose on-chain reader resolves a concrete decimals value (e.g. Sealevel/Solana native = 9). The expected side omits decimals for altVM native tokens, so `buildAltVmWarpRouteDiff` now skips the decimals comparison whenever the deploy config omits it, mirroring the existing ISM/hook/contractVersion handling.
+- 6967bef: Updated the AltVM warp route check to treat a per-destination gas that reads back as 0 from the on-chain `destination_gas` entrypoint as equivalent to an omitted value in the deploy config, but ONLY for no-IGP origins (Starknet/paradex). Those synthetic routers were deployed without per-domain gas so they read 0 on-chain, while the expected side derives a non-zero EVM `gasOverhead` default for every remote, producing perpetual false-positive `destinationGas` violations in `check-warp-deploy` on chains that have no IGP to consume the value. IGP-capable altVM protocols (Sealevel, CosmosNative, ...) still diff destinationGas normally, so a zero-vs-nonzero drift there is preserved. A genuinely configured (non-zero) on-chain destinationGas always surfaces as a violation.
+- 213f626: Updated the altVM warp route check to treat the paradex-only `collateralDex` registry annotation as equivalent to `collateral`. `collateralDex` has no matching SDK `TokenType`, and on-chain the leg is a standard collateral router, so the deriver reported `collateral` and the generic altVM diff produced a perpetual false-positive `type` ConfigMismatch in `check-warp-deploy` for the ETH/paradex and DIME/paradex routes.
+- 3811ba9: The warp check no longer emits a spurious `token` ConfigMismatch for synthetic tokens. The SVM/cosmos synthetic reader populates `token` with the on-chain mint/denom (a deterministic deployment artifact derived from the router), while the deploy-config-derived expected side has no counterpart, so the field is now excluded from the diff on both sides for synthetic token types.
+- 6c2ca1d: Updated the EVM warp route check to treat an unset (zero-address) on-chain post-dispatch hook as equivalent to an omitted hook in the deploy config. Previously, `expandVirtualWarpDeployConfig` resolved an unset on-chain hook to the zero address while the expected config left it undefined, producing a perpetual false-positive `hook` violation in `check-warp-deploy`. A genuinely configured (non-zero) on-chain hook still surfaces as a violation.
+- 1a31d04: Fixed a bug where deploying a warp route whose EVM owner differed from the deployer failed during cross-chain router enrollment with `Ownable: caller is not the owner`. The EVM token deployer transferred router ownership to the configured owner at the end of its per-protocol phase, before the global cross-chain enrollment (submitted by the deployer key) ran. `executeWarpDeploy` now deploys EVM routers under the deployer as an intermediate owner — mirroring the AltVM branch — so enrollment runs while the deployer still owns the router, and `enrollCrossChainRouters` hands ownership to the configured owner afterward. The deferred update also carries the configured ProxyAdmin owner through, so upgrade authority is transferred to the configured owner instead of being left with the deployer.
+- 9997aee: The warp route `ownerStatus` virtual check no longer recurses into the implementation contract's owner. Under the transparent-proxy pattern the implementation is inert (upgrade authority lives in the ProxyAdmin, not the implementation) and its owner is never a configured value, so a stale deployer EOA there produced false-positive owner-inactive drift. The check still recurses into the ProxyAdmin owner, which holds upgrade authority and is a managed owner.
+- Updated dependencies [f41f9fd]
+- Updated dependencies [4ef1fde]
+- Updated dependencies [6f61265]
+- Updated dependencies [6793396]
+- Updated dependencies [1a31d04]
+- Updated dependencies [735793b]
+  - @hyperlane-xyz/aleo-sdk@39.0.0
+  - @hyperlane-xyz/provider-sdk@8.0.0
+  - @hyperlane-xyz/tron-sdk@24.0.0
+  - @hyperlane-xyz/cosmos-sdk@39.0.0
+  - @hyperlane-xyz/radix-sdk@39.0.0
+  - @hyperlane-xyz/deploy-sdk@8.0.0
+  - @hyperlane-xyz/utils@39.0.0
+  - @hyperlane-xyz/core@11.3.1
+  - @hyperlane-xyz/starknet-core@39.0.0
+
 ## 38.0.0
 
 ### Major Changes

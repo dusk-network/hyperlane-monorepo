@@ -13,7 +13,7 @@ use tracing::{debug, instrument, warn};
 
 use hyperlane_core::{
     indexed_to_sequence_indexed_array, ContractSyncCursor, CursorAction, HyperlaneDomain,
-    HyperlaneSequenceAwareIndexerStoreReader, IndexMode, Indexed, LogMeta, SequenceAwareIndexer,
+    HyperlaneSequenceAwareIndexerStore, IndexMode, Indexed, LogMeta, SequenceAwareIndexer,
     SequenceIndexed,
 };
 
@@ -32,7 +32,7 @@ pub(crate) struct ForwardSequenceAwareSyncCursor<T> {
     /// establish targets to index towards.
     latest_sequence_querier: Arc<dyn SequenceAwareIndexer<T>>,
     /// A store used to check which logs have already been indexed.
-    store: Arc<dyn HyperlaneSequenceAwareIndexerStoreReader<T>>,
+    store: Arc<dyn HyperlaneSequenceAwareIndexerStore<T>>,
     /// A snapshot of the last indexed log, or if no indexing has occurred yet,
     /// the initial log to start indexing forward from.
     last_indexed_snapshot: LastIndexedSnapshot,
@@ -71,7 +71,7 @@ impl<T: Debug + Clone + Sync + Send + Indexable + 'static> ForwardSequenceAwareS
     pub fn new(
         chunk_size: u32,
         latest_sequence_querier: Arc<dyn SequenceAwareIndexer<T>>,
-        store: Arc<dyn HyperlaneSequenceAwareIndexerStoreReader<T>>,
+        store: Arc<dyn HyperlaneSequenceAwareIndexerStore<T>>,
         next_sequence: u32,
         start_block: u32,
         index_mode: IndexMode,
@@ -532,7 +532,8 @@ impl<T: Send + Sync + Clone + Debug + Indexable + 'static> ContractSyncCursor<T>
 pub(crate) mod test {
     use derive_new::new;
     use hyperlane_core::{
-        ChainResult, HyperlaneDomainProtocol, HyperlaneLogStore, Indexed, Indexer, Sequenced,
+        ChainResult, HyperlaneDomainProtocol, HyperlaneLogStore,
+        HyperlaneSequenceAwareIndexerStoreReader, Indexed, Indexer, Sequenced,
     };
 
     use crate::cursors::CursorType;
@@ -610,6 +611,36 @@ pub(crate) mod test {
         }
     }
 
+    #[async_trait]
+    impl<T: Sequenced + Debug + Clone + Send + Sync + Indexable + 'static>
+        hyperlane_core::HyperlaneBackwardCursorStore<T>
+        for MockHyperlaneSequenceAwareIndexerStore<T>
+    {
+        async fn retrieve_backward_cursors(
+            &self,
+        ) -> eyre::Result<Vec<hyperlane_core::BackwardCursorProgress>> {
+            Ok(Vec::new())
+        }
+
+        async fn store_backward_cursor(
+            &self,
+            _progress: hyperlane_core::BackwardCursorProgress,
+        ) -> eyre::Result<()> {
+            Ok(())
+        }
+
+        async fn reset_backward_cursor(
+            &self,
+            _progress: hyperlane_core::BackwardCursorProgress,
+        ) -> eyre::Result<()> {
+            Ok(())
+        }
+
+        async fn delete_backward_cursor(&self, _sequence: u32) -> eyre::Result<()> {
+            Ok(())
+        }
+    }
+
     #[derive(Debug, Clone, new)]
     pub struct MockSequencedData {
         pub sequence: u32,
@@ -661,6 +692,23 @@ pub(crate) mod test {
                 prometheus::Opts::new("cursor_max_sequence", "Max sequence of the cursor")
                     .namespace("mock")
                     .subsystem("cursor"),
+                &["event_type", "chain"],
+            )
+            .unwrap(),
+            cursor_sequence_gap_retries: prometheus::IntCounterVec::new(
+                prometheus::Opts::new("cursor_sequence_gap_retries", "Sequence gap retries")
+                    .namespace("mock")
+                    .subsystem("cursor"),
+                &["event_type", "chain"],
+            )
+            .unwrap(),
+            cursor_sequence_gap_backoff_seconds: prometheus::IntGaugeVec::new(
+                prometheus::Opts::new(
+                    "cursor_sequence_gap_backoff_seconds",
+                    "Sequence gap backoff",
+                )
+                .namespace("mock")
+                .subsystem("cursor"),
                 &["event_type", "chain"],
             )
             .unwrap(),

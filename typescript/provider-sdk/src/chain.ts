@@ -11,6 +11,12 @@ type ChainNameOrId = string | number;
  */
 export interface ChainMetadataForAltVM {
   name: string;
+  /** Highest transaction version supported by this SVM. Defaults to 0. */
+  maxSupportedTransactionVersion?: 0 | 1;
+  /** Default transaction version for the Sealevel signer. Defaults to 0. */
+  sealevelTransactionVersion?: 0 | 1;
+  /** Enable v1 submission only after this SVM activates the feature. */
+  sealevelV1TransactionsEnabled?: boolean;
   bech32Prefix?: string;
   protocol: ProtocolType;
   domainId: Domain;
@@ -31,6 +37,10 @@ export interface ChainMetadataForAltVM {
   gatewayUrls?: {
     http: string;
   }[];
+  gasPrice?: {
+    amount: string;
+    denom: string;
+  };
   // Used in radix tests after deploying
   // the package address to the local chain
   packageAddress?: string;
@@ -44,10 +54,6 @@ export interface TestChainMetadata extends ChainMetadataForAltVM {
   rpcUrl: string;
   restPort: number;
   gnosisSafeTransactionServiceUrl?: string;
-  gasPrice?: {
-    amount: string;
-    denom: string;
-  };
 }
 
 /**

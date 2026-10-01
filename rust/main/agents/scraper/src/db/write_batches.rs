@@ -1,0 +1,1010 @@
+//! Regression tests for PostgreSQL statement bounds and atomic event writes.
+
+use std::collections::BTreeMap;
+
+use migration::MigratorTrait;
+use sea_orm::{
+    sqlx::postgres::PgListener, ColumnTrait, ConnectionTrait, Database, DatabaseBackend,
+    EntityTrait, MockDatabase, MockExecResult, PaginatorTrait, QueryFilter, Value,
+};
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::postgres::Postgres;
+
+use hyperlane_core::{
+    BlockInfo, InterchainGasPayment, LogMeta, TxnInfo, TxnReceiptInfo, H256, H512, U256,
+};
+
+use super::{
+    generated::{delivered_message, gas_payment},
+    ScraperDb, StorableDelivery, StorablePayment, StorableTxn,
+};
+
+const DOMAIN: u32 = 1;
+
+fn result(key: &str, value: i64) -> Vec<BTreeMap<String, Value>> {
+    vec![BTreeMap::from([(
+        key.to_owned(),
+        Value::BigInt(Some(value)),
+    )])]
+}
+
+fn payments(count: u32) -> Vec<InterchainGasPayment> {
+    (0..count)
+        .map(|index| InterchainGasPayment {
+            message_id: H256::from_low_u64_be(u64::from(index)),
+            destination: DOMAIN,
+            payment: U256::from(1000),
+            gas_amount: U256::from(12345),
+        })
+        .collect()
+}
+
+fn payment_rows<'a>(
+    payments: &'a [InterchainGasPayment],
+    meta: &'a LogMeta,
+    txn_id: Option<i64>,
+) -> Vec<StorablePayment<'a>> {
+    payments
+        .iter()
+        .enumerate()
+        .map(|(index, payment)| StorablePayment {
+            payment,
+            sequence: Some(i64::try_from(index).unwrap()),
+            meta,
+            txn_id,
+        })
+        .collect()
+}
+
+fn deliveries(count: u32, meta: &LogMeta) -> impl Iterator<Item = StorableDelivery<'_>> {
+    (0..count).map(|index| StorableDelivery {
+        message_id: H256::from_low_u64_be(u64::from(index)),
+        sequence: Some(i64::from(index)),
+        meta,
+        txn_id: None,
+    })
+}
+
+#[tokio::test]
+async fn empty_event_writes_do_not_access_database() {
+    let db =
+        ScraperDb::with_connection(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+    assert_eq!(
+        db.store_deliveries(DOMAIN, H256::zero(), std::iter::empty())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        db.store_dispatched_messages(DOMAIN, &H256::zero(), std::iter::empty())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        db.store_payments(DOMAIN, &H256::zero(), &[]).await.unwrap(),
+        0
+    );
+    assert!(db.0.into_transaction_log().is_empty());
+}
+
+#[tokio::test]
+async fn delivery_batches_bound_binds_and_preserve_small_fast_path() {
+    for count in [1, 12_000] {
+        let chunks = if count == 1 { 1 } else { 2 };
+        let results = vec![result("max_id", 0), result("num_items", i64::from(count))];
+        let db = ScraperDb::with_connection(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results((0..chunks).map(|_| MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }))
+                .append_query_results(results)
+                .into_connection(),
+        );
+        assert_eq!(
+            db.store_deliveries(DOMAIN, H256::zero(), deliveries(count, &LogMeta::default()))
+                .await
+                .unwrap(),
+            u64::from(count)
+        );
+        let log = db.0.into_transaction_log();
+        let statements: Vec<_> = log
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .collect();
+        let binds: Vec<_> = statements
+            .iter()
+            .filter(|statement| statement.sql.starts_with("INSERT"))
+            .map(|statement| statement.values.as_ref().unwrap().0.len())
+            .collect();
+        assert_eq!(
+            binds,
+            if count == 1 {
+                vec![6]
+            } else {
+                vec![60_000, 12_000]
+            }
+        );
+        assert_eq!(statements.len(), if count == 1 { 3 } else { 6 });
+        if count > 1 {
+            assert_eq!(log[1].statements().first().unwrap().sql, "BEGIN");
+            assert_eq!(log[1].statements().last().unwrap().sql, "COMMIT");
+        }
+    }
+}
+
+#[tokio::test]
+async fn payment_prefetch_and_insert_statements_are_bounded_and_deduplicated() {
+    // 66,000 IDs exceed the old prefetch's 65,535 bind limit independently of INSERT statements.
+    for count in [5_000_u32, 66_000] {
+        let chunks = usize::try_from(count.div_ceil(5_000)).unwrap();
+        let mut results = (0..chunks).map(|_| Vec::new()).collect::<Vec<_>>();
+        results.push(result("max_id", 0));
+        results.extend((0..chunks).map(|_| result("id", 1)));
+        results.push(result("num_items", i64::from(count)));
+        let db = ScraperDb::with_connection(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .append_query_results(results)
+                .into_connection(),
+        );
+        let mut payments = payments(count);
+        payments.push(payments[0].clone()); // Prefetch and NULL-row identity must dedupe this.
+        let meta = LogMeta::default();
+        let rows = payment_rows(&payments, &meta, None);
+        assert_eq!(
+            db.store_payments(DOMAIN, &H256::zero(), &rows)
+                .await
+                .unwrap(),
+            u64::from(count)
+        );
+        let log = db.0.into_transaction_log();
+        assert_eq!(
+            log.len(),
+            1,
+            "one transaction must retain the advisory lock throughout"
+        );
+        let statements = log[0].statements();
+        assert_eq!(statements.first().unwrap().sql, "BEGIN");
+        assert_eq!(statements.last().unwrap().sql, "COMMIT");
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|statement| statement.sql.contains("pg_advisory_xact_lock"))
+                .count(),
+            1
+        );
+        let reads: Vec<_> = statements
+            .iter()
+            .filter(|statement| statement.sql.contains(" IN ("))
+            .collect();
+        assert_eq!(reads.len(), chunks);
+        assert!(reads.iter().all(|statement| statement.sql.starts_with(
+            "SELECT \"gas_payment\".\"id\", \"gas_payment\".\"msg_id\", \"gas_payment\".\"log_index\", \"gas_payment\".\"tx_id\" FROM"
+        )));
+        assert!(reads
+            .iter()
+            .all(|statement| statement.values.as_ref().unwrap().0.len() <= 5_002));
+        let inserts: Vec<_> = statements
+            .iter()
+            .filter(|statement| statement.sql.starts_with("INSERT"))
+            .collect();
+        assert_eq!(inserts.len(), chunks);
+        assert_eq!(inserts[0].values.as_ref().unwrap().0.len(), 55_000);
+        assert!(statements.iter().all(|statement| statement
+            .values
+            .as_ref()
+            .map_or(true, |values| values.0.len() <= usize::from(u16::MAX))));
+    }
+}
+
+#[tokio::test]
+async fn payment_fallback_replays_skip_count_baseline() {
+    for existing_tx_id in [None, Some(7)] {
+        let payments = payments(1);
+        let meta = LogMeta::default();
+        let existing = vec![BTreeMap::from([
+            ("0".to_owned(), Value::BigInt(Some(1))),
+            (
+                "1".to_owned(),
+                Value::Bytes(Some(Box::new(hyperlane_core::h256_to_bytes(
+                    &payments[0].message_id,
+                )))),
+            ),
+            ("2".to_owned(), Value::BigInt(Some(0))),
+            ("3".to_owned(), Value::BigInt(existing_tx_id)),
+        ])];
+        let db = ScraperDb::with_connection(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .append_query_results([existing])
+                .into_connection(),
+        );
+        assert_eq!(
+            db.store_payments(DOMAIN, &H256::zero(), &payment_rows(&payments, &meta, None))
+                .await
+                .unwrap(),
+            0
+        );
+        let log = db.0.into_transaction_log();
+        let statements = log[0].statements();
+        assert_eq!(statements.len(), 4);
+        assert_eq!(statements[0].sql, "BEGIN");
+        assert!(statements[1].sql.contains("pg_advisory_xact_lock"));
+        assert!(statements[2].sql.contains(" IN ("));
+        assert_eq!(statements[3].sql, "COMMIT");
+    }
+}
+
+#[tokio::test]
+async fn payment_prefetch_and_baseline_errors_precede_writes() {
+    for fail_prefetch in [true, false] {
+        let mock =
+            MockDatabase::new(DatabaseBackend::Postgres).append_exec_results([MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }]);
+        let mock = if fail_prefetch {
+            mock
+        } else {
+            mock.append_query_results([Vec::<BTreeMap<String, Value>>::new()])
+        };
+        let db = ScraperDb::with_connection(
+            mock.append_query_errors([sea_orm::DbErr::Custom("read failed".to_owned())])
+                .into_connection(),
+        );
+        let payments = payments(1);
+        let meta = LogMeta::default();
+        assert!(db
+            .store_payments(DOMAIN, &H256::zero(), &payment_rows(&payments, &meta, None))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("read failed"));
+        let log = db.0.into_transaction_log();
+        let statements = log[0].statements();
+        assert_eq!(statements.last().unwrap().sql, "ROLLBACK");
+        assert!(!statements
+            .iter()
+            .any(|s| s.sql.starts_with("INSERT") || s.sql.starts_with("DELETE")));
+    }
+}
+
+#[tokio::test]
+async fn duplicate_keys_across_chunks_are_rejected() {
+    let db = ScraperDb::with_connection(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([result("max_id", 0)])
+            .into_connection(),
+    );
+    let meta = LogMeta::default();
+    let rows = deliveries(12_000, &meta).chain(deliveries(1, &meta));
+    assert!(db
+        .store_deliveries(DOMAIN, H256::zero(), rows)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("Duplicate delivery"));
+    let mut payments = payments(6_000);
+    payments.push(payments[0].clone());
+    assert!(db
+        .store_payments(
+            DOMAIN,
+            &H256::zero(),
+            &payment_rows(&payments, &meta, Some(1))
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("Duplicate resolved gas payment"));
+    let log = db.0.into_transaction_log();
+    assert!(log.is_empty());
+}
+
+pub(super) async fn seed_transaction(db: &ScraperDb, index: u64) -> eyre::Result<i64> {
+    let hash = H256::from_low_u64_be(55);
+    db.store_blocks(
+        DOMAIN,
+        [BlockInfo {
+            hash,
+            timestamp: 1_700_000_000,
+            number: 500,
+        }]
+        .into_iter(),
+    )
+    .await?;
+    let block_id = db.get_block_basic([&hash].into_iter()).await?[0].id;
+    let tx_hash = H512::from_low_u64_be(66 + index);
+    db.store_txns(
+        [StorableTxn {
+            block_id,
+            info: TxnInfo {
+                hash: tx_hash,
+                gas_limit: U256::one(),
+                max_priority_fee_per_gas: None,
+                max_fee_per_gas: None,
+                gas_price: None,
+                nonce: 0,
+                sender: H256::zero(),
+                recipient: None,
+                receipt: Some(TxnReceiptInfo {
+                    gas_used: U256::one(),
+                    cumulative_gas_used: U256::one(),
+                    effective_gas_price: None,
+                }),
+                raw_input_data: None,
+            },
+        }]
+        .into_iter(),
+    )
+    .await?;
+    Ok(db.get_txn_ids([&tx_hash].into_iter()).await?[&tx_hash])
+}
+
+async fn explorer_notifications(db: &ScraperDb, listener: &mut PgListener) -> eyre::Result<usize> {
+    // PostgreSQL delivers notifications in commit order. A separate channel
+    // provides a deterministic barrier after the writes, without a quiet-period sleep.
+    db.0.execute_unprepared("SELECT pg_notify('replay_test_barrier', 'ready')")
+        .await?;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut count = 0_usize;
+        loop {
+            let notification = listener.recv().await?;
+            if notification.channel() == "replay_test_barrier" {
+                return Ok(count);
+            }
+            assert_eq!(notification.channel(), "scraper_explorer_event");
+            count = count.saturating_add(1);
+        }
+    })
+    .await?
+}
+
+#[tokio::test]
+async fn unchanged_replays_preserve_rows_and_do_not_notify_explorer() -> eyre::Result<()> {
+    let postgres = Postgres::default().start().await?;
+    let port = postgres.get_host_port_ipv4(5432).await?;
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let connection = Database::connect(&url).await?;
+    migration::Migrator::up(&connection, None).await?;
+    let db = ScraperDb::with_connection(connection);
+    let original_tx = seed_transaction(&db, 0).await?;
+    let replacement_tx = seed_transaction(&db, 1).await?;
+    let mut listener = PgListener::connect(&url).await?;
+    listener.listen("scraper_explorer_event").await?;
+    listener.listen("replay_test_barrier").await?;
+    let meta = LogMeta::default();
+    let address = H256::from_low_u64_be(1);
+    let mut payments = payments(1);
+    db.store_payments(
+        DOMAIN,
+        &address,
+        &payment_rows(&payments, &meta, Some(original_tx)),
+    )
+    .await?;
+    db.store_deliveries(
+        DOMAIN,
+        address,
+        deliveries(1, &meta).map(|mut row| {
+            row.txn_id = Some(original_tx);
+            row
+        }),
+    )
+    .await?;
+    assert_eq!(explorer_notifications(&db, &mut listener).await?, 2);
+    let payment_before = gas_payment::Entity::find()
+        .one(&db.0)
+        .await?
+        .expect("stored event row");
+    let delivery_before = delivered_message::Entity::find()
+        .one(&db.0)
+        .await?
+        .expect("stored event row");
+
+    for _ in 0..2 {
+        assert_eq!(
+            db.store_payments(
+                DOMAIN,
+                &address,
+                &payment_rows(&payments, &meta, Some(original_tx))
+            )
+            .await?,
+            0
+        );
+        assert_eq!(
+            db.store_deliveries(
+                DOMAIN,
+                address,
+                deliveries(1, &meta).map(|mut row| {
+                    row.txn_id = Some(original_tx);
+                    row
+                })
+            )
+            .await?,
+            0
+        );
+        // A later unresolved replay must not clear a resolved transaction.
+        assert_eq!(
+            db.store_deliveries(DOMAIN, address, deliveries(1, &meta))
+                .await?,
+            0
+        );
+        assert_eq!(explorer_notifications(&db, &mut listener).await?, 0);
+        assert_eq!(
+            gas_payment::Entity::find()
+                .one(&db.0)
+                .await?
+                .expect("stored event row"),
+            payment_before
+        );
+        assert_eq!(
+            delivered_message::Entity::find()
+                .one(&db.0)
+                .await?
+                .expect("stored event row"),
+            delivery_before
+        );
+    }
+
+    // Real content changes, including a NULL sequence transition, still update.
+    payments[0].payment = U256::from(2000);
+    let mut rows = payment_rows(&payments, &meta, Some(original_tx));
+    rows[0].sequence = None;
+    db.store_payments(DOMAIN, &address, &rows).await?;
+    assert_eq!(explorer_notifications(&db, &mut listener).await?, 1);
+    let changed = gas_payment::Entity::find()
+        .one(&db.0)
+        .await?
+        .expect("stored event row");
+    assert_eq!(changed.id, payment_before.id);
+    assert_eq!(changed.sequence, None);
+    assert_eq!(
+        changed.payment,
+        crate::conversions::u256_to_decimal(U256::from(2000))
+    );
+    db.store_payments(DOMAIN, &address, &rows).await?;
+    assert_eq!(explorer_notifications(&db, &mut listener).await?, 0);
+
+    // A reorg can change the delivery transaction; payment transaction IDs are
+    // part of their identity, so a new transaction remains a separate event.
+    db.store_deliveries(
+        DOMAIN,
+        address,
+        deliveries(1, &meta).map(|mut row| {
+            row.txn_id = Some(replacement_tx);
+            row
+        }),
+    )
+    .await?;
+    assert_eq!(
+        db.store_payments(
+            DOMAIN,
+            &address,
+            &payment_rows(&payments, &meta, Some(replacement_tx))
+        )
+        .await?,
+        1
+    );
+    assert_eq!(explorer_notifications(&db, &mut listener).await?, 2);
+    assert_eq!(
+        delivered_message::Entity::find()
+            .one(&db.0)
+            .await?
+            .expect("stored event row")
+            .destination_tx_id,
+        Some(replacement_tx)
+    );
+    assert_eq!(gas_payment::Entity::find().count(&db.0).await?, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn bulk_events_replay_and_rollback_failed_tail_in_postgres() -> eyre::Result<()> {
+    let postgres = Postgres::default().start().await?;
+    let port = postgres.get_host_port_ipv4(5432).await?;
+    let connection = Database::connect(format!(
+        "postgresql://postgres:postgres@127.0.0.1:{port}/postgres"
+    ))
+    .await?;
+    migration::Migrator::up(&connection, None).await?;
+    let db = ScraperDb::with_connection(connection);
+    let meta = LogMeta::default();
+    let address = H256::from_low_u64_be(1);
+
+    assert_eq!(
+        db.store_deliveries(DOMAIN, address, deliveries(12_000, &meta))
+            .await?,
+        12_000
+    );
+    // Both INSERT chunks have no changed rows on replay. This must still
+    // commit successfully when the conflict predicate skips every UPDATE.
+    assert_eq!(
+        db.store_deliveries(DOMAIN, address, deliveries(12_000, &meta))
+            .await?,
+        0
+    );
+    assert_eq!(
+        delivered_message::Entity::find().count(&db.0).await?,
+        12_000
+    );
+    db.0.execute_unprepared("TRUNCATE delivered_message")
+        .await?;
+    let original_tx = seed_transaction(&db, 0).await?;
+    let replacement_tx = seed_transaction(&db, 1).await?;
+    db.store_deliveries(
+        DOMAIN,
+        address,
+        deliveries(1, &meta).map(|mut row| {
+            row.txn_id = Some(original_tx);
+            row
+        }),
+    )
+    .await?;
+    db.0.execute_unprepared("ALTER TABLE delivered_message ADD CONSTRAINT reject_delivery_tail CHECK (sequence <> 10000)").await?;
+    assert!(db
+        .store_deliveries(
+            DOMAIN,
+            address,
+            deliveries(12_000, &meta).map(|mut row| {
+                row.txn_id = Some(replacement_tx);
+                row
+            })
+        )
+        .await
+        .is_err());
+    assert_eq!(delivered_message::Entity::find().count(&db.0).await?, 1);
+    assert_eq!(
+        delivered_message::Entity::find()
+            .one(&db.0)
+            .await?
+            .unwrap()
+            .destination_tx_id,
+        Some(original_tx)
+    );
+    db.0.execute_unprepared("ALTER TABLE delivered_message DROP CONSTRAINT reject_delivery_tail")
+        .await?;
+    assert_eq!(
+        db.store_deliveries(DOMAIN, address, deliveries(12_000, &meta))
+            .await?,
+        11_999
+    );
+
+    let payments = payments(6_000);
+    let fallback = payment_rows(&payments, &meta, None);
+    assert_eq!(db.store_payments(DOMAIN, &address, &fallback).await?, 6_000);
+    assert_eq!(db.store_payments(DOMAIN, &address, &fallback).await?, 0);
+    assert_eq!(gas_payment::Entity::find().count(&db.0).await?, 6_000);
+    // Reset the entire stream fixture, including its cursor foreign key and head.
+    db.0.execute_unprepared(
+        "TRUNCATE gas_payment, gas_payment_stream_cursor, gas_payment_stream_head",
+    )
+    .await?;
+    db.store_payments(DOMAIN, &address, &fallback[..1]).await?;
+    let tx_id = seed_transaction(&db, 0).await?;
+    let resolved = payment_rows(&payments, &meta, Some(tx_id));
+    db.0.execute_unprepared("ALTER TABLE gas_payment ADD CONSTRAINT reject_payment_tail CHECK (sequence <> 5000 OR tx_id IS NULL)").await?;
+    assert!(db
+        .store_payments(DOMAIN, &address, &resolved)
+        .await
+        .is_err());
+    assert_eq!(gas_payment::Entity::find().count(&db.0).await?, 1);
+    assert_eq!(
+        gas_payment::Entity::find()
+            .filter(gas_payment::Column::TxId.is_null())
+            .count(&db.0)
+            .await?,
+        1,
+        "failed tail must restore the NULL fallback row"
+    );
+    db.0.execute_unprepared("ALTER TABLE gas_payment DROP CONSTRAINT reject_payment_tail")
+        .await?;
+    assert_eq!(db.store_payments(DOMAIN, &address, &resolved).await?, 6_000);
+    assert_eq!(gas_payment::Entity::find().count(&db.0).await?, 6_000);
+    assert_eq!(
+        gas_payment::Entity::find()
+            .filter(gas_payment::Column::TxId.is_null())
+            .count(&db.0)
+            .await?,
+        0
+    );
+    assert_eq!(
+        db.store_payments(DOMAIN, &address, &fallback).await?,
+        0,
+        "later fallback replay must preserve resolved rows"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn dispatch_chunks_preserve_owned_payloads_and_replay() -> eyre::Result<()> {
+    let postgres = Postgres::default().start().await?;
+    let port = postgres.get_host_port_ipv4(5432).await?;
+    let connection = Database::connect(format!(
+        "postgresql://postgres:postgres@127.0.0.1:{port}/postgres"
+    ))
+    .await?;
+    migration::Migrator::up(&connection, None).await?;
+    let db = ScraperDb::with_connection(connection);
+    let meta = LogMeta::default();
+    let address = H256::from_low_u64_be(1);
+    let rows = || {
+        (0..3_251u32).map(|nonce| super::StorableMessage {
+            msg: hyperlane_core::HyperlaneMessage {
+                nonce,
+                origin: DOMAIN,
+                destination: DOMAIN,
+                body: if nonce == 0 {
+                    vec![]
+                } else {
+                    vec![(nonce % 251) as u8; 1_024]
+                },
+                ..Default::default()
+            },
+            meta: &meta,
+            txn_id: None,
+            id_override: None,
+        })
+    };
+    assert_eq!(
+        db.store_dispatched_messages(DOMAIN, &address, rows())
+            .await?,
+        3_251
+    );
+    assert_eq!(
+        db.store_dispatched_messages(DOMAIN, &address, rows())
+            .await?,
+        0
+    );
+    // Projected reads preserve both NULL/empty and nonempty bodies without transaction metadata.
+    for nonce in [0, 3_250] {
+        let mut expected = rows().nth(nonce as usize).unwrap().msg;
+        expected.version = 3; // Message versions are reconstructed, not stored.
+        assert_eq!(
+            db.retrieve_dispatched_message_by_nonce(DOMAIN, &address, nonce)
+                .await?,
+            Some(expected)
+        );
+    }
+    for (domain, mailbox, nonce) in [
+        (DOMAIN, address, 3_251),
+        (DOMAIN + 1, address, 0),
+        (DOMAIN, H256::from_low_u64_be(2), 0),
+    ] {
+        assert!(db
+            .retrieve_dispatched_message_by_nonce(domain, &mailbox, nonce)
+            .await?
+            .is_none());
+    }
+    let stored = super::generated::message::Entity::find().all(&db.0).await?;
+    assert_eq!(stored.len(), 3_251);
+    for row in stored {
+        let expected = if row.nonce == 0 {
+            None
+        } else {
+            Some(vec![(row.nonce % 251) as u8; 1_024])
+        };
+        assert_eq!(row.msg_body, expected);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn hash_lookups_read_both_chunks_without_duplicate_results_in_postgres() -> eyre::Result<()> {
+    let postgres = Postgres::default().start().await?;
+    let port = postgres.get_host_port_ipv4(5432).await?;
+    let connection = Database::connect(format!(
+        "postgresql://postgres:postgres@127.0.0.1:{port}/postgres"
+    ))
+    .await?;
+    migration::Migrator::up(&connection, None).await?;
+    let db = ScraperDb::with_connection(connection);
+    let first_tx = seed_transaction(&db, 0).await?;
+    let tail_tx = seed_transaction(&db, 65_000).await?;
+    db.store_blocks(
+        DOMAIN,
+        [BlockInfo {
+            hash: H256::from_low_u64_be(65_055),
+            timestamp: 1_700_000_001,
+            number: 501,
+        }]
+        .into_iter(),
+    )
+    .await?;
+    let blocks: Vec<_> = (0..66_000).map(H256::from_low_u64_be).collect();
+    let txns: Vec<_> = (0..66_000).map(H512::from_low_u64_be).collect();
+    let found_blocks = db
+        .get_block_basic(blocks.iter().chain(blocks[55..56].iter()))
+        .await?;
+    assert_eq!(found_blocks.len(), 2);
+    assert!(found_blocks.iter().any(|row| row.hash == blocks[55]));
+    assert!(found_blocks.iter().any(|row| row.hash == blocks[65_055]));
+    let found_txns = db
+        .get_txn_ids(txns.iter().chain(txns[66..67].iter()))
+        .await?;
+    assert_eq!(found_txns.len(), 2);
+    assert_eq!(found_txns[&txns[66]], first_tx);
+    assert_eq!(found_txns[&txns[65_066]], tail_tx);
+    Ok(())
+}
+
+#[tokio::test]
+async fn owned_raw_payloads_and_transaction_inputs_survive_storage() -> eyre::Result<()> {
+    use super::generated::{raw_message_dispatch, transaction};
+    use super::StorableRawMessageDispatch;
+    use hyperlane_core::HyperlaneMessage;
+
+    let postgres = Postgres::default().start().await?;
+    let port = postgres.get_host_port_ipv4(5432).await?;
+    let connection = Database::connect(format!(
+        "postgresql://postgres:postgres@127.0.0.1:{port}/postgres"
+    ))
+    .await?;
+    migration::Migrator::up(&connection, None).await?;
+    let db = ScraperDb::with_connection(connection);
+    let meta = LogMeta::default();
+    let address = H256::from_low_u64_be(1);
+    let messages: Vec<_> = (0..2_955u32)
+        .map(|nonce| HyperlaneMessage {
+            nonce,
+            origin: DOMAIN,
+            destination: DOMAIN,
+            body: if nonce == 0 {
+                vec![]
+            } else {
+                vec![(nonce % 251) as u8; 1_024]
+            },
+            ..Default::default()
+        })
+        .collect();
+    let rows = || {
+        messages
+            .iter()
+            .map(|msg| StorableRawMessageDispatch { msg, meta: &meta })
+    };
+    assert_eq!(
+        db.store_raw_message_dispatches(DOMAIN, &address, rows())
+            .await?,
+        2_955
+    );
+    assert_eq!(
+        db.store_raw_message_dispatches(DOMAIN, &address, rows())
+            .await?,
+        0
+    );
+    let stored = raw_message_dispatch::Entity::find().all(&db.0).await?;
+    assert_eq!(stored.len(), messages.len());
+    for row in stored {
+        assert_eq!(
+            row.msg_body.as_ref(),
+            Some(&messages[row.nonce as usize].body)
+        );
+    }
+
+    seed_transaction(&db, 0).await?;
+    let block_id = db
+        .get_block_basic([&H256::from_low_u64_be(55)].into_iter())
+        .await?[0]
+        .id;
+    let inputs = [None, Some(vec![]), Some(vec![0xab; 4_096])];
+    let transactions = || {
+        inputs
+            .iter()
+            .enumerate()
+            .map(|(index, raw_input_data)| StorableTxn {
+                block_id,
+                info: TxnInfo {
+                    hash: H512::from_low_u64_be(100 + index as u64),
+                    gas_limit: U256::one(),
+                    max_priority_fee_per_gas: None,
+                    max_fee_per_gas: None,
+                    gas_price: None,
+                    nonce: 0,
+                    sender: H256::zero(),
+                    recipient: None,
+                    receipt: Some(TxnReceiptInfo {
+                        gas_used: U256::one(),
+                        cumulative_gas_used: U256::one(),
+                        effective_gas_price: None,
+                    }),
+                    raw_input_data: raw_input_data.clone(),
+                },
+            })
+    };
+    db.store_txns(transactions()).await?;
+    db.store_txns(transactions()).await?;
+    for (index, expected) in inputs.iter().enumerate() {
+        let row = transaction::Entity::find()
+            .filter(transaction::Column::Hash.eq(hyperlane_core::h512_to_bytes(
+                &H512::from_low_u64_be(100 + index as u64),
+            )))
+            .one(&db.0)
+            .await?
+            .unwrap();
+        assert_eq!(&row.raw_input_data, expected);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn payment_fallback_updates_preserve_ids_and_bound_prefetch() {
+    let payments = payments(6_000);
+    let meta = LogMeta::default();
+    let results = payments.chunks(5_000).map(|chunk| {
+        chunk
+            .iter()
+            .map(|payment| {
+                BTreeMap::from([
+                    (
+                        "0".to_owned(),
+                        Value::BigInt(Some(payment.message_id.to_low_u64_be() as i64)),
+                    ),
+                    (
+                        "1".to_owned(),
+                        Value::Bytes(Some(Box::new(hyperlane_core::h256_to_bytes(
+                            &payment.message_id,
+                        )))),
+                    ),
+                    ("2".to_owned(), Value::BigInt(Some(0))),
+                    ("3".to_owned(), Value::BigInt(None)),
+                ])
+            })
+            .collect::<Vec<_>>()
+    });
+    let updated_rows = payments.iter().enumerate().map(|(id, payment)| {
+        vec![gas_payment::Model {
+            id: i64::try_from(id).unwrap(),
+            time_created: crate::date_time::now(),
+            domain: i32::try_from(DOMAIN).unwrap(),
+            msg_id: hyperlane_core::h256_to_bytes(&payment.message_id),
+            payment: crate::conversions::u256_to_decimal(payment.payment),
+            gas_amount: crate::conversions::u256_to_decimal(payment.gas_amount),
+            tx_id: Some(1),
+            log_index: 0,
+            origin: i32::try_from(DOMAIN).unwrap(),
+            destination: i32::try_from(payment.destination).unwrap(),
+            interchain_gas_paymaster: hyperlane_core::address_to_bytes(&H256::zero()),
+            sequence: Some(i64::try_from(id).unwrap()),
+        }]
+    });
+    let db = ScraperDb::with_connection(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_results([MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .append_query_results(results)
+            .append_query_results(updated_rows)
+            .into_connection(),
+    );
+    assert_eq!(
+        db.store_payments(
+            DOMAIN,
+            &H256::zero(),
+            &payment_rows(&payments, &meta, Some(1))
+        )
+        .await
+        .unwrap(),
+        6_000
+    );
+    let log = db.0.into_transaction_log();
+    assert_eq!(log.len(), 1);
+    let statements = log[0].statements();
+    assert_eq!(statements.first().unwrap().sql, "BEGIN");
+    assert_eq!(statements.last().unwrap().sql, "COMMIT");
+    let reads: Vec<_> = statements
+        .iter()
+        .filter(|statement| statement.sql.contains(" IN ("))
+        .collect();
+    assert_eq!(reads.len(), 2);
+    assert!(reads
+        .iter()
+        .all(|statement| statement.values.as_ref().unwrap().0.len() <= 5_002));
+    let updates: Vec<_> = statements
+        .iter()
+        .filter(|statement| statement.sql.starts_with("UPDATE"))
+        .collect();
+    assert_eq!(updates.len(), 6_000);
+    for (id, update) in updates.into_iter().enumerate() {
+        assert!(update.sql.contains("WHERE \"gas_payment\".\"id\" ="));
+        assert_eq!(
+            update.values.as_ref().unwrap().0.last(),
+            Some(&Value::BigInt(Some(i64::try_from(id).unwrap())))
+        );
+    }
+    assert!(!statements.iter().any(
+        |statement| statement.sql.starts_with("DELETE") || statement.sql.starts_with("INSERT")
+    ));
+}
+
+#[tokio::test]
+async fn payment_fallback_updates_preserve_neighbors_and_rollback_in_postgres() -> eyre::Result<()>
+{
+    let postgres = Postgres::default().start().await?;
+    let port = postgres.get_host_port_ipv4(5432).await?;
+    let connection = Database::connect(format!(
+        "postgresql://postgres:postgres@127.0.0.1:{port}/postgres"
+    ))
+    .await?;
+    migration::Migrator::up(&connection, None).await?;
+    let db = ScraperDb::with_connection(connection);
+    let meta = LogMeta::default();
+    let mut neighbor_meta = LogMeta::default();
+    neighbor_meta.log_index = U256::one();
+    let address = H256::from_low_u64_be(1);
+    let other_address = H256::from_low_u64_be(2);
+    let payments = payments(6_000);
+    let mut fallback = payment_rows(&payments, &meta, None);
+    for row in fallback.iter_mut().skip(1).step_by(2) {
+        row.meta = &neighbor_meta;
+    }
+    db.store_payments(DOMAIN, &address, &fallback).await?;
+    db.store_payments(DOMAIN, &other_address, &fallback[..1])
+        .await?;
+    db.store_payments(
+        DOMAIN,
+        &address,
+        &payment_rows(&payments[..1], &neighbor_meta, None),
+    )
+    .await?;
+    let other_domain = super::generated::domain::Entity::find()
+        .filter(super::generated::domain::Column::Id.gt(1))
+        .one(&db.0)
+        .await?
+        .unwrap()
+        .id;
+    db.store_payments(u32::try_from(other_domain)?, &address, &fallback[..1])
+        .await?;
+    let other_tx_id = seed_transaction(&db, 1).await?;
+    db.0.execute(sea_orm::Statement::from_sql_and_values(DatabaseBackend::Postgres,
+        "INSERT INTO gas_payment (time_created,domain,msg_id,payment,gas_amount,tx_id,log_index,origin,destination,interchain_gas_paymaster,sequence) SELECT time_created,domain,msg_id,payment,gas_amount,$1,log_index,origin,destination,interchain_gas_paymaster,sequence FROM gas_payment ORDER BY id LIMIT 1",
+        [other_tx_id.into()],
+    )).await?;
+    let tx_id = seed_transaction(&db, 0).await?;
+    let mut resolved = payment_rows(&payments, &meta, Some(tx_id));
+    for row in resolved.iter_mut().skip(1).step_by(2) {
+        row.meta = &neighbor_meta;
+    }
+    db.0.execute_unprepared("ALTER TABLE gas_payment ADD CONSTRAINT reject_repair_tail CHECK (sequence <> 5000 OR tx_id IS NULL)").await?;
+    assert!(db
+        .store_payments(DOMAIN, &address, &resolved)
+        .await
+        .is_err());
+    assert_eq!(gas_payment::Entity::find().count(&db.0).await?, 6_004);
+    assert_eq!(
+        gas_payment::Entity::find()
+            .filter(gas_payment::Column::TxId.is_null())
+            .count(&db.0)
+            .await?,
+        6_003
+    );
+    db.0.execute_unprepared("ALTER TABLE gas_payment DROP CONSTRAINT reject_repair_tail")
+        .await?;
+    assert_eq!(db.store_payments(DOMAIN, &address, &resolved).await?, 6_000);
+    assert_eq!(db.store_payments(DOMAIN, &address, &resolved).await?, 0);
+    assert_eq!(gas_payment::Entity::find().count(&db.0).await?, 6_004);
+    let neighbors = gas_payment::Entity::find()
+        .filter(gas_payment::Column::TxId.is_null())
+        .all(&db.0)
+        .await?;
+    assert_eq!(neighbors.len(), 3);
+    assert!(neighbors.iter().any(
+        |row| row.interchain_gas_paymaster == hyperlane_core::address_to_bytes(&other_address)
+    ));
+    assert!(neighbors.iter().any(|row| row.log_index == 1));
+    assert!(neighbors.iter().any(|row| row.domain == other_domain));
+    assert_eq!(
+        gas_payment::Entity::find()
+            .filter(gas_payment::Column::TxId.eq(other_tx_id))
+            .count(&db.0)
+            .await?,
+        1
+    );
+    Ok(())
+}
