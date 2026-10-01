@@ -60,10 +60,13 @@ jobs:
               .github/workflows/dusk-proposal-validation.yml|\
               .github/workflows/dusk-review-policy-gate.yml|\
               .github/workflows/monorepo-docker.yml|\
+              .github/workflows/node-services-docker.yml|\
               .github/workflows/rebalancer-e2e-test.yml|\
               .github/workflows/rebalancer-sim-test.yml|\
               .github/workflows/rust-docker.yml|\
               .github/workflows/rust.yml|\
+              .github/workflows/solidity-fork-tests.yml|\
+              .github/workflows/svm-v1-integration.yml|\
               .github/workflows/test.yml|\
               docs/dusk-ci-bootstrap-decisions.md|\
               docs/dusk-companion-compatibility.md|\

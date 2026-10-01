@@ -31,6 +31,7 @@ env:
 
 jobs:
   svm-v1-integration:
+    if: github.repository_owner == 'hyperlane-xyz'
     runs-on: depot-ubuntu-24.04
     timeout-minutes: 20
     steps:

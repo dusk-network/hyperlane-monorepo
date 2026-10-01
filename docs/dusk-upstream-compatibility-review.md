@@ -24,9 +24,12 @@ The integration preserves these boundaries across upstream's Rust changes:
 - GCP signer support and the Fuel removal are retained from upstream. The Dusk
   lockfile additions retain `dusk-bytes` 0.1.7 and `derive-hex` 0.1.2, compatible
   with the repository's Rust 1.88 toolchain.
-- Hyperlane-owned CI jobs retain their owner guards. Change detection uses a
-  GitHub-hosted runner in this fork. The proposal boundary includes upstream's
-  new validator `rpc.rs`, where Dusk endpoint selection is integrated.
+- Hyperlane-owned CI jobs retain their owner guards, including the new node
+  services image, Solidity fork-test, and SVM integration jobs that require
+  upstream app credentials or Depot runners. Change detection uses a
+  GitHub-hosted runner in this fork. The proposal boundary includes those
+  guarded workflows and upstream's new validator `rpc.rs`, where Dusk endpoint
+  selection is integrated.
 
 Fresh validation on macOS arm64 with Rust 1.88 passed the six affected-package
 check, 32 Dusk adapter tests, 167 validator tests, focused Dusk/parser/reorg and
@@ -35,7 +38,7 @@ validator production Clippy, and lockfile stability. One pre-existing core-chain
 test remains ignored. Removing the state-only provider fix makes the new Dusk
 quorum regression fail on the exclusive event-store lock; restoring it passes.
 
-Dusk workflow actionlint passed. Structural lint passed for the three adapted
+Dusk workflow actionlint passed. Structural lint passed for the adapted
 upstream workflows; their unchanged shell blocks still contain upstream
 ShellCheck warnings. An additional validator test-target Clippy pass reports
 denied unwrap/arithmetic/style lints in test fixtures, including unchanged
