@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -11,9 +14,225 @@ use crate::dispatcher::{
 use crate::error::LanderError;
 use crate::payload::{DropReason as PayloadDropReason, PayloadStatus};
 use crate::tests::test_utils::{
-    are_all_txs_in_pool, are_no_txs_in_pool, create_random_txs_and_store_them, tmp_dbs, MockAdapter,
+    are_all_txs_in_pool, are_no_txs_in_pool, create_random_txs_and_store_them, dummy_tx,
+    initialize_payload_db, tmp_dbs, MockAdapter,
 };
 use crate::transaction::{DropReason as TxDropReason, Transaction, TransactionStatus};
+use crate::FullPayload;
+
+use super::{
+    SubmitOutcome, MAX_REPROCESS_TXS_POLL_RATE, MAX_TX_STATUS_CHECK_DELAY,
+    REPROCESS_TXS_LIVENESS_RATE, STAGE_NAME,
+};
+
+async fn yield_to_reprocess_task() {
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+}
+
+fn reprocess_test_state(mock_adapter: MockAdapter) -> (DispatcherState, InclusionStagePool) {
+    let (payload_db, tx_db, _) = tmp_dbs();
+    let state = DispatcherState::new(
+        payload_db,
+        tx_db,
+        Arc::new(mock_adapter),
+        DispatcherMetrics::dummy_instance(),
+        "test".to_string(),
+    );
+    (state, Default::default())
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_reprocess_empty_results_back_off_to_bounded_poll_rate() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = calls.clone();
+    let mut mock_adapter = MockAdapter::new();
+    mock_adapter
+        .expect_reprocess_txs_poll_rate()
+        .return_const(Some(Duration::from_secs(5)));
+    mock_adapter.expect_get_reprocess_txs().returning(move || {
+        calls_for_mock.fetch_add(1, Ordering::SeqCst);
+        Ok(Vec::new())
+    });
+    let (state, pool) = reprocess_test_state(mock_adapter);
+
+    let task = tokio::spawn(InclusionStage::receive_reprocess_txs(
+        "test".to_string(),
+        pool,
+        state,
+    ));
+    yield_to_reprocess_task().await;
+
+    for (expected_calls, delay) in [5, 10, 20, 40, 80, 160, 300, 300].into_iter().enumerate() {
+        tokio::time::advance(Duration::from_secs(delay - 1)).await;
+        yield_to_reprocess_task().await;
+        assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        yield_to_reprocess_task().await;
+        assert_eq!(calls.load(Ordering::SeqCst), expected_calls + 1);
+    }
+
+    task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_reprocess_activity_wakeup_is_coalesced_and_resets_backoff() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = calls.clone();
+    let mut mock_adapter = MockAdapter::new();
+    mock_adapter
+        .expect_reprocess_txs_poll_rate()
+        .return_const(Some(Duration::from_secs(5)));
+    mock_adapter.expect_get_reprocess_txs().returning(move || {
+        calls_for_mock.fetch_add(1, Ordering::SeqCst);
+        Ok(Vec::new())
+    });
+    let (state, pool) = reprocess_test_state(mock_adapter);
+
+    // A notification just before the poller waits is retained. Multiple local
+    // activity notifications coalesce into one immediate check.
+    state.notify_reprocess_txs_activity();
+    state.notify_reprocess_txs_activity();
+    let task = tokio::spawn(InclusionStage::receive_reprocess_txs(
+        "test".to_string(),
+        pool,
+        state.clone(),
+    ));
+    yield_to_reprocess_task().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    tokio::time::advance(Duration::from_secs(10)).await;
+    yield_to_reprocess_task().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    // The poller is now waiting for 20s. Activity wakes it halfway through,
+    // then the successful empty check starts backoff again from the 5s base.
+    tokio::time::advance(Duration::from_secs(10)).await;
+    state.notify_reprocess_txs_activity();
+    yield_to_reprocess_task().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+    tokio::time::advance(Duration::from_secs(9)).await;
+    yield_to_reprocess_task().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    yield_to_reprocess_task().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+
+    task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_reprocess_long_idle_wait_keeps_liveness_without_polling() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = calls.clone();
+    let mut mock_adapter = MockAdapter::new();
+    mock_adapter
+        .expect_reprocess_txs_poll_rate()
+        .return_const(Some(MAX_REPROCESS_TXS_POLL_RATE));
+    mock_adapter.expect_get_reprocess_txs().returning(move || {
+        calls_for_mock.fetch_add(1, Ordering::SeqCst);
+        Ok(Vec::new())
+    });
+    let (state, pool) = reprocess_test_state(mock_adapter);
+    let metrics = state.metrics.clone();
+    let stage = format!("{STAGE_NAME}::receive_reprocess_txs");
+    let task = tokio::spawn(InclusionStage::receive_reprocess_txs(
+        "test".to_string(),
+        pool,
+        state.clone(),
+    ));
+    yield_to_reprocess_task().await;
+
+    metrics
+        .task_liveness
+        .remove_label_values(&["test", &stage])
+        .unwrap();
+    assert!(!String::from_utf8(metrics.gather().unwrap())
+        .unwrap()
+        .contains(&stage));
+
+    tokio::time::advance(REPROCESS_TXS_LIVENESS_RATE).await;
+    yield_to_reprocess_task().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(String::from_utf8(metrics.gather().unwrap())
+        .unwrap()
+        .contains(&stage));
+
+    state.notify_reprocess_txs_activity();
+    yield_to_reprocess_task().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_reprocess_nonempty_and_error_results_reset_backoff() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = calls.clone();
+    let reprocessed_tx = dummy_tx(Vec::new(), TransactionStatus::PendingInclusion);
+    let tx_for_mock = reprocessed_tx.clone();
+    let mut mock_adapter = MockAdapter::new();
+    mock_adapter
+        .expect_reprocess_txs_poll_rate()
+        .return_const(Some(Duration::from_secs(5)));
+    mock_adapter.expect_get_reprocess_txs().returning(move || {
+        let call = calls_for_mock.fetch_add(1, Ordering::SeqCst) + 1;
+        match call {
+            2 => Err(LanderError::NetworkError("test error".to_string())),
+            4 => Ok(vec![tx_for_mock.clone()]),
+            _ => Ok(Vec::new()),
+        }
+    });
+    let (state, pool) = reprocess_test_state(mock_adapter);
+    let task = tokio::spawn(InclusionStage::receive_reprocess_txs(
+        "test".to_string(),
+        pool.clone(),
+        state,
+    ));
+    yield_to_reprocess_task().await;
+
+    tokio::time::advance(Duration::from_secs(5)).await;
+    yield_to_reprocess_task().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    tokio::time::advance(Duration::from_secs(10)).await;
+    yield_to_reprocess_task().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    // An error restores the 5s base instead of suppressing retries.
+    tokio::time::advance(Duration::from_secs(5)).await;
+    yield_to_reprocess_task().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    tokio::time::advance(Duration::from_secs(10)).await;
+    yield_to_reprocess_task().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    assert!(pool.lock().await.contains_key(&reprocessed_tx.uuid));
+
+    // Finding work also restores the 5s base.
+    tokio::time::advance(Duration::from_secs(5)).await;
+    yield_to_reprocess_task().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+
+    task.abort();
+}
+
+#[tokio::test]
+async fn test_successful_submission_notifies_reprocess_poller() {
+    let mut mock_adapter = MockAdapter::new();
+    mock_adapter.expect_submit().returning(|_| Ok(()));
+    let (state, _) = reprocess_test_state(mock_adapter);
+    let tx = dummy_tx(Vec::new(), TransactionStatus::PendingInclusion);
+
+    InclusionStage::submit_tx(tx, &state).await.unwrap();
+
+    tokio::time::timeout(
+        Duration::from_millis(10),
+        state.wait_for_reprocess_txs_activity(),
+    )
+    .await
+    .expect("submission activity notification was not retained");
+}
 
 #[tokio::test]
 async fn test_processing_included_txs() {
@@ -43,6 +262,59 @@ async fn test_processing_included_txs() {
         TransactionStatus::Included,
     )
     .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn completed_prefix_is_applied_before_later_status_error() {
+    let mut earlier_tx = dummy_tx(Vec::new(), TransactionStatus::PendingInclusion);
+    let mut later_tx = dummy_tx(Vec::new(), TransactionStatus::PendingInclusion);
+    let now = chrono::Utc::now();
+    earlier_tx.creation_timestamp = now - chrono::Duration::seconds(2);
+    later_tx.creation_timestamp = now - chrono::Duration::seconds(1);
+    let mut mock_adapter = MockAdapter::new();
+    mock_adapter
+        .expect_estimated_block_time()
+        .return_const(Duration::from_secs(1));
+    let later_uuid = later_tx.uuid.clone();
+    mock_adapter.expect_tx_status().returning(move |tx| {
+        (tx.uuid != later_uuid)
+            .then_some(TransactionStatus::Included)
+            .ok_or_else(|| LanderError::TxSubmissionError("status read failed".to_string()))
+    });
+
+    let (payload_db, tx_db, _) = tmp_dbs();
+    let state = DispatcherState::new(
+        payload_db,
+        tx_db,
+        Arc::new(mock_adapter),
+        DispatcherMetrics::dummy_instance(),
+        "test".to_string(),
+    );
+    let pool = InclusionStagePool::default();
+    pool.lock()
+        .await
+        .insert(earlier_tx.uuid.clone(), earlier_tx.clone());
+    pool.lock()
+        .await
+        .insert(later_tx.uuid.clone(), later_tx.clone());
+    let (finality_stage_sender, mut finality_stage_receiver) = mpsc::channel(2);
+
+    let scan_pool = pool.clone();
+    let scan_state = state.clone();
+    let scan = tokio::spawn(async move {
+        InclusionStage::process_txs_step(&scan_pool, &finality_stage_sender, &scan_state, "test")
+            .await
+    });
+
+    let forwarded = tokio::time::timeout(Duration::from_millis(1), finality_stage_receiver.recv())
+        .await
+        .expect("the completed prefix should be applied before the later error")
+        .expect("the finality stage receiver should remain open");
+    assert_eq!(forwarded.uuid, earlier_tx.uuid);
+    assert!(!pool.lock().await.contains_key(&earlier_tx.uuid));
+    assert!(pool.lock().await.contains_key(&later_tx.uuid));
+
+    scan.await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -85,6 +357,172 @@ async fn test_unincluded_txs_reach_mempool() {
         &tx_db,
         &payload_db,
         TransactionStatus::Mempool,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_status_provider_error_keeps_tx_for_later_retry() {
+    let mut mock_adapter = MockAdapter::new();
+    mock_adapter
+        .expect_estimated_block_time()
+        .return_const(Duration::from_secs(1));
+    mock_adapter.expect_tx_status().once().returning(|_| {
+        Err(LanderError::ChainCommunicationError(
+            hyperlane_core::ChainCommunicationError::from_other_str("temporary RPC failure"),
+        ))
+    });
+
+    let (state, pool) = reprocess_test_state(mock_adapter);
+    let tx = dummy_tx(Vec::new(), TransactionStatus::PendingInclusion);
+    state.store_tx(&tx).await;
+    pool.lock().await.insert(tx.uuid.clone(), tx.clone());
+    let (finality_stage_sender, mut finality_stage_receiver) = mpsc::channel(1);
+
+    InclusionStage::process_txs_step(&pool, &finality_stage_sender, &state, "test")
+        .await
+        .unwrap();
+
+    let retained_tx = pool.lock().await.get(&tx.uuid).cloned().unwrap();
+    assert!(retained_tx.last_status_check.is_some());
+    let persisted_tx = state
+        .tx_db
+        .retrieve_transaction_by_uuid(&tx.uuid)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(persisted_tx.last_status_check.is_some());
+    assert!(finality_stage_receiver.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn finalized_reprocessed_tx_is_rechecked_and_resubmitted() {
+    let mut mock_adapter = MockAdapter::new();
+    mock_adapter
+        .expect_estimated_block_time()
+        .return_const(Duration::from_secs(1));
+    mock_adapter
+        .expect_tx_status()
+        .withf(|tx| tx.status == TransactionStatus::Finalized)
+        .once()
+        .returning(|_| Ok(TransactionStatus::PendingInclusion));
+    mock_adapter
+        .expect_tx_ready_for_resubmission()
+        .once()
+        .return_const(true);
+    mock_adapter.expect_simulate_tx().returning(|_| Ok(vec![]));
+    mock_adapter
+        .expect_estimate_tx()
+        .once()
+        .returning(|_| Ok(()));
+    mock_adapter.expect_submit().once().returning(|_| Ok(()));
+    mock_adapter
+        .expect_update_vm_specific_metrics()
+        .once()
+        .returning(|_, _| ());
+
+    let (state, pool) = reprocess_test_state(mock_adapter);
+    let tx = dummy_tx(Vec::new(), TransactionStatus::Finalized);
+    state.store_tx(&tx).await;
+    pool.lock().await.insert(tx.uuid.clone(), tx.clone());
+    let (finality_stage_sender, mut finality_stage_receiver) = mpsc::channel(1);
+
+    InclusionStage::process_txs_step(&pool, &finality_stage_sender, &state, "test")
+        .await
+        .unwrap();
+
+    let reprocessed_tx = pool.lock().await.get(&tx.uuid).cloned().unwrap();
+    assert_eq!(reprocessed_tx.status, TransactionStatus::Mempool);
+    assert_eq!(
+        reprocessed_tx.submission_attempts,
+        tx.submission_attempts + 1
+    );
+    assert!(finality_stage_receiver.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn test_status_provider_error_preserves_latest_persisted_status() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = calls.clone();
+    let mut mock_adapter = MockAdapter::new();
+    mock_adapter
+        .expect_estimated_block_time()
+        .return_const(Duration::from_secs(1));
+    mock_adapter
+        .expect_tx_status()
+        .times(2)
+        .returning(
+            move |_| match calls_for_mock.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(TransactionStatus::Mempool),
+                _ => Err(LanderError::ChainCommunicationError(
+                    hyperlane_core::ChainCommunicationError::from_other_str(
+                        "temporary RPC failure",
+                    ),
+                )),
+            },
+        );
+    mock_adapter
+        .expect_tx_ready_for_resubmission()
+        .once()
+        .return_const(false);
+
+    let (state, pool) = reprocess_test_state(mock_adapter);
+    let tx = dummy_tx(Vec::new(), TransactionStatus::PendingInclusion);
+    state.store_tx(&tx).await;
+    pool.lock().await.insert(tx.uuid.clone(), tx.clone());
+    let (finality_stage_sender, _finality_stage_receiver) = mpsc::channel(1);
+
+    InclusionStage::process_txs_step(&pool, &finality_stage_sender, &state, "test")
+        .await
+        .unwrap();
+    InclusionStage::process_txs_step(&pool, &finality_stage_sender, &state, "test")
+        .await
+        .unwrap();
+
+    let retained_tx = pool.lock().await.get(&tx.uuid).cloned().unwrap();
+    assert_eq!(retained_tx.status, TransactionStatus::Mempool);
+    assert!(retained_tx.last_status_check.is_some());
+    let persisted_tx = state
+        .tx_db
+        .retrieve_transaction_by_uuid(&tx.uuid)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted_tx.status, TransactionStatus::Mempool);
+    assert!(persisted_tx.last_status_check.is_some());
+}
+
+#[tokio::test]
+async fn test_finality_channel_error_preserves_latest_persisted_status() {
+    let mut mock_adapter = MockAdapter::new();
+    mock_adapter
+        .expect_estimated_block_time()
+        .return_const(Duration::from_secs(1));
+    mock_adapter
+        .expect_tx_status()
+        .once()
+        .returning(|_| Ok(TransactionStatus::Included));
+
+    let (state, pool) = reprocess_test_state(mock_adapter);
+    let payload = FullPayload::random();
+    initialize_payload_db(&state.payload_db, &payload).await;
+    let tx = dummy_tx(vec![payload], TransactionStatus::PendingInclusion);
+    state.store_tx(&tx).await;
+    pool.lock().await.insert(tx.uuid.clone(), tx.clone());
+    let (finality_stage_sender, finality_stage_receiver) = mpsc::channel(1);
+    drop(finality_stage_receiver);
+
+    InclusionStage::process_txs_step(&pool, &finality_stage_sender, &state, "test")
+        .await
+        .unwrap();
+
+    let retained_tx = pool.lock().await.get(&tx.uuid).cloned().unwrap();
+    assert_eq!(retained_tx.status, TransactionStatus::Included);
+    assert_tx_status(
+        vec![tx],
+        &state.tx_db,
+        &state.payload_db,
+        TransactionStatus::Included,
     )
     .await;
 }
@@ -727,4 +1165,307 @@ async fn test_processing_reprocess_txs() {
     };
 
     assert!(are_all_txs_in_pool(txs_created.clone(), &pool).await);
+}
+
+#[test]
+fn test_aged_pending_tx_backoff_is_escalated_and_capped() {
+    let base_interval = Duration::from_secs(1);
+    let now = chrono::Utc::now();
+
+    // At 10 minutes old, the interval has doubled from one to two seconds.
+    let mut escalating = dummy_tx(Vec::new(), TransactionStatus::PendingInclusion);
+    escalating.creation_timestamp = now - chrono::Duration::minutes(10);
+    escalating.last_status_check = Some(now - chrono::Duration::seconds(1));
+    assert!(!InclusionStage::tx_ready_for_processing(
+        base_interval,
+        now,
+        &escalating
+    ));
+    escalating.last_status_check = Some(now - chrono::Duration::seconds(2));
+    assert!(InclusionStage::tx_ready_for_processing(
+        base_interval,
+        now,
+        &escalating
+    ));
+
+    // A long-pending tx (1h old, e.g. one that never landed on-chain) checked
+    // 30s ago must be skipped: the aged backoff has escalated far past a single
+    // block time and is capped at MAX_TX_STATUS_CHECK_DELAY (5 min), so
+    // 30s < cap => not ready. Under the previous flat `base_interval` backoff
+    // this tx would have been re-polled every second, spamming the RPC.
+    let mut aged = dummy_tx(Vec::new(), TransactionStatus::PendingInclusion);
+    aged.creation_timestamp = now - chrono::Duration::seconds(3600);
+    aged.last_status_check = Some(now - chrono::Duration::seconds(30));
+    assert!(!InclusionStage::tx_ready_for_processing(
+        base_interval,
+        now,
+        &aged
+    ));
+
+    // Once the capped interval elapses, the aged tx is polled again.
+    let past_cap = i64::try_from(MAX_TX_STATUS_CHECK_DELAY.as_secs())
+        .expect("maximum delay fits in i64")
+        .saturating_add(1);
+    aged.last_status_check = Some(now - chrono::Duration::seconds(past_cap));
+    assert!(InclusionStage::tx_ready_for_processing(
+        base_interval,
+        now,
+        &aged
+    ));
+
+    // A fresh tx stays responsive: quarter-block backoff, checked 30s ago => ready.
+    let mut fresh = dummy_tx(Vec::new(), TransactionStatus::PendingInclusion);
+    fresh.creation_timestamp = now - chrono::Duration::seconds(5);
+    fresh.last_status_check = Some(now - chrono::Duration::seconds(30));
+    assert!(InclusionStage::tx_ready_for_processing(
+        base_interval,
+        now,
+        &fresh
+    ));
+}
+
+fn retry_clone_fixture() -> Transaction {
+    let mut payload = FullPayload::default();
+    payload.details.success_criteria = Some(vec![7; 4096]);
+    dummy_tx(vec![payload], TransactionStatus::PendingInclusion)
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_attempts_start_from_original_and_return_successful_mutations() {
+    for simulate in [false, true] {
+        let tx = retry_clone_fixture();
+        let original = tx.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempt_calls = calls.clone();
+        let mutate_attempt = move |tx: &mut Transaction| {
+            assert_eq!(tx.submission_attempts, 0);
+            let bytes = tx.payload_details[0].success_criteria.as_mut().unwrap();
+            assert_eq!(bytes.as_slice(), vec![7; 4096]);
+            let attempt = attempt_calls.fetch_add(1, Ordering::SeqCst);
+            bytes[0] = 9;
+            tx.submission_attempts = 3;
+            if attempt == 0 {
+                Err(LanderError::TxSubmissionError("retry fixture".to_owned()))
+            } else {
+                Ok(())
+            }
+        };
+        let mut adapter = MockAdapter::new();
+        if simulate {
+            adapter.expect_simulate_tx().times(2).returning(move |tx| {
+                mutate_attempt(tx)?;
+                Ok(Vec::new())
+            });
+        } else {
+            adapter
+                .expect_estimate_tx()
+                .times(2)
+                .returning(mutate_attempt);
+        }
+        let (state, _) = reprocess_test_state(adapter);
+        let result = if simulate {
+            InclusionStage::simulate_tx(tx.clone(), &state)
+                .await
+                .unwrap()
+        } else {
+            InclusionStage::estimate_tx(&tx, &state).await.unwrap()
+        };
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(tx, original);
+        assert_eq!(result.submission_attempts, 3);
+        assert_eq!(
+            result.payload_details[0].success_criteria.as_ref().unwrap()[0],
+            9
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_attempt_cancellation_discards_mutation_before_next_attempt() {
+    for simulate in [false, true] {
+        let tx = retry_clone_fixture();
+        let original = tx.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempt_calls = calls.clone();
+        let fail_attempt = move |tx: &mut Transaction| {
+            attempt_calls.fetch_add(1, Ordering::SeqCst);
+            tx.payload_details[0].success_criteria.as_mut().unwrap()[0] = 9;
+            Err(LanderError::TxSubmissionError("retry fixture".to_owned()))
+        };
+        let mut adapter = MockAdapter::new();
+        if simulate {
+            adapter.expect_simulate_tx().times(1).returning(move |tx| {
+                fail_attempt(tx)?;
+                Ok(Vec::new())
+            });
+        } else {
+            adapter
+                .expect_estimate_tx()
+                .times(1)
+                .returning(fail_attempt);
+        }
+        let (state, _) = reprocess_test_state(adapter);
+        let timeout = Duration::from_millis(10);
+        if simulate {
+            assert!(
+                tokio::time::timeout(timeout, InclusionStage::simulate_tx(tx.clone(), &state))
+                    .await
+                    .is_err()
+            );
+        } else {
+            assert!(
+                tokio::time::timeout(timeout, InclusionStage::estimate_tx(&tx, &state))
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(tx, original);
+    }
+}
+
+#[tokio::test]
+async fn retry_attempt_terminal_errors_return_without_retrying() {
+    for simulate in [false, true] {
+        let tx = retry_clone_fixture();
+        let original = tx.clone();
+        let mut adapter = MockAdapter::new();
+        if simulate {
+            adapter.expect_simulate_tx().times(1).returning(|tx| {
+                tx.submission_attempts = 3;
+                Err(LanderError::SimulationFailed(vec!["fixture".to_owned()]))
+            });
+        } else {
+            adapter.expect_estimate_tx().times(1).returning(|tx| {
+                tx.submission_attempts = 3;
+                Err(LanderError::EstimationFailed)
+            });
+        }
+        let (state, _) = reprocess_test_state(adapter);
+        let expected = if simulate {
+            LanderError::SimulationFailed(vec!["fixture".to_owned()])
+        } else {
+            LanderError::EstimationFailed
+        };
+        let expected = LanderError::NonRetryableError(expected.to_string()).to_string();
+        let actual = if simulate {
+            InclusionStage::simulate_tx(tx.clone(), &state)
+                .await
+                .unwrap_err()
+                .to_string()
+        } else {
+            InclusionStage::estimate_tx(&tx, &state)
+                .await
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(actual, expected);
+        assert_eq!(tx, original);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn owned_submission_preserves_retry_mutations_and_notifies_only_on_success() {
+    for already_exists in [false, true] {
+        let tx = retry_clone_fixture();
+        let pointer = tx.payload_details[0]
+            .success_criteria
+            .as_ref()
+            .unwrap()
+            .as_ptr() as usize;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempt_calls = calls.clone();
+        let mut adapter = MockAdapter::new();
+        adapter.expect_submit().times(2).returning(move |tx| {
+            let attempt = attempt_calls.fetch_add(1, Ordering::SeqCst);
+            let bytes = tx.payload_details[0].success_criteria.as_mut().unwrap();
+            assert_eq!(bytes.as_ptr() as usize, pointer);
+            assert_eq!(bytes[0], if attempt == 0 { 7 } else { 9 });
+            bytes[0] = if attempt == 0 { 9 } else { 11 };
+            if attempt == 0 {
+                Err(LanderError::TxSubmissionError("retry fixture".to_owned()))
+            } else if already_exists {
+                Err(LanderError::TxAlreadyExists)
+            } else {
+                Ok(())
+            }
+        });
+        let (state, _) = reprocess_test_state(adapter);
+        let task_state = state.clone();
+        let task = tokio::spawn(async move { InclusionStage::submit_tx(tx, &task_state).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first submission attempt must start");
+        assert!(tokio::time::timeout(
+            Duration::from_millis(10),
+            state.wait_for_reprocess_txs_activity()
+        )
+        .await
+        .is_err());
+        let SubmitOutcome::Submitted(result) = task.await.unwrap().unwrap() else {
+            panic!("successful submission should not be deferred");
+        };
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let bytes = result.payload_details[0].success_criteria.as_ref().unwrap();
+        assert_eq!(bytes.as_ptr() as usize, pointer);
+        assert_eq!(bytes[0], 11);
+        tokio::time::timeout(
+            Duration::from_millis(10),
+            state.wait_for_reprocess_txs_activity(),
+        )
+        .await
+        .expect("success must notify");
+        assert!(tokio::time::timeout(
+            Duration::from_millis(10),
+            state.wait_for_reprocess_txs_activity()
+        )
+        .await
+        .is_err());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn owned_submission_errors_and_cancellation_do_not_notify() {
+    for cancel in [false, true] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempt_calls = calls.clone();
+        let mut adapter = MockAdapter::new();
+        adapter.expect_submit().times(1).returning(move |tx| {
+            attempt_calls.fetch_add(1, Ordering::SeqCst);
+            tx.payload_details[0].success_criteria.as_mut().unwrap()[0] = 9;
+            if cancel {
+                Err(LanderError::TxSubmissionError("retry fixture".to_owned()))
+            } else {
+                Err(LanderError::EstimationFailed)
+            }
+        });
+        let (state, _) = reprocess_test_state(adapter);
+        let tx = retry_clone_fixture();
+        if cancel {
+            assert!(tokio::time::timeout(
+                Duration::from_millis(10),
+                InclusionStage::submit_tx(tx, &state)
+            )
+            .await
+            .is_err());
+        } else {
+            let error = InclusionStage::submit_tx(tx, &state).await.unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                LanderError::NonRetryableError(LanderError::EstimationFailed.to_string())
+                    .to_string()
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(tokio::time::timeout(
+            Duration::from_millis(10),
+            state.wait_for_reprocess_txs_activity()
+        )
+        .await
+        .is_err());
+    }
 }

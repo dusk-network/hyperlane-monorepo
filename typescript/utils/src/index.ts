@@ -61,6 +61,7 @@ export {
   isValidTransactionHashTron,
   isEmptyAddress,
   isZeroishAddress,
+  isZeroishAddressEvm,
   normalizeAddress,
   normalizeAddressCosmos,
   normalizeAddressEvm,
@@ -192,9 +193,9 @@ export {
   setEquality,
   symmetricDifference,
 } from './sets.js';
+export { formatError } from './errors.js';
 export {
   errorToString,
-  formatError,
   fromHexString,
   sanitizeString,
   streamToString,
@@ -234,7 +235,9 @@ export {
   SignatureLike,
   TokenCaip19Id,
   ValidatorMetadata,
+  ValidatorMetadataRpcEntry,
   WithAddress,
+  validatorMetadataRpcUrlHash,
 } from './types.js';
 export { isHttpsUrl, isRelativeUrl, isUrl } from './url.js';
 export { assert } from './validation.js';

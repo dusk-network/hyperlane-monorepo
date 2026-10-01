@@ -11,15 +11,20 @@ use hyperlane_core::{
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use crate::msg::pending_message::{MessageContext, PendingMessage};
+use crate::msg::{
+    pending_message::{MessageContext, PendingMessage},
+    QueueOperationBatch,
+};
 use crate::relay_api::metrics::RelayApiMetrics;
+
+pub(super) const PROCESSOR_CAPACITY_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Bounded cache for tracking recently submitted tx hashes to prevent replay attacks
 pub enum TxHashCacheError {
@@ -27,9 +32,16 @@ pub enum TxHashCacheError {
     CacheFull,
 }
 
+#[derive(Clone, Copy)]
+enum TxHashCacheEntry {
+    Reserved(u64),
+    Committed(Instant),
+}
+
 pub struct TxHashCache {
-    cache: HashMap<(String, String), Instant>,
+    cache: HashMap<(String, String), TxHashCacheEntry>,
     max_entries: usize,
+    next_reservation: u64,
     ttl: Duration,
 }
 
@@ -42,6 +54,7 @@ impl TxHashCache {
         Self {
             cache: HashMap::new(),
             max_entries,
+            next_reservation: 0,
             ttl,
         }
     }
@@ -55,28 +68,47 @@ impl TxHashCache {
             .unwrap_or(tx_hash)
             .to_lowercase();
         let key = (chain.to_owned(), normalized);
-        self.cache
-            .get(&key)
-            .is_some_and(|&ts| Instant::now().duration_since(ts) < self.ttl)
+        self.cache.get(&key).is_some_and(|entry| match entry {
+            TxHashCacheEntry::Reserved(_) => true,
+            TxHashCacheEntry::Committed(timestamp) => {
+                Instant::now().duration_since(*timestamp) < self.ttl
+            }
+        })
     }
 
-    /// Remove a previously inserted entry (used to roll back a reservation on handler error).
-    pub fn remove(&mut self, chain: &str, tx_hash: &str) {
+    fn key(chain: &str, tx_hash: &str) -> (String, String) {
         let normalized = tx_hash
             .strip_prefix("0x")
             .or_else(|| tx_hash.strip_prefix("0X"))
             .unwrap_or(tx_hash)
             .to_lowercase();
-        self.cache.remove(&(chain.to_owned(), normalized));
+        (chain.to_owned(), normalized)
+    }
+
+    fn remove_reservation(&mut self, chain: &str, tx_hash: &str, token: u64) {
+        let key = Self::key(chain, tx_hash);
+        if matches!(self.cache.get(&key), Some(TxHashCacheEntry::Reserved(current)) if *current == token)
+        {
+            self.cache.remove(&key);
+        }
+    }
+
+    fn commit_reservation(&mut self, chain: &str, tx_hash: &str, token: u64) {
+        let key = Self::key(chain, tx_hash);
+        if matches!(self.cache.get(&key), Some(TxHashCacheEntry::Reserved(current)) if *current == token)
+        {
+            self.cache
+                .insert(key, TxHashCacheEntry::Committed(Instant::now()));
+        }
     }
 
     /// Check if tx_hash was recently submitted and insert if not.
-    /// Returns `Ok(())` if new, `Err(TxHashCacheError)` if duplicate or cache full.
+    /// Returns a reservation token if new, or an error if duplicate/cache full.
     pub fn check_and_insert(
         &mut self,
         chain: String,
         tx_hash: String,
-    ) -> Result<(), TxHashCacheError> {
+    ) -> Result<u64, TxHashCacheError> {
         let now = Instant::now();
         let normalized = tx_hash
             .strip_prefix("0x")
@@ -88,15 +120,17 @@ impl TxHashCache {
         // Clean expired entries if cache is getting large (75% threshold)
         if self.cache.len() > self.max_entries.saturating_mul(3) / 4 {
             let ttl = self.ttl;
-            self.cache
-                .retain(|_, &mut timestamp| now.duration_since(timestamp) < ttl);
+            self.cache.retain(|_, entry| match entry {
+                TxHashCacheEntry::Reserved(_) => true,
+                TxHashCacheEntry::Committed(timestamp) => now.duration_since(*timestamp) < ttl,
+            });
         }
 
-        // Check for duplicate within TTL
-        if let Some(&timestamp) = self.cache.get(&key) {
-            if now.duration_since(timestamp) < self.ttl {
-                return Err(TxHashCacheError::Duplicate);
-            }
+        if self.cache.get(&key).is_some_and(|entry| match entry {
+            TxHashCacheEntry::Reserved(_) => true,
+            TxHashCacheEntry::Committed(timestamp) => now.duration_since(*timestamp) < self.ttl,
+        }) {
+            return Err(TxHashCacheError::Duplicate);
         }
 
         if self.cache.len() >= self.max_entries {
@@ -108,8 +142,10 @@ impl TxHashCache {
             return Err(TxHashCacheError::CacheFull);
         }
 
-        self.cache.insert(key, now);
-        Ok(())
+        let token = self.next_reservation;
+        self.next_reservation = self.next_reservation.wrapping_add(1);
+        self.cache.insert(key, TxHashCacheEntry::Reserved(token));
+        Ok(token)
     }
 }
 
@@ -123,30 +159,32 @@ pub struct TxHashReservation {
     cache: Arc<Mutex<TxHashCache>>,
     chain: String,
     tx_hash: String,
-    committed: bool,
+    token: u64,
 }
 
 impl TxHashReservation {
-    fn new(cache: Arc<Mutex<TxHashCache>>, chain: String, tx_hash: String) -> Self {
+    fn new(cache: Arc<Mutex<TxHashCache>>, chain: String, tx_hash: String, token: u64) -> Self {
         Self {
             cache,
             chain,
             tx_hash,
-            committed: false,
+            token,
         }
     }
 
-    /// Mark this reservation as permanent. Drop will no longer remove the entry.
-    pub fn commit(mut self) {
-        self.committed = true;
+    /// Commit the reservation and start its duplicate-detection TTL.
+    pub fn commit(self) {
+        self.cache
+            .lock()
+            .commit_reservation(&self.chain, &self.tx_hash, self.token);
     }
 }
 
 impl Drop for TxHashReservation {
     fn drop(&mut self) {
-        if !self.committed {
-            self.cache.lock().remove(&self.chain, &self.tx_hash);
-        }
+        self.cache
+            .lock()
+            .remove_reservation(&self.chain, &self.tx_hash, self.token);
     }
 }
 
@@ -159,7 +197,7 @@ pub struct ServerState {
     /// gas payment check never races the background `tx_id_indexer_task`.
     igp_indexers: HashMap<u32, Arc<dyn Indexer<InterchainGasPayment>>>,
     dbs: HashMap<u32, HyperlaneRocksDB>,
-    send_channels: HashMap<u32, UnboundedSender<QueueOperation>>,
+    send_channels: HashMap<u32, Sender<QueueOperationBatch>>,
     msg_ctxs: HashMap<(u32, u32), Arc<MessageContext>>,
     metrics: RelayApiMetrics,
     // Optional features
@@ -176,7 +214,7 @@ impl ServerState {
         indexers: HashMap<String, Arc<dyn Indexer<HyperlaneMessage>>>,
         igp_indexers: HashMap<u32, Arc<dyn Indexer<InterchainGasPayment>>>,
         dbs: HashMap<u32, HyperlaneRocksDB>,
-        send_channels: HashMap<u32, UnboundedSender<QueueOperation>>,
+        send_channels: HashMap<u32, Sender<QueueOperationBatch>>,
         msg_ctxs: HashMap<(u32, u32), Arc<MessageContext>>,
         metrics: RelayApiMetrics,
     ) -> Self {
@@ -438,10 +476,11 @@ async fn create_relay(
             .lock()
             .check_and_insert(req.origin_chain.clone(), req.tx_hash.clone())
         {
-            Ok(()) => Some(TxHashReservation::new(
+            Ok(token) => Some(TxHashReservation::new(
                 cache.clone(),
                 req.origin_chain.clone(),
                 req.tx_hash.clone(),
+                token,
             )),
             Err(TxHashCacheError::Duplicate) => {
                 state.record_failure("duplicate_tx");
@@ -460,20 +499,14 @@ async fn create_relay(
         None
     };
 
-    let result = relay_work(&state, &req).await;
-
-    if result.is_ok() {
-        if let Some(reservation) = maybe_reservation {
-            reservation.commit();
-        }
-    }
-    // On Err (or if this future is dropped/cancelled), `maybe_reservation` drops here
-    // and TxHashReservation::drop removes the entry so the client can retry.
-
-    result
+    relay_work(&state, &req, maybe_reservation).await
 }
 
-async fn relay_work(state: &ServerState, req: &RelayRequest) -> ServerResult<Json<RelayResponse>> {
+async fn relay_work(
+    state: &ServerState,
+    req: &RelayRequest,
+    maybe_reservation: Option<TxHashReservation>,
+) -> ServerResult<Json<RelayResponse>> {
     // 1. Extract message using indexers (with timeout)
     let indexers = &state.indexers;
 
@@ -525,7 +558,7 @@ async fn relay_work(state: &ServerState, req: &RelayRequest) -> ServerResult<Jso
     // If any message fails here, no side effects have occurred.
     struct ValidatedMessage {
         pending_msg: PendingMessage,
-        send_channel: UnboundedSender<QueueOperation>,
+        send_channel: Sender<QueueOperationBatch>,
         message_id: H256,
         origin_domain: u32,
         tx_hash: H512,
@@ -792,48 +825,89 @@ async fn relay_work(state: &ServerState, req: &RelayRequest) -> ServerResult<Jso
         }
     }
 
-    // Phase 3: send all validated messages.
-    //
-    // Pre-check: verify every destination channel is open before sending anything.
-    // UnboundedSender::send() only fails when the receiver (processor) has been
-    // dropped. If any channel is already closed we bail here — no messages have
-    // entered the queue yet, so the caller's retry is safe and won't double-enqueue.
-    for v in &validated {
-        if v.send_channel.is_closed() {
-            error!(
-                message_id = ?v.message_id,
-                destination_domain = v.destination_domain,
-                "Processor channel closed for destination; aborting before any send"
-            );
-            state.record_failure("send_failed");
-            return Err(ServerError::InternalError(
-                "Processor channel closed for destination".to_string(),
-            ));
-        }
+    // Phase 3: reserve one bounded channel slot per destination before enqueueing
+    // anything. Cancellation while awaiting capacity releases every permit and the
+    // tx-hash reservation, so a retry cannot duplicate a partially handed-off tx.
+    // Once every permit is held, committing the reservation and sending the batches
+    // are synchronous: the transaction becomes deduplicated at the same atomic
+    // boundary where all of its operations become owned by processor channels.
+    struct SentMessage {
+        message_id: H256,
+        origin_domain: u32,
+        tx_hash: H512,
+        destination_domain: u32,
+        app_context: Option<String>,
+        nonce: u32,
     }
 
-    // Send phase. A failure here is an extreme race (channel closed between the
-    // is_closed() check above and this send). If that happens, messages already
-    // sent in this loop may be double-enqueued on the caller's retry — this is
-    // unavoidable without transactional send semantics, but the pre-check above
-    // eliminates the common case (channel already closed before we start).
-    for v in validated {
-        if let Err(e) = v
-            .send_channel
-            .send(Box::new(v.pending_msg) as QueueOperation)
-        {
-            error!(
-                message_id = ?v.message_id,
-                error = %e,
-                "Processor channel closed mid-send (race); earlier messages in this \
-                 batch may be double-enqueued on retry"
-            );
-            state.record_failure("send_failed");
-            return Err(ServerError::InternalError(
-                "Failed to send message to processor".to_string(),
-            ));
-        }
+    // Canonical permit order prevents cross-request AB/BA deadlocks.
+    let mut batches: BTreeMap<u32, (Sender<QueueOperationBatch>, QueueOperationBatch)> =
+        BTreeMap::new();
+    let mut sent_messages = Vec::with_capacity(validated.len());
+    for validated_message in validated {
+        let ValidatedMessage {
+            pending_msg,
+            send_channel,
+            message_id,
+            origin_domain,
+            tx_hash,
+            destination_domain,
+            app_context,
+            nonce,
+        } = validated_message;
+        batches
+            .entry(destination_domain)
+            .or_insert_with(|| (send_channel, Vec::new()))
+            .1
+            .push(Box::new(pending_msg) as QueueOperation);
+        sent_messages.push(SentMessage {
+            message_id,
+            origin_domain,
+            tx_hash,
+            destination_domain,
+            app_context,
+            nonce,
+        });
+    }
 
+    let admission_started = Instant::now();
+    let reserve_batches = async {
+        let mut reserved_batches = Vec::with_capacity(batches.len());
+        for (destination, (send_channel, batch)) in batches {
+            match send_channel.reserve_owned().await {
+                Ok(permit) => reserved_batches.push((permit, batch)),
+                Err(error) => {
+                    error!(
+                        destination_domain = destination,
+                        %error,
+                        "Processor channel closed before transaction handoff"
+                    );
+                    state.record_failure("send_failed");
+                    return Err(ServerError::InternalError(
+                        "Failed to reserve processor channel capacity".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(reserved_batches)
+    };
+    let reservation = tokio::time::timeout(PROCESSOR_CAPACITY_TIMEOUT, reserve_batches).await;
+    state
+        .metrics
+        .observe_processor_admission(admission_started.elapsed());
+    let reserved_batches = reservation.map_err(|_| {
+        state.record_failure("processor_saturated");
+        ServerError::ServiceUnavailable("Processor capacity unavailable".to_string())
+    })??;
+
+    if let Some(reservation) = maybe_reservation {
+        reservation.commit();
+    }
+    for (permit, batch) in reserved_batches {
+        permit.send(batch);
+    }
+
+    for v in sent_messages {
         info!(
             message_id = ?v.message_id,
             destination = v.destination_domain,
@@ -870,4 +944,56 @@ async fn relay_work(state: &ServerState, req: &RelayRequest) -> ServerResult<Jso
     Ok(Json(RelayResponse {
         messages: processed_messages,
     }))
+}
+
+#[cfg(test)]
+mod tx_hash_cache_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn commit_starts_ttl_and_stale_guard_cannot_remove_replacement() {
+        let ttl = Duration::from_millis(5);
+        let cache = Arc::new(Mutex::new(TxHashCache::new_with_ttl(10, ttl)));
+        let Ok(first_token) = cache
+            .lock()
+            .check_and_insert("ethereum".to_owned(), "0x01".to_owned())
+        else {
+            panic!("first reservation");
+        };
+        let first = TxHashReservation::new(
+            cache.clone(),
+            "ethereum".to_owned(),
+            "0x01".to_owned(),
+            first_token,
+        );
+
+        cache
+            .lock()
+            .remove_reservation("ethereum", "0x01", first_token);
+        let Ok(second_token) = cache
+            .lock()
+            .check_and_insert("ethereum".to_owned(), "0x01".to_owned())
+        else {
+            panic!("replacement reservation");
+        };
+        let second = TxHashReservation::new(
+            cache.clone(),
+            "ethereum".to_owned(),
+            "0x01".to_owned(),
+            second_token,
+        );
+
+        drop(first);
+        assert!(cache.lock().contains("ethereum", "0x01"));
+        tokio::time::sleep(ttl + ttl).await;
+        assert!(
+            cache.lock().contains("ethereum", "0x01"),
+            "an in-flight reservation must not expire"
+        );
+
+        second.commit();
+        assert!(cache.lock().contains("ethereum", "0x01"));
+        tokio::time::sleep(ttl + ttl).await;
+        assert!(!cache.lock().contains("ethereum", "0x01"));
+    }
 }

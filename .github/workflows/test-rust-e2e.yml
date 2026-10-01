@@ -24,16 +24,26 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        e2e-type: [cosmwasm, cosmosnative, evm, sealevel, starknet, radix, tron]
+        e2e-type:
+          [
+            cosmwasm,
+            cosmosnative,
+            evm,
+            sealevel,
+            sealevel-composite,
+            starknet,
+            radix,
+            tron,
+          ]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: recursive
           persist-credentials: false
           fetch-depth: 0
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         if: matrix.e2e-type == 'evm'
         with:
           node-version-file: .nvmrc
@@ -53,8 +63,8 @@ jobs:
           if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
             PARENT_SHA=$(git rev-parse HEAD^)
             CHANGES=$(git diff --name-only $PARENT_SHA HEAD -- ./rust ./.github/workflows/test.yml ./.github/workflows/test-rust-e2e.yml ./.github/actions/)
-            # Filter out sealevel deployment config paths that don't affect build/tests
-            CHANGES=$(echo "$CHANGES" | grep -vE '^rust/sealevel/(environments/(mainnet3|testnet4)/|\.vscode/)' || true)
+            # Filter out deployment paths that don't affect Rust build/tests
+            CHANGES=$(echo "$CHANGES" | grep -vE '^rust/(main/helm/|sealevel/(environments/(mainnet3|testnet4)/|\.vscode/))' || true)
 
             if [[ -n "$CHANGES" ]]; then
               echo "rust_changes=true" >> $GITHUB_OUTPUT
@@ -67,8 +77,8 @@ jobs:
             # For PRs, use GitHub CLI to check changes
             PR_NUMBER=${{ github.event.pull_request.number }}
             CHANGES=$(gh pr view $PR_NUMBER --json files -q '.files[].path | select(startswith("rust/") or . == ".github/workflows/test.yml" or . == ".github/workflows/test-rust-e2e.yml" or test("^\\.github/workflows/rust\\.") or startswith(".github/actions/"))')
-            # Filter out sealevel deployment config paths that don't affect build/tests
-            CHANGES=$(echo "$CHANGES" | grep -vE '^rust/sealevel/(environments/(mainnet3|testnet4)/|\.vscode/)' || true)
+            # Filter out deployment paths that don't affect Rust build/tests
+            CHANGES=$(echo "$CHANGES" | grep -vE '^rust/(main/helm/|sealevel/(environments/(mainnet3|testnet4)/|\.vscode/))' || true)
 
             if [[ -n "$CHANGES" ]]; then
               echo "rust_changes=true" >> $GITHUB_OUTPUT
@@ -82,8 +92,8 @@ jobs:
             BASE_SHA="${{ github.event.merge_group.base_sha }}"
             HEAD_SHA="${{ github.event.merge_group.head_sha }}"
             CHANGES=$(git diff --name-only "$BASE_SHA"..."$HEAD_SHA" -- ./rust ./.github/workflows/test.yml ./.github/workflows/test-rust-e2e.yml ./.github/actions/)
-            # Filter out sealevel deployment config paths that don't affect build/tests
-            CHANGES=$(echo "$CHANGES" | grep -vE '^rust/sealevel/(environments/(mainnet3|testnet4)/|\.vscode/)' || true)
+            # Filter out deployment paths that don't affect Rust build/tests
+            CHANGES=$(echo "$CHANGES" | grep -vE '^rust/(main/helm/|sealevel/(environments/(mainnet3|testnet4)/|\.vscode/))' || true)
 
             if [[ -n "$CHANGES" ]]; then
               echo "rust_changes=true" >> $GITHUB_OUTPUT
@@ -116,12 +126,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           prefix-key: 'v3-rust-e2e'
-          shared-key: ${{ matrix.e2e-type }}
+          # Both sealevel legs build the same targets; only the main leg saves.
+          shared-key: ${{ startsWith(matrix.e2e-type, 'sealevel') && 'sealevel' || matrix.e2e-type }}
           cache-provider: 'github'
-          save-if: ${{ !startsWith(github.ref, 'refs/heads/gh-readonly-queue') }}
+          save-if: ${{ !startsWith(github.ref, 'refs/heads/gh-readonly-queue') && matrix.e2e-type != 'sealevel-composite' }}
           workspaces: |
             ./rust/main
-            ${{ matrix.e2e-type == 'sealevel' && './rust/sealevel' || '' }}
+            ${{ startsWith(matrix.e2e-type, 'sealevel') && './rust/sealevel' || '' }}
 
       - name: Free disk space
         if: steps.check-conditions.outputs.skip-e2e != 'true'
@@ -139,6 +150,8 @@ jobs:
       - name: pnpm-build
         if: (matrix.e2e-type == 'evm' || matrix.e2e-type == 'tron') && steps.check-conditions.outputs.skip-e2e != 'true'
         uses: ./.github/actions/pnpm-build-with-cache
+        with:
+          build-filter: ${{ matrix.e2e-type == 'evm' && '@hyperlane-xyz/infra...' || '@hyperlane-xyz/cli...' }}
 
       - name: Install system dependencies
         if: steps.check-conditions.outputs.skip-e2e != 'true'
@@ -146,8 +159,44 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -qq -y libudev-dev pkg-config protobuf-compiler
 
+      # cargo-build-sbf keeps its pinned toolchain outside Cargo's target cache.
+      - name: Cache SBF platform tools
+        if: startsWith(matrix.e2e-type, 'sealevel') && steps.check-conditions.outputs.skip-e2e != 'true'
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/solana
+          key: sbf-platform-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust/main/utils/run-locally/src/sealevel/solana.rs') }}
+
+      # The harness reuses these dirs when populated and fills them on a miss.
+      - name: Resolve Solana download versions
+        id: solana-downloads
+        if: startsWith(matrix.e2e-type, 'sealevel') && steps.check-conditions.outputs.skip-e2e != 'true'
+        run: |
+          SOLANA_RS=rust/main/utils/run-locally/src/sealevel/solana.rs
+          SOLANA_VERSION=$(grep -oP 'SOLANA_CONTRACTS_CLI_VERSION: &str = "\K[^"]+' "$SOLANA_RS")
+          SPL_TAG=$(grep -oP 'solana-program-library/releases/download/\K[^/]+(?=/spl\.tar\.gz)' "$SOLANA_RS")
+          test -n "$SOLANA_VERSION" && test -n "$SPL_TAG"
+          echo "solana-version=$SOLANA_VERSION" >> "$GITHUB_OUTPUT"
+          echo "spl-tag=$SPL_TAG" >> "$GITHUB_OUTPUT"
+          echo "E2E_SOLANA_RELEASE_DIR=$HOME/.cache/hyperlane-e2e/solana-release-$SOLANA_VERSION" >> "$GITHUB_ENV"
+          echo "E2E_SPL_PROGRAMS_DIR=$HOME/.cache/hyperlane-e2e/spl-$SPL_TAG" >> "$GITHUB_ENV"
+
+      - name: Cache Solana release
+        if: startsWith(matrix.e2e-type, 'sealevel') && steps.check-conditions.outputs.skip-e2e != 'true'
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/hyperlane-e2e/solana-release-${{ steps.solana-downloads.outputs.solana-version }}
+          key: solana-release-${{ steps.solana-downloads.outputs.solana-version }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Cache SPL programs
+        if: startsWith(matrix.e2e-type, 'sealevel') && steps.check-conditions.outputs.skip-e2e != 'true'
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/hyperlane-e2e/spl-${{ steps.solana-downloads.outputs.spl-tag }}
+          key: spl-${{ steps.solana-downloads.outputs.spl-tag }}
+
       - name: Install OpenSSL 1.1 for Solana toolchain
-        if: matrix.e2e-type == 'sealevel' && steps.check-conditions.outputs.skip-e2e != 'true'
+        if: startsWith(matrix.e2e-type, 'sealevel') && steps.check-conditions.outputs.skip-e2e != 'true'
         run: |
           wget --tries=3 --retry-connrefused -O libssl1.1.deb https://archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1f-1ubuntu2.24_amd64.deb
           sudo dpkg -i libssl1.1.deb
@@ -162,7 +211,7 @@ jobs:
 
       - name: agent tests (Tron)
         if: ${{ matrix.e2e-type == 'tron' && steps.check-conditions.outputs.skip-e2e != 'true' }}
-        run: cargo test --release --package run-locally --bin run-locally --features tron -- tron::test --nocapture
+        run: cargo test --locked --timings --package run-locally --bin run-locally --features 'tron test-utils memory-profiling' -- tron::test --nocapture
         working-directory: ./rust/main
         env:
           RUST_BACKTRACE: 'full'
@@ -171,20 +220,21 @@ jobs:
 
       - name: agent tests (CosmWasm)
         if: ${{ matrix.e2e-type == 'cosmwasm' && steps.check-conditions.outputs.skip-e2e != 'true' }}
-        run: cargo test --release --package run-locally --bin run-locally --features cosmos -- cosmos::test --nocapture
+        run: cargo test --locked --timings --package run-locally --bin run-locally --features 'cosmos test-utils' -- cosmos::test --nocapture
         working-directory: ./rust/main
         env:
           RUST_BACKTRACE: 'full'
 
       - name: agent tests (CosmosNative)
-        run: cargo test --release --package run-locally --bin run-locally --features cosmosnative -- cosmosnative::test --nocapture
+        run: |
+          cargo test --locked --timings --package run-locally --bin run-locally --features 'cosmosnative test-utils' -- cosmosnative:: --nocapture
         if: ${{ matrix.e2e-type == 'cosmosnative' && steps.check-rust-changes.outputs.rust_changes == 'true' }}
         working-directory: ./rust/main
         env:
           RUST_BACKTRACE: 'full'
 
       - name: agent tests (Radix)
-        run: cargo test --release --package run-locally --bin run-locally --features radix -- radix::test --nocapture
+        run: cargo test --locked --timings --package run-locally --bin run-locally --features 'radix test-utils' -- radix::test --nocapture
         if: ${{ matrix.e2e-type == 'radix' && steps.check-rust-changes.outputs.rust_changes == 'true' }}
         working-directory: ./rust/main
         env:
@@ -194,7 +244,7 @@ jobs:
 
       - name: agent tests (EVM)
         if: ${{ matrix.e2e-type == 'evm' && steps.check-conditions.outputs.skip-e2e != 'true' }}
-        run: cargo run --release --bin run-locally --features test-utils
+        run: cargo run --locked --timings --bin run-locally --features 'test-utils memory-profiling'
         working-directory: ./rust/main
         env:
           E2E_CI_MODE: 'true'
@@ -204,7 +254,16 @@ jobs:
 
       - name: agent tests (Sealevel)
         if: ${{ matrix.e2e-type == 'sealevel' && steps.check-conditions.outputs.skip-e2e != 'true' }}
-        run: cargo test --release --package run-locally --bin run-locally --features sealevel -- sealevel::test --nocapture
+        run: cargo test --locked --timings --package run-locally --bin run-locally --features 'sealevel test-utils' -- sealevel::test --nocapture
+        working-directory: ./rust/main
+        env:
+          E2E_CI_MODE: 'true'
+          E2E_CI_TIMEOUT_SEC: '600'
+          RUST_BACKTRACE: 'full'
+
+      - name: agent tests (Sealevel custom composite ISM)
+        if: ${{ matrix.e2e-type == 'sealevel-composite' && steps.check-conditions.outputs.skip-e2e != 'true' }}
+        run: cargo test --locked --timings --package run-locally --bin run-locally --features 'sealevel test-utils' -- sealevel::warp_route_composite_ism::test::test_warp_route_custom_composite_ism_process --exact --nocapture
         working-directory: ./rust/main
         env:
           E2E_CI_MODE: 'true'
@@ -212,7 +271,7 @@ jobs:
           RUST_BACKTRACE: 'full'
 
       - name: agent tests (Starknet)
-        run: cargo test --release --package run-locally --bin run-locally --features starknet -- starknet::test --nocapture
+        run: cargo test --locked --timings --package run-locally --bin run-locally --features 'starknet test-utils' -- starknet::test --nocapture
         if: ${{ matrix.e2e-type == 'starknet' && steps.check-rust-changes.outputs.rust_changes == 'true' }}
         working-directory: ./rust/main
         env:
@@ -223,7 +282,7 @@ jobs:
     needs: e2e-matrix
     if: always()
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Check e2e matrix status
         uses: ./.github/actions/check-job-status
         with:

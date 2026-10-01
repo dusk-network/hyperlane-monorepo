@@ -1,5 +1,7 @@
+import type { ChainMetadataForAltVM } from './chain.js';
 import { MinimumRequiredGasByAction } from './mingas.js';
 import type { ProtocolType } from './protocolType.js';
+import type { WarpArtifactConfig } from './warp.js';
 
 // ### QUERY BASE ###
 export type ReqGetBalance = { address: string; denom?: string };
@@ -196,6 +198,16 @@ export interface IProvider<T = any> {
   quoteRemoteTransfer(
     req: ReqQuoteRemoteTransfer,
   ): Promise<ResQuoteRemoteTransfer>;
+
+  /**
+   * Returns the minimum native-token amount (in the chain's native denom)
+   * needed to deploy ONE chain's portion of a warp route given its config.
+   * Composes the base router deploy cost with additive deltas for detected
+   * features (fee program, cross-collateral extras, custom ISM / hook / IGP
+   * deploy) and, for gas-metered protocols, multiplies gas units by the
+   * chain's gas price.
+   */
+  getMinGasForWarpDeploy(warpConfig: WarpArtifactConfig): Promise<bigint>;
 }
 
 export interface ISigner<T, R> extends IProvider<T> {
@@ -210,19 +222,29 @@ export interface ISigner<T, R> extends IProvider<T> {
   sendAndConfirmBatchTransactions(transactions: T[]): Promise<R>;
 }
 
+/**
+ * An {@link ISigner} that impersonates an account against a fork (it does not
+ * hold the impersonated key and relies on the fork's disabled signature
+ * verification). The `impersonatesAccount` marker makes this a nominal subtype,
+ * so a submitter that requires impersonation cannot be handed an ordinary live
+ * signer.
+ */
+export interface IImpersonatingSigner<T, R> extends ISigner<T, R> {
+  readonly impersonatesAccount: true;
+}
+
 export interface IProviderConnect {
   connect(
-    _rpcs: string[],
-    _chainId: string | number,
+    _metadata: ChainMetadataForAltVM,
     _extraParams?: Record<string, any>,
   ): Promise<IProvider>;
 }
 
 export interface ISignerConnect<T, R> {
   connectWithSigner(
-    _rpcs: string[],
+    _metadata: ChainMetadataForAltVM,
     _privateKey: string,
-    _extraParams: Record<string, any>,
+    _extraParams?: Record<string, any>,
   ): Promise<ISigner<T, R>>;
 }
 

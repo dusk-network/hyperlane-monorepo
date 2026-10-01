@@ -1,14 +1,20 @@
 import { expect } from 'chai';
-import { errors as EthersError, providers } from 'ethers';
+import { BigNumber, errors as EthersError, providers, utils } from 'ethers';
 import sinon from 'sinon';
+
+import { assert } from '@hyperlane-xyz/utils';
 
 import {
   AllProviderMethods,
   IProviderMethods,
   ProviderMethod,
 } from './ProviderMethods.js';
-import type { HyperlaneEtherscanProvider } from './HyperlaneEtherscanProvider.js';
-import type { HyperlaneJsonRpcProvider } from './HyperlaneJsonRpcProvider.js';
+import { HyperlaneEtherscanProvider } from './HyperlaneEtherscanProvider.js';
+import {
+  LogBlockHistoryUnavailableError,
+  LogBlockRangeTooLargeError,
+  type HyperlaneJsonRpcProvider,
+} from './HyperlaneJsonRpcProvider.js';
 import {
   BlockchainError,
   getSmartProviderErrorMessage,
@@ -175,6 +181,110 @@ describe('SmartProvider', () => {
     provider = new TestableSmartProvider([MockProvider.success('success')]);
   });
 
+  describe('explorer getLogs pagination', () => {
+    const address = '0x0000000000000000000000000000000000000001';
+    const topic = `0x${'2'.repeat(64)}`;
+
+    afterEach(() => sinon.restore());
+
+    function rawLog(blockNumber: number) {
+      return {
+        address,
+        blockHash: utils.hexZeroPad(utils.hexValue(blockNumber), 32),
+        blockNumber: utils.hexValue(blockNumber),
+        data: '0x',
+        logIndex: '0x0',
+        removed: false,
+        topics: [topic],
+        transactionHash: utils.hexZeroPad(utils.hexValue(blockNumber), 32),
+        transactionIndex: '0x0',
+      };
+    }
+
+    it('returns records past the first explorer page through a composite provider', async () => {
+      const firstPage = Array.from({ length: 1_000 }, (_, index) =>
+        rawLog(index + 1),
+      );
+      const secondPage = [rawLog(1_001)];
+      const fetchStub = sinon
+        .stub(HyperlaneEtherscanProvider.prototype, 'fetch')
+        .onFirstCall()
+        .resolves(firstPage)
+        .onSecondCall()
+        .resolves(secondPage);
+
+      const smartProvider = new HyperlaneSmartProvider(
+        { chainId: 1, name: 'test' },
+        [{ http: 'http://provider' }],
+        [
+          {
+            name: 'test explorer',
+            url: 'https://explorer.test',
+            apiUrl: 'https://explorer.test/api',
+          },
+        ],
+      );
+
+      const logs = await smartProvider.getLogs({
+        address,
+        fromBlock: 1,
+        toBlock: 2_000,
+        topics: [topic],
+      });
+
+      expect(logs).to.have.length(1_001);
+      expect(fetchStub.callCount).to.equal(2);
+      expect(fetchStub.firstCall.args[1]).to.include({
+        page: 1,
+        offset: 1_000,
+      });
+      expect(fetchStub.secondCall.args[1]).to.include({
+        page: 2,
+        offset: 1_000,
+      });
+    });
+
+    it('falls back to RPC rather than return an explorer page-ceiling prefix', async () => {
+      const fullPage = Array.from({ length: 1_000 }, (_, index) =>
+        rawLog(index + 1),
+      );
+      const fetchStub = sinon
+        .stub(HyperlaneEtherscanProvider.prototype, 'fetch')
+        .resolves(fullPage);
+      const rpcLog = rawLog(2_000);
+      const rpcPerform = sinon
+        .stub(providers.JsonRpcProvider.prototype, 'perform')
+        .callsFake(async (method: string) => {
+          if (method === ProviderMethod.GetLogs) return [rpcLog];
+          throw new Error(`Unexpected RPC method ${method}`);
+        });
+
+      const smartProvider = new HyperlaneSmartProvider(
+        { chainId: 1, name: 'test' },
+        [{ http: 'http://provider' }],
+        [
+          {
+            name: 'test explorer',
+            url: 'https://explorer.test',
+            apiUrl: 'https://explorer.test/api',
+          },
+        ],
+      );
+
+      const logs = await smartProvider.getLogs({
+        address,
+        fromBlock: 1,
+        toBlock: 2_000,
+        topics: [topic],
+      });
+
+      expect(fetchStub.callCount).to.equal(10);
+      expect(rpcPerform.calledOnce).to.be.true;
+      expect(logs).to.have.length(1);
+      expect(logs[0].blockNumber).to.equal(2_000);
+    });
+  });
+
   describe('custom_rpc_header handling', () => {
     it('merges custom headers into existing connection and preserves fields', () => {
       const rawUrl =
@@ -304,6 +414,298 @@ describe('SmartProvider', () => {
       // Actual connection (used for requests) has real value - last duplicate wins
       const actualConnection = provider.rpcProviders[0].connection;
       expect(actualConnection.headers?.['Authorization']).to.equal('second');
+    });
+  });
+
+  describe('multi-address getLogs', () => {
+    const addresses = [
+      '0x0000000000000000000000000000000000000001',
+      '0x0000000000000000000000000000000000000002',
+    ];
+    const rawLog = {
+      address: addresses[1],
+      blockHash: `0x${'1'.repeat(64)}`,
+      blockNumber: '0x2',
+      data: '0x',
+      logIndex: '0x0',
+      topics: [`0x${'2'.repeat(64)}`],
+      transactionHash: `0x${'3'.repeat(64)}`,
+      transactionIndex: '0x0',
+    };
+
+    afterEach(() => sinon.restore());
+
+    it('preserves retry, fallback, and formatted log behavior', async () => {
+      const filters: providers.Filter[] = [];
+      sinon
+        .stub(providers.JsonRpcProvider.prototype, 'perform')
+        .callsFake(async function (
+          this: providers.JsonRpcProvider,
+          method: string,
+          params: { filter?: providers.Filter },
+        ) {
+          if (method !== ProviderMethod.GetLogs) {
+            throw new Error(`Unexpected method ${method}`);
+          }
+          if (!params.filter) throw new Error('Missing log filter');
+          filters.push(params.filter);
+          if (this.connection.url === 'http://provider1') {
+            throw new ProviderError('server error', EthersError.SERVER_ERROR);
+          }
+          return [rawLog];
+        });
+      const smartProvider = new HyperlaneSmartProvider(
+        { chainId: 1, name: 'test' },
+        [{ http: 'http://provider1' }, { http: 'http://provider2' }],
+        [],
+        { fallbackStaggerMs: 5 },
+      );
+
+      const logs = await smartProvider.getLogs({ address: addresses });
+
+      expect(filters).to.have.length(2);
+      expect(filters.map((filter) => filter.address)).to.deep.equal([
+        addresses,
+        addresses,
+      ]);
+      expect(logs).to.deep.equal([
+        {
+          ...rawLog,
+          address: utils.getAddress(rawLog.address),
+          blockNumber: 2,
+          logIndex: 0,
+          removed: false,
+          transactionIndex: 0,
+        },
+      ]);
+    });
+
+    it('deterministically excludes explorer providers', async () => {
+      const explorerPerform = sinon.stub(
+        HyperlaneEtherscanProvider.prototype,
+        'perform',
+      );
+      sinon
+        .stub(providers.JsonRpcProvider.prototype, 'perform')
+        .withArgs(ProviderMethod.GetLogs)
+        .resolves([]);
+      const smartProvider = new HyperlaneSmartProvider(
+        { chainId: 1, name: 'test' },
+        [{ http: 'http://provider' }],
+        [
+          {
+            name: 'test explorer',
+            url: 'https://explorer.test',
+            apiUrl: 'https://explorer.test/api',
+          },
+        ],
+      );
+
+      await smartProvider.getLogs({ address: addresses });
+
+      expect(explorerPerform.called).to.be.false;
+    });
+
+    it('falls back from a slow primary without changing the filter', async () => {
+      const requests: Array<{ url: string; filter: providers.Filter }> = [];
+      sinon
+        .stub(providers.JsonRpcProvider.prototype, 'perform')
+        .callsFake(async function (
+          this: providers.JsonRpcProvider,
+          method: string,
+          params: { filter: providers.Filter },
+        ) {
+          if (method !== ProviderMethod.GetLogs) {
+            throw new Error(`Unexpected method ${method}`);
+          }
+          requests.push({ url: this.connection.url, filter: params.filter });
+          if (this.connection.url === 'http://provider1') {
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+          return [];
+        });
+      const smartProvider = new HyperlaneSmartProvider(
+        { chainId: 1, name: 'test' },
+        [{ http: 'http://provider1' }, { http: 'http://provider2' }],
+        [],
+        { fallbackStaggerMs: 1 },
+      );
+
+      await smartProvider.getLogs({ address: addresses });
+
+      expect(requests.map(({ url }) => url)).to.deep.equal([
+        'http://provider1',
+        'http://provider2',
+      ]);
+      expect(requests.map(({ filter }) => filter.address)).to.deep.equal([
+        addresses,
+        addresses,
+      ]);
+    });
+
+    it('retries the identical filter after a recoverable provider failure', async () => {
+      const filters: providers.Filter[] = [];
+      sinon
+        .stub(providers.JsonRpcProvider.prototype, 'perform')
+        .callsFake(
+          async (method: string, params: { filter: providers.Filter }) => {
+            if (method !== ProviderMethod.GetLogs) {
+              throw new Error(`Unexpected method ${method}`);
+            }
+            filters.push(params.filter);
+            if (filters.length === 1) {
+              throw new ProviderError('server error', EthersError.SERVER_ERROR);
+            }
+            return [];
+          },
+        );
+      const smartProvider = new HyperlaneSmartProvider(
+        { chainId: 1, name: 'test' },
+        [{ http: 'http://provider' }],
+        [],
+        { maxRetries: 2, baseRetryDelayMs: 1 },
+      );
+
+      await smartProvider.getLogs({ address: addresses });
+
+      expect(filters).to.have.length(2);
+      expect(filters.map((filter) => filter.address)).to.deep.equal([
+        addresses,
+        addresses,
+      ]);
+    });
+
+    it('fails closed when only explorer providers are configured', async () => {
+      const smartProvider = new HyperlaneSmartProvider(
+        { chainId: 1, name: 'test' },
+        [],
+        [
+          {
+            name: 'test explorer',
+            url: 'https://explorer.test',
+            apiUrl: 'https://explorer.test/api',
+          },
+        ],
+      );
+
+      try {
+        await smartProvider.getLogs({ address: addresses });
+        expect.fail('Expected multi-address explorer request to fail');
+      } catch (error) {
+        if (!(error instanceof Error)) throw error;
+        expect(error.message).to.equal(
+          'No RPC providers available for multi-address getLogs',
+        );
+      }
+    });
+
+    it('rejects direct multi-address explorer requests', async () => {
+      const explorerProvider = new HyperlaneEtherscanProvider(
+        {
+          name: 'test explorer',
+          url: 'https://explorer.test',
+          apiUrl: 'https://explorer.test/api',
+          apiKey: 'test-key',
+        },
+        { chainId: 1, name: 'test' },
+      );
+
+      try {
+        await explorerProvider.perform(ProviderMethod.GetLogs, {
+          filter: { address: addresses },
+        });
+        expect.fail('Expected multi-address explorer request to fail');
+      } catch (error) {
+        if (!(error instanceof Error)) throw error;
+        expect(error.message).to.equal(
+          'Multi-address getLogs is not supported by explorer providers',
+        );
+      }
+    });
+  });
+
+  describe('paginated getLogs failover', () => {
+    const PAGINATED_LATEST_BLOCK = 20;
+
+    afterEach(() => sinon.restore());
+
+    function decodeWindow(filter: {
+      fromBlock?: unknown;
+      toBlock?: unknown;
+    }): [number, number] {
+      const { fromBlock, toBlock } = filter;
+      assert(
+        typeof fromBlock === 'string' && typeof toBlock === 'string',
+        'Expected hex block bounds on the log filter',
+      );
+      return [
+        BigNumber.from(fromBlock).toNumber(),
+        BigNumber.from(toBlock).toNumber(),
+      ];
+    }
+
+    // Each sub-query of a paginated getLogs goes through the same provider, so
+    // one failing sub-query fails the whole call and the next provider has to
+    // re-serve every window before the combined result is complete.
+    it('re-serves every window from the next provider after a sub-query fails', async () => {
+      const requests: Array<{ url: string; window: [number, number] }> = [];
+      const logs = [12, 18].map((blockNumber) => ({
+        address: '0x0000000000000000000000000000000000000001',
+        blockHash: utils.hexZeroPad(utils.hexValue(blockNumber), 32),
+        blockNumber: utils.hexValue(blockNumber),
+        data: '0x',
+        logIndex: '0x0',
+        removed: false,
+        topics: [`0x${'2'.repeat(64)}`],
+        transactionHash: utils.hexZeroPad(utils.hexValue(blockNumber), 32),
+        transactionIndex: '0x0',
+      }));
+      sinon
+        .stub(providers.JsonRpcProvider.prototype, 'perform')
+        .callsFake(async function (
+          this: providers.JsonRpcProvider,
+          method: string,
+          params: { filter?: { fromBlock?: unknown; toBlock?: unknown } },
+        ) {
+          if (method === ProviderMethod.GetBlockNumber) {
+            return PAGINATED_LATEST_BLOCK;
+          }
+          if (method !== ProviderMethod.GetLogs) {
+            throw new Error(`Unexpected method ${method}`);
+          }
+          if (!params.filter) throw new Error('Missing log filter');
+          const window = decodeWindow(params.filter);
+          requests.push({ url: this.connection.url, window });
+          if (this.connection.url === 'http://provider1') {
+            throw new ProviderError('server error', EthersError.SERVER_ERROR);
+          }
+          return logs.filter((log) => {
+            const blockNumber = BigNumber.from(log.blockNumber).toNumber();
+            return blockNumber >= window[0] && blockNumber <= window[1];
+          });
+        });
+      const smartProvider = new HyperlaneSmartProvider(
+        { chainId: 1, name: 'test' },
+        [
+          { http: 'http://provider1', pagination: { maxBlockRange: 5 } },
+          { http: 'http://provider2', pagination: { maxBlockRange: 5 } },
+        ],
+        [],
+      );
+
+      const result = await smartProvider.getLogs({
+        address: '0x0000000000000000000000000000000000000001',
+        fromBlock: 11,
+        toBlock: 20,
+      });
+
+      expect(requests).to.deep.equal([
+        { url: 'http://provider1', window: [11, 15] },
+        { url: 'http://provider1', window: [16, 20] },
+        { url: 'http://provider2', window: [11, 15] },
+        { url: 'http://provider2', window: [16, 20] },
+      ]);
+      expect(result.map((log) => log.blockNumber)).to.deep.equal([12, 18]);
     });
   });
 
@@ -487,6 +889,91 @@ describe('SmartProvider', () => {
       });
     });
 
+    // A single provider refusing must not mark the combined error unretryable:
+    // perform()'s retryAsync would stop at the first attempt and never ask the
+    // provider whose failure was transient again.
+    const nonRecoverableTestCases: Array<{
+      name: string;
+      errors: () => Error[];
+      expectedIsRecoverable: false | undefined;
+      expectedCauseIndex: number;
+    }> = [
+      {
+        name: 'only one of two providers declared its failure unretryable',
+        errors: () => [
+          new LogBlockHistoryUnavailableError(
+            'Requested block 100 is below the earliest block this RPC serves',
+          ),
+          new ProviderError('connection refused', EthersError.SERVER_ERROR),
+        ],
+        expectedIsRecoverable: undefined,
+        expectedCauseIndex: 1,
+      },
+      {
+        name: 'every provider declared its failure unretryable',
+        errors: () => [
+          new LogBlockHistoryUnavailableError(
+            'Requested block 100 is below the earliest block this RPC serves',
+          ),
+          new LogBlockHistoryUnavailableError(
+            'Requested block 100 is below the earliest block this RPC serves',
+          ),
+        ],
+        expectedIsRecoverable: false,
+        expectedCauseIndex: 0,
+      },
+      // Both orders of the same pair, because the cause is what
+      // `isBlockRangeError` reads and only the range rejection is answerable by
+      // a narrower request. Picking by provider order would have the same two
+      // failures fail the read on one registry and complete it on another.
+      {
+        name: 'a range rejection was tried after a history floor',
+        errors: () => [
+          new LogBlockHistoryUnavailableError(
+            'Requested block 100 is below the earliest block this RPC serves',
+          ),
+          new LogBlockRangeTooLargeError(
+            'Serving blocks 100 to 200 needs 11 queries at a block range of 10',
+          ),
+        ],
+        expectedIsRecoverable: false,
+        expectedCauseIndex: 1,
+      },
+      {
+        name: 'a range rejection was tried before a history floor',
+        errors: () => [
+          new LogBlockRangeTooLargeError(
+            'Serving blocks 100 to 200 needs 11 queries at a block range of 10',
+          ),
+          new LogBlockHistoryUnavailableError(
+            'Requested block 100 is below the earliest block this RPC serves',
+          ),
+        ],
+        expectedIsRecoverable: false,
+        expectedCauseIndex: 0,
+      },
+    ];
+
+    nonRecoverableTestCases.forEach(
+      ({ name, errors, expectedIsRecoverable, expectedCauseIndex }) => {
+        it(`sets isRecoverable=${expectedIsRecoverable} when ${name}`, () => {
+          const providerErrors = errors();
+          const CombinedError = provider.testGetCombinedProviderError(
+            providerErrors,
+            'Test fallback message',
+          );
+
+          const e = new CombinedError();
+
+          expect(e).to.not.be.instanceOf(BlockchainError);
+          expect(Reflect.get(e, 'isRecoverable')).to.equal(
+            expectedIsRecoverable,
+          );
+          expect(e.cause).to.equal(providerErrors[expectedCauseIndex]);
+        });
+      },
+    );
+
     it('treats CALL_EXCEPTION without nested error as permanent (BlockchainError)', () => {
       // CALL_EXCEPTION without nested error means ethers failed to decode empty return data
       // This is permanent - retrying won't help since the contract doesn't have this method
@@ -585,6 +1072,172 @@ describe('SmartProvider', () => {
       expect(e).to.be.instanceOf(Error);
       expect(e.cause).to.equal(emptyResponseError);
       expect(isMissingSelectorCallException(e)).to.equal(true);
+    });
+
+    describe('when another provider timed out', () => {
+      const timeout = { status: ProviderStatus.Timeout };
+
+      interface TimeoutCase {
+        name: string;
+        others: Error[];
+        expectCause: 'timeout' | 'other';
+        causeIndex: number;
+        missingSelector: boolean;
+      }
+
+      const networkError = Object.assign(new Error('network error'), {
+        code: 'NETWORK_ERROR',
+      });
+      const emptyResponseError = new Error('Invalid response from provider');
+      const cases: TimeoutCase[] = [
+        {
+          name: 'keeps the empty-response error as the cause',
+          others: [emptyResponseError],
+          expectCause: 'other',
+          causeIndex: 0,
+          missingSelector: true,
+        },
+        {
+          name: 'keeps the timeout as the cause when it is the only error',
+          others: [],
+          expectCause: 'timeout',
+          causeIndex: 0,
+          missingSelector: false,
+        },
+        {
+          name: 'keeps the timeout as the cause for a generic error',
+          others: [new Error('generic')],
+          expectCause: 'timeout',
+          causeIndex: 0,
+          missingSelector: false,
+        },
+        {
+          name: 'keeps a network error as the cause and is not a missing selector',
+          others: [networkError],
+          expectCause: 'other',
+          causeIndex: 0,
+          missingSelector: false,
+        },
+        {
+          name: 'picks the empty-response error among several errors',
+          others: [new Error('generic'), emptyResponseError],
+          expectCause: 'other',
+          causeIndex: 1,
+          missingSelector: true,
+        },
+      ];
+
+      for (const c of cases) {
+        it(c.name, () => {
+          const CombinedError = provider.testGetCombinedProviderError(
+            [timeout, ...c.others],
+            'Test fallback message',
+          );
+
+          const e = new CombinedError();
+
+          expect(e.cause).to.equal(
+            c.expectCause === 'timeout' ? timeout : c.others[c.causeIndex],
+          );
+          expect(isMissingSelectorCallException(e)).to.equal(c.missingSelector);
+        });
+      }
+    });
+
+    describe('when a provider failed with a server error', () => {
+      const timeout = { status: ProviderStatus.Timeout };
+      const serverError = new ProviderError(
+        'connection refused',
+        EthersError.SERVER_ERROR,
+      );
+      const emptyResponseError = new Error('Invalid response from provider');
+
+      interface ServerErrorCase {
+        name: string;
+        errors: unknown[];
+        cause: unknown;
+        missingSelector: boolean;
+      }
+
+      const cases: ServerErrorCase[] = [
+        {
+          name: 'keeps the empty-response error as the cause next to a server error',
+          errors: [emptyResponseError, serverError],
+          cause: emptyResponseError,
+          missingSelector: true,
+        },
+        {
+          name: 'keeps the empty-response error as the cause regardless of order',
+          errors: [serverError, emptyResponseError],
+          cause: emptyResponseError,
+          missingSelector: true,
+        },
+        {
+          name: 'keeps the empty-response error as the cause next to a timeout and a server error',
+          errors: [timeout, emptyResponseError, serverError],
+          cause: emptyResponseError,
+          missingSelector: true,
+        },
+        {
+          name: 'keeps the server error as the cause when it is the only error',
+          errors: [serverError],
+          cause: serverError,
+          missingSelector: false,
+        },
+        {
+          name: 'keeps the server error as the cause next to a timeout',
+          errors: [timeout, serverError],
+          cause: serverError,
+          missingSelector: false,
+        },
+      ];
+
+      for (const c of cases) {
+        it(c.name, () => {
+          const CombinedError = provider.testGetCombinedProviderError(
+            c.errors,
+            'Test fallback message',
+          );
+
+          const e = new CombinedError();
+
+          expect(e.message).to.equal(
+            getSmartProviderErrorMessage(EthersError.SERVER_ERROR),
+          );
+          expect(e.cause).to.equal(c.cause);
+          expect(isMissingSelectorCallException(e)).to.equal(c.missingSelector);
+        });
+      }
+    });
+
+    describe('when a provider returned revert data alongside an empty response', () => {
+      const emptyResponseError = new Error('Invalid response from provider');
+      const revertWithData = new ProviderError(
+        'execution reverted',
+        EthersError.CALL_EXCEPTION,
+        '0x08c379a0',
+        { jsonRpcErrorCode: 3 },
+      );
+
+      const orderings = [
+        { name: 'revert first', errors: [revertWithData, emptyResponseError] },
+        { name: 'empty first', errors: [emptyResponseError, revertWithData] },
+      ];
+
+      for (const c of orderings) {
+        it(`keeps the revert as the cause with ${c.name}`, () => {
+          const CombinedError = provider.testGetCombinedProviderError(
+            c.errors,
+            'Test fallback message',
+          );
+
+          const e = new CombinedError();
+
+          expect(e).to.be.instanceOf(BlockchainError);
+          expect(e.cause).to.equal(revertWithData);
+          expect(isMissingSelectorCallException(e)).to.equal(false);
+        });
+      }
     });
 
     it('treats CALL_EXCEPTION with JSON-RPC error code 3 as permanent (BlockchainError)', () => {
@@ -712,6 +1365,70 @@ describe('SmartProvider', () => {
         expect(provider2.called).to.be.true;
       }
     });
+
+    interface LateErrorCase {
+      name: string;
+      firstError: Error;
+      otherError: Error;
+      missingSelector: boolean;
+    }
+
+    const emptyResponseError = new Error('Invalid response from provider');
+    const lateServerError = new ProviderError(
+      'connection refused',
+      EthersError.SERVER_ERROR,
+    );
+    const lateRevertWithData = new ProviderError(
+      'execution reverted',
+      EthersError.CALL_EXCEPTION,
+      '0x08c379a0',
+      { jsonRpcErrorCode: 3 },
+    );
+    const lateErrorCases: LateErrorCase[] = [
+      {
+        name: 'a late revert with data and an earlier late empty response',
+        firstError: lateRevertWithData,
+        otherError: emptyResponseError,
+        missingSelector: false,
+      },
+      {
+        name: 'a late empty response and an earlier late server error',
+        firstError: emptyResponseError,
+        otherError: lateServerError,
+        missingSelector: true,
+      },
+      {
+        name: 'a late server error and an earlier late empty response',
+        firstError: lateServerError,
+        otherError: emptyResponseError,
+        missingSelector: true,
+      },
+      {
+        name: 'two late server errors',
+        firstError: lateServerError,
+        otherError: new ProviderError(
+          'connection refused',
+          EthersError.SERVER_ERROR,
+        ),
+        missingSelector: false,
+      },
+    ];
+
+    for (const c of lateErrorCases) {
+      it(`classifies ${c.name} independently of arrival order (missing selector=${c.missingSelector})`, async () => {
+        // Both providers miss the stagger window; the second replies first
+        const provider1 = MockProvider.error(c.firstError, 300);
+        const provider2 = MockProvider.error(c.otherError, 150);
+        const provider = new TestableSmartProvider([provider1, provider2]);
+
+        try {
+          await provider.simplePerform('getBlockNumber', 1);
+          expect.fail('Should have thrown an error');
+        } catch (e: unknown) {
+          expect(isMissingSelectorCallException(e)).to.equal(c.missingSelector);
+        }
+      });
+    }
 
     it('blockchain error with revert data stops trying additional providers immediately', async () => {
       const blockchainError = new ProviderError(

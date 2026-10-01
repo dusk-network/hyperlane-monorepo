@@ -1,4 +1,4 @@
-ARG NODE_VERSION=24
+ARG NODE_VERSION=26
 FROM node:${NODE_VERSION}-slim
 
 WORKDIR /hyperlane-monorepo
@@ -16,9 +16,9 @@ RUN set -o pipefail && \
     curl --fail -L "https://github.com/foundry-rs/foundry/releases/download/${FOUNDRY_VERSION}/foundry_${FOUNDRY_VERSION}_linux_${ARCH}.tar.gz" | tar -xzC /usr/local/bin forge cast
 SHELL ["/bin/sh", "-c"]
 
-# Copy package.json first for corepack to read packageManager field
+# Copy package.json first for dependency layer caching
 COPY package.json ./
-RUN corepack enable && corepack install
+RUN npm install --global pnpm@12.3.0
 
 # Copy remaining config files
 COPY pnpm-lock.yaml pnpm-workspace.yaml ./
@@ -32,6 +32,7 @@ COPY typescript/cosmos-sdk/package.json ./typescript/cosmos-sdk/
 COPY typescript/cosmos-types/package.json ./typescript/cosmos-types/
 COPY typescript/deploy-sdk/package.json ./typescript/deploy-sdk/
 COPY typescript/fee-quoting/package.json ./typescript/fee-quoting/
+COPY typescript/forking-sdk/package.json ./typescript/forking-sdk/
 COPY typescript/github-proxy/package.json ./typescript/github-proxy/
 COPY typescript/helloworld/package.json ./typescript/helloworld/
 COPY typescript/http-registry-server/package.json ./typescript/http-registry-server/
@@ -43,6 +44,7 @@ COPY typescript/tron-sdk/package.json ./typescript/tron-sdk/
 COPY typescript/rebalancer/package.json ./typescript/rebalancer/
 COPY typescript/rebalancer-sim/package.json ./typescript/rebalancer-sim/
 COPY typescript/relayer/package.json ./typescript/relayer/
+COPY typescript/scraper-proxy/package.json ./typescript/scraper-proxy/package.json
 COPY typescript/sdk/package.json ./typescript/sdk/
 COPY typescript/svm-sdk/package.json ./typescript/svm-sdk/
 COPY typescript/starknet-sdk/package.json ./typescript/starknet-sdk/
@@ -74,8 +76,8 @@ COPY starknet ./starknet
 # To update when changing solidity version in solidity/rootHardhatConfig.cts:
 #   1. Find the commit hash: curl -s "https://binaries.soliditylang.org/linux-amd64/list.json" | jq '.releases["X.Y.Z"]'
 #   2. Update SOLC_VERSION and SOLC_COMMIT below
-ARG SOLC_VERSION=0.8.22
-ARG SOLC_COMMIT=4fc1097e
+ARG SOLC_VERSION=0.8.33
+ARG SOLC_COMMIT=64118f21
 RUN SOLC_BINARY="solc-linux-amd64-v${SOLC_VERSION}+commit.${SOLC_COMMIT}" && \
     SOLC_LIST_URL="https://binaries.soliditylang.org/linux-amd64/list.json" && \
     SOLC_BIN_URL="https://binaries.soliditylang.org/linux-amd64/${SOLC_BINARY}" && \
@@ -85,7 +87,10 @@ RUN SOLC_BINARY="solc-linux-amd64-v${SOLC_VERSION}+commit.${SOLC_COMMIT}" && \
     curl --retry 5 --retry-delay 5 --retry-all-errors -fsSL "$SOLC_BIN_URL" -o "$CACHE_DIR/${SOLC_BINARY}" && \
     chmod +x "$CACHE_DIR/${SOLC_BINARY}"
 
-RUN pnpm build
+ARG TARGETARCH
+RUN --mount=type=cache,id=monorepo-turbo-${TARGETARCH},target=/hyperlane-monorepo/.turbo/cache \
+    --mount=type=cache,target=/root/.tron/solc \
+    pnpm build
 
 # Baked-in registry version
 # keep for back-compat until we update all usage of the monorepo image (e.g. key-funder)

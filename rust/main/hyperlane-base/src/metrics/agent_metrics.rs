@@ -13,6 +13,7 @@ use hyperlane_core::HyperlaneDomain;
 use hyperlane_core::HyperlaneProvider;
 use hyperlane_core::NativeToken;
 use hyperlane_core::ReorgPeriod;
+use hyperlane_metric::rpc_operation::{with_rpc_operation, RpcOperation};
 use maplit::hashmap;
 use prometheus::GaugeVec;
 use prometheus::IntGaugeVec;
@@ -356,6 +357,12 @@ impl ChainSpecificMetricsUpdater {
         })
     }
 
+    /// Disable periodic wallet balance reads while retaining chain metrics.
+    pub fn without_wallet_balance(mut self) -> Self {
+        self.conf.address = None;
+        self
+    }
+
     async fn update_agent_metrics(&self) {
         let Some(wallet_addr) = self.conf.address.clone() else {
             return;
@@ -401,7 +408,7 @@ impl ChainSpecificMetricsUpdater {
             }
         };
 
-        let height = chain_metrics.latest_block.number as i64;
+        let height = chain_metrics.block_height as i64;
         trace!(chain, height, "Fetched block height for metrics");
         self.chain_metrics.set_block_height(chain, height);
 
@@ -437,8 +444,11 @@ impl ChainSpecificMetricsUpdater {
             .name(&name)
             .spawn(
                 async move {
-                    self.start_updating_on_interval(METRICS_SCRAPE_INTERVAL)
-                        .await;
+                    with_rpc_operation(
+                        RpcOperation::AgentMetrics,
+                        self.start_updating_on_interval(METRICS_SCRAPE_INTERVAL),
+                    )
+                    .await;
                 }
                 .instrument(info_span!("MetricsUpdater")),
             )

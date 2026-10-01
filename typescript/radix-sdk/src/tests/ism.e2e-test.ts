@@ -36,21 +36,10 @@ describe('Radix ISMs (e2e)', function () {
   let artifactManager: RadixIsmArtifactManager;
 
   before(async () => {
-    const rpcUrls =
-      DEPLOYED_TEST_CHAIN_METADATA.rpcUrls?.map((url) => url.http) ?? [];
-    assert(rpcUrls.length > 0, 'Expected at least 1 rpc url for the tests');
-
-    radixSigner = (await RadixSigner.connectWithSigner(
-      rpcUrls,
+    radixSigner = await RadixSigner.connectWithSigner(
+      DEPLOYED_TEST_CHAIN_METADATA,
       TEST_RADIX_PRIVATE_KEY,
-      {
-        metadata: {
-          chainId: DEPLOYED_TEST_CHAIN_METADATA.chainId,
-          gatewayUrls: DEPLOYED_TEST_CHAIN_METADATA.gatewayUrls,
-          packageAddress: DEPLOYED_TEST_CHAIN_METADATA.packageAddress,
-        },
-      },
-    )) as RadixSigner;
+    );
 
     providerSdkSigner = radixSigner;
 
@@ -226,12 +215,12 @@ describe('Radix ISMs (e2e)', function () {
       expect(readIsm.config.type).to.equal(AltVM.IsmType.ROUTING);
       expect(readIsm.config.owner).to.equal(TEST_RADIX_DEPLOYER_ADDRESS);
       expect(Object.keys(readIsm.config.domains)).to.have.length(2);
-      expect(readIsm.config.domains[DOMAIN_1].deployed.address).to.equal(
-        testIsmAddress,
-      );
-      expect(readIsm.config.domains[DOMAIN_2].deployed.address).to.equal(
-        multisigIsmAddress,
-      );
+      const domain1Ism = readIsm.config.domains[DOMAIN_1];
+      const domain2Ism = readIsm.config.domains[DOMAIN_2];
+      assert(domain1Ism, `Missing ISM for domain ${DOMAIN_1}`);
+      assert(domain2Ism, `Missing ISM for domain ${DOMAIN_2}`);
+      expect(domain1Ism.deployed.address).to.equal(testIsmAddress);
+      expect(domain2Ism.deployed.address).to.equal(multisigIsmAddress);
     });
 
     it('should add a new domain ISM', async () => {
@@ -257,7 +246,9 @@ describe('Radix ISMs (e2e)', function () {
       const txs = await routingIsmWriter.update(updatedConfig);
 
       expect(txs).to.be.an('array').with.length.greaterThan(0);
-      expect(txs[0].annotation).to.include(`domain ${DOMAIN_3}`);
+      const [firstTx] = txs;
+      assert(firstTx, 'Expected at least one update transaction');
+      expect(firstTx.annotation).to.include(`domain ${DOMAIN_3}`);
 
       for (const tx of txs) {
         await providerSdkSigner.sendAndConfirmTransaction(tx);
@@ -265,14 +256,16 @@ describe('Radix ISMs (e2e)', function () {
 
       const reader = artifactManager.createReader(AltVM.IsmType.ROUTING);
       const readIsm = await reader.read(routingIsm.deployed.address);
-      expect(readIsm.config.domains[DOMAIN_3].deployed.address).to.equal(
-        testIsmAddress,
-      );
+      const domain3Ism = readIsm.config.domains[DOMAIN_3];
+      assert(domain3Ism, `Missing ISM for domain ${DOMAIN_3}`);
+      expect(domain3Ism.deployed.address).to.equal(testIsmAddress);
       expect(Object.keys(readIsm.config.domains)).to.have.length(3);
     });
 
     it('should remove a domain ISM', async () => {
       const [routingIsm] = await routingIsmWriter.create({ config });
+      const domain1Ism = routingIsm.config.domains[DOMAIN_1];
+      assert(domain1Ism, `Missing ISM for domain ${DOMAIN_1}`);
 
       const updatedConfig: ArtifactDeployed<
         RawRoutingIsmArtifactConfig,
@@ -282,7 +275,7 @@ describe('Radix ISMs (e2e)', function () {
         config: {
           ...routingIsm.config,
           domains: {
-            [DOMAIN_1]: routingIsm.config.domains[DOMAIN_1],
+            [DOMAIN_1]: domain1Ism,
           },
         },
       };
@@ -309,6 +302,8 @@ describe('Radix ISMs (e2e)', function () {
 
     it('should update the ISM address for an existing domain', async () => {
       const [routingIsm] = await routingIsmWriter.create({ config });
+      const domain2Ism = routingIsm.config.domains[DOMAIN_2];
+      assert(domain2Ism, `Missing ISM for domain ${DOMAIN_2}`);
 
       const updatedConfig: ArtifactDeployed<
         RawRoutingIsmArtifactConfig,
@@ -322,7 +317,7 @@ describe('Radix ISMs (e2e)', function () {
               artifactState: ArtifactState.UNDERIVED,
               deployed: { address: multisigIsmAddress },
             },
-            [DOMAIN_2]: routingIsm.config.domains[DOMAIN_2],
+            [DOMAIN_2]: domain2Ism,
           },
         },
       };
@@ -341,9 +336,9 @@ describe('Radix ISMs (e2e)', function () {
 
       const reader = artifactManager.createReader(AltVM.IsmType.ROUTING);
       const readIsm = await reader.read(routingIsm.deployed.address);
-      expect(readIsm.config.domains[DOMAIN_1].deployed.address).to.equal(
-        multisigIsmAddress,
-      );
+      const domain1Ism = readIsm.config.domains[DOMAIN_1];
+      assert(domain1Ism, `Missing ISM for domain ${DOMAIN_1}`);
+      expect(domain1Ism.deployed.address).to.equal(multisigIsmAddress);
     });
 
     it('should transfer ownership of the ISM', async () => {

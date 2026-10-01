@@ -1,0 +1,445 @@
+import {
+  collectDefaultMetrics,
+  Counter,
+  Gauge,
+  Histogram,
+  Registry,
+} from 'prom-client';
+
+import type { EventType } from './live/protocol.js';
+
+const PREFIX = 'hyperlane_scraper_proxy_';
+
+export type WebSocketMetricsSnapshot = {
+  catchUps: number;
+  connections: Record<'agent' | 'messages', number>;
+  explorerPendingBytes: number;
+  explorerPendingMessages: number;
+  maxExplorerPendingBytes: number;
+  maxExplorerPendingMessages: number;
+  messageClientIps: number;
+  messageMaxConnectionsPerIp: number;
+  limits: {
+    agentConnections: number;
+    catchUpMs: number;
+    clientMessagesPerMinute: number;
+    concurrentCatchUps: number;
+    explorerPendingBytes: number;
+    explorerPendingMessages: number;
+    messageConnections: number;
+    messageConnectionsPerIp: number;
+    notificationEvents: number;
+    pendingEvents: number;
+    socketBufferedBytes: number;
+    totalPendingBytes: number;
+  };
+  listenerReady: boolean;
+  maxCatchUpDurationMs: number;
+  maxCatchUpRows: number;
+  maxClientBufferedBytes: number;
+  maxPendingCatchUpEvents: number;
+  notificationQueue: Record<'agent' | 'messages', number>;
+  outboundPendingBytes: number;
+  pendingCatchUpEvents: number;
+  subscriptions: Record<EventType, { catchingUp: number; live: number }>;
+};
+
+type DatabasePoolMetrics = {
+  idle: number;
+  limit: number;
+  total: number;
+  waiting: number;
+};
+
+export type DatabaseMetricsSnapshot = {
+  listeners: number;
+  pools: Record<'live' | 'main', DatabasePoolMetrics>;
+};
+
+export const DatabaseQueryRole = {
+  GraphqlPrimary: 'graphql_primary',
+  GraphqlReplica: 'graphql_replica',
+  LivePrimary: 'live_primary',
+} as const;
+
+export type DatabaseQueryRole =
+  (typeof DatabaseQueryRole)[keyof typeof DatabaseQueryRole];
+
+export const metricsRegistry = new Registry();
+
+collectDefaultMetrics({ prefix: PREFIX, register: metricsRegistry });
+
+export const graphqlActiveRequests = new Gauge({
+  help: 'Current number of active GraphQL requests.',
+  name: `${PREFIX}graphql_active_requests`,
+  registers: [metricsRegistry],
+});
+
+export const graphqlActiveRequestLimit = new Gauge({
+  help: 'Maximum number of concurrent GraphQL requests.',
+  name: `${PREFIX}graphql_active_request_limit`,
+  registers: [metricsRegistry],
+});
+
+export const graphqlRequests = new Counter({
+  help: 'GraphQL requests by outcome.',
+  labelNames: ['outcome'] as const,
+  name: `${PREFIX}graphql_requests_total`,
+  registers: [metricsRegistry],
+});
+
+export const graphqlErrors = new Counter({
+  help: 'GraphQL errors returned to clients.',
+  name: `${PREFIX}graphql_errors_total`,
+  registers: [metricsRegistry],
+});
+
+export const graphqlRequestDuration = new Histogram({
+  buckets: [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20],
+  help: 'GraphQL request duration in seconds.',
+  name: `${PREFIX}graphql_request_duration_seconds`,
+  registers: [metricsRegistry],
+});
+
+export const databaseQueries = new Counter({
+  help: 'Database queries by fixed workload role and outcome.',
+  labelNames: ['role', 'outcome'] as const,
+  name: `${PREFIX}database_queries_total`,
+  registers: [metricsRegistry],
+});
+
+export const databaseQueryDuration = new Histogram({
+  buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20],
+  help: 'Database query duration in seconds by fixed workload role and outcome.',
+  labelNames: ['role', 'outcome'] as const,
+  name: `${PREFIX}database_query_duration_seconds`,
+  registers: [metricsRegistry],
+});
+
+export const databaseRows = new Counter({
+  help: 'Database rows returned by fixed workload role.',
+  labelNames: ['role'] as const,
+  name: `${PREFIX}database_rows_total`,
+  registers: [metricsRegistry],
+});
+
+for (const role of Object.values(DatabaseQueryRole)) {
+  for (const outcome of ['error', 'success'])
+    databaseQueries.inc({ outcome, role }, 0);
+  databaseRows.inc({ role }, 0);
+}
+
+export const websocketConnections = new Counter({
+  help: 'Accepted WebSocket connections by route.',
+  labelNames: ['route'] as const,
+  name: `${PREFIX}websocket_connections_total`,
+  registers: [metricsRegistry],
+});
+
+export const websocketConnectionRejections = new Counter({
+  help: 'Rejected WebSocket connections by route and reason.',
+  labelNames: ['route', 'reason'] as const,
+  name: `${PREFIX}websocket_connection_rejections_total`,
+  registers: [metricsRegistry],
+});
+
+export const websocketCatchUps = new Counter({
+  help: 'Historical WebSocket catch-ups by outcome.',
+  labelNames: ['outcome'] as const,
+  name: `${PREFIX}websocket_catch_ups_total`,
+  registers: [metricsRegistry],
+});
+
+export const websocketClientMessageRejections = new Counter({
+  help: 'Agent WebSocket messages rejected by the per-client rate limit.',
+  name: `${PREFIX}websocket_client_message_rejections_total`,
+  registers: [metricsRegistry],
+});
+
+export const websocketSendFailures = new Counter({
+  help: 'WebSocket send failures by reason.',
+  labelNames: ['reason'] as const,
+  name: `${PREFIX}websocket_send_failures_total`,
+  registers: [metricsRegistry],
+});
+
+export const websocketNotificationQueueOverflows = new Counter({
+  help: 'PostgreSQL notification queue overflows by isolated route.',
+  labelNames: ['route'] as const,
+  name: `${PREFIX}websocket_notification_queue_overflows_total`,
+  registers: [metricsRegistry],
+});
+
+for (const outcome of ['aborted', 'capacity_rejected', 'failure', 'success'])
+  websocketCatchUps.inc({ outcome }, 0);
+for (const reason of [
+  'buffer_limit',
+  'notification_queue_limit',
+  'queue_limit',
+  'send_error',
+])
+  websocketSendFailures.inc({ reason }, 0);
+for (const route of ['agent', 'messages']) {
+  for (const reason of ['connection_limit', 'listener_unavailable'])
+    websocketConnectionRejections.inc({ reason, route }, 0);
+}
+for (const reason of ['invalid_client_ip', 'per_ip_limit'])
+  websocketConnectionRejections.inc({ reason, route: 'messages' }, 0);
+for (const route of ['agent', 'messages'])
+  websocketNotificationQueueOverflows.inc({ route }, 0);
+
+let websocketMetricsProvider: (() => WebSocketMetricsSnapshot) | undefined;
+let databaseMetricsProvider: (() => DatabaseMetricsSnapshot) | undefined;
+
+export function setDatabaseMetricsProvider(
+  provider: () => DatabaseMetricsSnapshot,
+): void {
+  databaseMetricsProvider = provider;
+}
+
+export function setWebSocketMetricsProvider(
+  provider: () => WebSocketMetricsSnapshot,
+): void {
+  websocketMetricsProvider = provider;
+}
+
+function snapshotGauge(
+  name: string,
+  help: string,
+  collect: (gauge: Gauge, snapshot: WebSocketMetricsSnapshot) => void,
+  labelNames: string[] = [],
+): void {
+  new Gauge({
+    collect() {
+      this.reset();
+      const snapshot = websocketMetricsProvider?.();
+      if (snapshot) collect(this, snapshot);
+    },
+    help,
+    labelNames,
+    name: `${PREFIX}${name}`,
+    registers: [metricsRegistry],
+  });
+}
+
+function databaseSnapshotGauge(
+  name: string,
+  help: string,
+  collect: (gauge: Gauge, snapshot: DatabaseMetricsSnapshot) => void,
+  labelNames: string[] = [],
+): void {
+  new Gauge({
+    collect() {
+      this.reset();
+      const snapshot = databaseMetricsProvider?.();
+      if (snapshot) collect(this, snapshot);
+    },
+    help,
+    labelNames,
+    name: `${PREFIX}${name}`,
+    registers: [metricsRegistry],
+  });
+}
+
+databaseSnapshotGauge(
+  'database_pool_connections',
+  'Current database pool connections by pool and state.',
+  (gauge, snapshot) => {
+    for (const [pool, values] of Object.entries(snapshot.pools)) {
+      gauge.set({ pool, state: 'active' }, values.total - values.idle);
+      gauge.set({ pool, state: 'idle' }, values.idle);
+    }
+  },
+  ['pool', 'state'],
+);
+databaseSnapshotGauge(
+  'database_pool_connection_limit',
+  'Maximum database connections by pool.',
+  (gauge, snapshot) => {
+    for (const [pool, values] of Object.entries(snapshot.pools))
+      gauge.set({ pool }, values.limit);
+  },
+  ['pool'],
+);
+databaseSnapshotGauge(
+  'database_pool_waiting_requests',
+  'Current requests waiting for a database connection by pool.',
+  (gauge, snapshot) => {
+    for (const [pool, values] of Object.entries(snapshot.pools))
+      gauge.set({ pool }, values.waiting);
+  },
+  ['pool'],
+);
+databaseSnapshotGauge(
+  'database_listener_connections',
+  'Current dedicated PostgreSQL listener connections.',
+  (gauge, snapshot) => gauge.set(snapshot.listeners),
+);
+
+snapshotGauge(
+  'websocket_connections',
+  'Current WebSocket connections by route.',
+  (gauge, snapshot) => {
+    gauge.set({ route: 'agent' }, snapshot.connections.agent);
+    gauge.set({ route: 'messages' }, snapshot.connections.messages);
+  },
+  ['route'],
+);
+snapshotGauge(
+  'websocket_connection_limit',
+  'Maximum WebSocket connections by route.',
+  (gauge, snapshot) => {
+    gauge.set({ route: 'agent' }, snapshot.limits.agentConnections);
+    gauge.set({ route: 'messages' }, snapshot.limits.messageConnections);
+  },
+  ['route'],
+);
+snapshotGauge(
+  'websocket_message_client_ips',
+  'Current number of distinct /messages client IPs.',
+  (gauge, snapshot) => gauge.set(snapshot.messageClientIps),
+);
+snapshotGauge(
+  'websocket_message_connection_limit_per_ip',
+  'Maximum /messages WebSocket connections per client IP.',
+  (gauge, snapshot) => gauge.set(snapshot.limits.messageConnectionsPerIp),
+);
+snapshotGauge(
+  'websocket_message_max_connections_per_ip',
+  'Largest current /messages connection count for one client IP.',
+  (gauge, snapshot) => gauge.set(snapshot.messageMaxConnectionsPerIp),
+);
+snapshotGauge(
+  'websocket_listener_ready',
+  'Whether the database event listener is ready.',
+  (gauge, snapshot) => gauge.set(snapshot.listenerReady ? 1 : 0),
+);
+snapshotGauge(
+  'websocket_catch_ups',
+  'Current historical WebSocket catch-ups.',
+  (gauge, snapshot) => gauge.set(snapshot.catchUps),
+);
+snapshotGauge(
+  'websocket_catch_up_concurrency_limit',
+  'Maximum concurrent historical WebSocket catch-ups.',
+  (gauge, snapshot) => gauge.set(snapshot.limits.concurrentCatchUps),
+);
+snapshotGauge(
+  'websocket_max_catch_up_rows',
+  'Largest current row count delivered by one historical catch-up.',
+  (gauge, snapshot) => gauge.set(snapshot.maxCatchUpRows),
+);
+snapshotGauge(
+  'websocket_catch_up_duration_limit_seconds',
+  'Maximum duration of one historical WebSocket catch-up in seconds.',
+  (gauge, snapshot) => gauge.set(snapshot.limits.catchUpMs / 1_000),
+);
+snapshotGauge(
+  'websocket_max_catch_up_duration_seconds',
+  'Longest current historical WebSocket catch-up duration in seconds.',
+  (gauge, snapshot) => gauge.set(snapshot.maxCatchUpDurationMs / 1_000),
+);
+snapshotGauge(
+  'websocket_pending_catch_up_events',
+  'Current live events buffered behind historical catch-ups.',
+  (gauge, snapshot) => gauge.set(snapshot.pendingCatchUpEvents),
+);
+snapshotGauge(
+  'websocket_pending_catch_up_event_limit',
+  'Maximum live events buffered behind one historical catch-up.',
+  (gauge, snapshot) => gauge.set(snapshot.limits.pendingEvents),
+);
+snapshotGauge(
+  'websocket_max_pending_catch_up_events',
+  'Largest current live-event buffer behind one historical catch-up.',
+  (gauge, snapshot) => gauge.set(snapshot.maxPendingCatchUpEvents),
+);
+snapshotGauge(
+  'websocket_client_message_limit_per_minute',
+  'Maximum agent messages accepted per client per minute.',
+  (gauge, snapshot) => gauge.set(snapshot.limits.clientMessagesPerMinute),
+);
+snapshotGauge(
+  'websocket_subscriptions',
+  'Current agent subscriptions by event type and state.',
+  (gauge, snapshot) => {
+    for (const [eventType, subscriptions] of Object.entries(
+      snapshot.subscriptions,
+    )) {
+      gauge.set(
+        { event_type: eventType, state: 'catching_up' },
+        subscriptions.catchingUp,
+      );
+      gauge.set({ event_type: eventType, state: 'live' }, subscriptions.live);
+    }
+  },
+  ['event_type', 'state'],
+);
+snapshotGauge(
+  'websocket_notification_queue',
+  'Current queued database notifications by route.',
+  (gauge, snapshot) => {
+    gauge.set({ route: 'agent' }, snapshot.notificationQueue.agent);
+    gauge.set({ route: 'messages' }, snapshot.notificationQueue.messages);
+  },
+  ['route'],
+);
+snapshotGauge(
+  'websocket_notification_queue_limit',
+  'Maximum queued PostgreSQL notifications before route clients are closed.',
+  (gauge, snapshot) => {
+    gauge.set({ route: 'agent' }, snapshot.limits.notificationEvents);
+    gauge.set({ route: 'messages' }, snapshot.limits.notificationEvents);
+  },
+  ['route'],
+);
+snapshotGauge(
+  'websocket_explorer_pending_bytes',
+  'Current serialized Explorer bytes queued behind send callbacks.',
+  (gauge, snapshot) => gauge.set(snapshot.explorerPendingBytes),
+);
+snapshotGauge(
+  'websocket_explorer_max_pending_bytes',
+  'Largest current serialized Explorer byte queue for one client.',
+  (gauge, snapshot) => gauge.set(snapshot.maxExplorerPendingBytes),
+);
+snapshotGauge(
+  'websocket_explorer_pending_byte_limit',
+  'Maximum serialized Explorer bytes queued behind one client callback.',
+  (gauge, snapshot) => gauge.set(snapshot.limits.explorerPendingBytes),
+);
+snapshotGauge(
+  'websocket_explorer_pending_messages',
+  'Current Explorer messages queued behind per-client send callbacks.',
+  (gauge, snapshot) => gauge.set(snapshot.explorerPendingMessages),
+);
+snapshotGauge(
+  'websocket_explorer_max_pending_messages',
+  'Largest current per-client Explorer message queue.',
+  (gauge, snapshot) => gauge.set(snapshot.maxExplorerPendingMessages),
+);
+snapshotGauge(
+  'websocket_explorer_pending_message_limit',
+  'Maximum Explorer messages queued behind one client send callback.',
+  (gauge, snapshot) => gauge.set(snapshot.limits.explorerPendingMessages),
+);
+snapshotGauge(
+  'websocket_outbound_pending_bytes',
+  'Current bytes awaiting WebSocket send callbacks.',
+  (gauge, snapshot) => gauge.set(snapshot.outboundPendingBytes),
+);
+snapshotGauge(
+  'websocket_outbound_pending_byte_limit',
+  'Maximum total bytes awaiting WebSocket send callbacks.',
+  (gauge, snapshot) => gauge.set(snapshot.limits.totalPendingBytes),
+);
+snapshotGauge(
+  'websocket_max_client_buffered_bytes',
+  'Largest current ws bufferedAmount among connected clients.',
+  (gauge, snapshot) => gauge.set(snapshot.maxClientBufferedBytes),
+);
+snapshotGauge(
+  'websocket_client_buffered_byte_limit',
+  'Maximum ws bufferedAmount allowed for one client.',
+  (gauge, snapshot) => gauge.set(snapshot.limits.socketBufferedBytes),
+);

@@ -73,16 +73,18 @@ pub struct RelayerSettings {
     pub tx_id_indexing_enabled: bool,
     /// Whether to enable IGP indexing.
     pub igp_indexing_enabled: bool,
+    /// Optional scraper-proxy WebSocket used for shared indexing.
+    pub websocket_url: Option<url::Url>,
+    /// Whether a healthy scraper-proxy stream may replace direct RPC indexing.
+    pub websocket_authority_enabled: bool,
     /// Whether to enable the relay API endpoint (default: false)
     ///
     /// # Deployment requirement
     ///
-    /// The relay API feeds an `UnboundedSender` that is shared with the normal
-    /// message-processing path. There is no back-pressure at the channel level:
-    /// the rate limiter (`relay_api_rate_limit_*`) and `MAX_MESSAGES_PER_TX=10`
-    /// provide a soft cap (~17 ops/sec at default limits) but will not prevent
-    /// unbounded queue growth under sustained load if the endpoint is exposed
-    /// publicly without per-tenant limiting at the ingress layer.
+    /// The relay API shares the bounded, backpressured message-processing channel
+    /// with the normal loader. The rate limiter (`relay_api_rate_limit_*`) and
+    /// `MAX_MESSAGES_PER_TX=10` additionally limit admitted work, but do not
+    /// replace per-tenant limiting at the ingress layer.
     ///
     /// **The relay API must be deployed behind an ingress that enforces
     /// per-tenant rate limits.** Enabling it on a publicly reachable port
@@ -406,6 +408,31 @@ impl FromRawConf<RawRelayerSettings> for RelayerSettings {
             .parse_bool()
             .unwrap_or(true);
 
+        let websocket_url: Option<url::Url> = p
+            .chain(&mut err)
+            .get_opt_key("websocketUrl")
+            .parse_from_str("Expected a valid scraper-proxy WebSocket URL")
+            .end();
+        if let Some(url) = &websocket_url {
+            if !matches!(url.scheme(), "ws" | "wss") {
+                err.push(
+                    cwp.clone(),
+                    eyre::eyre!("`websocketUrl` must use ws:// or wss://"),
+                );
+            }
+        }
+        let websocket_authority_enabled = p
+            .chain(&mut err)
+            .get_opt_key("websocketAuthorityEnabled")
+            .parse_bool()
+            .unwrap_or(false);
+        if websocket_authority_enabled && websocket_url.is_none() {
+            err.push(
+                cwp.clone(),
+                eyre::eyre!("`websocketAuthorityEnabled` requires `websocketUrl`"),
+            );
+        }
+
         let relay_api_enabled = p
             .chain(&mut err)
             .get_opt_key("relayApiEnabled")
@@ -482,6 +509,8 @@ impl FromRawConf<RawRelayerSettings> for RelayerSettings {
             max_retries: max_message_retries,
             tx_id_indexing_enabled,
             igp_indexing_enabled,
+            websocket_url,
+            websocket_authority_enabled,
             relay_api_enabled,
             relay_api_port,
             relay_api_rate_limit_max_requests,
@@ -662,5 +691,52 @@ mod test {
             }],
         }))
         .expect("zero feeToken should parse");
+    }
+
+    #[test]
+    fn parses_scraper_websocket_url() {
+        let settings = parse_settings(json!({
+            "relaychains": "legacy",
+            "websocketurl": "wss://scraper.example/ws/events",
+            "chains": {
+                "legacy": chain_config("legacy", 1000),
+            },
+        }))
+        .expect("valid WebSocket URL should parse");
+
+        assert_eq!(
+            settings.websocket_url.expect("configured URL").as_str(),
+            "wss://scraper.example/ws/events"
+        );
+    }
+
+    #[test]
+    fn rejects_non_websocket_scraper_url() {
+        let error = parse_settings(json!({
+            "relaychains": "legacy",
+            "websocketurl": "https://scraper.example/ws/events",
+            "chains": {
+                "legacy": chain_config("legacy", 1000),
+            },
+        }))
+        .expect_err("HTTP URL must reject")
+        .to_string();
+
+        assert!(error.contains("must use ws:// or wss://"));
+    }
+
+    #[test]
+    fn scraper_authority_requires_websocket_url() {
+        let error = parse_settings(json!({
+            "relaychains": "legacy",
+            "websocketauthorityenabled": true,
+            "chains": {
+                "legacy": chain_config("legacy", 1000),
+            },
+        }))
+        .expect_err("authority without a WebSocket URL must reject")
+        .to_string();
+
+        assert!(error.contains("requires `websocketUrl`"));
     }
 }

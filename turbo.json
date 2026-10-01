@@ -27,6 +27,9 @@
       "cache": false
     },
     "format": {},
+    "check": {
+      "dependsOn": ["^build"]
+    },
     "version:update": {
       "cache": false
     },
@@ -36,6 +39,12 @@
     },
     "bundle": {
       "dependsOn": ["build"],
+      "env": ["RUNNER_OS", "RUNNER_ARCH"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/scripts/ncc.post-bundle.mjs",
+        "$TURBO_ROOT$/.nvmrc"
+      ],
       "outputs": ["bundle/**"]
     }
   }

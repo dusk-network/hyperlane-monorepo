@@ -6,16 +6,19 @@ import {
   Contract,
   RawArgsArray,
   RpcProvider,
-  hash,
   shortString,
 } from 'starknet';
 
 import { AltVM } from '@hyperlane-xyz/provider-sdk';
 import { ChainMetadataForAltVM } from '@hyperlane-xyz/provider-sdk/chain';
 import {
+  composeWarpDeployGas,
+  type WarpArtifactConfig,
+} from '@hyperlane-xyz/provider-sdk/warp';
+import {
   ContractType,
-  getCompiledContract,
-} from '@hyperlane-xyz/starknet-core';
+  getContractClassHash,
+} from '@hyperlane-xyz/starknet-core/runtime';
 import {
   addressToBytes32,
   assert,
@@ -41,6 +44,12 @@ import { StarknetAnnotatedTx } from '../types.js';
 
 let tokenTypeByClassHash: Map<string, AltVM.TokenType> | undefined;
 
+function getRpcSpecVersion(rpcUrl: string): '0.8.1' | '0.9.0' {
+  return /\/rpc\/v0_8(?:\/|$)/i.test(new URL(rpcUrl).pathname)
+    ? '0.8.1'
+    : '0.9.0';
+}
+
 function getTokenTypeByClassHash(): Map<string, AltVM.TokenType> {
   if (tokenTypeByClassHash) {
     return tokenTypeByClassHash;
@@ -48,27 +57,18 @@ function getTokenTypeByClassHash(): Map<string, AltVM.TokenType> {
 
   const entries = [
     [
-      hash.computeContractClassHash(
-        getCompiledContract(StarknetContractName.HYP_ERC20, ContractType.TOKEN),
-      ),
+      getContractClassHash(StarknetContractName.HYP_ERC20, ContractType.TOKEN),
       AltVM.TokenType.synthetic,
     ],
     [
-      hash.computeContractClassHash(
-        getCompiledContract(
-          StarknetContractName.HYP_ERC20_COLLATERAL,
-          ContractType.TOKEN,
-        ),
+      getContractClassHash(
+        StarknetContractName.HYP_ERC20_COLLATERAL,
+        ContractType.TOKEN,
       ),
       AltVM.TokenType.collateral,
     ],
     [
-      hash.computeContractClassHash(
-        getCompiledContract(
-          StarknetContractName.HYP_NATIVE,
-          ContractType.TOKEN,
-        ),
-      ),
+      getContractClassHash(StarknetContractName.HYP_NATIVE, ContractType.TOKEN),
       AltVM.TokenType.native,
     ],
   ] satisfies ReadonlyArray<readonly [string, AltVM.TokenType]>;
@@ -83,22 +83,34 @@ function getTokenTypeByClassHash(): Map<string, AltVM.TokenType> {
   return tokenTypeByClassHash;
 }
 
+// Warp-deploy cost breakdown for Starknet. Composed additively in
+// getMinGasForWarpDeploy() based on the WarpConfig shape. Values are native
+// denom (fri, 18 decimals).
+//
+// The base is a devnet-observed base-router deploy floor with safety margin;
+// mainnet gas prices differ, so treat it as a lower-bound advisory. Per-feature
+// deltas stay 0n pending measured feature-heavy deploys.
+const WARP_DEPLOY_BASE_FRI = 10_000_000_000_000_000_000n; // 10 STRK base router deploy
+const WARP_DEPLOY_CROSS_COLLATERAL_EXTRA_FRI = 0n; // + crossCollateral router extras
+const WARP_DEPLOY_FEE_PROGRAM_FRI = 0n; // + fee program (config.fee object)
+const WARP_DEPLOY_CUSTOM_ISM_FRI = 0n; // + custom ISM (config.interchainSecurityModule object)
+const WARP_DEPLOY_CUSTOM_HOOK_FRI = 0n; // + custom hook / IGP (config.hook object)
+
 export class StarknetProvider implements AltVM.IProvider<StarknetAnnotatedTx> {
-  static connect(
-    rpcUrls: string[],
-    _chainId: string | number,
-    extraParams?: { metadata?: ChainMetadataForAltVM },
-  ): StarknetProvider {
-    assert(extraParams?.metadata, 'metadata missing for Starknet provider');
-    const metadata = extraParams.metadata;
-    assert(rpcUrls.length > 0, 'at least one rpc url is required');
+  static connect(metadata: ChainMetadataForAltVM): StarknetProvider {
+    const rpcUrls = (metadata.rpcUrls ?? []).map(({ http }) => http);
+    const rpcUrl = rpcUrls[0];
+    assert(rpcUrl, 'at least one rpc url is required');
 
     const blockTime = metadata.blocks?.estimateBlockTime;
     const transactionRetryIntervalFallback =
       !isNullish(blockTime) && blockTime <= 1 ? 1000 : undefined;
 
     const provider = new RpcProvider({
-      nodeUrl: rpcUrls[0],
+      nodeUrl: rpcUrl,
+      // starknet.js v8 defaults to RPC 0.9, whose receipt parser does not
+      // recognize the REJECTED finality status returned by RPC 0.8 endpoints.
+      specVersion: getRpcSpecVersion(rpcUrl),
       transactionRetryIntervalFallback,
       // Default reads to the latest accepted block instead of starknet.js's
       // `pending` default. Some RPC providers reject `block_id: "pending"`
@@ -114,6 +126,18 @@ export class StarknetProvider implements AltVM.IProvider<StarknetAnnotatedTx> {
     protected readonly metadata: ChainMetadataForAltVM,
     protected readonly rpcUrls: string[],
   ) {}
+
+  async getMinGasForWarpDeploy(
+    warpConfig: WarpArtifactConfig,
+  ): Promise<bigint> {
+    return composeWarpDeployGas(warpConfig, {
+      base: WARP_DEPLOY_BASE_FRI,
+      crossCollateralExtra: WARP_DEPLOY_CROSS_COLLATERAL_EXTRA_FRI,
+      feeProgram: WARP_DEPLOY_FEE_PROGRAM_FRI,
+      customIsm: WARP_DEPLOY_CUSTOM_ISM_FRI,
+      customHook: WARP_DEPLOY_CUSTOM_HOOK_FRI,
+    });
+  }
 
   getRawProvider(): RpcProvider {
     return this.provider;
@@ -153,6 +177,7 @@ export class StarknetProvider implements AltVM.IProvider<StarknetAnnotatedTx> {
 
     if (typeof value === 'number' || typeof value === 'bigint') {
       try {
+        // oxlint-disable-next-line typescript/no-deprecated -- starknet.js v8 deprecates this but ships no public utility replacement.
         return shortString.decodeShortString(
           ensure0x(BigInt(value).toString(16)),
         );

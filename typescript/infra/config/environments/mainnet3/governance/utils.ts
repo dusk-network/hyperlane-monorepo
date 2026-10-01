@@ -28,6 +28,7 @@ import {
 } from './signers/regular.js';
 import { warpFeesSigners, warpFeesThreshold } from './signers/warpFees.js';
 import { awTimelocks } from './timelock/aw.js';
+import { irregularTimelocks } from './timelock/irregular.js';
 import { regularTimelocks } from './timelock/regular.js';
 
 export function getGovernanceTimelocks(governanceType: GovernanceType) {
@@ -39,7 +40,7 @@ export function getGovernanceTimelocks(governanceType: GovernanceType) {
     case GovernanceType.WarpFees:
       return {};
     case GovernanceType.Irregular:
-      return {};
+      return irregularTimelocks;
     case GovernanceType.OUSDT:
       return {};
     default:
@@ -172,6 +173,28 @@ export function getAllSafesForChain(chain: ChainName): string[] {
     .map((governanceType) => getGovernanceSafes(governanceType)[chain])
     .filter((safe) => safe !== undefined);
 }
+
+export function getSafesByGovernanceForChain(
+  chain: ChainName,
+): Array<{ governanceType: GovernanceType; safe: Address }> {
+  return Object.values(GovernanceType)
+    .map((governanceType) => ({
+      governanceType,
+      safe: getGovernanceSafes(governanceType)[chain],
+    }))
+    .filter(
+      (entry): entry is { governanceType: GovernanceType; safe: Address } =>
+        entry.safe !== undefined,
+    );
+}
+
+/**
+ * Turnkey "EVM Warp Fees Owner" key. Warp routes whose EVM fee contracts have
+ * been rotated to Turnkey treasury custody use this as the fee owner instead of
+ * the per-chain WarpFees Safe/ICA returned by getWarpFeeOwner.
+ */
+export const WARP_FEES_TURNKEY_OWNER: Address =
+  '0xe95C605096A1AD38BaC3E5210e145952Cbdc6998';
 
 /**
  * Get the owner address for warp fee contracts on a given chain.

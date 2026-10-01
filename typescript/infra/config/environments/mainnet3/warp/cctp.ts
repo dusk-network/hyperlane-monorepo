@@ -34,7 +34,7 @@ export const tokenMessengerV2Addresses = {
   sei: '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d',
   hyperevm: '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d',
   ink: '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d',
-  plume: '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d',
+  arc: '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d',
 } as const;
 
 export const messageTransmitterV2Addresses = {
@@ -51,7 +51,7 @@ export const messageTransmitterV2Addresses = {
   sei: '0x81D40F21F12A8F0E3252Bccb954D722d4c464B64',
   hyperevm: '0x81D40F21F12A8F0E3252Bccb954D722d4c464B64',
   ink: '0x81D40F21F12A8F0E3252Bccb954D722d4c464B64',
-  plume: '0x81D40F21F12A8F0E3252Bccb954D722d4c464B64',
+  arc: '0x81D40F21F12A8F0E3252Bccb954D722d4c464B64',
 } as const;
 
 // https://developers.circle.com/cctp/concepts/fees
@@ -60,14 +60,13 @@ export const messageTransmitterV2Addresses = {
 export const FAST_TRANSFER_FEE_BPS: Partial<
   Record<keyof typeof tokenMessengerV2Addresses, number>
 > = {
-  arbitrum: 1.3,
+  arbitrum: 1.4,
   base: 1.3,
   ethereum: 1,
   ink: 2,
-  linea: 11,
+  linea: 13,
   optimism: 1.3,
-  plume: 2,
-  unichain: 1.5,
+  unichain: 2,
   worldchain: 1.3,
 };
 
@@ -79,6 +78,7 @@ export const usdcTokenAddresses = {
   algorand: '31566704',
   aptos: '0xbae207659db88bea0cbead6da0ed00aac12edcdda169e591cd41c94180b46f3b',
   arbitrum: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',
+  arc: '0x3600000000000000000000000000000000000000',
   avalanche: '0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E',
   base: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
   bsc: '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d',
@@ -97,7 +97,6 @@ export const usdcTokenAddresses = {
   optimism: '0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85',
   polkadotassethub: '1337',
   polygon: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359',
-  plume: '0x222365EF19F7947e5484218551B56bb3965Aa7aF',
   sei: '0xe15fC38F6D8c56aF07bbCBe3BAf5708A2Bf42392',
   sonic: '0x29219dd400f2Bf60E5a23d13Be72B486D4038894',
   stellar: 'USDC-GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',

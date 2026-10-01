@@ -1,18 +1,10 @@
-import {
-  AleoKeyProvider as AleoMainnetKeyProvider,
+import type {
   AleoNetworkClient as AleoMainnetNetworkClient,
-  Account as MainnetAccount,
-  NetworkRecordProvider as MainnetNetworkRecordProvider,
   ProgramManager as MainnetProgramManager,
-  Plaintext,
 } from '@provablehq/sdk/mainnet.js';
-import {
-  AleoKeyProvider as AleoTestnetKeyProvider,
+import type {
   AleoNetworkClient as AleoTestnetNetworkClient,
-  Account as TestnetAccount,
-  NetworkRecordProvider as TestnetNetworkRecordProvider,
   ProgramManager as TestnetProgramManager,
-  getOrInitConsensusVersionTestHeights,
 } from '@provablehq/sdk/testnet.js';
 
 import { assert, retryAsync } from '@hyperlane-xyz/utils';
@@ -22,6 +14,7 @@ import {
   RETRY_ATTEMPTS,
   RETRY_DELAY_MS,
 } from '../utils/helper.js';
+import type { AleoSdk } from '../utils/provable.js';
 import { AleoNetworkId, toAleoNetworkId } from '../utils/types.js';
 
 export type AnyAleoNetworkClient =
@@ -31,8 +24,9 @@ export type AnyAleoNetworkClient =
 export type AnyProgramManager = MainnetProgramManager | TestnetProgramManager;
 
 export class AleoBase {
-  protected readonly rpcUrls: string[];
+  protected readonly rpcUrls: [string, ...string[]];
   protected readonly chainId: number;
+  protected readonly sdk: AleoSdk;
 
   protected readonly prefix: string;
 
@@ -43,20 +37,23 @@ export class AleoBase {
   protected readonly ismManager: string;
   protected readonly warpSuffix: string;
 
-  constructor(rpcUrls: string[], chainId: string | number) {
+  constructor(rpcUrls: string[], chainId: string | number, sdk: AleoSdk) {
     const aleoNetworkId = toAleoNetworkId(+chainId);
-    assert(rpcUrls.length > 0, `got no rpcUrls`);
+    const [rpcUrl, ...otherRpcUrls] = rpcUrls;
+    assert(rpcUrl, `got no rpcUrls`);
 
     // because the aleo provable sdk appends /testnet or /mainnet to the base
     // rpc automatically we need to remove it here
-    this.rpcUrls = rpcUrls.map((r) =>
-      r.replaceAll('/testnet', '').replaceAll('/mainnet', ''),
-    );
+    const normalizeRpcUrl = (url: string) =>
+      url.replaceAll('/testnet', '').replaceAll('/mainnet', '');
+    this.rpcUrls = [
+      normalizeRpcUrl(rpcUrl),
+      ...otherRpcUrls.map(normalizeRpcUrl),
+    ];
     this.chainId = aleoNetworkId;
+    this.sdk = sdk;
 
-    this.aleoClient = this.chainId
-      ? new AleoTestnetNetworkClient(this.rpcUrls[0])
-      : new AleoMainnetNetworkClient(this.rpcUrls[0]);
+    this.aleoClient = new this.sdk.AleoNetworkClient(this.rpcUrls[0]);
 
     this.skipProofs = JSON.parse(process.env['ALEO_SKIP_PROOFS'] || 'false');
     this.skipSuffixes = JSON.parse(
@@ -66,7 +63,9 @@ export class AleoBase {
       process.env['ALEO_CONSENSUS_VERSION_HEIGHTS'] || '';
 
     if (this.consensusVersionHeights) {
-      getOrInitConsensusVersionTestHeights(this.consensusVersionHeights);
+      this.sdk.getOrInitConsensusVersionTestHeights(
+        this.consensusVersionHeights,
+      );
     }
 
     this.prefix = getNetworkPrefix(aleoNetworkId);
@@ -83,42 +82,19 @@ export class AleoBase {
   }
 
   protected getProgramManager(privateKey?: string): AnyProgramManager {
-    if (this.chainId) {
-      const account = privateKey
-        ? new TestnetAccount({ privateKey })
-        : new TestnetAccount();
-
-      const keyProvider = new AleoTestnetKeyProvider();
-      keyProvider.useCache(true);
-
-      const networkRecordProvider = new TestnetNetworkRecordProvider(
-        account,
-        new AleoTestnetNetworkClient(this.rpcUrls[0]),
-      );
-
-      const programManager = new TestnetProgramManager(
-        this.rpcUrls[0],
-        keyProvider,
-        networkRecordProvider,
-      );
-      programManager.setAccount(account);
-
-      return programManager;
-    }
-
     const account = privateKey
-      ? new MainnetAccount({ privateKey })
-      : new MainnetAccount();
+      ? new this.sdk.Account({ privateKey })
+      : new this.sdk.Account();
 
-    const keyProvider = new AleoMainnetKeyProvider();
+    const keyProvider = new this.sdk.AleoKeyProvider();
     keyProvider.useCache(true);
 
-    const networkRecordProvider = new MainnetNetworkRecordProvider(
+    const networkRecordProvider = new this.sdk.NetworkRecordProvider(
       account,
-      new AleoMainnetNetworkClient(this.rpcUrls[0]),
+      new this.sdk.AleoNetworkClient(this.rpcUrls[0]),
     );
 
-    const programManager = new MainnetProgramManager(
+    const programManager = new this.sdk.ProgramManager(
       this.rpcUrls[0],
       keyProvider,
       networkRecordProvider,
@@ -177,7 +153,7 @@ export class AleoBase {
         return;
       }
 
-      return Plaintext.fromString(result).toObject();
+      return this.sdk.Plaintext.fromString(result).toObject();
     } catch (err) {
       throw new Error(
         `Failed to query mapping value for program ${programId}/${mappingName}/${key}: ${err}`,

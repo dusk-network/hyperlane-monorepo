@@ -1,10 +1,16 @@
 import { expect } from 'chai';
-import { CallData } from 'starknet';
+import { CallData, hash } from 'starknet';
 
 import {
-  ContractType,
+  getCompiledClassHash,
   getCompiledContract,
 } from '@hyperlane-xyz/starknet-core';
+import {
+  ContractType,
+  getContractAbi,
+  getContractClassHash,
+  getRuntimeContractNames,
+} from '@hyperlane-xyz/starknet-core/runtime';
 import { ZERO_ADDRESS_HEX_32 } from '@hyperlane-xyz/utils';
 
 import {
@@ -66,7 +72,7 @@ describe('starknet-sdk contracts helpers', () => {
   });
 
   it('compiles calldata when populateTransaction helper is unavailable', async () => {
-    const { abi } = getCompiledContract(
+    const abi = getContractAbi(
       StarknetContractName.HYP_ERC20,
       ContractType.TOKEN,
     );
@@ -83,6 +89,46 @@ describe('starknet-sdk contracts helpers', () => {
     );
     expect(tx.entrypoint).to.equal('owner');
     expect(tx.calldata).to.deep.equal(new CallData(abi).compile('owner', []));
+  });
+
+  it('publishes runtime data matching deployment artifacts in every group', function () {
+    // starknet.js v8's computeContractClassHash is ~2-4s per artifact (~130s total).
+    this.timeout(300_000);
+
+    for (const contractType of Object.values(ContractType)) {
+      const contractNames = getRuntimeContractNames(contractType);
+      expect(contractNames).not.to.be.empty;
+
+      for (const name of contractNames) {
+        const compiledContract = getCompiledContract(name, contractType);
+
+        expect(getContractAbi(name, contractType)).to.deep.equal(
+          compiledContract.abi,
+        );
+        expect(getContractClassHash(name, contractType)).to.equal(
+          hash.computeContractClassHash(compiledContract),
+        );
+      }
+    }
+  });
+
+  it('computes compiled class hashes for both Starknet hash eras', function () {
+    this.timeout(30_000);
+
+    expect(getCompiledClassHash('mailbox')).to.equal(
+      '0x188e5a5af7c6e8805709a50e5266abd92d99130ef21f1df948fe81d1afffde',
+    );
+    expect(
+      getCompiledClassHash('mailbox', ContractType.CONTRACT, '0.14.1'),
+    ).to.equal(
+      '0x434b65e8120a34ab8b2e7c5940636b45ede0d6fcaa15af741c52569496fa168',
+    );
+  });
+
+  it('throws when runtime data does not own the requested contract', () => {
+    for (const name of ['missing-contract', 'toString']) {
+      expect(() => getContractAbi(name)).to.throw('CONTRACT_NOT_FOUND');
+    }
   });
 
   it('throws when coercing bigint values above the safe integer range', () => {

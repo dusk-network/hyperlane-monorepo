@@ -1,12 +1,15 @@
 use std::sync::Arc;
 
+use serde_json::{json, Value};
 use solana_client::{
+    client_error::ClientError,
     nonblocking::rpc_client::RpcClient,
     rpc_client::{GetConfirmedSignaturesForAddress2Config, SerializableTransaction},
     rpc_config::{
         RpcBlockConfig, RpcProgramAccountsConfig, RpcSendTransactionConfig,
         RpcSimulateTransactionConfig, RpcTransactionConfig,
     },
+    rpc_request::RpcRequest,
     rpc_response::{
         Response, RpcConfirmedTransactionStatusWithSignature, RpcSimulateTransactionResult,
     },
@@ -21,8 +24,8 @@ use solana_sdk::{
     transaction::{Transaction, VersionedTransaction},
 };
 use solana_transaction_status::{
-    EncodedConfirmedTransactionWithStatusMeta, TransactionStatus, UiConfirmedBlock,
-    UiTransactionEncoding,
+    EncodedConfirmedTransactionWithStatusMeta, TransactionDetails, TransactionStatus,
+    UiConfirmedBlock, UiTransactionEncoding,
 };
 
 use hyperlane_core::{rpc_clients::BlockNumberGetter, ChainCommunicationError, ChainResult, U256};
@@ -32,9 +35,49 @@ use crate::tx_type::SealevelTxType;
 
 /// Wrapper struct around Solana's RpcClient
 #[derive(Clone)]
-pub struct SealevelRpcClient(Arc<RpcClient>);
+pub struct SealevelRpcClient {
+    client: Arc<RpcClient>,
+    max_supported_transaction_version: u8,
+}
 
 impl SealevelRpcClient {
+    async fn get_signature_statuses_with_config(
+        &self,
+        signatures: &[Signature],
+        search_transaction_history: bool,
+    ) -> ChainResult<Response<Vec<Option<TransactionStatus>>>> {
+        let signatures = signatures
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let params = if search_transaction_history {
+            json!([signatures, { "searchTransactionHistory": true }])
+        } else {
+            json!([signatures])
+        };
+        let mut response: Value = self
+            .client
+            .send(RpcRequest::GetSignatureStatuses, params)
+            .await
+            .map_err(ChainCommunicationError::from_other)?;
+
+        // Some providers return an empty optional API version. Preserve valid
+        // versions while treating only the empty value as absent.
+        if let Some(api_version) = response.pointer_mut("/context/apiVersion") {
+            if api_version.as_str() == Some("") {
+                *api_version = Value::Null;
+            }
+        }
+
+        serde_json::from_value(response)
+            .map_err(|error| {
+                ClientError::new_with_request(error.into(), RpcRequest::GetSignatureStatuses)
+            })
+            .map_err(Box::new)
+            .map_err(HyperlaneSealevelError::ClientError)
+            .map_err(Into::into)
+    }
+
     /// constructor
     pub fn new(rpc_endpoint: String) -> Self {
         let rpc_client =
@@ -44,12 +87,22 @@ impl SealevelRpcClient {
 
     /// constructor with an rpc client
     pub fn from_rpc_client(rpc_client: Arc<RpcClient>) -> Self {
-        Self(rpc_client)
+        Self {
+            client: rpc_client,
+            max_supported_transaction_version: 0,
+        }
+    }
+
+    /// Select the highest transaction version accepted by this chain's JSON readers.
+    /// This does not change the format used to submit transactions.
+    pub fn with_max_supported_transaction_version(mut self, version: u8) -> Self {
+        self.max_supported_transaction_version = version;
+        self
     }
 
     /// Get Url
     pub fn url(&self) -> String {
-        self.0.url()
+        self.client.url()
     }
 
     /// confirm transaction with given commitment
@@ -58,7 +111,7 @@ impl SealevelRpcClient {
         signature: &Signature,
         commitment: CommitmentConfig,
     ) -> ChainResult<bool> {
-        self.0
+        self.client
             .confirm_transaction_with_commitment(signature, commitment)
             .await
             .map(|ctx| ctx.value)
@@ -93,7 +146,7 @@ impl SealevelRpcClient {
         commitment: CommitmentConfig,
     ) -> ChainResult<Option<Account>> {
         let account = self
-            .0
+            .client
             .get_account_with_commitment(pubkey, commitment)
             .await
             .map_err(ChainCommunicationError::from_other)?
@@ -104,7 +157,7 @@ impl SealevelRpcClient {
     /// get balance
     pub async fn get_balance(&self, pubkey: &Pubkey) -> ChainResult<U256> {
         let balance = self
-            .0
+            .client
             .get_balance(pubkey)
             .await
             .map_err(Box::new)
@@ -120,13 +173,11 @@ impl SealevelRpcClient {
         slot: u64,
         commitment: CommitmentConfig,
     ) -> ChainResult<UiConfirmedBlock> {
-        let config = RpcBlockConfig {
-            commitment: Some(commitment),
-            max_supported_transaction_version: Some(0),
-            ..Default::default()
-        };
-        self.0
-            .get_block_with_config(slot, config)
+        self.client
+            .get_block_with_config(
+                slot,
+                block_config(commitment, self.max_supported_transaction_version),
+            )
             .await
             .map_err(Box::new)
             .map_err(HyperlaneSealevelError::ClientError)
@@ -139,9 +190,19 @@ impl SealevelRpcClient {
             .await
     }
 
+    /// Get block metadata without downloading transactions.
+    pub async fn get_block_info(&self, slot: u64) -> ChainResult<UiConfirmedBlock> {
+        self.client
+            .get_block_with_config(slot, block_info_config(CommitmentConfig::finalized()))
+            .await
+            .map_err(Box::new)
+            .map_err(HyperlaneSealevelError::ClientError)
+            .map_err(Into::into)
+    }
+
     /// get block_height
     pub async fn get_block_height(&self) -> ChainResult<u64> {
-        self.0
+        self.client
             .get_block_height()
             .await
             .map_err(Box::new)
@@ -151,7 +212,7 @@ impl SealevelRpcClient {
 
     /// get minimum balance for rent exemption
     pub async fn get_minimum_balance_for_rent_exemption(&self, len: usize) -> ChainResult<u64> {
-        self.0
+        self.client
             .get_minimum_balance_for_rent_exemption(len)
             .await
             .map_err(ChainCommunicationError::from_other)
@@ -163,7 +224,7 @@ impl SealevelRpcClient {
         pubkeys: &[Pubkey],
     ) -> ChainResult<Vec<Option<Account>>> {
         let accounts = self
-            .0
+            .client
             .get_multiple_accounts_with_commitment(pubkeys, CommitmentConfig::finalized())
             .await
             .map_err(ChainCommunicationError::from_other)?
@@ -177,7 +238,7 @@ impl SealevelRpcClient {
         &self,
         commitment: CommitmentConfig,
     ) -> ChainResult<Hash> {
-        self.0
+        self.client
             .get_latest_blockhash_with_commitment(commitment)
             .await
             .map_err(ChainCommunicationError::from_other)
@@ -190,7 +251,7 @@ impl SealevelRpcClient {
         pubkey: &Pubkey,
         config: RpcProgramAccountsConfig,
     ) -> ChainResult<Vec<(Pubkey, Account)>> {
-        self.0
+        self.client
             .get_program_accounts_with_config(pubkey, config)
             .await
             .map_err(ChainCommunicationError::from_other)
@@ -207,7 +268,7 @@ impl SealevelRpcClient {
             limit: Some(limit),
             ..Default::default()
         };
-        self.0
+        self.client
             .get_signatures_for_address_with_config(address, config)
             .await
             .map_err(ChainCommunicationError::from_other)
@@ -218,10 +279,17 @@ impl SealevelRpcClient {
         &self,
         signatures: &[Signature],
     ) -> ChainResult<Response<Vec<Option<TransactionStatus>>>> {
-        self.0
-            .get_signature_statuses(signatures)
+        self.get_signature_statuses_with_config(signatures, false)
             .await
-            .map_err(ChainCommunicationError::from_other)
+    }
+
+    /// Get signature statuses, including rooted transaction history.
+    pub async fn get_signature_statuses_with_history(
+        &self,
+        signatures: &[Signature],
+    ) -> ChainResult<Response<Vec<Option<TransactionStatus>>>> {
+        self.get_signature_statuses_with_config(signatures, true)
+            .await
     }
 
     /// get slot
@@ -237,7 +305,7 @@ impl SealevelRpcClient {
 
     /// get slot
     pub async fn get_slot_raw(&self) -> ChainResult<Slot> {
-        self.0
+        self.client
             .get_slot_with_commitment(CommitmentConfig::finalized())
             .await
             .map_err(ChainCommunicationError::from_other)
@@ -252,9 +320,9 @@ impl SealevelRpcClient {
         let config = RpcTransactionConfig {
             encoding: Some(UiTransactionEncoding::JsonParsed),
             commitment: Some(commitment),
-            max_supported_transaction_version: Some(0),
+            max_supported_transaction_version: Some(self.max_supported_transaction_version),
         };
-        self.0
+        self.client
             .get_transaction_with_config(signature, config)
             .await
             .map_err(Box::new)
@@ -273,7 +341,7 @@ impl SealevelRpcClient {
 
     /// check if block hash is valid
     pub async fn is_blockhash_valid(&self, hash: &Hash) -> ChainResult<bool> {
-        self.0
+        self.client
             .is_blockhash_valid(hash, CommitmentConfig::processed())
             .await
             .map_err(ChainCommunicationError::from_other)
@@ -285,7 +353,7 @@ impl SealevelRpcClient {
         transaction: &Transaction,
         skip_preflight: bool,
     ) -> ChainResult<Signature> {
-        self.0
+        self.client
             .send_transaction_with_config(
                 transaction,
                 RpcSendTransactionConfig {
@@ -303,7 +371,7 @@ impl SealevelRpcClient {
         transaction: &VersionedTransaction,
         skip_preflight: bool,
     ) -> ChainResult<Signature> {
-        self.0
+        self.client
             .send_transaction_with_config(
                 transaction,
                 RpcSendTransactionConfig {
@@ -338,7 +406,7 @@ impl SealevelRpcClient {
         transaction: &impl SerializableTransaction,
     ) -> ChainResult<RpcSimulateTransactionResult> {
         let result = self
-            .0
+            .client
             .simulate_transaction_with_config(
                 transaction,
                 RpcSimulateTransactionConfig {
@@ -382,7 +450,7 @@ impl SealevelRpcClient {
 
 impl std::fmt::Debug for SealevelRpcClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "RpcClient {{ url: {} }}", self.0.url())
+        write!(f, "RpcClient {{ url: {} }}", self.client.url())
     }
 }
 
@@ -390,6 +458,31 @@ impl std::fmt::Debug for SealevelRpcClient {
 impl BlockNumberGetter for SealevelRpcClient {
     async fn get_block_number(&self) -> ChainResult<u64> {
         self.get_block_height().await
+    }
+}
+
+/// Builds the `getBlock` request config. Rewards are explicitly disabled: the
+/// scraper/indexer only reads blockhash, block_time, and transactions, never
+/// rewards. Requesting rewards makes getBlock fail to deserialize when a block
+/// carries a reward_type our pinned solana crates don't know (e.g.
+/// `DeactivatedStake`), and because SerdeJson errors aren't classified as
+/// skippable this permanently stalls the sequence-aware cursor.
+fn block_config(commitment: CommitmentConfig, max_version: u8) -> RpcBlockConfig {
+    RpcBlockConfig {
+        commitment: Some(commitment),
+        // JSON exposes the accounts/instructions we index for legacy, v0 and v1.
+        // Never request binary: the sending SDK does not decode v1 wire messages.
+        encoding: Some(UiTransactionEncoding::Json),
+        max_supported_transaction_version: Some(max_version),
+        rewards: Some(false),
+        ..Default::default()
+    }
+}
+
+fn block_info_config(commitment: CommitmentConfig) -> RpcBlockConfig {
+    RpcBlockConfig {
+        transaction_details: Some(TransactionDetails::None),
+        ..block_config(commitment, 0)
     }
 }
 

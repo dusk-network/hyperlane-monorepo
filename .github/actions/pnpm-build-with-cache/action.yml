@@ -5,12 +5,11 @@ inputs:
   build-filter:
     description: 'Optional turbo filter to scope the build (e.g. @hyperlane-xyz/cli...)'
     required: false
-
 runs:
   using: 'composite'
   steps:
     - name: Setup Node
-      uses: actions/setup-node@v6
+      uses: actions/setup-node@v7
       with:
         node-version-file: .nvmrc
 
@@ -22,10 +21,12 @@ runs:
       uses: ./.github/actions/pnpm-cache
 
     - name: Cache Hardhat compilers
-      uses: actions/cache@v5
+      uses: actions/cache@v6
       with:
-        path: ~/.cache/hardhat-nodejs/compilers-v2
-        key: hardhat-compilers-${{ runner.os }}
+        path: |
+          ~/.cache/hardhat-nodejs/compilers-v2
+          ~/.tron/solc
+        key: contract-compilers-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('solidity/rootHardhatConfig.cts', 'solidity/tron-hardhat.config.cts', 'solidity/plugins/hardhat-tron-solc.cts') }}
 
     # Always run install - pnpm needs to create symlinks from the cached store
     # The cache makes this much faster by restoring the pnpm store
@@ -35,9 +36,11 @@ runs:
 
     - name: Build
       shell: bash
+      env:
+        BUILD_FILTER: ${{ inputs.build-filter }}
       run: |
-        if [ -n "${{ inputs.build-filter }}" ]; then
-          pnpm exec turbo run build --filter='${{ inputs.build-filter }}'
+        if [ -n "$BUILD_FILTER" ]; then
+          pnpm exec turbo run build --filter="$BUILD_FILTER"
         else
           pnpm run build
         fi

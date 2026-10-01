@@ -16,33 +16,20 @@ import { EnvironmentConfig } from '../src/config/environment.js';
 import { RouterConfigWithoutOwner } from '../src/config/warp.js';
 
 import { getAleoUSDCWarpConfig } from './environments/mainnet3/warp/configGetters/getAleoUSDCWarpConfig.js';
-import { getAppChainBaseUSDCWarpConfig } from './environments/mainnet3/warp/configGetters/getAppchainBaseUSDCWarpConfig.js';
-import {
-  getArbitrumAvalancheBaseBscEthereumLumiaprismOptimismPolygonLUMIAWarpConfig,
-  getLUMIAGnosisSafeBuilderStrategyConfig,
-} from './environments/mainnet3/warp/configGetters/getArbitrumAvalancheBaseBscEthereumLumiaprismOptimismPolygonLUMIAWarpConfig.js';
-import {
-  getArbitrumBaseEthereumLumiaprismOptimismPolygonETHGnosisSafeBuilderStrategyConfig,
-  getArbitrumBaseEthereumLumiaprismOptimismPolygonETHWarpConfig,
-} from './environments/mainnet3/warp/configGetters/getArbitrumBaseEthereumLumiaprismOptimismPolygonETHWarpConfig.js';
-import { getBaseEthereumSuperseedCBBTCWarpConfig } from './environments/mainnet3/warp/configGetters/getBaseEthereumSuperseedCBBTCWarpConfig.js';
-import { getTRUMPWarpConfig } from './environments/mainnet3/warp/configGetters/getBaseSolanaTRUMPWarpConfig.js';
-import { getBscHyperevmEnzoBTCWarpConfig } from './environments/mainnet3/warp/configGetters/getBscHyperevmEnzoBTCWarpConfig.js';
-import { getBscHyperevmSTBTCWarpConfig } from './environments/mainnet3/warp/configGetters/getBscHyperevmSTBTCWarpConfig.js';
+
 import {
   getCCTPV1StrategyConfig,
   getCCTPV1WarpConfig,
+  getCCTPV2FastStagingWarpConfig,
   getCCTPV2FastWarpConfig,
+  getCCTPV2StandardStagingWarpConfig,
   getCCTPV2StandardWarpConfig,
   getCCTPV2StrategyConfig,
 } from './environments/mainnet3/warp/configGetters/getCCTPConfig.js';
 import { getCarrChainCARRWarpConfig } from './environments/mainnet3/warp/configGetters/getCarrchainCARRWarpConfig.js';
-import { getCarchainnUSDCWarpConfig } from './environments/mainnet3/warp/configGetters/getCarrchainUSDCWarpConfig.js';
-import { getCarchainnUSDTWarpConfig } from './environments/mainnet3/warp/configGetters/getCarrchainUSDTWarpConfig.js';
-import { getCarchainnWBTCWarpConfig } from './environments/mainnet3/warp/configGetters/getCarrchainWBTCWarpConfig.js';
 import { getEclipseEthereumESWarpConfig } from './environments/mainnet3/warp/configGetters/getEclipseEthereumESWarpConfig.js';
 import {
-  getEclipseUSDTGnosisSafeBuilderStrategyConfig,
+  getEclipseUSDTStrategyConfig,
   getEclipseUSDTWarpConfig,
 } from './environments/mainnet3/warp/configGetters/getEclipseUSDTWarpConfig.js';
 import { getEclipseEthereumWBTCWarpConfig } from './environments/mainnet3/warp/configGetters/getEclipseEthereumWBTCWarpConfig.js';
@@ -68,20 +55,13 @@ import {
   getEniWbtcWarpConfig,
 } from './environments/mainnet3/warp/configGetters/getEniWarpConfigs.js';
 import { getEthereumInkUSDCConfig } from './environments/mainnet3/warp/configGetters/getEthereumInkUSDCWarpConfig.js';
-import { getEthereumLineaTurtleWarpConfig } from './environments/mainnet3/warp/configGetters/getEthereumLineaTurtleWarpConfig.js';
 import { getEthereumVictionUSDCWarpConfig } from './environments/mainnet3/warp/configGetters/getEthereumVictionUSDCWarpConfig.js';
 import { getEthereumVictionUSDTWarpConfig } from './environments/mainnet3/warp/configGetters/getEthereumVictionUSDTWarpConfig.js';
-import { getLumiaUSDCWarpConfig } from './environments/mainnet3/warp/configGetters/getLumiaUSDCWarpConfig.js';
 import { getMantraUSDCWarpConfig } from './environments/mainnet3/warp/configGetters/getMantraUSDCWarpConfig.js';
-import {
-  getMatchainUSDCStrategyConfig,
-  getMatchainUSDCWarpConfig,
-} from './environments/mainnet3/warp/configGetters/getMatchainUSDCWarpConfig.js';
 import { getMitosisMITOWarpConfig } from './environments/mainnet3/warp/configGetters/getMitosisMITOWarpConfig.js';
 import { getETHStageWarpConfig } from './environments/mainnet3/warp/configGetters/getETHStageWarpConfig.js';
 import { getParadexUSDCWarpConfig } from './environments/mainnet3/warp/configGetters/getParadexUSDCWarpConfig.js';
 import { getPulsechainUSDCWarpConfig } from './environments/mainnet3/warp/configGetters/getPulsechainUSDCWarpConfig.js';
-import { getRadixUSDCWarpConfig } from './environments/mainnet3/warp/configGetters/getRadixUSDCWarpConfig.js';
 import { getEZETHFileSubmitterStrategyConfig } from './environments/mainnet3/warp/configGetters/getRenzoEZETHWarpConfig.js';
 import { getREZBaseEthereumWarpConfig } from './environments/mainnet3/warp/configGetters/getRenzoREZBaseEthereum.js';
 import {
@@ -89,10 +69,7 @@ import {
   getRezStagingWarpConfig,
 } from './environments/mainnet3/warp/configGetters/getRenzoREZStaging.js';
 import { getSubtensorUSDCWarpConfig } from './environments/mainnet3/warp/configGetters/getSubtensorUSDCWarpConfig.js';
-import {
-  getSuperseedUSDCStrategyConfig,
-  getSuperseedUSDCWarpConfig,
-} from './environments/mainnet3/warp/configGetters/getSuperseedUSDCWarpConfig.js';
+
 import {
   getVictionETHStrategyConfig,
   getVictionETHWarpConfig,
@@ -101,10 +78,15 @@ import {
   getoXAUTGnosisSafeSubmitterStrategyConfig,
   getoXAUTTokenProductionWarpConfig,
 } from './environments/mainnet3/warp/configGetters/getoXAUTTokenWarpConfig.js';
+import {
+  getoUSDTTokenProductionWarpConfig,
+  getoUSDTTokenStagingWarpConfig,
+} from './environments/mainnet3/warp/configGetters/getoUSDTTokenWarpConfig.js';
 import { WarpRouteIds } from './environments/mainnet3/warp/warpIds.js';
 import { getCCTPWarpConfig as getTestnetCCTPWarpConfig } from './environments/testnet4/warp/getCCTPConfig.js';
 import { DEFAULT_REGISTRY_URI } from './registry.js';
 import { getUSDCCitreaIronBridgeWarpConfig } from './environments/mainnet3/warp/configGetters/getUSDCCitreaIronBridgeWarpConfig.js';
+import { getCrossMoonpayLocalBridgeWarpConfig } from './environments/mainnet3/warp/configGetters/getCrossMoonpayLocalBridgeWarpConfig.js';
 import { getUSDCCitreaMoonpayWarpConfig } from './environments/mainnet3/warp/configGetters/getUSDCCitreaMoonpayWarpConfig.js';
 import { getUSDCCitreaMoonpayStagingWarpConfig } from './environments/mainnet3/warp/configGetters/getUSDCCitreaMoonpayStagingWarpConfig.js';
 import { getUSDTCitreaMoonpayWarpConfig } from './environments/mainnet3/warp/configGetters/getUSDTCitreaMoonpayWarpConfig.js';
@@ -120,8 +102,6 @@ type WarpConfigGetter = (
 ) => Promise<ChainMap<HypTokenRouterConfig>>;
 
 export const warpConfigGetterMap: Record<string, WarpConfigGetter> = {
-  [WarpRouteIds.ArbitrumAvalancheBaseFlowmainnetFormOptimismSolanamainnetWorldchainTRUMP]:
-    getTRUMPWarpConfig,
   [WarpRouteIds.EthereumInkUSDC]: getEthereumInkUSDCConfig,
   [WarpRouteIds.VictionETH]: getVictionETHWarpConfig,
   [WarpRouteIds.EthereumVictionUSDC]: getEthereumVictionUSDCWarpConfig,
@@ -134,38 +114,26 @@ export const warpConfigGetterMap: Record<string, WarpConfigGetter> = {
   [WarpRouteIds.BaseEthereumREZ]: getREZBaseEthereumWarpConfig,
   [WarpRouteIds.BaseEthereumREZSTAGING]: getRezStagingWarpConfig,
   [WarpRouteIds.CarrChainCARR]: getCarrChainCARRWarpConfig,
-  [WarpRouteIds.AppchainBaseUSDC]: getAppChainBaseUSDCWarpConfig,
-  [WarpRouteIds.BaseEthereumSuperseedCBBTC]:
-    getBaseEthereumSuperseedCBBTCWarpConfig,
-  [WarpRouteIds.SuperseedUSDC]: getSuperseedUSDCWarpConfig,
   [WarpRouteIds.EclipseEthereumES]: getEclipseEthereumESWarpConfig,
   // TODO: uncomment after merging the staging route to registry
   // this has been commented out as it leads to check-warp-deploy cron job failing
   [WarpRouteIds.oXAUT]: getoXAUTTokenProductionWarpConfig,
-  [WarpRouteIds.ArbitrumBaseEthereumLumiaprismOptimismPolygonETH]:
-    getArbitrumBaseEthereumLumiaprismOptimismPolygonETHWarpConfig,
-  [WarpRouteIds.BscHyperevmEnzoBTC]: getBscHyperevmEnzoBTCWarpConfig,
-  [WarpRouteIds.BscHyperevmSTBTC]: getBscHyperevmSTBTCWarpConfig,
-  [WarpRouteIds.EthereumLineaTURTLE]: getEthereumLineaTurtleWarpConfig,
-  [WarpRouteIds.ArbitrumAvalancheBaseBscEthereumLumiaprismOptimismPolygonLUMIA]:
-    getArbitrumAvalancheBaseBscEthereumLumiaprismOptimismPolygonLUMIAWarpConfig,
+  [WarpRouteIds.oUSDT]: getoUSDTTokenProductionWarpConfig,
+  [WarpRouteIds.oUSDTSTAGE]: getoUSDTTokenStagingWarpConfig,
   [WarpRouteIds.SubtensorUSDC]: getSubtensorUSDCWarpConfig,
   [WarpRouteIds.ParadexUSDC]: getParadexUSDCWarpConfig,
   [WarpRouteIds.TestnetCCTPV1]: getTestnetCCTPWarpConfig,
   [WarpRouteIds.MainnetCCTPV1]: getCCTPV1WarpConfig,
   [WarpRouteIds.MainnetCCTPV2Fast]: getCCTPV2FastWarpConfig,
   [WarpRouteIds.MainnetCCTPV2Standard]: getCCTPV2StandardWarpConfig,
-  [WarpRouteIds.LumiaUSDC]: getLumiaUSDCWarpConfig,
-  [WarpRouteIds.MatchainUSDC]: getMatchainUSDCWarpConfig,
+  [WarpRouteIds.MainnetCCTPV2StandardStaging]:
+    getCCTPV2StandardStagingWarpConfig,
+  [WarpRouteIds.MainnetCCTPV2FastStaging]: getCCTPV2FastStagingWarpConfig,
   [WarpRouteIds.MitosisMITO]: getMitosisMITOWarpConfig,
-  [WarpRouteIds.RadixUSDC]: getRadixUSDCWarpConfig,
   [WarpRouteIds.PulsechainUSDC]: getPulsechainUSDCWarpConfig,
   [WarpRouteIds.ElectroneumUSDC]: getElectroneumUSDCWarpConfig,
   [WarpRouteIds.IgraUSDC]: getIgraUSDCWarpConfig,
   [WarpRouteIds.MantraUSDC]: getMantraUSDCWarpConfig,
-  [WarpRouteIds.CarrChainUSDC]: getCarchainnUSDCWarpConfig,
-  [WarpRouteIds.CarrChainUSDT]: getCarchainnUSDTWarpConfig,
-  [WarpRouteIds.CarrChainWBTC]: getCarchainnWBTCWarpConfig,
   [WarpRouteIds.EniETH]: getEniEthWarpConfig,
   [WarpRouteIds.EniWBTC]: getEniWbtcWarpConfig,
   [WarpRouteIds.EniUSDC]: getEniUsdcWarpConfig,
@@ -182,28 +150,24 @@ export const warpConfigGetterMap: Record<string, WarpConfigGetter> = {
     getUSDCCitreaMoonpayStagingWarpConfig,
   [WarpRouteIds.USDTCitreaMoonpaySTAGING]:
     getUSDTCitreaMoonpayStagingWarpConfig,
+  [WarpRouteIds.CROSSMoonpayLocalBridgeUSDT]:
+    getCrossMoonpayLocalBridgeWarpConfig,
 };
 
 type StrategyConfigGetter = () => ChainSubmissionStrategy;
 export const strategyConfigGetterMap: Record<string, StrategyConfigGetter> = {
-  [WarpRouteIds.ArbitrumAvalancheBaseBscEthereumLumiaprismOptimismPolygonLUMIA]:
-    getLUMIAGnosisSafeBuilderStrategyConfig,
-  [WarpRouteIds.ArbitrumBaseEthereumLumiaprismOptimismPolygonETH]:
-    getArbitrumBaseEthereumLumiaprismOptimismPolygonETHGnosisSafeBuilderStrategyConfig,
   [WarpRouteIds.BaseEthereumREZ]: getEZETHFileSubmitterStrategyConfig,
   [WarpRouteIds.BaseEthereumREZSTAGING]:
     getRezStagingGnosisSafeBuilderStrategyConfig,
   [WarpRouteIds.EclipseUSDC]: getEclipseUSDCStrategyConfig,
-  [WarpRouteIds.EclipseUSDT]: getEclipseUSDTGnosisSafeBuilderStrategyConfig,
+  [WarpRouteIds.EclipseUSDT]: getEclipseUSDTStrategyConfig,
   [WarpRouteIds.IgraUSDC]: getIgraUSDCStrategyConfig,
   [WarpRouteIds.EclipseUSDCSTAGE]:
     getUSDCSTAGEEclipseFileSubmitterStrategyConfig,
   [WarpRouteIds.MainnetCCTPV1]: getCCTPV1StrategyConfig,
   [WarpRouteIds.MainnetCCTPV2Fast]: getCCTPV2StrategyConfig,
   [WarpRouteIds.MainnetCCTPV2Standard]: getCCTPV2StrategyConfig,
-  [WarpRouteIds.MatchainUSDC]: getMatchainUSDCStrategyConfig,
   [WarpRouteIds.oXAUT]: getoXAUTGnosisSafeSubmitterStrategyConfig,
-  [WarpRouteIds.SuperseedUSDC]: getSuperseedUSDCStrategyConfig,
   [WarpRouteIds.VictionETH]: getVictionETHStrategyConfig,
 };
 

@@ -12,17 +12,21 @@ import { MultiProvider } from '../providers/MultiProvider.js';
 import { ChainMap, ChainName } from '../types.js';
 
 import { ChainMetadataSchemaObject } from './chainMetadataTypes.js';
-import { ZHash, ZNzUint, ZUWei, ZUint } from './customZodTypes.js';
+import { ZHash, ZNzUint, ZUWei } from './customZodTypes.js';
 import {
   HyperlaneDeploymentArtifacts,
   HyperlaneDeploymentArtifactsSchema,
 } from './deploymentArtifacts.js';
 import { MatchingListSchema } from './matchingList.js';
 
+// Keep in sync with MAX_SIGN_CONCURRENCY in the validator settings parser.
+const MAX_SIGN_CONCURRENCY = 1_000;
+
 export enum RpcConsensusType {
   Single = 'single',
   Fallback = 'fallback',
   Quorum = 'quorum',
+  Majority = 'majority',
 }
 
 export enum AgentLogLevel {
@@ -48,6 +52,7 @@ export enum AgentIndexMode {
 
 export enum AgentSignerKeyType {
   Aws = 'aws',
+  Gcp = 'gcp',
   Hex = 'hexKey',
   Node = 'node',
   Cosmos = 'cosmosKey',
@@ -90,6 +95,21 @@ const AgentSignerAwsKeySchema = z
   .describe(
     'An AWS signer. Note that AWS credentials must be inserted into the env separately.',
   );
+const AgentSignerGcpKeySchema = z
+  .object({
+    // Required, unlike Hex/Aws's optional `type` - those stay optional only
+    // for backward compat with configs written before those had a
+    // discriminant; Gcp has no such pre-discriminant format to preserve, and
+    // an optional type here would let `signerType` resolve to `undefined`,
+    // silently skipping the protocol-signer refinement below.
+    type: z.literal(AgentSignerKeyType.Gcp),
+    keyVersionName: z
+      .string()
+      .describe('The full GCP KMS CryptoKeyVersion resource name'),
+  })
+  .describe(
+    'A GCP Cloud KMS signer. Note that GCP credentials (e.g. Workload Identity) must be available in the env separately.',
+  );
 const AgentSignerCosmosKeySchema = z
   .object({
     type: z.literal(AgentSignerKeyType.Cosmos),
@@ -113,12 +133,14 @@ const AgentSignerNodeSchema = z
 const AgentSignerSchema = z.union([
   AgentSignerHexKeySchema,
   AgentSignerAwsKeySchema,
+  AgentSignerGcpKeySchema,
   AgentSignerCosmosKeySchema,
   AgentSignerNodeSchema,
   AgentSignerRadixKeySchema,
 ]);
 
 export type AgentSignerHexKey = z.infer<typeof AgentSignerHexKeySchema>;
+export type AgentSignerGcpKey = z.infer<typeof AgentSignerGcpKeySchema>;
 export type AgentSignerAwsKey = z.infer<typeof AgentSignerAwsKeySchema>;
 export type AgentSignerCosmosKey = z.infer<typeof AgentSignerNodeSchema>;
 export type AgentSignerNode = z.infer<typeof AgentSignerNodeSchema>;
@@ -153,13 +175,16 @@ export type AgentCosmosGasPrice = z.infer<
 >['gasPrice'];
 
 const AgentSealevelChainMetadataSchema = z.object({
+  maxSupportedTransactionVersion: z
+    .union([z.literal(0), z.literal(1)])
+    .optional(),
   priorityFeeOracle: z
     .union([
       z.object({
         type: z.literal(AgentSealevelPriorityFeeOracleType.Helius),
         url: z.string(),
         // TODO add options
-        feeLevel: z.nativeEnum(AgentSealevelHeliusFeeLevel),
+        feeLevel: z.enum(AgentSealevelHeliusFeeLevel),
       }),
       z.object({
         type: z.literal(AgentSealevelPriorityFeeOracleType.Constant),
@@ -170,27 +195,43 @@ const AgentSealevelChainMetadataSchema = z.object({
     .optional(),
   transactionSubmitter: z
     .object({
-      type: z.nativeEnum(AgentSealevelTransactionSubmitterType),
+      type: z.enum(AgentSealevelTransactionSubmitterType),
       url: z.string().optional(),
     })
     .optional(),
+  mailboxProcessAlt: z
+    .string()
+    .optional()
+    .describe('Legacy single ALT for Mailbox.process transactions.'),
+  mailboxProcessAlts: z
+    .array(z.string())
+    .min(1)
+    .optional()
+    .describe('ALTs used for Mailbox.process transactions, in compile order.'),
   processAltOverrides: z
     .union([
       z.array(
-        z.object({
-          matchingList: MatchingListSchema,
-          addressLookupTable: z.string(),
-        }),
+        z.union([
+          z.object({
+            matchingList: MatchingListSchema,
+            addressLookupTables: z.array(z.string()).min(1),
+          }),
+          z.object({
+            matchingList: MatchingListSchema,
+            addressLookupTable: z.string(),
+            addressLookupTables: z.never().optional(),
+          }),
+        ]),
       ),
       z.string().min(1),
     ])
     .optional()
     .describe(
-      'Per-message ALT overrides. Array of {matchingList, addressLookupTable} or JSON string.',
+      'Per-message ALT overrides. Accepts legacy addressLookupTable or plural addressLookupTables.',
     ),
   urReveal: z
     .object({
-      ccsUrl: z.string().url().describe('CCS endpoint for calldata lookup'),
+      ccsUrl: z.url().describe('CCS endpoint for calldata lookup'),
       programId: z
         .string()
         .refine((val) => {
@@ -221,8 +262,15 @@ export type AgentSealevelTransactionSubmitter =
 
 export type AgentSealevelUrReveal = AgentSealevelChainMetadata['urReveal'];
 
-export const AgentChainMetadataSchema = ChainMetadataSchemaObject.merge(
-  HyperlaneDeploymentArtifactsSchema,
+const CompiledAgentCosmosChainMetadataSchema = z.compile(
+  AgentCosmosChainMetadataSchema,
+);
+const CompiledAgentSealevelChainMetadataSchema = z.compile(
+  AgentSealevelChainMetadataSchema,
+);
+
+export const AgentChainMetadataSchema = ChainMetadataSchemaObject.extend(
+  HyperlaneDeploymentArtifactsSchema.shape,
 )
   .extend({
     customRpcUrls: z
@@ -231,23 +279,47 @@ export const AgentChainMetadataSchema = ChainMetadataSchemaObject.merge(
       .describe(
         'Specify a comma separated list of custom RPC URLs to use for this chain. If not specified, the default RPC urls will be used.',
       ),
+    additionalQuorumRpcUrls: z
+      .never()
+      .optional()
+      .describe(
+        'Removed. Move endpoints into rpcUrls/customRpcUrls and remove this setting.',
+      ),
+    customAdditionalQuorumRpcUrls: z
+      .never()
+      .optional()
+      .describe(
+        'Removed. Move endpoints into rpcUrls/customRpcUrls and remove this setting.',
+      ),
     rpcConsensusType: z
-      .nativeEnum(RpcConsensusType)
-      .describe('The consensus type to use when multiple RPCs are configured.')
+      .enum(RpcConsensusType)
+      .describe(
+        'RPC consensus policy. Validators default to majority for ceil(2N/3), with optional quorum for ceil(N/2) matching checkpoint histories across protocols. Majority is validator-only. Lightweight validators always require ceil(2N/3).',
+      )
       .optional(),
+    fallbackHedgeDelayMillis: ZNzUint.optional().describe(
+      'For fallback RPC consensus, start one speculative immutable read on the next provider after this delay. Unset disables hedging.',
+    ),
+    fallbackHedgeTimeoutMillis: ZNzUint.optional().describe(
+      'Per-provider timeout for hedged immutable reads. Requires fallbackHedgeDelayMillis and defaults to 30000ms.',
+    ),
     signer: AgentSignerSchema.optional().describe(
       'The signer to use for this chain',
     ),
     index: z
       .object({
-        from: ZUint.optional().describe(
-          'The starting block from which to index events.',
-        ),
+        from: z
+          .number()
+          .int()
+          .optional()
+          .describe(
+            'The absolute block or sequence to start indexing from. Negative values are offsets from the current tip in the selected index mode unit.',
+          ),
         chunk: ZNzUint.optional().describe(
           'The number of blocks to index at a time.',
         ),
         mode: z
-          .nativeEnum(AgentIndexMode)
+          .enum(AgentIndexMode)
           .optional()
           .describe(
             'The indexing method to use for this chain; will attempt to choose a suitable default if not specified.',
@@ -258,8 +330,35 @@ export const AgentChainMetadataSchema = ChainMetadataSchemaObject.merge(
       })
       .optional(),
   })
-  .merge(AgentCosmosChainMetadataSchema.partial())
-  .merge(AgentSealevelChainMetadataSchema.partial())
+  .extend(AgentCosmosChainMetadataSchema.partial().shape)
+  .extend(AgentSealevelChainMetadataSchema.partial().shape)
+  .refine(
+    (metadata) =>
+      metadata.fallbackHedgeTimeoutMillis === undefined ||
+      metadata.fallbackHedgeDelayMillis !== undefined,
+    {
+      message: 'fallbackHedgeTimeoutMillis requires fallbackHedgeDelayMillis',
+      path: ['fallbackHedgeTimeoutMillis'],
+    },
+  )
+  .refine(
+    (metadata) =>
+      metadata.fallbackHedgeDelayMillis === undefined ||
+      metadata.protocol === ProtocolType.Ethereum,
+    {
+      message: 'fallback RPC hedging is only supported for Ethereum chains',
+      path: ['fallbackHedgeDelayMillis'],
+    },
+  )
+  .refine(
+    (metadata) =>
+      metadata.fallbackHedgeDelayMillis === undefined ||
+      metadata.rpcConsensusType === RpcConsensusType.Fallback,
+    {
+      message: 'fallback RPC hedging requires fallback RPC consensus',
+      path: ['fallbackHedgeDelayMillis'],
+    },
+  )
   .refine((metadata) => {
     // Make sure that the signer is valid for the protocol
 
@@ -276,8 +375,9 @@ export const AgentChainMetadataSchema = ChainMetadataSchemaObject.merge(
         if (
           ![
             AgentSignerKeyType.Hex,
-            signerType === AgentSignerKeyType.Aws,
-            signerType === AgentSignerKeyType.Node,
+            AgentSignerKeyType.Aws,
+            AgentSignerKeyType.Node,
+            AgentSignerKeyType.Gcp,
           ].includes(signerType)
         ) {
           return false;
@@ -306,14 +406,14 @@ export const AgentChainMetadataSchema = ChainMetadataSchemaObject.merge(
       metadata.protocol === ProtocolType.Cosmos ||
       metadata.protocol === ProtocolType.CosmosNative
     ) {
-      if (!AgentCosmosChainMetadataSchema.safeParse(metadata).success) {
+      if (!z.validate(CompiledAgentCosmosChainMetadataSchema, metadata)) {
         return false;
       }
     }
 
     // If the protocol type is Sealevel, require everything in AgentSealevelChainMetadataSchema
     if (metadata.protocol === ProtocolType.Sealevel) {
-      if (!AgentSealevelChainMetadataSchema.safeParse(metadata).success) {
+      if (!z.validate(CompiledAgentSealevelChainMetadataSchema, metadata)) {
         return false;
       }
     }
@@ -330,7 +430,7 @@ export const AgentConfigSchema = z.object({
       'The port to expose prometheus metrics on. Accessible via `GET /metrics`.',
     ),
   chains: z
-    .record(AgentChainMetadataSchema)
+    .record(z.string(), AgentChainMetadataSchema)
     .describe('Chain metadata for all chains that the agent will index.')
     .superRefine((data, ctx) => {
       for (const c in data) {
@@ -348,11 +448,11 @@ export const AgentConfigSchema = z.object({
   log: z
     .object({
       format: z
-        .nativeEnum(AgentLogFormat)
+        .enum(AgentLogFormat)
         .optional()
         .describe('The format to use for tracing logs.'),
       level: z
-        .nativeEnum(AgentLogLevel)
+        .enum(AgentLogLevel)
         .optional()
         .describe("The log level to use for the agent's logs."),
     })
@@ -457,7 +557,7 @@ const IsmCacheConfigSchema = z.object({
     'The selector to use for the ISM cache policy',
   ),
   moduleTypes: z
-    .array(z.nativeEnum(ModuleType))
+    .array(z.enum(ModuleType))
     .describe('The ISM module types to use the cache policy for.'),
   chains: z
     .array(z.string())
@@ -465,9 +565,7 @@ const IsmCacheConfigSchema = z.object({
     .describe(
       'The chains to use the cache policy for. If not specified, all chains will be used.',
     ),
-  cachePolicy: z
-    .nativeEnum(IsmCachePolicy)
-    .describe('The cache policy to use.'),
+  cachePolicy: z.enum(IsmCachePolicy).describe('The cache policy to use.'),
 });
 export type IsmCacheConfig = z.infer<typeof IsmCacheConfigSchema>;
 
@@ -542,6 +640,24 @@ export const RelayerAgentConfigSchema = AgentConfigSchema.extend({
     .boolean()
     .optional()
     .describe('Whether to enable IGP indexing'),
+  websocketUrl: z
+    .url()
+    .refine(
+      (value) => value.startsWith('ws://') || value.startsWith('wss://'),
+      {
+        message: 'websocketUrl must use ws:// or wss://',
+      },
+    )
+    .optional()
+    .describe(
+      'Scraper-proxy WebSocket URL used for shared dispatch, Merkle, and gas-payment indexing.',
+    ),
+  websocketAuthorityEnabled: z
+    .boolean()
+    .optional()
+    .describe(
+      'Whether a healthy scraper-proxy stream may replace direct RPC indexing. Defaults to false.',
+    ),
   relayApiEnabled: z
     .boolean()
     .optional()
@@ -580,6 +696,15 @@ export const RelayerAgentConfigSchema = AgentConfigSchema.extend({
       'Relay API allowed CORS origins, comma-separated. Defaults to https://nexus.hyperlane.xyz.',
     ),
 }).superRefine((config, ctx) => {
+  if (config.websocketAuthorityEnabled && !config.websocketUrl) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['websocketUrl'],
+      message:
+        'websocketUrl is required when websocketAuthorityEnabled is true',
+    });
+  }
+
   // Mirror the Rust relayer gate: the current IGP event does not expose the
   // token address, so exact non-native `feeToken` enforcement is rejected.
   const { policies, parseError } = gasPaymentEnforcementPolicies(
@@ -617,7 +742,7 @@ export const ScraperAgentConfigSchema = AgentConfigSchema.extend({
     'Comma separated list of chain names to scrape',
   ),
   ccrRouters: z
-    .record(z.record(z.string()))
+    .record(z.string(), z.record(z.string(), z.string()))
     .optional()
     .describe(
       'Per-domain CCR router → underlying ERC20 token mapping. Domain ID → { router_address → token_address }. Auto-populated from registry.',
@@ -667,22 +792,68 @@ export const ValidatorAgentConfigSchema = AgentConfigSchema.extend({
           .min(1)
           .optional()
           .describe('The folder to use, defaults to the root of the bucket'),
-        service_account_key: z
+        serviceAccountKey: z
           .string()
           .min(1)
           .optional()
           .describe('The path to GCS service account key file'),
-        user_secrets: z
+        userSecrets: z
           .string()
           .min(1)
           .optional()
           .describe('The path to GCS user secret file'),
+        useApplicationDefault: z
+          .boolean()
+          .optional()
+          .describe(
+            'Use ambient Application Default Credentials (e.g. GKE Workload Identity) instead of a key file or user secrets',
+          ),
       })
       .describe('A checkpoint syncer that uses Google Cloud Storage'),
   ]),
   interval: ZNzUint.optional().describe(
     'How long to wait between checking for new checkpoints in seconds. Defaults to 2s, falling back to the origin chain’s index.interval if set and this is unset.',
   ),
+  maxSignConcurrency: ZNzUint.max(MAX_SIGN_CONCURRENCY)
+    .optional()
+    .describe(
+      `Maximum number of checkpoints signed concurrently. Defaults to 50; maximum ${MAX_SIGN_CONCURRENCY}.`,
+    ),
+  lightweight: z
+    .boolean()
+    .optional()
+    .describe(
+      'Uses trusted websocket indexing and requires at least two thirds of configured state-read endpoints to match local roots. Signs through the highest index supported by that majority, independently of rpcConsensusType. Disables RPC indexing fallback; insufficient agreement pauses signing.',
+    ),
+  leightweigt: z.boolean().optional().describe('Alias for lightweight.'),
+  websocketUrl: z
+    .url()
+    .refine((url) => /^wss?:\/\//i.test(url), {
+      message: 'Must use ws:// or wss://',
+    })
+    .optional()
+    .describe(
+      'Merkle tree insertion source for replay and live events. RPC indexing fallback is disabled in lightweight mode.',
+    ),
+}).superRefine((config, ctx) => {
+  if (
+    config.lightweight !== undefined &&
+    config.leightweigt !== undefined &&
+    config.lightweight !== config.leightweigt
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['lightweight'],
+      message: 'lightweight and leightweigt must agree when both are set',
+    });
+  }
+  if ((config.lightweight ?? config.leightweigt) && !config.websocketUrl) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['websocketUrl'],
+      message: 'websocketUrl is required in lightweight mode',
+    });
+  }
 });
 
 export type ValidatorConfig = z.infer<typeof ValidatorAgentConfigSchema>;

@@ -14,11 +14,11 @@ import { assert } from '@hyperlane-xyz/utils';
 import { type AnyAleoNetworkClient } from '../clients/base.js';
 import { type AleoSigner } from '../clients/signer.js';
 import { getMailboxConfig } from '../mailbox/mailbox-query.js';
+import { toAleoAddress } from '../utils/helper.crypto.js';
 import {
   getNetworkPrefix,
   getUnusedSuffix,
   SUFFIX_LENGTH_SHORT,
-  toAleoAddress,
 } from '../utils/helper.js';
 import {
   type AleoArtifactNetworkConfig,
@@ -71,7 +71,10 @@ export class AleoValidatorAnnounceReader implements ArtifactReader<
 export class AleoValidatorAnnounceWriter
   extends AleoValidatorAnnounceReader
   implements
-    ArtifactWriter<RawValidatorAnnounceConfig, DeployedValidatorAnnounceAddress>
+    ArtifactWriter<
+      RawValidatorAnnounceConfig,
+      DeployedValidatorAnnounceAddress
+    >
 {
   constructor(
     private readonly config: AleoArtifactNetworkConfig,

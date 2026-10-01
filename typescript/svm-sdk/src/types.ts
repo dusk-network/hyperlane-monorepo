@@ -12,12 +12,17 @@ import type { DeployedIsmAddress } from '@hyperlane-xyz/provider-sdk/ism';
 import { isNullish } from '@hyperlane-xyz/utils';
 
 import type { IgpFeeConfig } from './codecs/igp.js';
+import type { InstructionAccountMeta } from './instructions/utils.js';
 
 export type SvmInstruction = Instruction;
 
 export type SvmRpc = Rpc<SolanaRpcApi>;
 
 export interface SvmTransaction {
+  /** Override the chain's default sending version. V1 requires chain opt-in. */
+  version?: 0 | 1;
+  /** Price per CU; v1 converts this to a total lamport fee, rounding up. */
+  priorityFeeMicroLamports?: number;
   /** Fee payer for the compiled transaction.
    *  Used to set the correct signer in the serialized transaction
    *  output (e.g. a Squads vault instead of the local keypair).
@@ -25,6 +30,10 @@ export interface SvmTransaction {
   feePayer?: Address;
   instructions: SvmInstruction[];
   computeUnits?: number;
+  /** Requested heap frame in bytes (32-256 KiB, in 1 KiB increments). */
+  heapSize?: number;
+  /** Loaded account data budget in bytes; v1 defaults to the legacy 64 MiB maximum. */
+  loadedAccountsDataSizeLimit?: number;
   additionalSigners?: TransactionSigner[];
   /** Skip preflight simulation.
    *  Some transactions that include account creation might fail the simulation check.
@@ -73,6 +82,33 @@ export type WithExtraSigners<T> = T & {
 export type AnnotatedSvmTransaction = SvmTransaction & {
   annotation?: string;
 };
+
+/** Transaction input for the submission pipeline — feePayer is provided by the signer. */
+export type SendableSvmTransaction = Omit<SvmTransaction, 'feePayer'>;
+
+/** Shape returned by `buildPrintableTransaction`. */
+export interface PrintableSvmTransaction {
+  annotation?: string;
+  instructions: PrintableSvmInstruction[];
+  computeUnits?: number;
+  transaction_base58: string;
+  message_base58: string;
+  /**
+   * Carried over from `SvmTransaction.waitForSlotAdvance`. A live signer
+   * enforces this itself, but exported (file/Squads) transactions are signed
+   * and submitted by an external executor: when true, that executor MUST wait
+   * for the cluster slot to advance past this transaction's confirmation slot
+   * before submitting the next transaction, otherwise the loader rejects an
+   * extend→upgrade→config sequence sharing a slot.
+   */
+  waitForSlotAdvance?: boolean;
+}
+
+export interface PrintableSvmInstruction {
+  programAddress: Address;
+  accounts?: readonly InstructionAccountMeta[];
+  data?: string;
+}
 
 /**
  * Specifies how to obtain a deployed program address:

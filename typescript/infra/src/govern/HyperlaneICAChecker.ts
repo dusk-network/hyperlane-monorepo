@@ -8,16 +8,18 @@ import {
 } from '@hyperlane-xyz/sdk';
 import { rootLogger } from '@hyperlane-xyz/utils';
 
-import { legacyIcaChains } from '../config/chain.js';
+import { deploymentChains as ousdtChains } from '../../config/environments/mainnet3/warp/configGetters/getoUSDTTokenWarpConfig.js';
 
 const MAINNET = 'ethereum';
 
 const FULLY_CONNECTED_ICA_CHAINS = new Set([
   'arbitrum',
+  'arc',
   'bsc',
   'polygon',
   'subtensor',
   MAINNET,
+  ...ousdtChains,
 ]);
 
 export class HyperlaneICAChecker extends InterchainAccountChecker {
@@ -48,11 +50,10 @@ export class HyperlaneICAChecker extends InterchainAccountChecker {
   async checkIcaRouterEnrollment(chain: ChainName): Promise<void> {
     // If the chain should be fully connected, do the regular full check.
     if (FULLY_CONNECTED_ICA_CHAINS.has(chain)) {
-      // don't try to enroll legacy ica chains
       const actualRemoteChains = await this.app.remoteChains(chain);
       // .remoteChains() already filters out the origin chain itself
       const filteredRemoteChains = actualRemoteChains.filter(
-        (c) => !legacyIcaChains.includes(c) && c !== 'eden',
+        (c) => c !== 'eden',
       );
       return super.checkEnrolledRouters(chain, filteredRemoteChains);
     }
@@ -61,9 +62,8 @@ export class HyperlaneICAChecker extends InterchainAccountChecker {
     // the "core" ICA controller chains.
     else {
       // have to manually filter out the origin chain itself
-      // and then filter out legacy ica chains
       const remotes = Array.from(FULLY_CONNECTED_ICA_CHAINS).filter(
-        (c) => c !== chain && !legacyIcaChains.includes(c) && c !== 'eden',
+        (c) => c !== chain && c !== 'eden',
       );
       return super.checkEnrolledRouters(chain, remotes);
     }
@@ -74,15 +74,6 @@ export class HyperlaneICAChecker extends InterchainAccountChecker {
       rootLogger.warn(
         chalk.bold.yellow(
           `Skipping check for ${chain} because there is no expected config`,
-        ),
-      );
-      return;
-    }
-
-    if (legacyIcaChains.includes(chain)) {
-      rootLogger.warn(
-        chalk.bold.yellow(
-          `Skipping check for ${chain} because it is a legacy ica chain`,
         ),
       );
       return;

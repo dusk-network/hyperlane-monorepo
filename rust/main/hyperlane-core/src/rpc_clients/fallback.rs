@@ -10,6 +10,7 @@ use std::{
 use async_rwlock::RwLock;
 use async_trait::async_trait;
 use derive_new::new;
+use futures::lock::Mutex;
 use itertools::Itertools;
 use tokio;
 use tracing::{info, warn, warn_span};
@@ -28,6 +29,9 @@ pub trait BlockNumberGetter: Send + Sync + Debug {
 const MAX_BLOCK_TIME: Duration = Duration::from_secs(2 * 60);
 
 const FAILED_REQUEST_THRESHOLD: u32 = 10;
+
+// Caps how long we wait on one provider; otherwise a stalled connection blocks the whole loop.
+const FALLBACK_PROVIDER_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Information about a provider in `PrioritizedProviders`
 
@@ -77,6 +81,9 @@ pub struct FallbackProvider<T, B> {
     /// The sub-providers called by this provider
     pub inner: Arc<PrioritizedProviders<T>>,
     max_block_time: Duration,
+    call_timeout: Duration,
+    /// Serializes block-height probes for each provider.
+    block_height_probe_locks: Arc<Vec<Mutex<()>>>,
     _phantom: PhantomData<B>,
 }
 
@@ -97,6 +104,8 @@ impl<T, B> Clone for FallbackProvider<T, B> {
         Self {
             inner: self.inner.clone(),
             max_block_time: self.max_block_time,
+            call_timeout: self.call_timeout,
+            block_height_probe_locks: self.block_height_probe_locks.clone(),
             _phantom: PhantomData,
         }
     }
@@ -127,6 +136,34 @@ where
     T: Into<B> + Debug + Clone,
     B: BlockNumberGetter,
 {
+    async fn call_provider<V>(
+        &self,
+        priority: &PrioritizedProviderInner,
+        future: Pin<Box<dyn Future<Output = ChainResult<V>> + Send>>,
+    ) -> ChainResult<V> {
+        let provider = &self.inner.providers[priority.index];
+        let response = match tokio::time::timeout(self.call_timeout, async {
+            let response = future.await;
+            if response.is_ok() {
+                // A probe timeout is treated the same as a request timeout,
+                // not silently ignored.
+                self.handle_stalled_provider(priority, provider).await?;
+            }
+            response
+        })
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => Err(crate::ChainCommunicationError::from_other_str(
+                "fallback provider call timed out",
+            )),
+        };
+        if response.is_err() {
+            self.handle_failed_provider(priority).await;
+        }
+        response
+    }
+
     /// Convenience method for creating a `FallbackProviderBuilder` with same
     /// `JsonRpcClient` types
     pub fn builder() -> FallbackProviderBuilder<T, B> {
@@ -155,43 +192,91 @@ where
         }
     }
 
+    async fn priority_for_provider(
+        &self,
+        provider_index: usize,
+    ) -> Option<PrioritizedProviderInner> {
+        self.inner
+            .priorities
+            .read()
+            .await
+            .iter()
+            .find(|priority| priority.index == provider_index)
+            .copied()
+    }
+
     /// Used to iterate the providers in a non-blocking way
     pub async fn take_priorities_snapshot(&self) -> Vec<PrioritizedProviderInner> {
         let read_lock = self.inner.priorities.read().await;
         (*read_lock).clone()
     }
 
-    /// De-prioritize a provider that has either timed out or returned a bad response
-    pub async fn handle_stalled_provider(&self, priority: &PrioritizedProviderInner, provider: &T) {
-        let now = Instant::now();
-        if now
+    /// De-prioritize a provider that has either timed out or returned a bad response.
+    /// Returns an error if the block height probe itself times out.
+    pub async fn handle_stalled_provider(
+        &self,
+        priority: &PrioritizedProviderInner,
+        provider: &T,
+    ) -> ChainResult<()> {
+        // With one endpoint there is nothing to reprioritize. Do not add a
+        // health-probe RPC (or fail a successful read because that probe stalls).
+        if self.len() == 1 {
+            return Ok(());
+        }
+        if Instant::now()
             .duration_since(priority.last_block_height.1)
             .le(&self.max_block_time)
         {
             // Do nothing, it's too early to tell if the provider has stalled
-            return;
+            return Ok(());
+        }
+
+        // Multiple requests can share the same stale priorities snapshot. Only
+        // one of them should probe a provider; the rest re-check current state.
+        let Some(_probe_guard) = self.block_height_probe_locks[priority.index].try_lock() else {
+            return Ok(());
+        };
+        let Some(current_priority) = self.priority_for_provider(priority.index).await else {
+            return Err(crate::ChainCommunicationError::from_other_str(
+                "fallback provider priority is missing",
+            ));
+        };
+        if Instant::now()
+            .duration_since(current_priority.last_block_height.1)
+            .le(&self.max_block_time)
+        {
+            return Ok(());
         }
 
         let block_getter: B = provider.clone().into();
-        let current_block_height = block_getter
-            .get_block_number()
-            .await
-            .unwrap_or(priority.last_block_height.0);
-        if current_block_height <= priority.last_block_height.0 {
-            let new_priority = priority.reset_failed_count();
+        let current_block_height =
+            match tokio::time::timeout(self.call_timeout, block_getter.get_block_number()).await {
+                Ok(result) => result.unwrap_or(current_priority.last_block_height.0),
+                Err(_) => {
+                    return Err(crate::ChainCommunicationError::from_other_str(
+                        "fallback provider call timed out",
+                    ))
+                }
+            };
+        if current_block_height <= current_priority.last_block_height.0 {
+            let new_priority = PrioritizedProviderInner::from_block_height(
+                current_priority.index,
+                current_priority.last_block_height.0,
+            );
 
             // The `max_block_time` elapsed but the block number returned by the provider has not increased
             self.deprioritize_provider(new_priority).await;
             info!(
-                provider_index=%priority.index,
-                provider=?self.inner.providers[priority.index],
+                provider_index=%current_priority.index,
+                provider=?self.inner.providers[current_priority.index],
                 reason="Block height low",
                 "Deprioritizing an inner provider in FallbackProvider",
             );
         } else {
-            self.update_last_seen_block(priority.index, current_block_height)
+            self.update_last_seen_block(current_priority.index, current_block_height)
                 .await;
         }
+        Ok(())
     }
 
     /// De-prioritize a provider that has returned a bad response
@@ -222,22 +307,36 @@ where
     /// If all providers fail, return an error.
     pub async fn call<V>(
         &self,
+        f: impl FnMut(T) -> Pin<Box<dyn Future<Output = ChainResult<V>> + Send>>,
+    ) -> ChainResult<V> {
+        self.call_with_retry_predicate(f, |_| true).await
+    }
+
+    /// Call providers until one succeeds, without retrying a provider when
+    /// `should_retry` returns false for its error.
+    ///
+    /// Every provider is attempted once before terminal providers are excluded
+    /// from later retry rounds. This preserves fallback across independently
+    /// configured providers while avoiding repeated calls that cannot succeed.
+    pub async fn call_with_retry_predicate<V>(
+        &self,
         mut f: impl FnMut(T) -> Pin<Box<dyn Future<Output = ChainResult<V>> + Send>>,
+        should_retry: impl Fn(&crate::ChainCommunicationError) -> bool,
     ) -> ChainResult<V> {
         let mut errors = vec![];
+        let mut retryable_providers = vec![true; self.inner.providers.len()];
         // make sure we do at least 4 total retries.
-        while errors.len() <= 3 {
+        while errors.len() <= 3 && retryable_providers.iter().any(|retryable| *retryable) {
             if !errors.is_empty() {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             let priorities_snapshot = self.take_priorities_snapshot().await;
             for (idx, priority) in priorities_snapshot.iter().enumerate() {
-                let provider = &self.inner.providers[priority.index];
-                let resp = f(provider.clone()).await;
-                self.handle_stalled_provider(priority, provider).await;
-                if resp.is_err() {
-                    self.handle_failed_provider(priority).await;
+                if !retryable_providers[priority.index] {
+                    continue;
                 }
+                let provider = &self.inner.providers[priority.index];
+                let resp = self.call_provider(priority, f(provider.clone())).await;
                 let _span =
                     warn_span!("FallbackProvider::call", fallback_count=%idx, provider_index=%priority.index, ?provider).entered();
                 match resp {
@@ -247,6 +346,7 @@ where
                             error=?e,
                             "Got error from inner fallback provider",
                         );
+                        retryable_providers[priority.index] = should_retry(&e);
                         errors.push(e);
                     }
                 }
@@ -255,6 +355,78 @@ where
 
         Err(RpcClientError::FallbackProvidersFailed(errors).into())
     }
+
+    /// Call providers once in priority order until the accumulated responses
+    /// satisfy `is_complete` or every provider has been queried.
+    ///
+    /// This supports RPCs whose successful responses must be combined rather
+    /// than accepting the first response as authoritative.
+    pub async fn call_until<V>(
+        &self,
+        mut f: impl FnMut(T) -> Pin<Box<dyn Future<Output = ChainResult<V>> + Send>>,
+        is_complete: impl Fn(&[ChainResult<V>]) -> bool,
+    ) -> Vec<ChainResult<V>> {
+        let priorities_snapshot = self.take_priorities_snapshot().await;
+        let mut responses = Vec::with_capacity(priorities_snapshot.len());
+        for (idx, priority) in priorities_snapshot.iter().enumerate() {
+            let provider = &self.inner.providers[priority.index];
+            let response = self.call_provider(priority, f(provider.clone())).await;
+            let _span = warn_span!(
+                "FallbackProvider::call_until",
+                fallback_count = %idx,
+                provider_index = %priority.index,
+                ?provider,
+            )
+            .entered();
+            if let Err(error) = &response {
+                warn!(?error, "Got error from inner fallback provider");
+            }
+            responses.push(response);
+            if is_complete(&responses) {
+                break;
+            }
+        }
+        responses
+    }
+
+    /// Call each provider once until one returns `Some`.
+    ///
+    /// Returns `None` only when every provider successfully reports absence. If
+    /// any provider fails and none reports presence, the result is ambiguous and
+    /// the provider errors are returned.
+    pub async fn call_optional<V>(
+        &self,
+        mut f: impl FnMut(T) -> Pin<Box<dyn Future<Output = ChainResult<Option<V>>> + Send>>,
+    ) -> ChainResult<Option<V>> {
+        let mut errors = vec![];
+        let priorities_snapshot = self.take_priorities_snapshot().await;
+        if priorities_snapshot.is_empty() {
+            return Err(RpcClientError::FallbackProvidersFailed(errors).into());
+        }
+
+        for (idx, priority) in priorities_snapshot.iter().enumerate() {
+            let provider = &self.inner.providers[priority.index];
+            let resp = self.call_provider(priority, f(provider.clone())).await;
+            let _span = warn_span!("FallbackProvider::call_optional", fallback_count=%idx, provider_index=%priority.index, ?provider).entered();
+            match resp {
+                Ok(Some(value)) => return Ok(Some(value)),
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(
+                        error=?error,
+                        "Got error from inner fallback provider",
+                    );
+                    errors.push(error);
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(None)
+        } else {
+            Err(RpcClientError::FallbackProvidersFailed(errors).into())
+        }
+    }
 }
 
 /// Builder to create a new fallback provider.
@@ -262,6 +434,7 @@ where
 pub struct FallbackProviderBuilder<T, B> {
     providers: Vec<T>,
     max_block_time: Duration,
+    call_timeout: Duration,
     _phantom: PhantomData<B>,
 }
 
@@ -270,6 +443,7 @@ impl<T, B> Default for FallbackProviderBuilder<T, B> {
         Self {
             providers: Vec::new(),
             max_block_time: MAX_BLOCK_TIME,
+            call_timeout: FALLBACK_PROVIDER_CALL_TIMEOUT,
             _phantom: PhantomData,
         }
     }
@@ -296,6 +470,13 @@ impl<T, B> FallbackProviderBuilder<T, B> {
         self
     }
 
+    /// Override the per-provider call timeout. Mainly useful for tests that
+    /// need to exercise the timeout path without waiting 30 seconds.
+    pub fn with_call_timeout(mut self, call_timeout: Duration) -> Self {
+        self.call_timeout = call_timeout;
+        self
+    }
+
     /// Create a fallback provider.
     pub fn build(self) -> FallbackProvider<T, B> {
         let provider_count = self.providers.len();
@@ -311,6 +492,10 @@ impl<T, B> FallbackProviderBuilder<T, B> {
         FallbackProvider {
             inner: Arc::new(prioritized_providers),
             max_block_time: self.max_block_time,
+            call_timeout: self.call_timeout,
+            block_height_probe_locks: Arc::new(
+                (0..provider_count).map(|_| Mutex::new(())).collect(),
+            ),
             _phantom: PhantomData,
         }
     }
@@ -320,7 +505,10 @@ impl<T, B> FallbackProviderBuilder<T, B> {
 pub mod test {
     use std::{
         ops::Deref,
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
     };
 
     use super::*;
@@ -333,6 +521,7 @@ pub mod test {
         // for interior mutability in `JsonRpcClient::request`
         requests: Arc<Mutex<Vec<(String, String)>>>,
         request_sleep: Option<Duration>,
+        block_height_requests: Arc<AtomicUsize>,
     }
 
     impl Default for ProviderMock {
@@ -340,6 +529,7 @@ pub mod test {
             Self {
                 requests: Arc::new(Mutex::new(vec![])),
                 request_sleep: None,
+                block_height_requests: Arc::new(AtomicUsize::new(0)),
             }
         }
     }
@@ -374,6 +564,11 @@ pub mod test {
             self.request_sleep
         }
 
+        /// Get the number of block-height probes.
+        pub fn block_height_requests(&self) -> usize {
+            self.block_height_requests.load(Ordering::Relaxed)
+        }
+
         /// Get how many times each provider was called
         pub async fn get_call_counts<T: Deref<Target = ProviderMock>, B>(
             fallback_provider: &FallbackProvider<T, B>,
@@ -402,7 +597,11 @@ pub mod test {
     #[async_trait::async_trait]
     impl BlockNumberGetter for ProviderMock {
         async fn get_block_number(&self) -> ChainResult<u64> {
-            return Ok(100);
+            self.block_height_requests.fetch_add(1, Ordering::Relaxed);
+            if let Some(sleep) = self.request_sleep {
+                tokio::time::sleep(sleep).await;
+            }
+            Ok(100)
         }
     }
 
@@ -443,5 +642,371 @@ pub mod test {
             .map(|p| p.index)
             .collect();
         assert_eq!(expected, actual);
+    }
+
+    #[tokio::test]
+    async fn test_call_with_retry_predicate_skips_terminal_provider() {
+        let terminal_provider = ProviderMock::default();
+        terminal_provider.push("terminal", true);
+        let retryable_provider = ProviderMock::default();
+        retryable_provider.push("retryable", true);
+        let fallback_provider: FallbackProvider<ProviderMock, ProviderMock> =
+            FallbackProvider::new([terminal_provider.clone(), retryable_provider.clone()]);
+
+        let result: ChainResult<()> = fallback_provider
+            .call_with_retry_predicate(
+                |provider| {
+                    let response = provider.requests()[0].0.clone();
+                    provider.push("call", true);
+                    Box::pin(async move {
+                        if response == "terminal" {
+                            Err(crate::ChainCommunicationError::BatchingFailed)
+                        } else {
+                            Err(crate::ChainCommunicationError::TransactionTimeout)
+                        }
+                    })
+                },
+                |error| !matches!(error, crate::ChainCommunicationError::BatchingFailed),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(terminal_provider.requests().len(), 2);
+        assert_eq!(retryable_provider.requests().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_call_timeout_unblocks_stalled_provider() {
+        let provider1 = ProviderMock::new(None);
+        let provider2 = ProviderMock::new(None);
+        provider2.push("aaa", true);
+
+        let fallback_provider: FallbackProvider<ProviderMock, ProviderMock> =
+            FallbackProvider::builder()
+                .add_providers(vec![provider1, provider2])
+                .with_call_timeout(Duration::from_millis(50))
+                .build();
+
+        let call = fallback_provider.call(|provider: ProviderMock| {
+            let future = async move {
+                if provider.requests.lock().unwrap().is_empty() {
+                    // simulate a provider that connects but never responds
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    Ok(100)
+                } else {
+                    Ok(100)
+                }
+            };
+            Box::pin(future)
+        });
+
+        // If the timeout doesn't kick in, this outer timeout is what catches the hang.
+        let result = tokio::time::timeout(Duration::from_secs(2), call).await;
+        assert!(result.is_ok(), "call() hung past the configured timeout");
+        assert_eq!(result.unwrap().unwrap(), 100);
+
+        let failed_counts: Vec<_> = fallback_provider
+            .inner
+            .priorities
+            .read()
+            .await
+            .iter()
+            .map(|p| p.last_failed_count)
+            .collect();
+        assert_eq!(failed_counts[0], 1);
+    }
+
+    #[tokio::test]
+    async fn test_call_optional_prefers_secondary_presence_over_primary_absence() {
+        let provider1 = ProviderMock::default();
+        provider1.push("none", true);
+        let provider2 = ProviderMock::default();
+        provider2.push("some", true);
+        let fallback_provider: FallbackProvider<ProviderMock, ProviderMock> =
+            FallbackProvider::new([provider1.clone(), provider2.clone()]);
+
+        let result = fallback_provider
+            .call_optional(|provider| {
+                let response = provider.requests()[0].0.clone();
+                provider.push("call", true);
+                Box::pin(async move {
+                    match response.as_str() {
+                        "some" => Ok(Some(42)),
+                        _ => Ok(None),
+                    }
+                })
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result, Some(42));
+        assert_eq!(provider1.requests().len(), 2);
+        assert_eq!(provider2.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_call_until_queries_every_provider_while_incomplete() {
+        let provider1 = ProviderMock::default();
+        provider1.push("first", true);
+        let provider2 = ProviderMock::default();
+        provider2.push("second", true);
+        let fallback_provider: FallbackProvider<ProviderMock, ProviderMock> =
+            FallbackProvider::new([provider1.clone(), provider2.clone()]);
+
+        let responses = fallback_provider
+            .call_until(
+                |provider| {
+                    let response = provider.requests()[0].0.clone();
+                    provider.push("call", true);
+                    Box::pin(async move { Ok(response) })
+                },
+                |_| false,
+            )
+            .await;
+
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0].as_ref().unwrap(), "first");
+        assert_eq!(responses[1].as_ref().unwrap(), "second");
+        assert_eq!(provider1.requests().len(), 2);
+        assert_eq!(provider2.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_call_until_stops_when_complete() {
+        let provider1 = ProviderMock::default();
+        provider1.push("first", true);
+        let provider2 = ProviderMock::default();
+        provider2.push("second", true);
+        let fallback_provider: FallbackProvider<ProviderMock, ProviderMock> =
+            FallbackProvider::new([provider1.clone(), provider2.clone()]);
+
+        let responses = fallback_provider
+            .call_until(
+                |provider| {
+                    let response = provider.requests()[0].0.clone();
+                    provider.push("call", true);
+                    Box::pin(async move { Ok(response) })
+                },
+                |responses| responses.len() == 1,
+            )
+            .await;
+
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].as_ref().unwrap(), "first");
+        assert_eq!(provider1.requests().len(), 2);
+        assert_eq!(provider2.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_call_optional_returns_none_when_all_providers_report_absence() {
+        let provider1 = ProviderMock::default();
+        provider1.push("none", true);
+        let provider2 = ProviderMock::default();
+        provider2.push("none", true);
+        let fallback_provider: FallbackProvider<ProviderMock, ProviderMock> =
+            FallbackProvider::new([provider1.clone(), provider2.clone()]);
+
+        let result = fallback_provider
+            .call_optional(|provider| {
+                provider.push("call", true);
+                Box::pin(async move { Ok::<_, crate::ChainCommunicationError>(None::<u64>) })
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result, None);
+        assert_eq!(provider1.requests().len(), 2);
+        assert_eq!(provider2.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_call_optional_does_not_treat_provider_error_as_absence() {
+        let provider1 = ProviderMock::default();
+        provider1.push("none", true);
+        let provider2 = ProviderMock::default();
+        provider2.push("error", true);
+        let fallback_provider: FallbackProvider<ProviderMock, ProviderMock> =
+            FallbackProvider::new([provider1, provider2]);
+
+        let result = fallback_provider
+            .call_optional(|provider| {
+                let response = provider.requests()[0].0.clone();
+                Box::pin(async move {
+                    if response == "error" {
+                        Err(crate::ChainCommunicationError::BatchingFailed)
+                    } else {
+                        Ok(None::<u64>)
+                    }
+                })
+            })
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_call_timeout_unblocks_stalled_block_height_check() {
+        // Provider1 responds fine to the main call but hangs on the
+        // get_block_number() probe. The combined timeout should fail the
+        // whole attempt over to provider2, not return provider1's response.
+        let provider1 = ProviderMock::new(Some(Duration::from_secs(5)));
+        let provider2 = ProviderMock::new(None);
+
+        let fallback_provider: FallbackProvider<ProviderMock, ProviderMock> =
+            FallbackProvider::builder()
+                .add_providers(vec![provider1, provider2])
+                .with_call_timeout(Duration::from_millis(50))
+                // Zero so handle_stalled_provider doesn't skip the block height
+                // check as "too early to tell".
+                .with_max_block_time(Duration::ZERO)
+                .build();
+
+        let call = fallback_provider.call(|provider: ProviderMock| {
+            let future = async move {
+                provider.push("call", true);
+                Ok(100)
+            };
+            Box::pin(future)
+        });
+
+        // If the combined timeout doesn't kick in, this outer timeout catches the hang.
+        let result = tokio::time::timeout(Duration::from_secs(2), call).await;
+        assert!(result.is_ok(), "call() hung past the configured timeout");
+        assert_eq!(result.unwrap().unwrap(), 100);
+
+        let priorities = fallback_provider.inner.priorities.read().await;
+        let failed_counts: Vec<_> = priorities.iter().map(|p| p.last_failed_count).collect();
+        assert_eq!(
+            failed_counts[0], 1,
+            "provider1's attempt should count as a failure"
+        );
+
+        // Confirms the fallback actually reached provider2, not just that the
+        // call didn't hang.
+        let call_counts: Vec<_> = priorities
+            .iter()
+            .map(|p| fallback_provider.inner.providers[p.index].requests().len())
+            .collect();
+        assert_eq!(call_counts[1], 1, "provider2 should have been tried");
+    }
+
+    #[tokio::test]
+    async fn single_endpoint_does_not_probe_height_after_successful_reads() {
+        let provider = ProviderMock::default();
+        let fallback: FallbackProvider<ProviderMock, ProviderMock> = FallbackProvider::builder()
+            .add_provider(provider.clone())
+            .with_max_block_time(Duration::ZERO)
+            .build();
+        let result = fallback
+            .call(|provider| Box::pin(async move { provider.get_block_number().await }))
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            provider.block_height_requests(),
+            1,
+            "only the requested read, no implicit health probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_stale_snapshots_share_block_height_probe() {
+        let provider = ProviderMock::new(Some(Duration::from_millis(50)));
+        let fallback_provider: FallbackProvider<ProviderMock, ProviderMock> =
+            FallbackProvider::builder()
+                .add_providers([provider.clone(), ProviderMock::default()])
+                .with_max_block_time(Duration::from_secs(60))
+                .build();
+
+        let stale_priority = {
+            let mut priorities = fallback_provider.inner.priorities.write().await;
+            priorities[0].last_block_height.1 = Instant::now() - Duration::from_secs(61);
+            priorities[0]
+        };
+
+        let probes = (0..20)
+            .map(|_| {
+                let fallback_provider = fallback_provider.clone();
+                let provider = provider.clone();
+                tokio::spawn(async move {
+                    fallback_provider
+                        .handle_stalled_provider(&stale_priority, &provider)
+                        .await
+                })
+            })
+            .collect_vec();
+        for probe in probes {
+            probe
+                .await
+                .expect("probe task should complete")
+                .expect("block-height probe should succeed");
+        }
+
+        assert_eq!(provider.block_height_requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_low_block_height_probe_observes_cooldown() {
+        let provider1 = ProviderMock::default();
+        let provider2 = ProviderMock::default();
+        let fallback_provider: FallbackProvider<ProviderMock, ProviderMock> =
+            FallbackProvider::builder()
+                .add_providers([provider1.clone(), provider2])
+                .with_max_block_time(Duration::from_secs(60))
+                .build();
+
+        let stale_priority = {
+            let mut priorities = fallback_provider.inner.priorities.write().await;
+            priorities[0].last_block_height = (100, Instant::now() - Duration::from_secs(61));
+            priorities[0]
+        };
+        fallback_provider
+            .handle_stalled_provider(&stale_priority, &provider1)
+            .await
+            .expect("first block-height probe should succeed");
+        fallback_provider
+            .handle_stalled_provider(&stale_priority, &provider1)
+            .await
+            .expect("second block-height check should observe cooldown");
+
+        assert_eq!(provider1.block_height_requests(), 1);
+        let priorities = fallback_provider.take_priorities_snapshot().await;
+        assert_eq!(
+            priorities
+                .iter()
+                .map(|priority| priority.index)
+                .collect_vec(),
+            [1, 0]
+        );
+        assert!(
+            Instant::now().duration_since(priorities[1].last_block_height.1)
+                < Duration::from_secs(60)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_timed_out_block_height_probe_can_be_retried() {
+        let provider = ProviderMock::new(Some(Duration::from_secs(5)));
+        let fallback_provider: FallbackProvider<ProviderMock, ProviderMock> =
+            FallbackProvider::builder()
+                .add_providers([provider.clone(), ProviderMock::default()])
+                .with_max_block_time(Duration::from_secs(60))
+                .with_call_timeout(Duration::from_millis(10))
+                .build();
+
+        let stale_priority = {
+            let mut priorities = fallback_provider.inner.priorities.write().await;
+            priorities[0].last_block_height.1 = Instant::now() - Duration::from_secs(61);
+            priorities[0]
+        };
+        assert!(fallback_provider
+            .handle_stalled_provider(&stale_priority, &provider)
+            .await
+            .is_err());
+        assert!(fallback_provider
+            .handle_stalled_provider(&stale_priority, &provider)
+            .await
+            .is_err());
+
+        assert_eq!(provider.block_height_requests(), 2);
     }
 }

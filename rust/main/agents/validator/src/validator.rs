@@ -4,11 +4,15 @@ use async_trait::async_trait;
 use axum::Router;
 use derive_more::AsRef;
 use ethers::utils::keccak256;
-use eyre::{eyre, Result};
+use eyre::{eyre, Context, Result};
 use futures_util::future::try_join_all;
-use itertools::Itertools;
+use rand::Rng;
 use serde::Serialize;
-use tokio::{task::JoinHandle, time::sleep};
+use tokio::{
+    sync::Notify,
+    task::JoinHandle,
+    time::{sleep, Instant},
+};
 use tracing::{error, info, info_span, warn, Instrument};
 use url::Url;
 
@@ -16,29 +20,307 @@ use hyperlane_base::{
     db::{HyperlaneDb, HyperlaneRocksDB, DB},
     git_sha,
     metrics::AgentMetrics,
-    settings::{ChainConf, CheckpointSyncerBuildError},
+    settings::ChainConf,
     BaseAgent, ChainMetrics, ChainSpecificMetricsUpdater, CheckpointSyncer, ContractSyncMetrics,
     ContractSyncer, CoreMetrics, HyperlaneAgentCore, MetadataFromSettings, RuntimeMetrics,
     SequencedDataContractSync,
 };
 use hyperlane_core::{
-    rpc_clients::RPC_RETRY_SLEEP_DURATION, Announcement, ChainResult, HyperlaneChain,
-    HyperlaneContract, HyperlaneDomain, HyperlaneSigner, HyperlaneSignerExt, Mailbox,
-    MerkleTreeHook, MerkleTreeInsertion, ReorgPeriod, TxOutcome, ValidatorAnnounce, H256, U256,
+    accumulator::incremental::IncrementalMerkle, rpc_clients::RPC_RETRY_SLEEP_DURATION,
+    Announcement, ChainResult, CheckpointAtBlock, HyperlaneChain, HyperlaneContract,
+    HyperlaneDomain, HyperlaneSigner, HyperlaneSignerExt, IncrementalMerkleAtBlock, MerkleTreeHook,
+    MerkleTreeInsertion, ReorgPeriod, TxOutcome, ValidatorAnnounce, ValidatorAnnounceSubmission,
+    H256, U256,
 };
 use hyperlane_ethereum::{Signers, SingletonSigner, SingletonSignerHandle};
+use hyperlane_metric::{
+    prometheus_metric::RpcRole,
+    rpc_operation::{with_rpc_operation, RpcOperation},
+};
 
+use crate::checkpoint_consensus::CheckpointReader;
+use crate::merkle_tree_hook_sync::{
+    merkle_tree_cursor_state, CheckpointingMerkleTreeStore, MerkleTreeHookWebSocketSync,
+    MerkleTreeRpcRecovery,
+};
 use crate::reorg_reporter::{
     LatestCheckpointReorgReporter, LatestCheckpointReorgReporterWithStorageWriter, ReorgReporter,
 };
 use crate::reorg_tombstone;
-use crate::server::{self as validator_server, merkle_tree_insertions};
+use crate::rpc::{build_validator_per_url_hooks, dedupe_rpc_urls, state_read_urls};
+use crate::server::{self as validator_server, merkle_tree_insertions, ValidatorReadiness};
 use crate::{
     settings::ValidatorSettings,
     submit::{ValidatorSubmitter, ValidatorSubmitterMetrics},
 };
 
 const CURSOR_INSTANTIATION_ATTEMPTS: usize = 10;
+
+#[derive(Debug)]
+enum MerkleTreeHookSync {
+    Rpc(Arc<SequencedDataContractSync<MerkleTreeInsertion>>),
+    WebSocket {
+        fallback: Option<Arc<SequencedDataContractSync<MerkleTreeInsertion>>>,
+        websocket: Box<MerkleTreeHookWebSocketSync>,
+    },
+}
+
+const ANNOUNCEMENT_RETRY_MIN_DELAY: Duration = Duration::from_secs(30);
+const ANNOUNCEMENT_RETRY_MAX_DELAY: Duration = Duration::from_secs(900);
+const ANNOUNCEMENT_FUNDING_POLL_INTERVAL: Duration = Duration::from_secs(30);
+const ANNOUNCEMENT_RETRY_MIN_JITTER_PERMILLE: u32 = 800;
+const ANNOUNCEMENT_RETRY_MAX_JITTER_PERMILLE: u32 = 1000;
+
+/// Keeps announcement submission and unfunded warnings off the validator's hot poll loop while
+/// still allowing that loop to observe funding and on-chain announcement progress promptly.
+#[derive(Debug, Default)]
+struct AnnouncementRetryBackoff {
+    consecutive_failures: u32,
+    next_attempt_at: Option<Instant>,
+    next_funding_check_at: Option<Instant>,
+    last_tokens_needed: Option<U256>,
+    consecutive_unfunded_observations: u8,
+    funding_reset_armed: bool,
+    submission_in_flight: bool,
+}
+
+impl AnnouncementRetryBackoff {
+    fn ready(&self, now: Instant) -> bool {
+        !self.submission_in_flight
+            && self
+                .next_attempt_at
+                .is_none_or(|next_attempt_at| now >= next_attempt_at)
+    }
+
+    fn next_failure_delay(&self) -> Duration {
+        let multiplier = 2_u32.saturating_pow(self.consecutive_failures.min(31));
+        ANNOUNCEMENT_RETRY_MIN_DELAY
+            .saturating_mul(multiplier)
+            .min(ANNOUNCEMENT_RETRY_MAX_DELAY)
+    }
+
+    fn funding_check_due(&self, now: Instant) -> bool {
+        self.next_funding_check_at
+            .is_none_or(|next_funding_check_at| now >= next_funding_check_at)
+    }
+
+    /// Poll funding between attempts only when the last successful preflight proved the signer is
+    /// unfunded. If preflight is unavailable (for example, an RPC does not support `feeHistory`),
+    /// retrying it on a separate timer cannot detect funding and only creates more failed calls.
+    fn should_check_funding(&self, now: Instant) -> bool {
+        if self.submission_in_flight {
+            return false;
+        }
+
+        self.ready(now)
+            || (self
+                .last_tokens_needed
+                .is_some_and(|tokens_needed| !tokens_needed.is_zero())
+                && self.funding_check_due(now))
+    }
+
+    fn record_funding_check(&mut self, now: Instant) {
+        self.next_funding_check_at = now.checked_add(ANNOUNCEMENT_FUNDING_POLL_INTERVAL);
+    }
+
+    fn jittered(delay: Duration, jitter_permille: u32) -> Duration {
+        let bounded_jitter = jitter_permille.clamp(
+            ANNOUNCEMENT_RETRY_MIN_JITTER_PERMILLE,
+            ANNOUNCEMENT_RETRY_MAX_JITTER_PERMILLE,
+        );
+        let millis = delay
+            .as_millis()
+            .saturating_mul(u128::from(bounded_jitter))
+            .checked_div(u128::from(ANNOUNCEMENT_RETRY_MAX_JITTER_PERMILLE))
+            .unwrap_or_default();
+        Duration::from_millis(u64::try_from(millis).unwrap_or(u64::MAX))
+    }
+
+    fn record_failure(&mut self, now: Instant, delay: Duration) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.next_attempt_at = now.checked_add(delay);
+    }
+
+    fn mark_submission_in_flight(&mut self) {
+        self.consecutive_failures = 0;
+        self.next_attempt_at = None;
+        self.submission_in_flight = true;
+    }
+
+    /// A transition to a preflight-confirmed funded state is actionable progress: allow an
+    /// immediate attempt even if earlier failures were cooling down. Missing preflight data does
+    /// not erase the last known state, preventing intermittent RPC errors from defeating backoff.
+    fn observe_tokens_needed(&mut self, tokens_needed: Option<U256>) -> bool {
+        let Some(tokens_needed) = tokens_needed else {
+            return false;
+        };
+
+        let became_funded = if tokens_needed.is_zero() {
+            self.consecutive_unfunded_observations = 0;
+            let became_funded = self.funding_reset_armed;
+            self.funding_reset_armed = false;
+            became_funded
+        } else {
+            self.consecutive_unfunded_observations =
+                self.consecutive_unfunded_observations.saturating_add(1);
+            if self.consecutive_unfunded_observations >= 2 {
+                self.funding_reset_armed = true;
+            }
+            false
+        };
+        self.last_tokens_needed = Some(tokens_needed);
+        if became_funded {
+            self.consecutive_failures = 0;
+            self.next_attempt_at = None;
+        }
+        became_funded
+    }
+
+    /// Use the last successful preflight result when the current preflight is unavailable. In
+    /// particular, a transient estimation failure must not turn a known-unfunded signer into a
+    /// submission attempt.
+    fn effective_tokens_needed(&self, current: Option<U256>) -> Option<U256> {
+        current.or(self.last_tokens_needed)
+    }
+}
+
+/// Connects safety-critical MerkleTreeHook reads to the validator readiness endpoint. An empty
+/// tree is an expected ready state because there is nothing to sign. Once a tree exists, any
+/// failed correctness read blocks signing and readiness until a later read succeeds.
+#[derive(Debug)]
+struct ReadinessMerkleTreeHook {
+    inner: Arc<dyn MerkleTreeHook>,
+    readiness: Arc<ValidatorReadiness>,
+    source: &'static str,
+}
+
+impl ReadinessMerkleTreeHook {
+    fn new(
+        inner: Arc<dyn MerkleTreeHook>,
+        readiness: Arc<ValidatorReadiness>,
+        source: &'static str,
+    ) -> Self {
+        Self {
+            inner,
+            readiness,
+            source,
+        }
+    }
+
+    fn operation(&self, operation: &str) -> String {
+        format!("{}.{}", self.source, operation)
+    }
+
+    fn record_checkpoint_read<T>(&self, operation: &str, result: &ChainResult<T>) {
+        let operation = self.operation(operation);
+        match result {
+            Ok(_) => self.readiness.mark_operation_ready(&operation),
+            Err(_) => {
+                let snapshot = self.readiness.mark_operation_blocked(&operation);
+                warn!(
+                    operation = operation.as_str(),
+                    consecutive_failures = snapshot.consecutive_failures,
+                    failure_duration_ms = snapshot.failure_duration_ms,
+                    signing_blocked = snapshot.signing_blocked,
+                    "Validator checkpoint production is blocked"
+                );
+            }
+        }
+    }
+
+    fn record_count(&self, result: &ChainResult<u32>) {
+        let operation = self.operation("count");
+        match result {
+            Ok(_) => self.readiness.mark_operation_ready(&operation),
+            Err(_) => {
+                let snapshot = self.readiness.mark_operation_blocked(&operation);
+                warn!(
+                    operation = operation.as_str(),
+                    consecutive_failures = snapshot.consecutive_failures,
+                    failure_duration_ms = snapshot.failure_duration_ms,
+                    signing_blocked = snapshot.signing_blocked,
+                    "Validator checkpoint production is blocked"
+                );
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl MerkleTreeHook for ReadinessMerkleTreeHook {
+    async fn tree(&self, reorg_period: &ReorgPeriod) -> ChainResult<IncrementalMerkleAtBlock> {
+        let result = self.inner.tree(reorg_period).await;
+        self.record_checkpoint_read("tree", &result);
+        result
+    }
+
+    async fn count(&self, reorg_period: &ReorgPeriod) -> ChainResult<u32> {
+        let result = self.inner.count(reorg_period).await;
+        self.record_count(&result);
+        result
+    }
+
+    async fn latest_checkpoint(
+        &self,
+        reorg_period: &ReorgPeriod,
+    ) -> ChainResult<CheckpointAtBlock> {
+        let result = self.inner.latest_checkpoint(reorg_period).await;
+        self.record_checkpoint_read("latest_checkpoint", &result);
+        result
+    }
+
+    async fn latest_checkpoint_at_block(&self, height: u64) -> ChainResult<CheckpointAtBlock> {
+        let result = self.inner.latest_checkpoint_at_block(height).await;
+        self.record_checkpoint_read("latest_checkpoint_at_block", &result);
+        result
+    }
+}
+
+impl HyperlaneChain for ReadinessMerkleTreeHook {
+    fn domain(&self) -> &HyperlaneDomain {
+        self.inner.domain()
+    }
+
+    fn provider(&self) -> Box<dyn hyperlane_core::HyperlaneProvider> {
+        self.inner.provider()
+    }
+}
+
+impl HyperlaneContract for ReadinessMerkleTreeHook {
+    fn address(&self) -> H256 {
+        self.inner.address()
+    }
+}
+
+async fn wait_for_first_message(
+    merkle_tree_hook: Arc<dyn MerkleTreeHook>,
+    reorg_period: &ReorgPeriod,
+    interval: Duration,
+    readiness: &ValidatorReadiness,
+) -> IncrementalMerkleAtBlock {
+    loop {
+        match merkle_tree_hook.count(reorg_period).await {
+            Err(_) => {
+                error!("Error getting merkle tree count");
+            }
+            Ok(0) => {
+                readiness.mark_waiting_for_first_message();
+                info!("Waiting for first message in merkle tree hook");
+            }
+            Ok(_) => match merkle_tree_hook.tree(reorg_period).await {
+                Err(_) => {
+                    error!("Error getting merkle tree");
+                }
+                Ok(tree) if tree.count() == 0 => {
+                    readiness.mark_waiting_for_first_message();
+                    info!("Waiting for first message in merkle tree hook");
+                }
+                Ok(tree) => return tree,
+            },
+        }
+        sleep(interval).await;
+    }
+}
 
 /// A validator agent
 #[derive(Debug, AsRef)]
@@ -48,10 +330,10 @@ pub struct Validator {
     #[as_ref]
     core: HyperlaneAgentCore,
     db: HyperlaneRocksDB,
-    merkle_tree_hook_sync: Arc<SequencedDataContractSync<MerkleTreeInsertion>>,
-    mailbox: Arc<dyn Mailbox>,
+    merkle_tree_hook_sync: MerkleTreeHookSync,
+    checkpoint_wake: Option<Arc<Notify>>,
     merkle_tree_hook: Arc<dyn MerkleTreeHook>,
-    validator_announce: Arc<dyn ValidatorAnnounce>,
+    readiness: Arc<ValidatorReadiness>,
     signer: SingletonSignerHandle,
     raw_signer: Signers,
     // temporary holder until `run` is called
@@ -65,7 +347,9 @@ pub struct Validator {
     runtime_metrics: RuntimeMetrics,
     agent_metadata: ValidatorMetadata,
     max_sign_concurrency: usize,
-    reorg_reporter: Arc<dyn ReorgReporter>,
+    reorg_reporter: Option<Arc<dyn ReorgReporter>>,
+    skip_announce: bool,
+    checkpoint_reader: Option<Arc<CheckpointReader>>,
     reorg_tombstone_path: PathBuf,
 }
 
@@ -82,6 +366,20 @@ pub struct ValidatorMetadataRpcEntry {
     host_hash: H256,
 }
 
+impl ValidatorMetadataRpcEntry {
+    fn hash_rpc(rpc: &crate::settings::RpcConfig) -> Self {
+        Self {
+            url_hash: H256::from_slice(&keccak256(&rpc.url)),
+            host_hash: H256::from_slice(&keccak256(
+                Url::parse(&rpc.url)
+                    .ok()
+                    .and_then(|url| url.host_str().map(str::to_string))
+                    .unwrap_or("".to_string()),
+            )),
+        }
+    }
+}
+
 impl MetadataFromSettings<ValidatorSettings> for ValidatorMetadata {
     /// Create a new instance of the agent metadata from the settings
     fn build_metadata(settings: &ValidatorSettings) -> ValidatorMetadata {
@@ -89,15 +387,7 @@ impl MetadataFromSettings<ValidatorSettings> for ValidatorMetadata {
         let rpcs = settings
             .rpcs
             .iter()
-            .map(|rpc| ValidatorMetadataRpcEntry {
-                url_hash: H256::from_slice(&keccak256(&rpc.url)),
-                host_hash: H256::from_slice(&keccak256(
-                    Url::parse(&rpc.url)
-                        .ok()
-                        .and_then(|url| url.host_str().map(str::to_string))
-                        .unwrap_or("".to_string()),
-                )),
-            })
+            .map(ValidatorMetadataRpcEntry::hash_rpc)
             .collect();
         ValidatorMetadata {
             git_sha: git_sha(),
@@ -126,12 +416,16 @@ impl BaseAgent for Validator {
     where
         Self: Sized,
     {
-        // Check for public rpcs in the config
-        if settings.rpcs.iter().any(|x| x.public) && !settings.allow_public_rpcs {
+        let public_rpc_urls: Vec<String> = settings
+            .rpcs
+            .iter()
+            .filter_map(|x| if x.public { Some(x.url.clone()) } else { None })
+            .collect();
+        if !public_rpc_urls.is_empty() && !settings.allow_public_rpcs {
             return Err(
                 eyre!(
                     "Public RPC endpoints detected: {}. Using public RPCs can compromise security and reliability. If you understand the risks and still want to proceed, set `--allowPublicRpcs true`. We strongly recommend using private RPC endpoints for production validators.",
-                    settings.rpcs.iter().filter_map(|x| if x.public { Some(x.url.clone()) } else { None }).join(", ")
+                    public_rpc_urls.join(", ")
                 )
             );
         }
@@ -149,69 +443,163 @@ impl BaseAgent for Validator {
 
         let core = settings.build_hyperlane_core(metrics.clone());
 
-        let reorg_reporter =
-            LatestCheckpointReorgReporter::from_settings(&settings, &metrics).await?;
-        let reorg_reporter = Arc::new(reorg_reporter) as Arc<dyn ReorgReporter>;
-
-        let checkpoint_syncer_result = settings.checkpoint_syncer.build_and_validate(None).await;
-
-        Self::report_latest_checkpoints_from_each_endpoint(
-            &reorg_reporter,
-            &checkpoint_syncer_result,
-        )
-        .await;
-
-        // Be extra sure to panic when checkpoint syncer fails, which indicates
-        // a fatal startup error.
-        let checkpoint_syncer: Arc<dyn CheckpointSyncer> = checkpoint_syncer_result
+        // A reorg flag or an unreadable status must stop startup before any
+        // diagnostic RPC setup or reads, which can stall indefinitely.
+        let checkpoint_syncer: Arc<dyn CheckpointSyncer> = settings
+            .checkpoint_syncer
+            .build_and_validate(None)
+            .await
             .expect("Failed to build checkpoint syncer")
             .into();
 
+        let reorg_reporter = if settings.lightweight {
+            None
+        } else {
+            Some(LatestCheckpointReorgReporter::from_settings(&settings, &metrics).await?)
+        };
+
         // If checkpoint syncer initialization was successful, use a reorg-reporter which
         // writes to the storage location in addition to the logs.
-        let reorg_reporter_with_storage_writer =
-            LatestCheckpointReorgReporterWithStorageWriter::from_settings_with_storage_writer(
-                &settings,
-                &metrics,
+        let reorg_reporter = reorg_reporter.map(|reporter| {
+            Arc::new(LatestCheckpointReorgReporterWithStorageWriter::new(
+                reporter,
                 checkpoint_syncer.clone(),
-            )
-            .await?;
-        let reorg_reporter = Arc::new(reorg_reporter_with_storage_writer) as Arc<dyn ReorgReporter>;
+            )) as Arc<dyn ReorgReporter>
+        });
 
         let origin_chain_conf = core.settings.chain_setup(&settings.origin_chain)?.clone();
-
-        let mailbox = origin_chain_conf.build_mailbox(&metrics).await?;
-
-        let merkle_tree_hook = settings
-            .build_merkle_tree_hook(&settings.origin_chain, &metrics)
-            .await?;
-
-        let validator_announce = settings
-            .build_validator_announce(&settings.origin_chain, &metrics)
-            .await?;
-
-        let contract_sync_metrics = Arc::new(ContractSyncMetrics::new(&metrics));
-
-        let merkle_tree_hook_sync = settings
-            .sequenced_contract_sync::<MerkleTreeInsertion, _>(
-                &settings.origin_chain,
+        let (raw_merkle_tree_hook, checkpoint_reader): (
+            Arc<dyn MerkleTreeHook>,
+            Option<Arc<CheckpointReader>>,
+        ) = if let Some(consensus) = settings.checkpoint_consensus {
+            let rpc_urls = settings
+                .rpcs
+                .iter()
+                .enumerate()
+                .map(|(i, rpc)| Url::parse(&rpc.url).map_err(|_| eyre!("Invalid rpcUrls[{i}] URL")))
+                .collect::<Result<Vec<_>>>()?;
+            let (source, urls) = state_read_urls(&origin_chain_conf, rpc_urls);
+            let urls = dedupe_rpc_urls(urls, source);
+            let hooks = build_validator_per_url_hooks(
+                &origin_chain_conf,
+                source,
+                RpcRole::Primary,
+                &urls,
                 &metrics,
-                &contract_sync_metrics,
-                msg_db.clone().into(),
-                false,
-                false,
             )
             .await?;
+            let hooks: Vec<Arc<dyn MerkleTreeHook>> =
+                hooks.into_iter().map(|(_, hook)| hook).collect();
+            let first = hooks.first().cloned().ok_or_else(|| {
+                eyre!("Checkpoint consensus requires at least one state-read endpoint")
+            })?;
+            let reader = Arc::new(CheckpointReader::new(consensus, hooks)?);
+            let hook = if settings.lightweight {
+                first
+            } else {
+                Arc::from(
+                    settings
+                        .build_merkle_tree_hook(&settings.origin_chain, &metrics)
+                        .await?,
+                )
+            };
+            (hook, Some(reader))
+        } else {
+            (
+                settings
+                    .build_merkle_tree_hook(&settings.origin_chain, &metrics)
+                    .await?
+                    .into(),
+                None,
+            )
+        };
+        let readiness = Arc::new(ValidatorReadiness::default());
+        let merkle_tree_hook: Arc<dyn MerkleTreeHook> = Arc::new(ReadinessMerkleTreeHook::new(
+            raw_merkle_tree_hook,
+            Arc::clone(&readiness),
+            "merkle_tree_hook",
+        ));
+
+        let contract_sync_metrics = Arc::new(ContractSyncMetrics::new(&metrics));
+        let cursor_state = settings
+            .websocket_url
+            .as_ref()
+            .map(|_| merkle_tree_cursor_state());
+        let rpc_sync = if settings.lightweight {
+            None
+        } else {
+            Some(if let Some(cursor_state) = cursor_state.clone() {
+                settings
+                    .sequenced_contract_sync::<MerkleTreeInsertion, _>(
+                        &settings.origin_chain,
+                        &metrics,
+                        &contract_sync_metrics,
+                        Arc::new(CheckpointingMerkleTreeStore::new(
+                            msg_db.clone(),
+                            cursor_state,
+                        )),
+                        false,
+                        false,
+                    )
+                    .await?
+            } else {
+                settings
+                    .sequenced_contract_sync::<MerkleTreeInsertion, _>(
+                        &settings.origin_chain,
+                        &metrics,
+                        &contract_sync_metrics,
+                        msg_db.clone().into(),
+                        false,
+                        false,
+                    )
+                    .await?
+            })
+        };
+        let sync_source = metrics.new_int_gauge(
+            "merkle_tree_hook_sync_source_active",
+            "Whether a Merkle tree hook indexing source is active",
+            &["origin", "source"],
+        )?;
+        let websocket_active =
+            sync_source.with_label_values(&[settings.origin_chain.name(), "websocket"]);
+        let rpc_active = sync_source.with_label_values(&[settings.origin_chain.name(), "rpc"]);
+        let (merkle_tree_hook_sync, checkpoint_wake) =
+            if let Some(url) = settings.websocket_url.clone() {
+                let checkpoint_wake = Arc::new(Notify::new());
+                (
+                    MerkleTreeHookSync::WebSocket {
+                        fallback: rpc_sync,
+                        websocket: Box::new(MerkleTreeHookWebSocketSync::new_with_cursor_state(
+                            msg_db.clone(),
+                            settings.origin_chain.id(),
+                            origin_chain_conf.addresses.merkle_tree_hook,
+                            url,
+                            websocket_active,
+                            rpc_active,
+                            cursor_state.expect("WebSocket configuration initializes cursor state"),
+                            checkpoint_wake.clone(),
+                        )),
+                    },
+                    Some(checkpoint_wake),
+                )
+            } else {
+                websocket_active.set(0);
+                rpc_active.set(1);
+                (
+                    MerkleTreeHookSync::Rpc(rpc_sync.expect("RPC mode builds an indexer")),
+                    None,
+                )
+            };
 
         Ok(Self {
             origin_chain: settings.origin_chain,
             origin_chain_conf,
             core,
             db: msg_db,
-            mailbox: mailbox.into(),
-            merkle_tree_hook: merkle_tree_hook.into(),
+            merkle_tree_hook,
+            readiness,
             merkle_tree_hook_sync,
-            validator_announce: validator_announce.into(),
+            checkpoint_wake,
             signer,
             raw_signer,
             signer_instance: Some(Box::new(signer_instance)),
@@ -226,6 +614,8 @@ impl BaseAgent for Validator {
             max_sign_concurrency: settings.max_sign_concurrency,
             reorg_reporter,
             reorg_tombstone_path,
+            skip_announce: settings.skip_announce,
+            checkpoint_reader,
         })
     }
 
@@ -238,6 +628,7 @@ impl BaseAgent for Validator {
             .merge(validator_server::router(
                 self.origin_chain.clone(),
                 self.core.metrics.clone(),
+                Arc::clone(&self.readiness),
             ))
             .merge(
                 merkle_tree_insertions::list_merkle_tree_insertions::ServerState::new(
@@ -284,7 +675,9 @@ impl BaseAgent for Validator {
             }
         };
 
-        let task = metrics_updater.spawn();
+        // Checkpoint signing is off-chain. Announcement funding is checked on
+        // demand by announce_tokens_needed, so no periodic balance reads are needed.
+        let task = metrics_updater.without_wallet_balance().spawn();
         tasks.push(task);
 
         // report agent metadata
@@ -295,26 +688,43 @@ impl BaseAgent for Validator {
         // announce the validator after spawning the signer task
         self.announce().await.expect("Failed to announce validator");
 
-        // Ensure that the merkle tree hook has count > 0 before we begin indexing
-        // messages or submitting checkpoints.
-        loop {
-            match self.merkle_tree_hook.count(&self.reorg_period).await {
-                Err(err) => {
-                    error!(?err, "Error getting merkle tree hook count");
-                    sleep(self.interval).await;
-                }
-                Ok(0) => {
-                    info!("Waiting for first message in merkle tree hook");
-                    sleep(self.interval).await;
-                }
-                Ok(_) => {
-                    break;
-                }
+        let submitter = self.checkpoint_submitter();
+        // Authenticate the snapshot before choosing the websocket replay cursor.
+        let tip_tree = if self.checkpoint_reader.is_some() {
+            self.readiness.mark_waiting_for_first_message();
+            IncrementalMerkleAtBlock {
+                tree: submitter.restore_consensus_tree().await,
+                block_height: None,
             }
-        }
+        } else {
+            wait_for_first_message(
+                Arc::clone(&self.merkle_tree_hook),
+                &self.reorg_period,
+                self.interval,
+                &self.readiness,
+            )
+            .await
+        };
+
+        let backfill_tree = if self.checkpoint_reader.is_some() {
+            tip_tree.tree.clone()
+        } else {
+            submitter
+                .restored_snapshot_tree(tip_tree.index())
+                .await
+                .unwrap_or_default()
+        };
+        let replay_from = u32::try_from(backfill_tree.count()).expect("snapshot count fits in u32");
 
         let merkle_tree_hook_sync = match self
-            .try_n_times_to_run_merkle_tree_hook_sync(CURSOR_INSTANTIATION_ATTEMPTS)
+            .try_n_times_to_run_merkle_tree_hook_sync(
+                CURSOR_INSTANTIATION_ATTEMPTS,
+                tip_tree
+                    .count()
+                    .try_into()
+                    .expect("Merkle tree leaf count must fit in u32"),
+                replay_from,
+            )
             .await
         {
             Ok(s) => s,
@@ -324,7 +734,10 @@ impl BaseAgent for Validator {
             }
         };
         tasks.push(merkle_tree_hook_sync);
-        for checkpoint_sync_task in self.run_checkpoint_submitters().await {
+        for checkpoint_sync_task in self
+            .run_checkpoint_submitters(submitter, tip_tree, backfill_tree)
+            .await
+        {
             tasks.push(checkpoint_sync_task);
         }
 
@@ -332,7 +745,7 @@ impl BaseAgent for Validator {
 
         // Note that this only returns an error if one of the tasks panics
         if let Err(err) = try_join_all(tasks).await {
-            error!(?err, "One of the validator tasks returned an error");
+            panic!("One of the validator tasks failed: {err}");
         }
     }
 }
@@ -342,9 +755,14 @@ impl Validator {
     async fn try_n_times_to_run_merkle_tree_hook_sync(
         &self,
         attempts: usize,
+        next_sequence_hint: u32,
+        replay_from: u32,
     ) -> eyre::Result<JoinHandle<()>> {
         for i in 0..attempts {
-            let task = match self.run_merkle_tree_hook_sync().await {
+            let task = match self
+                .run_merkle_tree_hook_sync(next_sequence_hint, replay_from)
+                .await
+            {
                 Ok(s) => s,
                 Err(err) => {
                     error!(
@@ -369,31 +787,74 @@ impl Validator {
         ))
     }
 
-    async fn run_merkle_tree_hook_sync(&self) -> eyre::Result<JoinHandle<()>> {
-        let index_settings = self
-            .as_ref()
-            .settings
-            .chains
-            .get(&self.origin_chain)
-            .map(|chain| chain.index_settings())
-            .ok_or_else(|| eyre::eyre!("No index setting found"))?;
-        let contract_sync = self.merkle_tree_hook_sync.clone();
-        let cursor = contract_sync.cursor(index_settings).await?;
+    async fn run_merkle_tree_hook_sync(
+        &self,
+        next_sequence_hint: u32,
+        replay_from: u32,
+    ) -> eyre::Result<JoinHandle<()>> {
         let origin = self.origin_chain.name().to_string();
-
-        let handle = tokio::spawn(
-            async move {
-                let label = "merkle_tree_hook";
-                contract_sync.clone().sync(label, cursor.into()).await;
-                info!(chain = origin, label, "contract sync task exit");
+        match &self.merkle_tree_hook_sync {
+            MerkleTreeHookSync::Rpc(contract_sync) => {
+                let index_settings = self
+                    .as_ref()
+                    .settings
+                    .chains
+                    .get(&self.origin_chain)
+                    .map(|chain| chain.index_settings())
+                    .ok_or_else(|| eyre::eyre!("No index setting found"))?;
+                let contract_sync = contract_sync.clone();
+                let cursor = contract_sync.cursor(index_settings).await?;
+                Ok(tokio::spawn(
+                    async move {
+                        let label = "merkle_tree_hook";
+                        contract_sync.clone().sync(label, cursor.into()).await;
+                        info!(chain = origin, label, "contract sync task exit");
+                    }
+                    .instrument(info_span!("MerkleTreeHookSyncer")),
+                ))
             }
-            .instrument(info_span!("MerkleTreeHookSyncer")),
-        );
-        Ok(handle)
+            MerkleTreeHookSync::WebSocket {
+                fallback,
+                websocket,
+            } => {
+                let index_settings = self
+                    .as_ref()
+                    .settings
+                    .chains
+                    .get(&self.origin_chain)
+                    .map(|chain| chain.index_settings())
+                    .ok_or_else(|| eyre::eyre!("No index setting found"))?;
+                let websocket = websocket.clone();
+                let cursor_sync = websocket.clone();
+                let next_sequence = tokio::task::spawn_blocking(move || {
+                    cursor_sync.next_sequence_after_snapshot(replay_from)
+                })
+                .await
+                .context("Finding the next Merkle tree insertion sequence")??;
+                let fallback = fallback.clone();
+                let merkle_tree_hook = self.merkle_tree_hook.clone();
+                let reorg_period = self.reorg_period.clone();
+                Ok(tokio::spawn(
+                    async move {
+                        websocket
+                            .run(
+                                next_sequence,
+                                next_sequence_hint,
+                                fallback,
+                                index_settings,
+                                merkle_tree_hook,
+                                reorg_period,
+                            )
+                            .await
+                    }
+                    .instrument(info_span!("MerkleTreeHookWebSocketSyncer")),
+                ))
+            }
+        }
     }
 
-    async fn run_checkpoint_submitters(&self) -> Vec<JoinHandle<()>> {
-        let submitter = ValidatorSubmitter::new(
+    fn checkpoint_submitter(&self) -> ValidatorSubmitter {
+        ValidatorSubmitter::new(
             self.interval,
             self.reorg_period.clone(),
             self.merkle_tree_hook.clone(),
@@ -404,36 +865,93 @@ impl Validator {
             ValidatorSubmitterMetrics::new(&self.core.metrics, &self.origin_chain),
             self.max_sign_concurrency,
             self.reorg_reporter.clone(),
+            Arc::clone(&self.readiness),
             self.reorg_tombstone_path.clone(),
-        );
+        )
+        .with_checkpoint_wake(self.checkpoint_wake.clone())
+        .with_websocket_health(match &self.merkle_tree_hook_sync {
+            MerkleTreeHookSync::WebSocket { websocket, .. } => Some(websocket.health()),
+            MerkleTreeHookSync::Rpc(_) => None,
+        })
+    }
 
-        let tip_tree = self
-            .merkle_tree_hook
-            .tree(&self.reorg_period)
-            .await
-            .expect("failed to get merkle tree");
+    async fn run_checkpoint_submitters(
+        &self,
+        mut submitter: ValidatorSubmitter,
+        tip_tree: IncrementalMerkleAtBlock,
+        backfill_tree: IncrementalMerkle,
+    ) -> Vec<JoinHandle<()>> {
+        if let Some(reader) = &self.checkpoint_reader {
+            let sync = match &self.merkle_tree_hook_sync {
+                MerkleTreeHookSync::Rpc(sync) => Some(sync.clone()),
+                MerkleTreeHookSync::WebSocket { fallback, .. } => fallback.clone(),
+            };
+            if let Some(sync) = sync {
+                submitter = submitter.with_rpc_recovery(MerkleTreeRpcRecovery {
+                    sync,
+                    db: self.db.clone(),
+                    index_settings: self.origin_chain_conf.index_settings(),
+                    // Endpoint block metadata is not authenticated by a root vote.
+                    from_block: None,
+                });
+            }
+            let reader = reader.clone();
+            return vec![tokio::spawn(
+                async move {
+                    with_rpc_operation(
+                        RpcOperation::ValidatorCheckpoint,
+                        submitter.consensus_checkpoint_submitter(reader, tip_tree.tree),
+                    )
+                    .await
+                }
+                .instrument(info_span!("ConsensusCheckpointSubmitter")),
+            )];
+        }
 
-        // This function is only called after we have already checked that the
-        // merkle tree hook has count > 0, but we assert to be extra sure this is
-        // the case.
+        // `wait_for_first_message` only returns a non-empty, quorum-verified tree.
         assert!(tip_tree.count() > 0, "merkle tree is empty");
         let backfill_target = submitter.checkpoint_at_block(&tip_tree);
 
-        let backfill_submitter = submitter.clone();
+        let mut backfill_submitter = submitter.clone();
+
+        if let MerkleTreeHookSync::WebSocket {
+            fallback: Some(fallback),
+            ..
+        } = &self.merkle_tree_hook_sync
+        {
+            let mut recovery = MerkleTreeRpcRecovery {
+                sync: fallback.clone(),
+                db: self.db.clone(),
+                index_settings: self.core.settings.chains[&self.origin_chain].index_settings(),
+                from_block: None,
+            };
+            backfill_submitter = backfill_submitter.with_rpc_recovery(recovery.clone());
+            recovery.from_block = tip_tree.block_height;
+            submitter = submitter.with_rpc_recovery(recovery);
+        }
 
         let mut tasks = vec![];
         tasks.push(tokio::spawn(
             async move {
-                backfill_submitter
-                    .backfill_checkpoint_submitter(backfill_target)
-                    .await
+                with_rpc_operation(
+                    RpcOperation::ValidatorCheckpoint,
+                    backfill_submitter
+                        .backfill_checkpoint_submitter(backfill_target, backfill_tree),
+                )
+                .await
             }
             .instrument(info_span!("BackfillCheckpointSubmitter")),
         ));
 
         tasks.push(tokio::spawn(
-            async move { submitter.checkpoint_submitter(tip_tree.tree).await }
-                .instrument(info_span!("TipCheckpointSubmitter")),
+            async move {
+                with_rpc_operation(
+                    RpcOperation::ValidatorCheckpoint,
+                    submitter.checkpoint_submitter(tip_tree.tree),
+                )
+                .await
+            }
+            .instrument(info_span!("TipCheckpointSubmitter")),
         ));
 
         tasks
@@ -468,6 +986,18 @@ impl Validator {
         }
     }
 
+    fn announcement_submission_may_be_in_flight(
+        result: &ChainResult<ValidatorAnnounceSubmission>,
+    ) -> bool {
+        matches!(
+            result,
+            Ok(ValidatorAnnounceSubmission::Confirmed(outcome)) if outcome.executed
+        ) || matches!(
+            result,
+            Ok(ValidatorAnnounceSubmission::BroadcastError { .. })
+        )
+    }
+
     async fn metadata(&self) -> Result<()> {
         let serialized_metadata = serde_json::to_string_pretty(&self.agent_metadata)?;
         self.checkpoint_syncer
@@ -482,8 +1012,8 @@ impl Validator {
         // Sign and post the validator announcement
         let announcement = Announcement {
             validator: address,
-            mailbox_address: self.mailbox.address(),
-            mailbox_domain: self.mailbox.domain().id(),
+            mailbox_address: self.origin_chain_conf.addresses.mailbox,
+            mailbox_domain: self.origin_chain.id(),
             storage_location: self.announcement_location()?, // Use formatted location for the signed announcement
         };
         let signed_announcement = self.signer.sign(announcement.clone()).await?;
@@ -491,15 +1021,30 @@ impl Validator {
             .write_announcement(&signed_announcement)
             .await?;
 
+        if self.skip_announce {
+            warn!(
+                "Skipping on-chain validator announcement (skipAnnounce=true) — \
+                 test-only, checkpoints signed by this validator will not be \
+                 discoverable by relayers until it actually announces"
+            );
+            return Ok(());
+        }
+
         // Ensure that the validator has announced themselves before we enter
         // the main validator submit loop. This is to avoid a situation in
         // which the validator is signing checkpoints but has not announced
         // their locations, which makes them functionally unusable.
+        let validator_announce = self
+            .origin_chain_conf
+            .build_validator_announce_reader(&self.core.metrics)
+            .await?;
+        // Only a real submission needs a signer, gas oracle, or escalator.
+        let mut submission_contract: Option<Box<dyn ValidatorAnnounce>> = None;
         let validators: [H256; 1] = [address.into()];
+        let mut retry_backoff = AnnouncementRetryBackoff::default();
         loop {
             info!("Checking for validator announcement");
-            if let Some(locations) = self
-                .validator_announce
+            if let Some(locations) = validator_announce
                 .get_announced_storage_locations(&validators)
                 .await?
                 .first()
@@ -526,27 +1071,99 @@ impl Validator {
                 {
                     let chain_signer_string = chain_signer.address_string();
                     let chain_signer_h256 = chain_signer.address_h256();
-                    info!(eth_validator_address=?announcement.validator, ?chain_signer_string, ?chain_signer_h256, "Attempting self announce");
+                    let now = Instant::now();
+                    if !retry_backoff.should_check_funding(now) {
+                        sleep(self.interval).await;
+                        continue;
+                    }
+                    retry_backoff.record_funding_check(now);
 
-                    let balance_delta = self
-                        .validator_announce
+                    let balance_delta = validator_announce
                         .announce_tokens_needed(signed_announcement.clone(), chain_signer_h256)
-                        .await
-                        .unwrap_or_default();
-                    if balance_delta > U256::zero() {
-                        warn!(
-                            tokens_needed=%balance_delta,
+                        .await;
+                    if retry_backoff.observe_tokens_needed(balance_delta) {
+                        info!(
                             eth_validator_address=?announcement.validator,
                             ?chain_signer_string,
                             ?chain_signer_h256,
-                            "Please send tokens to your chain signer address to announce",
+                            "Validator chain signer is funded; resetting announcement retry backoff",
                         );
-                    } else {
-                        let result = self
-                            .validator_announce
-                            .announce(signed_announcement.clone())
-                            .await;
-                        Self::log_on_announce_failure(result, &chain_signer_string);
+                    }
+
+                    let effective_balance_delta =
+                        retry_backoff.effective_tokens_needed(balance_delta);
+                    if retry_backoff.ready(Instant::now()) {
+                        if let Some(balance_delta) =
+                            effective_balance_delta.filter(|balance_delta| !balance_delta.is_zero())
+                        {
+                            let delay = Self::jittered_announcement_retry_delay(
+                                retry_backoff.next_failure_delay(),
+                            );
+                            warn!(
+                                tokens_needed=%balance_delta,
+                                eth_validator_address=?announcement.validator,
+                                ?chain_signer_string,
+                                ?chain_signer_h256,
+                                retry_delay_ms=delay.as_millis(),
+                                consecutive_failures=retry_backoff.consecutive_failures.saturating_add(1),
+                                "Please send tokens to your chain signer address to announce",
+                            );
+                            retry_backoff.record_failure(Instant::now(), delay);
+                        } else {
+                            info!(eth_validator_address=?announcement.validator, ?chain_signer_string, ?chain_signer_h256, "Attempting self announce");
+                            if submission_contract.is_none() {
+                                submission_contract = Some(
+                                    self.origin_chain_conf
+                                        .build_validator_announce(&self.core.metrics)
+                                        .await?,
+                                );
+                            }
+                            let result = submission_contract
+                                .as_ref()
+                                .expect("announcement submission client initialized")
+                                .announce_with_status(signed_announcement.clone())
+                                .await;
+                            let submission_may_be_in_flight =
+                                Self::announcement_submission_may_be_in_flight(&result);
+                            match result {
+                                Ok(ValidatorAnnounceSubmission::Confirmed(outcome)) => {
+                                    Self::log_on_announce_failure(
+                                        Ok(outcome),
+                                        &chain_signer_string,
+                                    );
+                                }
+                                Ok(ValidatorAnnounceSubmission::BroadcastError {
+                                    tx_id,
+                                    error,
+                                }) => {
+                                    error!(
+                                        ?tx_id,
+                                        ?error,
+                                        chain_signer=?chain_signer_string,
+                                        "Failed to track broadcast validator announcement; gas escalator retains ownership",
+                                    );
+                                }
+                                Err(error) => {
+                                    Self::log_on_announce_failure(Err(error), &chain_signer_string);
+                                }
+                            }
+                            if submission_may_be_in_flight {
+                                // Any error after receiving a transaction hash leaves the gas
+                                // escalator responsible for replacement with the same nonce.
+                                retry_backoff.mark_submission_in_flight();
+                            } else {
+                                let delay = Self::jittered_announcement_retry_delay(
+                                    retry_backoff.next_failure_delay(),
+                                );
+                                info!(
+                                    retry_delay_ms = delay.as_millis(),
+                                    consecutive_failures =
+                                        retry_backoff.consecutive_failures.saturating_add(1),
+                                    "Scheduled validator announcement retry",
+                                );
+                                retry_backoff.record_failure(Instant::now(), delay);
+                            }
+                        }
                     }
                 } else {
                     warn!(origin_chain=%self.origin_chain, "Cannot announce validator without a signer; make sure a signer is set for the origin chain");
@@ -558,29 +1175,11 @@ impl Validator {
         Ok(())
     }
 
-    async fn report_latest_checkpoints_from_each_endpoint(
-        reorg_reporter: &Arc<dyn ReorgReporter>,
-        checkpoint_syncer_result: &Result<Box<dyn CheckpointSyncer>, CheckpointSyncerBuildError>,
-    ) {
-        if let Err(CheckpointSyncerBuildError::ReorgFlag(reorg_resp)) =
-            checkpoint_syncer_result.as_ref()
-        {
-            match reorg_resp.event.as_ref() {
-                Some(reorg_event) => {
-                    reorg_reporter
-                        .report_with_reorg_period(&reorg_event.reorg_period)
-                        .await;
-                }
-                None => {
-                    tracing::error!(
-                        "Failed to parse reorg event, reporting with default reorg period"
-                    );
-                    reorg_reporter
-                        .report_with_reorg_period(&ReorgPeriod::None)
-                        .await;
-                }
-            }
-        }
+    fn jittered_announcement_retry_delay(delay: Duration) -> Duration {
+        let jitter_permille = rand::thread_rng().gen_range(
+            ANNOUNCEMENT_RETRY_MIN_JITTER_PERMILLE..=ANNOUNCEMENT_RETRY_MAX_JITTER_PERMILLE,
+        );
+        AnnouncementRetryBackoff::jittered(delay, jitter_permille)
     }
 
     fn announcement_location(&self) -> Result<String> {
@@ -615,7 +1214,642 @@ impl Validator {
 
 #[cfg(test)]
 mod tests {
+    use crate::rpc::chain_conf_for_read_url;
+    use hyperlane_base::settings::ChainConnectionConf;
+    use hyperlane_ethereum::RpcConnectionConf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use hyperlane_core::{test_utils::dummy_domain, ChainCommunicationError};
+    use prometheus::Registry;
+
     use super::*;
+    use crate::test_utils::mock_merkle_tree_hook::MockMerkleTreeHook;
+
+    #[tokio::test(start_paused = true)]
+    async fn announcement_retry_backoff_grows_and_caps() {
+        let mut backoff = AnnouncementRetryBackoff::default();
+        let expected_delays = [
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            Duration::from_secs(120),
+            Duration::from_secs(240),
+            Duration::from_secs(480),
+            Duration::from_secs(900),
+            Duration::from_secs(900),
+        ];
+
+        for expected_delay in expected_delays {
+            let now = Instant::now();
+            assert!(backoff.ready(now));
+            assert_eq!(backoff.next_failure_delay(), expected_delay);
+            backoff.record_failure(now, expected_delay);
+            assert!(!backoff.ready(now));
+
+            let before_deadline = expected_delay
+                .checked_sub(Duration::from_millis(1))
+                .expect("retry delays exceed one millisecond");
+            tokio::time::advance(before_deadline).await;
+            assert!(!backoff.ready(Instant::now()));
+            tokio::time::advance(Duration::from_millis(1)).await;
+            assert!(backoff.ready(Instant::now()));
+        }
+    }
+
+    #[test]
+    fn announcement_retry_jitter_stays_bounded() {
+        assert_eq!(
+            AnnouncementRetryBackoff::jittered(Duration::from_secs(30), 0),
+            Duration::from_secs(24)
+        );
+        assert_eq!(
+            AnnouncementRetryBackoff::jittered(Duration::from_secs(30), 900),
+            Duration::from_secs(27)
+        );
+        assert_eq!(
+            AnnouncementRetryBackoff::jittered(Duration::from_secs(30), u32::MAX),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            AnnouncementRetryBackoff::jittered(
+                ANNOUNCEMENT_RETRY_MAX_DELAY,
+                ANNOUNCEMENT_RETRY_MAX_JITTER_PERMILLE,
+            ),
+            ANNOUNCEMENT_RETRY_MAX_DELAY
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sustained_unfunded_then_confirmed_funding_resets_retry_immediately() {
+        let mut backoff = AnnouncementRetryBackoff::default();
+        let now = Instant::now();
+        backoff.record_failure(now, ANNOUNCEMENT_RETRY_MAX_DELAY);
+        assert!(!backoff.observe_tokens_needed(None));
+        assert!(!backoff.ready(now));
+
+        assert!(!backoff.observe_tokens_needed(Some(U256::from(10_u64))));
+        assert!(!backoff.observe_tokens_needed(Some(U256::from(10_u64))));
+        assert!(backoff.observe_tokens_needed(Some(U256::zero())));
+        assert!(backoff.ready(now));
+        assert_eq!(backoff.consecutive_failures, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn funding_preflight_uses_bounded_polling_while_submission_backs_off() {
+        let mut backoff = AnnouncementRetryBackoff::default();
+        let now = Instant::now();
+        assert!(!backoff.observe_tokens_needed(Some(U256::from(1_u64))));
+        backoff.record_failure(now, ANNOUNCEMENT_RETRY_MAX_DELAY);
+        assert!(backoff.should_check_funding(now));
+        backoff.record_funding_check(now);
+        assert!(!backoff.should_check_funding(now));
+
+        let before_poll = ANNOUNCEMENT_FUNDING_POLL_INTERVAL
+            .checked_sub(Duration::from_millis(1))
+            .expect("funding poll interval exceeds one millisecond");
+        tokio::time::advance(before_poll).await;
+        assert!(!backoff.should_check_funding(Instant::now()));
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(backoff.should_check_funding(Instant::now()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unavailable_funding_preflight_waits_for_submission_retry_deadline() {
+        let mut backoff = AnnouncementRetryBackoff::default();
+        let now = Instant::now();
+        backoff.record_funding_check(now);
+        backoff.record_failure(now, ANNOUNCEMENT_RETRY_MAX_DELAY);
+
+        assert_eq!(backoff.last_tokens_needed, None);
+        assert!(!backoff.should_check_funding(now));
+        tokio::time::advance(ANNOUNCEMENT_RETRY_MAX_DELAY).await;
+        assert!(backoff.should_check_funding(Instant::now()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn funded_preflight_waits_for_submission_retry_deadline() {
+        let mut backoff = AnnouncementRetryBackoff::default();
+        let now = Instant::now();
+        assert!(!backoff.observe_tokens_needed(Some(U256::zero())));
+        backoff.record_funding_check(now);
+        backoff.record_failure(now, ANNOUNCEMENT_RETRY_MAX_DELAY);
+
+        assert!(!backoff.should_check_funding(now));
+        tokio::time::advance(ANNOUNCEMENT_RETRY_MAX_DELAY).await;
+        assert!(backoff.should_check_funding(Instant::now()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn in_flight_announcement_never_creates_a_second_submission_stream() {
+        let mut backoff = AnnouncementRetryBackoff::default();
+        let now = Instant::now();
+        backoff.record_failure(now, Duration::from_secs(30));
+        backoff.record_failure(now, Duration::from_secs(60));
+
+        backoff.mark_submission_in_flight();
+        assert_eq!(backoff.consecutive_failures, 0);
+        assert!(!backoff.ready(now));
+        assert!(!backoff.should_check_funding(now));
+        tokio::time::advance(ANNOUNCEMENT_RETRY_MAX_DELAY.saturating_mul(10)).await;
+        assert!(!backoff.ready(Instant::now()));
+        assert!(!backoff.should_check_funding(Instant::now()));
+
+        // Delayed zero preflight or a transient unfunded/funded flap cannot erase in-flight state.
+        assert!(!backoff.observe_tokens_needed(Some(U256::from(1_u64))));
+        assert!(!backoff.observe_tokens_needed(Some(U256::zero())));
+        assert!(!backoff.ready(Instant::now()));
+    }
+
+    #[test]
+    fn every_post_broadcast_error_suppresses_outer_resubmission() {
+        let tx_id = hyperlane_core::H512::from_low_u64_be(9);
+        let dropped_tx_id = H256::from_low_u64_be(9);
+        let post_broadcast_errors = [
+            ChainCommunicationError::TransactionDropped(dropped_tx_id),
+            ChainCommunicationError::TransactionTimeout,
+            ChainCommunicationError::from_other_str("receipt provider failed"),
+        ];
+
+        for error in post_broadcast_errors {
+            let result = Ok(ValidatorAnnounceSubmission::BroadcastError { tx_id, error });
+            assert!(Validator::announcement_submission_may_be_in_flight(&result));
+        }
+    }
+
+    #[test]
+    fn pre_broadcast_error_remains_retryable() {
+        let result = Err(ChainCommunicationError::from_other_str(
+            "initial send failed",
+        ));
+        assert!(!Validator::announcement_submission_may_be_in_flight(
+            &result
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_preflight_failure_preserves_known_unfunded_gate_and_backoff() {
+        let mut backoff = AnnouncementRetryBackoff::default();
+        let now = Instant::now();
+        let unfunded = U256::from(25_u64);
+        assert!(!backoff.observe_tokens_needed(Some(unfunded)));
+        backoff.record_failure(now, ANNOUNCEMENT_RETRY_MIN_DELAY);
+
+        assert!(!backoff.observe_tokens_needed(None));
+        assert_eq!(backoff.effective_tokens_needed(None), Some(unfunded));
+        tokio::time::advance(ANNOUNCEMENT_RETRY_MIN_DELAY).await;
+        assert!(backoff.ready(Instant::now()));
+        assert_eq!(backoff.effective_tokens_needed(None), Some(unfunded));
+    }
+
+    #[test]
+    fn single_unfunded_funded_flap_does_not_reset_failed_submission_backoff() {
+        let mut backoff = AnnouncementRetryBackoff::default();
+        let now = Instant::now();
+        backoff.record_failure(now, ANNOUNCEMENT_RETRY_MAX_DELAY);
+
+        assert!(!backoff.observe_tokens_needed(Some(U256::from(1_u64))));
+        assert!(!backoff.observe_tokens_needed(Some(U256::zero())));
+        assert!(!backoff.ready(now));
+    }
+
+    fn dummy_ethereum_chain_conf(rpc_urls: Vec<Url>) -> ChainConf {
+        ChainConf {
+            domain: dummy_domain(1337, "test-domain"),
+            signer: None,
+            identity: None,
+            submitter: Default::default(),
+            estimated_block_time: Duration::from_secs_f64(1.0),
+            reorg_period: Default::default(),
+            addresses: Default::default(),
+            connection: ChainConnectionConf::Ethereum(hyperlane_ethereum::ConnectionConf {
+                rpc_connection: RpcConnectionConf::HttpFallback { urls: rpc_urls },
+                transaction_overrides: Default::default(),
+                op_submission_config: Default::default(),
+                consider_null_transaction_receipt: false,
+                fallback_hedge: None,
+            }),
+            metrics_conf: Default::default(),
+            index: Default::default(),
+            confirmations: Default::default(),
+            chain_id: Default::default(),
+            ignore_reorg_reports: false,
+            native_token: Default::default(),
+        }
+    }
+
+    #[test]
+    fn lightweight_rpc_deduplication_preserves_order() {
+        let a = Url::parse("https://rpc.example/a").expect("URL");
+        let b = Url::parse("https://rpc.example/b").expect("URL");
+        assert_eq!(
+            dedupe_rpc_urls(vec![a.clone(), a.clone(), b.clone()], "rpcUrls"),
+            vec![a, b]
+        );
+    }
+
+    #[test]
+    fn chain_conf_for_read_url_uses_single_http_connection() {
+        let chain_conf = dummy_ethereum_chain_conf(vec![
+            Url::parse("http://rpc-a.example").unwrap(),
+            Url::parse("http://rpc-b.example").unwrap(),
+        ]);
+        let url = Url::parse("http://quorum-node.example").unwrap();
+
+        let per_url_conf = chain_conf_for_read_url(&chain_conf, url.clone(), RpcRole::Primary);
+
+        match per_url_conf.connection {
+            ChainConnectionConf::Ethereum(conn) => match conn.rpc_connection {
+                RpcConnectionConf::Http { url: got } => assert_eq!(got, url),
+                other => panic!("expected a single Http connection, got {other:?}"),
+            },
+            _ => panic!("expected an ethereum connection"),
+        }
+        assert_eq!(per_url_conf.metrics_conf.rpc_role, RpcRole::Primary);
+    }
+
+    #[test]
+    fn chain_conf_for_read_url_preserves_websocket_connection() {
+        let chain_conf =
+            dummy_ethereum_chain_conf(vec![Url::parse("http://rpc-a.example").unwrap()]);
+        let url = Url::parse("wss://quorum-node.example").unwrap();
+
+        let per_url_conf = chain_conf_for_read_url(&chain_conf, url.clone(), RpcRole::Primary);
+
+        match per_url_conf.connection {
+            ChainConnectionConf::Ethereum(conn) => match conn.rpc_connection {
+                RpcConnectionConf::Ws { url: got } => assert_eq!(got, url),
+                other => panic!("expected a Ws connection, got {other:?}"),
+            },
+            _ => panic!("expected an ethereum connection"),
+        }
+        assert_eq!(per_url_conf.metrics_conf.rpc_role, RpcRole::Primary);
+    }
+
+    #[test]
+    fn lightweight_isolates_the_state_read_transport_for_every_protocol() {
+        use hyperlane_base::settings::{parser::RawAgentConf, Settings};
+        use hyperlane_core::config::{ConfigPath, FromRawConf};
+
+        for (protocol, source) in [
+            ("ethereum", "rpcUrls"),
+            ("sealevel", "rpcUrls"),
+            ("cosmos", "grpcUrls"),
+            ("cosmosnative", "grpcUrls"),
+            ("starknet", "rpcUrls"),
+            ("radix", "rpcUrls"),
+            ("tron", "walletSolidityUrls"),
+            ("dusk", "rpcUrls"),
+            #[cfg(feature = "aleo")]
+            ("aleo", "rpcUrls"),
+        ] {
+            let raw = serde_json::json!({
+                "lightweight": true, "originchainname": "test",
+                "websocketurl": "wss://scraper.example/events",
+                "validator": {"type": "hexKey", "key": format!("0x{}", "11".repeat(32))},
+                "checkpointsyncer": {"type": "localStorage", "path": "/tmp/lightweight-checkpoints"},
+                "chains": {"test": {
+                    "name": "test", "domainid": 1337,
+                    "chainid": if protocol.starts_with("cosmos") { "test-1" } else if protocol == "dusk" { "7" } else { "1337" },
+                    "eventcursordir": "/tmp/dusk-quorum-events",
+                    "protocol": protocol,
+                    "rpcurls": [{"http": "https://rpc-a.example"}, {"http": "https://rpc-b.example"}],
+                    "rpcconsensustype": "single",
+                    "grpcurls": [{"http": "https://grpc-a.example"}, {"http": "https://grpc-b.example"}],
+                    "walleturls": [{"http": "https://wallet.example"}],
+                    "walletsolidityurls": [{"http": "https://solid-a.example"}, {"http": "https://solid-b.example"}],
+                    "gatewayurls": [{"http": "https://gateway.example"}],
+                    "bech32prefix": "test", "gasprice": if protocol == "dusk" { serde_json::json!(1) } else { serde_json::json!({"denom": "utest", "amount": "0.1"}) },
+                    "contractaddressbytes": 32, "networkname": "mainnet",
+                    "nativetoken": {"denom": "0x0000000000000000000000000000000000000005", "decimals": 18, "symbol": "TEST"},
+                    "mailboxprogram": "mailbox.aleo", "hookmanagerprogram": "hooks.aleo",
+                    "ismmanagerprogram": "isms.aleo", "validatorannounceprogram": "announce.aleo",
+                    "mailbox": "0x0000000000000000000000000000000000000001",
+                    "interchaingaspaymaster": "0x0000000000000000000000000000000000000002",
+                    "validatorannounce": "0x0000000000000000000000000000000000000003",
+                    "merkletreehook": "0x0000000000000000000000000000000000000004"
+                }}
+            });
+            let settings = Settings::from_config(
+                serde_json::from_value::<RawAgentConf>(raw).unwrap(),
+                &ConfigPath::default(),
+                "validator",
+            )
+            .unwrap_or_else(|err| panic!("{protocol}: {err}"));
+            let chain = &settings.chains[&settings.lookup_domain("test").unwrap()];
+            let raw_rpc_urls = vec![
+                Url::parse("https://rpc-a.example").unwrap(),
+                Url::parse("https://rpc-b.example").unwrap(),
+            ];
+            let (selected_source, urls) = state_read_urls(chain, raw_rpc_urls);
+            assert_eq!(selected_source, source, "{protocol}");
+            assert_eq!(urls.len(), 2, "{protocol}");
+            for url in urls {
+                let per_url = chain_conf_for_read_url(chain, url.clone(), RpcRole::Primary);
+                let actual = match per_url.connection {
+                    ChainConnectionConf::Ethereum(conn) => conn.rpc_urls(),
+                    ChainConnectionConf::Sealevel(conn) => conn.urls,
+                    ChainConnectionConf::Starknet(conn) => conn.urls,
+                    ChainConnectionConf::Cosmos(conn) | ChainConnectionConf::CosmosNative(conn) => {
+                        conn.grpc_urls
+                    }
+                    ChainConnectionConf::Tron(conn) => conn.wallet_solidity_urls,
+                    ChainConnectionConf::Radix(conn) => conn.core,
+                    ChainConnectionConf::Dusk(conn) => vec![conn.url],
+                    #[cfg(feature = "aleo")]
+                    ChainConnectionConf::Aleo(conn) => conn.rpcs,
+                };
+                assert_eq!(
+                    actual,
+                    vec![url],
+                    "{protocol} must not retain a shared root-read pool"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn build_validator_per_url_hooks_produces_one_hook_per_url() {
+        let chain_conf =
+            dummy_ethereum_chain_conf(vec![Url::parse("http://normal-rpc.example").unwrap()]);
+        let urls = vec![
+            Url::parse("http://quorum-a.example").unwrap(),
+            Url::parse("http://quorum-b.example").unwrap(),
+            Url::parse("http://quorum-c.example").unwrap(),
+        ];
+        let metrics = Arc::new(
+            CoreMetrics::new(
+                "validator-test-ethereum-quorum-hooks",
+                9091,
+                Registry::new(),
+            )
+            .unwrap(),
+        );
+
+        let hooks = build_validator_per_url_hooks(
+            &chain_conf,
+            "rpcUrls",
+            RpcRole::Primary,
+            &urls,
+            &metrics,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(hooks.len(), 3);
+        let labels: Vec<&str> = hooks.iter().map(|(label, _)| label.as_str()).collect();
+        assert_eq!(labels, vec!["rpcUrls[0]", "rpcUrls[1]", "rpcUrls[2]"]);
+    }
+
+    #[tokio::test]
+    async fn dusk_quorum_readers_use_each_endpoint_without_locking_the_event_store() {
+        use hyperlane_base::settings::{parser::RawAgentConf, Settings};
+        use hyperlane_core::config::{ConfigPath, FromRawConf};
+
+        async fn node() -> (Url, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = calls.clone();
+            let app = axum::Router::new().route(
+                "/{*path}",
+                axum::routing::post(move |uri: axum::http::Uri| {
+                    let observed = observed.clone();
+                    async move {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        if uri.path().ends_with("/chain_id") {
+                            (axum::http::StatusCode::OK, vec![7u8])
+                        } else if uri.path().ends_with("/local_domain") {
+                            (axum::http::StatusCode::OK, 1337u32.to_le_bytes().to_vec())
+                        } else {
+                            (axum::http::StatusCode::NOT_FOUND, Vec::new())
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            (url, calls, server)
+        }
+
+        let (first, first_calls, first_server) = node().await;
+        let (second, second_calls, second_server) = node().await;
+        let directory = tempfile::tempdir().unwrap();
+        let raw = serde_json::json!({
+            "chains": {"test": {
+                "name": "test", "domainid": 1337, "chainid": 7, "protocol": "dusk",
+                "rpcurls": [{"http": first.as_str()}, {"http": second.as_str()}],
+                "eventcursordir": directory.path().join("events"),
+                "nativetoken": {"decimals": 9, "symbol": "DUSK", "denom": "LUX"},
+                "mailbox": "0x0000000000000000000000000000000000000001",
+                "interchaingaspaymaster": "0x0000000000000000000000000000000000000002",
+                "validatorannounce": "0x0000000000000000000000000000000000000003",
+                "merkletreehook": "0x0000000000000000000000000000000000000004"
+            }}
+        });
+        let settings = Settings::from_config(
+            serde_json::from_value::<RawAgentConf>(raw).unwrap(),
+            &ConfigPath::default(),
+            "validator",
+        )
+        .unwrap();
+        let chain = &settings.chains[&settings.lookup_domain("test").unwrap()];
+        let metrics = Arc::new(CoreMetrics::new("dusk-quorum-test", 0, Registry::new()).unwrap());
+        // Hold the primary indexer's exclusive database open throughout construction.
+        let _indexer_provider = chain.build_provider(&metrics).await.unwrap();
+        let (source, urls) = state_read_urls(chain, vec![first.clone(), second.clone()]);
+        assert_eq!(urls, vec![first, second]);
+        let hooks = tokio::time::timeout(
+            Duration::from_secs(5),
+            build_validator_per_url_hooks(chain, source, RpcRole::Primary, &urls, &metrics),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(hooks.len(), 2);
+        assert_eq!(first_calls.load(Ordering::SeqCst), 6);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 3);
+        first_server.abort();
+        second_server.abort();
+    }
+
+    #[tokio::test]
+    async fn unavailable_or_stalled_ws_does_not_veto_pool_initialization() {
+        use futures_util::StreamExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncWriteExt;
+        for stalled in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let observed = attempts.clone();
+            let server = tokio::spawn(async move {
+                let mut sockets = Vec::new();
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    if stalled {
+                        sockets.push(socket);
+                    } else {
+                        socket
+                            .write_all(
+                                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+                            )
+                            .await
+                            .unwrap();
+                    }
+                }
+            });
+            let chain = dummy_ethereum_chain_conf(vec![]);
+            let urls = vec![
+                Url::parse("https://a.example").unwrap(),
+                Url::parse("https://b.example").unwrap(),
+                Url::parse(&format!("ws://{address}")).unwrap(),
+            ];
+            let metrics = Arc::new(CoreMetrics::new("ws-test", 0, Registry::new()).unwrap());
+            let hooks = tokio::time::timeout(
+                Duration::from_secs(1),
+                build_validator_per_url_hooks(&chain, "rpcUrls", RpcRole::Primary, &urls, &metrics),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(hooks.len(), 3);
+            assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                0,
+                "construction does not connect"
+            );
+            let ws = hooks[2].1.clone();
+            for _ in 0..2 {
+                let result = tokio::time::timeout(
+                    Duration::from_millis(100),
+                    ws.latest_checkpoint(&ReorgPeriod::None),
+                )
+                .await;
+                if stalled {
+                    assert!(result.is_err());
+                } else {
+                    assert!(result.unwrap().is_err());
+                }
+            }
+            assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                2,
+                "failed or cancelled initialization retries"
+            );
+            let mut voters: Vec<Arc<dyn MerkleTreeHook>> = Vec::new();
+            for _ in 0..2 {
+                let mut hook = MockMerkleTreeHook::new();
+                hook.expect_latest_checkpoint().once().returning(|_| {
+                    Ok(CheckpointAtBlock {
+                        checkpoint: hyperlane_core::Checkpoint {
+                            merkle_tree_hook_address: H256::zero(),
+                            mailbox_domain: 1337,
+                            root: H256::zero(),
+                            index: 0,
+                        },
+                        block_height: None,
+                    })
+                });
+                voters.push(Arc::new(hook));
+            }
+            voters.push(ws);
+            let reader = CheckpointReader::new(
+                crate::checkpoint_consensus::CheckpointConsensus::Majority,
+                voters,
+            )
+            .unwrap();
+            assert_eq!(reader.endpoint_count(), 3);
+            assert_eq!(reader.consensus.required(reader.endpoint_count()), 2);
+            let period = ReorgPeriod::None;
+            let mut stream = reader.checkpoint_stream(&period);
+            for _ in 0..2 {
+                let (slot, checkpoint) =
+                    tokio::time::timeout(Duration::from_secs(1), stream.next())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert!(slot < 2);
+                assert!(checkpoint.is_some());
+            }
+            server.abort();
+            assert!(server.await.unwrap_err().is_cancelled());
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_rpc_endpoint_is_fatal_before_initialization() {
+        let chain = dummy_ethereum_chain_conf(vec![]);
+        let metrics = Arc::new(CoreMetrics::new("invalid-rpc-test", 0, Registry::new()).unwrap());
+        let urls = vec![Url::parse("file:///invalid").unwrap()];
+        assert!(build_validator_per_url_hooks(
+            &chain,
+            "rpcUrls",
+            RpcRole::Primary,
+            &urls,
+            &metrics
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn empty_tree_waits_then_starts_from_first_message_without_restart() {
+        let count_calls = Arc::new(AtomicUsize::new(0));
+        let mut hook = MockMerkleTreeHook::new();
+        hook.expect_count().times(2).returning({
+            let count_calls = Arc::clone(&count_calls);
+            move |_| {
+                Ok(if count_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    0
+                } else {
+                    1
+                })
+            }
+        });
+        hook.expect_tree().once().return_once(|_| {
+            let mut tree = hyperlane_core::accumulator::incremental::IncrementalMerkle::default();
+            tree.ingest(H256::from_low_u64_be(1));
+            Ok(IncrementalMerkleAtBlock {
+                tree,
+                block_height: Some(10),
+            })
+        });
+
+        let readiness = Arc::new(ValidatorReadiness::default());
+        let readiness_hook: Arc<dyn MerkleTreeHook> = Arc::new(ReadinessMerkleTreeHook::new(
+            Arc::new(hook),
+            Arc::clone(&readiness),
+            "merkle_tree_hook",
+        ));
+        let task = tokio::spawn({
+            let readiness = Arc::clone(&readiness);
+            async move {
+                wait_for_first_message(
+                    readiness_hook,
+                    &ReorgPeriod::None,
+                    Duration::from_secs(5),
+                    &readiness,
+                )
+                .await
+            }
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            readiness.snapshot().state,
+            validator_server::ValidatorReadinessState::WaitingForFirstMessage
+        );
+        assert!(!logs_contain("Error getting merkle tree"));
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let tree = task.await.expect("wait task should complete");
+        assert_eq!(tree.count(), 1);
+        assert_eq!(
+            readiness.snapshot().state,
+            validator_server::ValidatorReadinessState::Ready
+        );
+    }
+
     #[test]
     fn aleo_announcement_location_exactly_max_minus_null() -> Result<()> {
         // 479 bytes input should be padded to 480 with a single null

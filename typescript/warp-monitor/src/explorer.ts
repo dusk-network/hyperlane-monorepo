@@ -13,6 +13,8 @@ import {
   parseWarpRouteMessage,
 } from '@hyperlane-xyz/utils';
 
+import { DEFAULT_EXPLORER_QUERY_LIMIT } from './constants.js';
+
 type ExplorerMessageRow = {
   msg_id: string;
   origin_domain_id: number;
@@ -21,6 +23,7 @@ type ExplorerMessageRow = {
   recipient: string;
   message_body: string;
   send_occurred_at: string | null;
+  send_scraped_at: string;
 };
 
 export type RouterNodeMetadata = {
@@ -107,7 +110,7 @@ export class ExplorerPendingTransfersClient {
   }
 
   async getPendingDestinationTransfers(
-    limit = 200,
+    limit = DEFAULT_EXPLORER_QUERY_LIMIT,
   ): Promise<PendingDestinationTransfer[]> {
     const rows = await this.queryInflightTransfers(limit);
     const transfers: PendingDestinationTransfer[] = [];
@@ -148,7 +151,12 @@ export class ExplorerPendingTransfersClient {
         continue;
       }
 
-      const sendOccurredAtMs = this.parseSendOccurredAt(row.send_occurred_at);
+      // Fallback rows have no transaction/block timestamp. Their scrape time
+      // is less precise, but still prevents permanently suppressing age-based
+      // pending alerts for those messages.
+      const sendOccurredAtMs = this.parseSendOccurredAt(
+        row.send_occurred_at ?? row.send_scraped_at,
+      );
 
       transfers.push({
         messageId: normalizeExplorerHex(row.msg_id),
@@ -212,7 +220,7 @@ export class ExplorerPendingTransfersClient {
               { destination_domain_id: { _in: $destinationDomains } }
             ]
           }
-          order_by: { origin_tx_id: desc }
+          order_by: { id: desc }
           limit: $limit
         ) {
           msg_id
@@ -222,6 +230,7 @@ export class ExplorerPendingTransfersClient {
           recipient
           message_body
           send_occurred_at
+          send_scraped_at
         }
       }
     `;

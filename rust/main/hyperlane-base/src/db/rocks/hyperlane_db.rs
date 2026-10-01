@@ -1,22 +1,32 @@
-use std::ops::Add;
+use std::{
+    ops::Add,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use async_trait::async_trait;
 use eyre::{bail, Result};
+use parking_lot::Mutex;
 use tracing::{debug, instrument, trace};
 
 use hyperlane_core::{
-    identifiers::UniqueIdentifier, Decode, Encode, GasPaymentKey, HyperlaneDomain,
-    HyperlaneLogStore, HyperlaneMessage, HyperlaneSequenceAwareIndexerStoreReader,
-    HyperlaneWatermarkedLogStore, Indexed, InterchainGasExpenditure, InterchainGasPayment,
-    InterchainGasPaymentMeta, LogMeta, MerkleTreeInsertion, PendingOperationStatus, H256, H512,
+    identifiers::UniqueIdentifier, BackwardCursorProgress, Decode, Encode, GasPaymentKey,
+    HyperlaneBackwardCursorStore, HyperlaneDomain, HyperlaneLogStore, HyperlaneMessage,
+    HyperlaneSequenceAwareIndexerStoreReader, HyperlaneWatermarkedLogStore, Indexed,
+    InterchainGasExpenditure, InterchainGasPayment, InterchainGasPaymentMeta, LogMeta,
+    MerkleTreeInsertion, PendingOperationStatus, H256, H512,
 };
 
 use crate::db::{
-    storage_types::{InterchainGasExpenditureData, InterchainGasPaymentData},
+    storage_types::{
+        InterchainGasExpenditureData, InterchainGasPaymentData, PendingMessageRetryState,
+    },
     HyperlaneDb,
 };
 
-use super::{DbError, TypedDB, DB};
+use super::{DbError, GasPaymentSequenceConflict, TypedDB, DB};
 
 // these keys MUST not be given multiple uses in case multiple agents are
 // started with the same database and domain.
@@ -34,6 +44,12 @@ const GAS_EXPENDITURE_FOR_MESSAGE_ID: &str = "gas_expenditure_for_message_id_v2_
 const STATUS_BY_MESSAGE_ID: &str = "status_by_message_id_";
 const PENDING_MESSAGE_RETRY_COUNT_FOR_MESSAGE_ID: &str =
     "pending_message_retry_count_for_message_id_";
+const PENDING_MESSAGE_RETRY_STATE_FOR_MESSAGE_ID: &str =
+    "pending_message_retry_state_for_message_id_v1_";
+const PENDING_MESSAGE_BY_DESTINATION: &str = "pending_message_by_destination_v1_";
+const PENDING_MESSAGE_INDEX_MIGRATION_COMPLETE: &str =
+    "pending_message_index_migration_complete_v1_";
+const TERMINALLY_DROPPED_MESSAGE_BY_ID: &str = "terminally_dropped_message_by_id_v1_";
 const MERKLE_TREE_INSERTION: &str = "merkle_tree_insertion_";
 const MERKLE_LEAF_INDEX_BY_MESSAGE_ID: &str = "merkle_leaf_index_by_message_id_";
 const MERKLE_TREE_INSERTION_BLOCK_NUMBER_BY_LEAF_INDEX: &str =
@@ -41,13 +57,16 @@ const MERKLE_TREE_INSERTION_BLOCK_NUMBER_BY_LEAF_INDEX: &str =
 const LATEST_INDEXED_GAS_PAYMENT_BLOCK: &str = "latest_indexed_gas_payment_block";
 const PAYLOAD_UUIDS_BY_MESSAGE_ID: &str = "payload_uuids_by_message_id_";
 const MESSAGE_DISPATCHED_TX_HASH_BY_MESSAGE_ID: &str = "message_dispatched_tx_hash_by_message_id_";
+const MESSAGE_BACKWARD_CURSOR: &str = "message_backward_cursor_v2_";
+const GAS_PAYMENT_BACKWARD_CURSOR: &str = "gas_payment_backward_cursor_v2_";
+const MERKLE_TREE_INSERTION_BACKWARD_CURSOR: &str = "merkle_tree_insertion_backward_cursor_v2_";
 
 /// Rocks DB result type
 pub type DbResult<T> = std::result::Result<T, DbError>;
 
 /// DB handle for storing data tied to a specific Mailbox.
 #[derive(Debug, Clone)]
-pub struct HyperlaneRocksDB(HyperlaneDomain, TypedDB);
+pub struct HyperlaneRocksDB(HyperlaneDomain, TypedDB, Arc<Mutex<()>>, Arc<Mutex<()>>);
 
 impl std::ops::Deref for HyperlaneRocksDB {
     type Target = TypedDB;
@@ -72,12 +91,38 @@ impl AsRef<DB> for HyperlaneRocksDB {
 impl HyperlaneRocksDB {
     /// Instantiated new `HyperlaneRocksDB`
     pub fn new(domain: &HyperlaneDomain, db: DB) -> Self {
-        Self(domain.clone(), TypedDB::new(domain, db))
+        Self(
+            domain.clone(),
+            TypedDB::new(domain, db),
+            Arc::new(Mutex::new(())),
+            Arc::new(Mutex::new(())),
+        )
     }
 
     /// Get the domain this database is scoped to
     pub fn domain(&self) -> &HyperlaneDomain {
         &self.0
+    }
+
+    fn retrieve_backward_cursor_progress(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<BackwardCursorProgress>> {
+        Ok(self.retrieve_decodables_by_prefix(prefix)?)
+    }
+
+    fn store_backward_cursor_progress(
+        &self,
+        prefix: &str,
+        progress: BackwardCursorProgress,
+    ) -> Result<()> {
+        Ok(self.store_keyed_encodable(prefix, &progress.sequence, &progress)?)
+    }
+
+    fn delete_backward_cursor_progress(&self, prefix: &str, sequence: u32) -> Result<()> {
+        let mut batch = self.1.batch();
+        batch.delete_keyed(prefix, &sequence);
+        Ok(batch.commit()?)
     }
 
     /// Store a raw committed message. If message already exists, then do nothing.
@@ -91,9 +136,19 @@ impl HyperlaneRocksDB {
         message: &HyperlaneMessage,
         dispatched_block_number: u64,
     ) -> DbResult<bool> {
-        if let Ok(Some(_)) = self.retrieve_message_id_by_nonce(&message.nonce) {
+        if let Some(stored_message) = self.retrieve_message_by_nonce(message.nonce)? {
             trace!(hyp_message=?message, "Message already stored in db");
             self.try_update_max_seen_message_nonce(message.nonce)?;
+            self.reconcile_pending_message_index(&stored_message)?;
+            if self
+                .retrieve_dispatched_block_number_by_nonce(&message.nonce)?
+                .is_none()
+            {
+                self.store_dispatched_block_number_by_nonce(
+                    &message.nonce,
+                    &dispatched_block_number,
+                )?;
+            }
             return Ok(false);
         }
         self.upsert_message(message, dispatched_block_number)?;
@@ -112,17 +167,235 @@ impl HyperlaneRocksDB {
         dispatched_block_number: u64,
     ) -> DbResult<()> {
         let id = message.id();
+        let previous = self.retrieve_message_by_nonce(message.nonce)?;
+        let max_nonce = self
+            .retrieve_highest_seen_message_nonce()?
+            .unwrap_or_default()
+            .max(message.nonce);
         debug!(hyp_message=?message,  "Storing new message in db",);
 
-        // - `id` --> `message`
-        self.store_message_by_id(&id, message)?;
-        // - `nonce` --> `id`
-        self.store_message_id_by_nonce(&message.nonce, &id)?;
-        // Update the max seen nonce to allow forward-backward iteration in the processor
-        self.try_update_max_seen_message_nonce(message.nonce)?;
-        // - `nonce` --> `dispatched block number`
-        self.store_dispatched_block_number_by_nonce(&message.nonce, &dispatched_block_number)?;
+        let entries = [
+            (MESSAGE.as_bytes().to_vec(), id.to_vec(), message.to_vec()),
+            (
+                MESSAGE_ID.as_bytes().to_vec(),
+                message.nonce.to_vec(),
+                id.to_vec(),
+            ),
+            (
+                HIGHEST_SEEN_MESSAGE_NONCE.as_bytes().to_vec(),
+                bool::default().to_vec(),
+                max_nonce.to_vec(),
+            ),
+            (
+                MESSAGE_DISPATCHED_BLOCK_NUMBER.as_bytes().to_vec(),
+                message.nonce.to_vec(),
+                dispatched_block_number.to_vec(),
+            ),
+            (
+                Self::pending_message_destination_prefix(message.destination),
+                message.nonce.to_vec(),
+                id.to_vec(),
+            ),
+        ];
+        let mut deletions = Vec::new();
+        if let Some(previous) = previous.filter(|previous| previous.id() != id) {
+            deletions.push((
+                TERMINALLY_DROPPED_MESSAGE_BY_ID.as_bytes().to_vec(),
+                previous.id().to_vec(),
+            ));
+            if previous.destination != message.destination {
+                deletions.push((
+                    Self::pending_message_destination_prefix(previous.destination),
+                    previous.nonce.to_vec(),
+                ));
+            }
+        }
+        self.store_and_delete_batch(entries, deletions)?;
         Ok(())
+    }
+
+    fn pending_message_destination_prefix(destination: u32) -> Vec<u8> {
+        PENDING_MESSAGE_BY_DESTINATION
+            .as_bytes()
+            .iter()
+            .chain(destination.to_be_bytes().iter())
+            .copied()
+            .collect()
+    }
+
+    /// Check that migration finished and subsequent writes maintained the index.
+    /// Older binaries do not maintain this index; missing WAL also requires a rescan.
+    pub fn pending_message_index_migration_complete(&self) -> DbResult<bool> {
+        self.pending_message_index_migration_complete_with_cancellation(&AtomicBool::new(false))
+    }
+
+    /// Check migration completion while allowing a blocking WAL scan to stop on shutdown.
+    pub fn pending_message_index_migration_complete_with_cancellation(
+        &self,
+        cancellation: &AtomicBool,
+    ) -> DbResult<bool> {
+        let Some(checkpoint) =
+            self.retrieve_value_by_key::<_, u64>(PENDING_MESSAGE_INDEX_MIGRATION_COMPLETE, &false)?
+        else {
+            return Ok(false);
+        };
+        // Capture before validation so concurrent writes remain covered next time.
+        let sequence = self.latest_sequence_number();
+        let validation = (|| {
+            if checkpoint > sequence {
+                return Ok(true);
+            }
+            // Standalone cleanup can race a replacement or crash before repair.
+            // One WAL pass detects both legacy source writes and derived-index
+            // deletions not paired with a canonical upsert/processed batch.
+            self.has_unmarked_pending_index_updates_since(
+                checkpoint,
+                &[MESSAGE_ID.as_bytes(), NONCE_PROCESSED.as_bytes()],
+                PENDING_MESSAGE_BY_DESTINATION.as_bytes(),
+                cancellation,
+            )
+        })();
+        if cancellation.load(Ordering::Relaxed) {
+            return Err(DbError::Other(
+                "Pending message index migration validation cancelled".to_string(),
+            ));
+        }
+        match validation {
+            Ok(false) => {}
+            result => {
+                debug!(
+                    ?result,
+                    checkpoint, "Pending message index cannot be certified; repeating migration"
+                );
+                self.store_and_delete_batch(
+                    std::iter::empty(),
+                    [(
+                        PENDING_MESSAGE_INDEX_MIGRATION_COMPLETE.as_bytes().to_vec(),
+                        false.to_vec(),
+                    )],
+                )?;
+                return Ok(false);
+            }
+        }
+        self.mark_pending_message_index_migration_complete(sequence)?;
+        Ok(true)
+    }
+
+    /// Seal a finished migration using the sequence captured before it started.
+    /// Keeping that conservative boundary also detects legacy writes during migration.
+    pub fn mark_pending_message_index_migration_complete(&self, sequence: u64) -> DbResult<()> {
+        self.store_value_by_key(PENDING_MESSAGE_INDEX_MIGRATION_COMPLETE, &false, &sequence)
+    }
+
+    /// Add an unprocessed message to its destination range.
+    pub fn store_pending_message_index(&self, message: &HyperlaneMessage) -> DbResult<()> {
+        self.store_value_by_key(
+            Self::pending_message_destination_prefix(message.destination),
+            &message.nonce,
+            &message.id(),
+        )
+    }
+
+    /// Remove a message from its destination range.
+    pub fn delete_pending_message_index(&self, message: &HyperlaneMessage) -> DbResult<()> {
+        self.store_and_delete_batch(
+            std::iter::empty(),
+            [
+                (
+                    Self::pending_message_destination_prefix(message.destination),
+                    message.nonce.to_vec(),
+                ),
+                (
+                    TERMINALLY_DROPPED_MESSAGE_BY_ID.as_bytes().to_vec(),
+                    message.id().to_vec(),
+                ),
+            ],
+        )
+    }
+
+    /// Remove a destination range entry when the message value is unavailable.
+    pub fn delete_pending_message_index_by_nonce(
+        &self,
+        destination: u32,
+        nonce: u32,
+    ) -> DbResult<()> {
+        self.store_and_delete_batch(
+            std::iter::empty(),
+            [(
+                Self::pending_message_destination_prefix(destination),
+                nonce.to_vec(),
+            )],
+        )
+    }
+
+    /// Persist that a message reached a terminal relayer outcome.
+    /// Cleared when the message is processed or replaced at the same nonce.
+    pub fn store_terminally_dropped_message(&self, message_id: &H256) -> DbResult<()> {
+        self.store_value_by_key(TERMINALLY_DROPPED_MESSAGE_BY_ID, message_id, &true)
+    }
+
+    /// Return whether a message reached a terminal relayer outcome.
+    pub fn retrieve_terminally_dropped_message(&self, message_id: &H256) -> DbResult<bool> {
+        Ok(self
+            .retrieve_value_by_key::<_, bool>(TERMINALLY_DROPPED_MESSAGE_BY_ID, message_id)?
+            .unwrap_or(false))
+    }
+
+    /// Restore or remove an index entry according to the processed marker.
+    pub fn reconcile_pending_message_index(&self, message: &HyperlaneMessage) -> DbResult<()> {
+        let existing =
+            self.retrieve_pending_message_at_or_after(message.destination, message.nonce)?;
+        let existing = existing.filter(|(nonce, _)| *nonce == message.nonce);
+        if self
+            .retrieve_processed_by_nonce(&message.nonce)?
+            .unwrap_or(false)
+        {
+            if existing.is_some() {
+                self.delete_pending_message_index(message)?;
+            }
+        } else if existing != Some((message.nonce, message.id())) {
+            self.store_pending_message_index(message)?;
+        }
+        Ok(())
+    }
+
+    /// Retrieve the first destination entry at or after `nonce`.
+    pub fn retrieve_pending_message_at_or_after(
+        &self,
+        destination: u32,
+        nonce: u32,
+    ) -> DbResult<Option<(u32, H256)>> {
+        self.retrieve_pending_message_from(destination, nonce, true)
+    }
+
+    /// Retrieve the first destination entry at or before `nonce`.
+    pub fn retrieve_pending_message_at_or_before(
+        &self,
+        destination: u32,
+        nonce: u32,
+    ) -> DbResult<Option<(u32, H256)>> {
+        self.retrieve_pending_message_from(destination, nonce, false)
+    }
+
+    fn retrieve_pending_message_from(
+        &self,
+        destination: u32,
+        nonce: u32,
+        forward: bool,
+    ) -> DbResult<Option<(u32, H256)>> {
+        let prefix = Self::pending_message_destination_prefix(destination);
+        let entry = if forward {
+            self.retrieve_by_prefix_at_or_after(&prefix, nonce.to_be_bytes())?
+        } else {
+            self.retrieve_by_prefix_at_or_before(&prefix, nonce.to_be_bytes())?
+        };
+        let Some((nonce, message_id)) = entry else {
+            return Ok(None);
+        };
+        let nonce: [u8; 4] = nonce.try_into().map_err(|nonce: Vec<u8>| {
+            DbError::Other(format!("Invalid pending message index key: {nonce:?}"))
+        })?;
+        Ok(Some((u32::from_be_bytes(nonce), message_id)))
     }
 
     /// Retrieve a message by its nonce
@@ -132,6 +405,15 @@ impl HyperlaneRocksDB {
             None => Ok(None),
             Some(id) => self.retrieve_message_by_id(&id),
         }
+    }
+
+    /// Retrieve the greatest nonce represented by the canonical nonce-to-ID map.
+    pub fn retrieve_highest_message_nonce(&self) -> DbResult<Option<u32>> {
+        // A message hash beginning with `id_` also matches MESSAGE_ID, but has
+        // a 29-byte suffix instead of a four-byte nonce. Filter before decoding.
+        Ok(self
+            .retrieve_last_key_by_prefix(MESSAGE_ID)?
+            .map(u32::from_be_bytes))
     }
 
     /// Update the nonce of the highest processed message we're aware of
@@ -153,26 +435,77 @@ impl HyperlaneRocksDB {
         indexed_payment: Indexed<InterchainGasPayment>,
         log_meta: &LogMeta,
     ) -> DbResult<bool> {
+        let _guard = self.2.lock();
         let payment = *(indexed_payment.inner());
-        let gas_processing_successful = self.process_gas_payment(payment, log_meta)?;
+        let gas_payment_sequence = if let Some(sequence) = indexed_payment.sequence {
+            let stored_payment = self.retrieve_gas_payment_by_sequence(&sequence)?;
+            let stored_block = self.retrieve_gas_payment_block_by_sequence(&sequence)?;
+            match (stored_payment, stored_block) {
+                (Some(stored_payment), Some(stored_block))
+                    if stored_payment == payment && stored_block == log_meta.block_number =>
+                {
+                    trace!(
+                        ?indexed_payment,
+                        ?log_meta,
+                        "Attempted to process an already-processed indexed gas payment"
+                    );
+                    return Ok(false);
+                }
+                (Some(stored_payment), None) if stored_payment == payment => {
+                    let mut batch = self.batch();
+                    batch.store_keyed_encodable(
+                        GAS_PAYMENT_BY_SEQUENCE,
+                        &sequence,
+                        indexed_payment.inner(),
+                    );
+                    batch.store_keyed_encodable(
+                        GAS_PAYMENT_BLOCK_BY_SEQUENCE,
+                        &sequence,
+                        &log_meta.block_number,
+                    );
+                    batch.commit()?;
+                    debug!(
+                        sequence,
+                        block_number = log_meta.block_number,
+                        "Repaired indexed gas payment block metadata"
+                    );
+                    return Ok(false);
+                }
+                (None, None) => {}
+                (stored, stored_block) => {
+                    return Err(DbError::GasPaymentSequenceConflict(Box::new(
+                        GasPaymentSequenceConflict {
+                            sequence,
+                            stored,
+                            stored_block,
+                            incoming: payment,
+                            incoming_block: log_meta.block_number,
+                        },
+                    )));
+                }
+            }
+            Some(sequence)
+        } else {
+            None
+        };
 
-        // only store the payment and return early if there's no sequence
-        let Some(gas_payment_sequence) = indexed_payment.sequence else {
+        let gas_processing_successful = self.process_gas_payment_inner(payment, log_meta)?;
+        let Some(gas_payment_sequence) = gas_payment_sequence else {
             return Ok(gas_processing_successful);
         };
-        // otherwise store the indexing decorator as well
-        if let Ok(Some(_)) = self.retrieve_gas_payment_by_sequence(&gas_payment_sequence) {
-            trace!(
-                ?indexed_payment,
-                ?log_meta,
-                "Attempted to process an already-processed indexed gas payment"
-            );
-            // Return false to indicate the gas payment was already processed
-            return Ok(false);
-        }
 
-        self.store_gas_payment_by_sequence(&gas_payment_sequence, indexed_payment.inner())?;
-        self.store_gas_payment_block_by_sequence(&gas_payment_sequence, &log_meta.block_number)?;
+        let mut batch = self.batch();
+        batch.store_keyed_encodable(
+            GAS_PAYMENT_BY_SEQUENCE,
+            &gas_payment_sequence,
+            indexed_payment.inner(),
+        );
+        batch.store_keyed_encodable(
+            GAS_PAYMENT_BLOCK_BY_SEQUENCE,
+            &gas_payment_sequence,
+            &log_meta.block_number,
+        );
+        batch.commit()?;
 
         Ok(gas_processing_successful)
     }
@@ -181,6 +514,15 @@ impl HyperlaneRocksDB {
     /// processed, processes the gas payment and records it as processed.
     /// Returns whether the gas payment was processed for the first time.
     pub fn process_gas_payment(
+        &self,
+        payment: InterchainGasPayment,
+        log_meta: &LogMeta,
+    ) -> DbResult<bool> {
+        let _guard = self.2.lock();
+        self.process_gas_payment_inner(payment, log_meta)
+    }
+
+    fn process_gas_payment_inner(
         &self,
         payment: InterchainGasPayment,
         log_meta: &LogMeta,
@@ -199,11 +541,21 @@ impl HyperlaneRocksDB {
             // Return false to indicate the gas payment was already processed
             return Ok(false);
         }
-        // Set the gas payment as processed
-        self.store_processed_by_gas_payment_meta(&payment_meta, &true)?;
-
-        // Update the total gas payment for the message to include the payment
-        self.update_gas_payment_by_gas_payment_key(payment)?;
+        let gas_payment_key = payment.into();
+        let existing_payment =
+            match self.retrieve_gas_payment_by_gas_payment_key(gas_payment_key)? {
+                Some(payment) => payment,
+                None => InterchainGasPayment::from_gas_payment_key(gas_payment_key),
+            };
+        let total = existing_payment.add(payment);
+        let mut batch = self.batch();
+        batch.store_keyed_encodable(GAS_PAYMENT_META_PROCESSED, &payment_meta, &true);
+        batch.store_keyed_encodable(
+            GAS_PAYMENT_FOR_MESSAGE_ID,
+            &gas_payment_key,
+            &InterchainGasPaymentData::from(total),
+        );
+        batch.commit()?;
 
         // Return true to indicate the gas payment was processed for the first time
         Ok(true)
@@ -215,11 +567,25 @@ impl HyperlaneRocksDB {
         insertion: &MerkleTreeInsertion,
         insertion_block_number: u64,
     ) -> DbResult<bool> {
-        if let Ok(Some(_)) = self.retrieve_merkle_tree_insertion_by_leaf_index(&insertion.index()) {
-            debug!(insertion=?insertion, "Tree insertion already stored in db");
-            return Ok(false);
+        let _guard = self.3.lock();
+        if let Some(existing) =
+            self.retrieve_merkle_tree_insertion_by_leaf_index(&insertion.index())?
+        {
+            let reverse_index =
+                self.retrieve_merkle_leaf_index_by_message_id(&insertion.message_id())?;
+            let block_number =
+                self.retrieve_merkle_tree_insertion_block_number_by_leaf_index(&insertion.index())?;
+            if existing == *insertion
+                && reverse_index == Some(insertion.index())
+                && block_number == Some(insertion_block_number)
+            {
+                debug!(insertion=?insertion, "Tree insertion already stored in db");
+                return Ok(false);
+            }
+            self.store_tree_insertion_inner(insertion, insertion_block_number)?;
+            return Ok(existing != *insertion);
         }
-        self.store_tree_insertion(insertion, insertion_block_number)
+        self.store_tree_insertion_inner(insertion, insertion_block_number)
     }
 
     /// Store the merkle tree insertion event, and also store a mapping from message_id to leaf_index.
@@ -229,17 +595,55 @@ impl HyperlaneRocksDB {
         insertion: &MerkleTreeInsertion,
         insertion_block_number: u64,
     ) -> DbResult<bool> {
+        let _guard = self.3.lock();
+        self.store_tree_insertion_inner(insertion, insertion_block_number)
+    }
+
+    /// Store an unverified insertion only if its leaf index is absent. Returns the
+    /// existing insertion otherwise. Shares the RPC writer's lock so a concurrent
+    /// stream replay cannot overwrite a canonical insertion or its block metadata.
+    pub fn store_tree_insertion_if_absent(
+        &self,
+        insertion: &MerkleTreeInsertion,
+        insertion_block_number: u64,
+    ) -> DbResult<Option<MerkleTreeInsertion>> {
+        let _guard = self.3.lock();
+        if let Some(existing) =
+            self.retrieve_merkle_tree_insertion_by_leaf_index(&insertion.index())?
+        {
+            return Ok(Some(existing));
+        }
+        self.store_tree_insertion_inner(insertion, insertion_block_number)?;
+        Ok(None)
+    }
+
+    fn store_tree_insertion_inner(
+        &self,
+        insertion: &MerkleTreeInsertion,
+        insertion_block_number: u64,
+    ) -> DbResult<bool> {
+        let existing = self.retrieve_merkle_tree_insertion_by_leaf_index(&insertion.index())?;
+        let mut batch = self.batch();
+        if let Some(existing) = existing {
+            if existing.message_id() != insertion.message_id() {
+                batch.delete_keyed(MERKLE_LEAF_INDEX_BY_MESSAGE_ID, &existing.message_id());
+            }
+        }
         // even if double insertions are ok, store the leaf by `leaf_index` (guaranteed to be unique)
         // rather than by `message_id` (not guaranteed to be recurring), so that leaves can be retrieved
         // based on insertion order.
-        self.store_merkle_tree_insertion_by_leaf_index(&insertion.index(), insertion)?;
-
-        self.store_merkle_leaf_index_by_message_id(&insertion.message_id(), &insertion.index())?;
-
-        self.store_merkle_tree_insertion_block_number_by_leaf_index(
+        batch.store_keyed_encodable(MERKLE_TREE_INSERTION, &insertion.index(), insertion);
+        batch.store_keyed_encodable(
+            MERKLE_LEAF_INDEX_BY_MESSAGE_ID,
+            &insertion.message_id(),
+            &insertion.index(),
+        );
+        batch.store_keyed_encodable(
+            MERKLE_TREE_INSERTION_BLOCK_NUMBER_BY_LEAF_INDEX,
             &insertion.index(),
             &insertion_block_number,
-        )?;
+        );
+        batch.commit()?;
         // Return true to indicate the tree insertion was processed
         Ok(true)
     }
@@ -249,22 +653,6 @@ impl HyperlaneRocksDB {
     pub fn process_gas_expenditure(&self, expenditure: InterchainGasExpenditure) -> DbResult<()> {
         // Update the total gas expenditure for the message to include the payment
         self.update_gas_expenditure_by_message_id(expenditure)
-    }
-
-    /// Update the total gas payment for a message to include gas_payment
-    fn update_gas_payment_by_gas_payment_key(&self, event: InterchainGasPayment) -> DbResult<()> {
-        let gas_payment_key = event.into();
-        let existing_payment =
-            match self.retrieve_gas_payment_by_gas_payment_key(gas_payment_key)? {
-                Some(payment) => payment,
-                None => InterchainGasPayment::from_gas_payment_key(gas_payment_key),
-            };
-        let total = existing_payment.add(event);
-
-        debug!(?event, new_total_gas_payment=?total, "Storing gas payment");
-        self.store_interchain_gas_payment_data_by_gas_payment_key(&gas_payment_key, &total.into())?;
-
-        Ok(())
     }
 
     /// Update the total gas spent for a message
@@ -310,6 +698,367 @@ impl HyperlaneRocksDB {
     }
 }
 
+#[cfg(test)]
+mod pending_index_tests {
+    use std::sync::atomic::AtomicBool;
+
+    use hyperlane_core::{HyperlaneDomain, HyperlaneMessage, H256};
+
+    use super::*;
+    use crate::db::rocks::test_utils::run_test_db;
+
+    #[tokio::test]
+    async fn zero_dispatch_tx_id_is_never_stored() {
+        run_test_db(|raw_db| async move {
+            let db = HyperlaneRocksDB::new(&HyperlaneDomain::new_test_domain("origin"), raw_db);
+            let message = message(7, 10);
+            let meta = |transaction_id| LogMeta {
+                address: H256::from_low_u64_be(1),
+                block_number: 1,
+                block_hash: H256::from_low_u64_be(1),
+                transaction_id,
+                transaction_index: 0,
+                log_index: 0.into(),
+            };
+            let stored = || {
+                db.retrieve_dispatched_tx_hash_by_message_id(&message.id())
+                    .unwrap()
+            };
+            for (transaction_id, expected) in [
+                // Zero is never written.
+                (H512::zero(), None),
+                (H512::from_low_u64_be(2), Some(H512::from_low_u64_be(2))),
+                // Re-indexing with Sealevel basic metadata keeps the known ID.
+                (H512::zero(), Some(H512::from_low_u64_be(2))),
+                // A nonzero ID still replaces it.
+                (H512::from_low_u64_be(3), Some(H512::from_low_u64_be(3))),
+            ] {
+                let logs = [(Indexed::new(message.clone()), meta(transaction_id))];
+                db.store_logs(&logs).await.unwrap();
+                assert_eq!(stored(), expected);
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn highest_message_nonce_ignores_overlapping_message_keys() {
+        run_test_db(|raw_db| async move {
+            let db = HyperlaneRocksDB::new(&HyperlaneDomain::new_test_domain("origin"), raw_db);
+            assert_eq!(db.retrieve_highest_message_nonce().unwrap(), None);
+
+            // A valid row in the message table whose hash shares the nonce-map prefix.
+            let mut hash = [0xfe; 32];
+            hash[..3].copy_from_slice(b"id_");
+            let hash = H256::from(hash);
+            db.store_message_by_id(&hash, &message(7, 10)).unwrap();
+            assert_eq!(db.retrieve_highest_message_nonce().unwrap(), None);
+
+            // These sort below the overlapping row; the watermark must still be exact.
+            for nonce in [0, 256, 2] {
+                db.store_message_id_by_nonce(&nonce, &H256::zero()).unwrap();
+            }
+            assert_eq!(db.retrieve_highest_message_nonce().unwrap(), Some(256));
+            assert!(db.retrieve_message_by_id(&hash).unwrap().is_some());
+
+            db.store_message_id_by_nonce(&u32::MAX, &H256::zero())
+                .unwrap();
+            assert_eq!(db.retrieve_highest_message_nonce().unwrap(), Some(u32::MAX));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn highest_message_nonce_filters_key_width_before_value_decode() {
+        run_test_db(|raw_db| async move {
+            let db = HyperlaneRocksDB::new(&HyperlaneDomain::new_test_domain("origin"), raw_db);
+            let other = HyperlaneRocksDB::new(
+                &HyperlaneDomain::new_test_domain("other"),
+                AsRef::<DB>::as_ref(&db).clone(),
+            );
+            other
+                .store_message_id_by_nonce(&u32::MAX, &H256::zero())
+                .unwrap();
+            // Non-nonce keys may also have values that cannot decode as an H256.
+            for key in [vec![0xfe], vec![0xfe; 29]] {
+                db.store_encodable(MESSAGE_ID, key, &true).unwrap();
+            }
+            assert_eq!(db.retrieve_highest_message_nonce().unwrap(), None);
+            db.store_message_id_by_nonce(&0, &H256::zero()).unwrap();
+            assert_eq!(db.retrieve_highest_message_nonce().unwrap(), Some(0));
+        })
+        .await;
+    }
+
+    fn message(nonce: u32, destination: u32) -> HyperlaneMessage {
+        HyperlaneMessage {
+            nonce,
+            origin: 1,
+            destination,
+            sender: H256::zero(),
+            recipient: H256::zero(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_seal_rejects_standalone_cleanup_after_replacement() {
+        run_test_db(|raw_db| async move {
+            let db = HyperlaneRocksDB::new(&HyperlaneDomain::new_test_domain("origin"), raw_db);
+            for cleanup_during_migration in [false, true] {
+                let original = message(2, 10);
+                db.upsert_message(&original, 1).expect("original");
+                let sequence = db.latest_sequence_number();
+                if !cleanup_during_migration {
+                    db.mark_pending_message_index_migration_complete(sequence)
+                        .expect("seal");
+                }
+                // A loader's old terminal/missing-row observation can precede
+                // an atomic replacement, then delete that replacement's entry.
+                let mut replacement = original.clone();
+                replacement.body = vec![1];
+                db.upsert_message(&replacement, 2).expect("replacement");
+                db.delete_pending_message_index_by_nonce(10, 2)
+                    .expect("stale cleanup");
+                if cleanup_during_migration {
+                    db.mark_pending_message_index_migration_complete(sequence)
+                        .expect("seal");
+                }
+                assert!(!db
+                    .pending_message_index_migration_complete()
+                    .expect("validate"));
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn migration_seal_decode_error_is_propagated() {
+        run_test_db(|raw_db| async move {
+            let db = HyperlaneRocksDB::new(&HyperlaneDomain::new_test_domain("origin"), raw_db);
+            db.store_value_by_key(PENDING_MESSAGE_INDEX_MIGRATION_COMPLETE, &false, &true)
+                .expect("write malformed seal");
+            assert!(db.pending_message_index_migration_complete().is_err());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_migration_validation_preserves_seal() {
+        run_test_db(|raw_db| async move {
+            let db = HyperlaneRocksDB::new(&HyperlaneDomain::new_test_domain("origin"), raw_db);
+            db.mark_pending_message_index_migration_complete(db.latest_sequence_number())
+                .expect("seal");
+
+            let cancellation = AtomicBool::new(true);
+            assert!(db
+                .pending_message_index_migration_complete_with_cancellation(&cancellation)
+                .is_err());
+            assert!(db.pending_message_index_migration_complete().unwrap());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn migration_seal_accepts_atomic_writes_and_refreshes() {
+        run_test_db(|raw_db| async move {
+            let db = HyperlaneRocksDB::new(&HyperlaneDomain::new_test_domain("origin"), raw_db);
+            assert!(!db.pending_message_index_migration_complete().unwrap());
+            db.mark_pending_message_index_migration_complete(db.latest_sequence_number())
+                .unwrap();
+            db.store_message(&message(100, 10), 1).unwrap();
+            db.store_message(&message(2, 10), 1).unwrap();
+            db.upsert_message(&message(2, 11), 2).unwrap();
+            db.store_message_processed(&message(2, 11)).unwrap();
+            db.store_dispatched_block_number_by_nonce(&100, &3).unwrap();
+            db.store_dispatched_tx_hash_by_message_id(&message(100, 10).id(), &H512::zero())
+                .unwrap();
+            let sequence = db.latest_sequence_number();
+            assert!(db.pending_message_index_migration_complete().unwrap());
+            assert_eq!(
+                db.retrieve_value_by_key::<_, u64>(
+                    PENDING_MESSAGE_INDEX_MIGRATION_COMPLETE,
+                    &false
+                )
+                .unwrap(),
+                Some(sequence)
+            );
+            assert!(db.pending_message_index_migration_complete().unwrap());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn migration_seal_rejects_legacy_low_nonce_insert_and_replacement() {
+        run_test_db(|raw_db| async move {
+            let db = HyperlaneRocksDB::new(&HyperlaneDomain::new_test_domain("origin"), raw_db);
+            db.store_message(&message(100, 10), 1).unwrap();
+            for legacy in [message(2, 10), message(2, 11)] {
+                db.mark_pending_message_index_migration_complete(db.latest_sequence_number())
+                    .unwrap();
+                // Reproduce the older writer's separate message and nonce-map writes.
+                db.store_message_by_id(&legacy.id(), &legacy).unwrap();
+                db.store_message_id_by_nonce(&legacy.nonce, &legacy.id())
+                    .unwrap();
+                assert_eq!(db.retrieve_highest_seen_message_nonce().unwrap(), Some(100));
+                assert!(!db.pending_message_index_migration_complete().unwrap());
+                assert!(db
+                    .retrieve_value_by_key::<_, u64>(
+                        PENDING_MESSAGE_INDEX_MIGRATION_COMPLETE,
+                        &false,
+                    )
+                    .unwrap()
+                    .is_none());
+                assert!(!db.pending_message_index_migration_complete().unwrap());
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn migration_seal_rejects_legacy_processed_reset() {
+        run_test_db(|raw_db| async move {
+            let db = HyperlaneRocksDB::new(&HyperlaneDomain::new_test_domain("origin"), raw_db);
+            let message = message(2, 10);
+            db.store_message(&message, 1).unwrap();
+            db.store_message_processed(&message).unwrap();
+            db.mark_pending_message_index_migration_complete(db.latest_sequence_number())
+                .unwrap();
+            db.store_processed_by_nonce(&message.nonce, &false).unwrap();
+            assert!(!db.pending_message_index_migration_complete().unwrap());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn migration_seal_keeps_writes_during_migration_visible() {
+        run_test_db(|raw_db| async move {
+            let db = HyperlaneRocksDB::new(&HyperlaneDomain::new_test_domain("origin"), raw_db);
+            let sequence = db.latest_sequence_number();
+            db.store_message_id_by_nonce(&0, &message(0, 10).id())
+                .unwrap();
+            db.mark_pending_message_index_migration_complete(sequence)
+                .unwrap();
+            assert!(!db.pending_message_index_migration_complete().unwrap());
+        })
+        .await;
+    }
+
+    #[test]
+    fn migration_seal_survives_reopen_with_retained_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain = HyperlaneDomain::new_test_domain("origin");
+        {
+            let db = HyperlaneRocksDB::new(
+                &domain,
+                DB::from_path_with_rollback_wal(dir.path()).unwrap(),
+            );
+            db.store_message(&message(0, 10), 1).unwrap();
+            db.mark_pending_message_index_migration_complete(db.latest_sequence_number())
+                .unwrap();
+        }
+        let db = HyperlaneRocksDB::new(
+            &domain,
+            DB::from_path_with_rollback_wal(dir.path()).unwrap(),
+        );
+        assert!(db.pending_message_index_migration_complete().unwrap());
+    }
+
+    #[test]
+    fn migration_seal_rejects_missing_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain = HyperlaneDomain::new_test_domain("origin");
+        let mut options = rocksdb::Options::default();
+        options.create_if_missing(true);
+        {
+            let rocks = std::sync::Arc::new(rocksdb::DB::open(&options, dir.path()).unwrap());
+            let db = HyperlaneRocksDB::new(&domain, DB(rocks.clone()));
+            db.mark_pending_message_index_migration_complete(db.latest_sequence_number())
+                .unwrap();
+            db.store_message(&message(0, 10), 1).unwrap();
+            rocks.flush().unwrap();
+            db.store_message(&message(1, 10), 1).unwrap();
+        }
+        let db = HyperlaneRocksDB::new(
+            &domain,
+            rocksdb::DB::open(&options, dir.path()).unwrap().into(),
+        );
+        assert!(!db.pending_message_index_migration_complete().unwrap());
+    }
+
+    #[tokio::test]
+    async fn destination_index_is_ordered_and_isolated() {
+        run_test_db(|raw_db| async move {
+            let db = HyperlaneRocksDB::new(&HyperlaneDomain::new_test_domain("origin"), raw_db);
+            let first = message(0, 10);
+            let later = message(2, 10);
+            let other = message(1, 11);
+            db.store_message(&later, 1).unwrap();
+            db.store_message(&other, 1).unwrap();
+            db.store_message(&first, 1).unwrap();
+
+            assert_eq!(
+                db.retrieve_pending_message_at_or_after(10, 0).unwrap(),
+                Some((0, first.id()))
+            );
+            assert_eq!(
+                db.retrieve_pending_message_at_or_after(10, 1).unwrap(),
+                Some((2, later.id()))
+            );
+            assert_eq!(
+                db.retrieve_pending_message_at_or_before(10, u32::MAX)
+                    .unwrap(),
+                Some((2, later.id()))
+            );
+            assert_eq!(
+                db.retrieve_pending_message_at_or_after(11, 0).unwrap(),
+                Some((1, other.id()))
+            );
+            assert_eq!(
+                db.retrieve_pending_message_at_or_after(10, 3).unwrap(),
+                None
+            );
+            assert_eq!(
+                db.retrieve_pending_message_at_or_before(11, 0).unwrap(),
+                None
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn upsert_moves_index_and_processing_removes_it() {
+        run_test_db(|raw_db| async move {
+            let db = HyperlaneRocksDB::new(&HyperlaneDomain::new_test_domain("origin"), raw_db);
+            let old = message(7, 10);
+            let moved = message(7, 11);
+            db.upsert_message(&old, 1).unwrap();
+            db.upsert_message(&moved, 2).unwrap();
+
+            assert_eq!(
+                db.retrieve_pending_message_at_or_after(10, 0).unwrap(),
+                None
+            );
+            assert_eq!(
+                db.retrieve_pending_message_at_or_after(11, 0).unwrap(),
+                Some((7, moved.id()))
+            );
+            db.store_pending_message_index(&moved).unwrap();
+            db.store_pending_message_index(&moved).unwrap();
+            db.store_terminally_dropped_message(&moved.id()).unwrap();
+
+            db.store_message_processed(&moved).unwrap();
+            assert_eq!(db.retrieve_processed_by_nonce(&7).unwrap(), Some(true));
+            assert!(!db.retrieve_terminally_dropped_message(&moved.id()).unwrap());
+            assert_eq!(
+                db.retrieve_pending_message_at_or_after(11, 0).unwrap(),
+                None
+            );
+        })
+        .await;
+    }
+}
+
 #[async_trait]
 impl HyperlaneLogStore<HyperlaneMessage> for HyperlaneRocksDB {
     /// Store a list of dispatched messages and their associated metadata.
@@ -321,10 +1070,17 @@ impl HyperlaneLogStore<HyperlaneMessage> for HyperlaneRocksDB {
             if stored_message {
                 stored = stored.saturating_add(1);
             }
-            self.store_dispatched_tx_hash_by_message_id(
-                &message.inner().id(),
-                &meta.transaction_id,
-            )?;
+            // Sealevel's basic log metadata carries a zero transaction ID, which
+            // parity backfill and CCIP-read treat as absent. Never write it, so it cannot
+            // replace a known ID (e.g. backfilled from the scraper); a nonzero ID
+            // still replaces it. Sealevel relayer indexing is finalized, so a kept
+            // ID is never orphaned by a reorg re-index.
+            if meta.transaction_id != H512::zero() {
+                self.store_dispatched_tx_hash_by_message_id(
+                    &message.inner().id(),
+                    &meta.transaction_id,
+                )?;
+            }
         }
         if stored > 0 {
             debug!(messages = stored, "Wrote new messages to database");
@@ -398,6 +1154,33 @@ impl HyperlaneSequenceAwareIndexerStoreReader<HyperlaneMessage> for HyperlaneRoc
         Ok(number)
     }
 }
+
+macro_rules! impl_backward_cursor_store {
+    ($event:ty, $key:expr) => {
+        #[async_trait]
+        impl HyperlaneBackwardCursorStore<$event> for HyperlaneRocksDB {
+            async fn retrieve_backward_cursors(&self) -> Result<Vec<BackwardCursorProgress>> {
+                self.retrieve_backward_cursor_progress($key)
+            }
+
+            async fn store_backward_cursor(&self, progress: BackwardCursorProgress) -> Result<()> {
+                self.store_backward_cursor_progress($key, progress)
+            }
+
+            async fn reset_backward_cursor(&self, progress: BackwardCursorProgress) -> Result<()> {
+                self.store_backward_cursor_progress($key, progress)
+            }
+
+            async fn delete_backward_cursor(&self, sequence: u32) -> Result<()> {
+                self.delete_backward_cursor_progress($key, sequence)
+            }
+        }
+    };
+}
+
+impl_backward_cursor_store!(HyperlaneMessage, MESSAGE_BACKWARD_CURSOR);
+impl_backward_cursor_store!(InterchainGasPayment, GAS_PAYMENT_BACKWARD_CURSOR);
+impl_backward_cursor_store!(MerkleTreeInsertion, MERKLE_TREE_INSERTION_BACKWARD_CURSOR);
 
 #[async_trait]
 impl HyperlaneSequenceAwareIndexerStoreReader<MerkleTreeInsertion> for HyperlaneRocksDB {
@@ -476,6 +1259,10 @@ impl HyperlaneDb for HyperlaneRocksDB {
         self.retrieve_highest_seen_message_nonce_number()
     }
 
+    fn retrieve_highest_message_nonce(&self) -> DbResult<Option<u32>> {
+        self.retrieve_highest_message_nonce()
+    }
+
     fn retrieve_message_by_nonce(&self, nonce: u32) -> DbResult<Option<HyperlaneMessage>> {
         self.retrieve_message_by_nonce(nonce)
     }
@@ -515,6 +1302,26 @@ impl HyperlaneDb for HyperlaneRocksDB {
     /// Store whether a message was processed by its nonce
     fn store_processed_by_nonce(&self, nonce: &u32, processed: &bool) -> DbResult<()> {
         self.store_value_by_key(NONCE_PROCESSED, nonce, processed)
+    }
+
+    fn store_message_processed(&self, message: &HyperlaneMessage) -> DbResult<()> {
+        self.store_and_delete_batch(
+            [(
+                NONCE_PROCESSED.as_bytes().to_vec(),
+                message.nonce.to_vec(),
+                true.to_vec(),
+            )],
+            [
+                (
+                    Self::pending_message_destination_prefix(message.destination),
+                    message.nonce.to_vec(),
+                ),
+                (
+                    TERMINALLY_DROPPED_MESSAGE_BY_ID.as_bytes().to_vec(),
+                    message.id().to_vec(),
+                ),
+            ],
+        )
     }
 
     fn retrieve_processed_by_nonce(&self, nonce: &u32) -> DbResult<Option<bool>> {
@@ -629,6 +1436,65 @@ impl HyperlaneDb for HyperlaneRocksDB {
         message_id: &H256,
     ) -> DbResult<Option<u32>> {
         self.retrieve_value_by_key(PENDING_MESSAGE_RETRY_COUNT_FOR_MESSAGE_ID, message_id)
+    }
+
+    fn store_pending_message_retry_state_by_message_id(
+        &self,
+        message_id: &H256,
+        state: &PendingMessageRetryState,
+    ) -> DbResult<()> {
+        self.store_batch([
+            (
+                PENDING_MESSAGE_RETRY_STATE_FOR_MESSAGE_ID
+                    .as_bytes()
+                    .to_vec(),
+                message_id.to_vec(),
+                state.to_vec(),
+            ),
+            (
+                PENDING_MESSAGE_RETRY_COUNT_FOR_MESSAGE_ID
+                    .as_bytes()
+                    .to_vec(),
+                message_id.to_vec(),
+                state.retry_count.to_vec(),
+            ),
+        ])
+    }
+
+    fn store_pending_message_retry_state_and_status_by_message_id(
+        &self,
+        message_id: &H256,
+        state: &PendingMessageRetryState,
+        status: &PendingOperationStatus,
+    ) -> DbResult<()> {
+        self.store_batch([
+            (
+                PENDING_MESSAGE_RETRY_STATE_FOR_MESSAGE_ID
+                    .as_bytes()
+                    .to_vec(),
+                message_id.to_vec(),
+                state.to_vec(),
+            ),
+            (
+                PENDING_MESSAGE_RETRY_COUNT_FOR_MESSAGE_ID
+                    .as_bytes()
+                    .to_vec(),
+                message_id.to_vec(),
+                state.retry_count.to_vec(),
+            ),
+            (
+                STATUS_BY_MESSAGE_ID.as_bytes().to_vec(),
+                message_id.to_vec(),
+                status.to_vec(),
+            ),
+        ])
+    }
+
+    fn retrieve_pending_message_retry_state_by_message_id(
+        &self,
+        message_id: &H256,
+    ) -> DbResult<Option<PendingMessageRetryState>> {
+        self.retrieve_value_by_key(PENDING_MESSAGE_RETRY_STATE_FOR_MESSAGE_ID, message_id)
     }
 
     fn store_merkle_tree_insertion_by_leaf_index(

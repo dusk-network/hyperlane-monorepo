@@ -3,12 +3,16 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use eyre::{Context, Result};
 use hyperlane_core::{
-    ReorgEvent, ReorgEventResponse, SignedAnnouncement, SignedCheckpointWithMessageId,
+    accumulator::incremental::MerkleTreeSnapshot, ReorgEvent, ReorgEventResponse,
+    SignedAnnouncement, SignedCheckpointWithMessageId,
 };
 use prometheus::IntGauge;
+use tokio::io::AsyncReadExt;
 use tracing::error;
 
 use crate::traits::CheckpointSyncer;
+
+use super::utils::MAX_CHECKPOINT_OBJECT_SIZE;
 
 #[derive(Debug, Clone)]
 /// Type for reading/write to LocalStorage
@@ -35,6 +39,10 @@ impl LocalStorage {
 
     fn latest_index_file_path(&self) -> PathBuf {
         self.path.join("index.json")
+    }
+
+    fn merkle_snapshot_file_path(&self) -> PathBuf {
+        self.path.join("merkle_snapshot.json")
     }
 
     fn announcement_file_path(&self) -> PathBuf {
@@ -82,9 +90,37 @@ impl CheckpointSyncer for LocalStorage {
         Ok(())
     }
 
+    async fn read_merkle_snapshot(&self) -> Result<Option<MerkleTreeSnapshot>> {
+        let file = match tokio::fs::File::open(self.merkle_snapshot_file_path()).await {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        let mut data = Vec::new();
+        file.take(MAX_CHECKPOINT_OBJECT_SIZE as u64)
+            .read_to_end(&mut data)
+            .await?;
+        if data.len() >= MAX_CHECKPOINT_OBJECT_SIZE {
+            eyre::bail!("Merkle snapshot exceeds the checkpoint object size limit");
+        }
+        let snapshot = serde_json::from_slice(&data)?;
+        Ok(Some(snapshot))
+    }
+
+    async fn write_merkle_snapshot(&self, snapshot: &MerkleTreeSnapshot) -> Result<()> {
+        let serialized_snapshot = serde_json::to_string(snapshot)?;
+        let path = self.merkle_snapshot_file_path();
+        tokio::fs::write(&path, &serialized_snapshot)
+            .await
+            .with_context(|| format!("Writing merkle snapshot to {path:?}"))?;
+        Ok(())
+    }
+
     async fn fetch_checkpoint(&self, index: u32) -> Result<Option<SignedCheckpointWithMessageId>> {
-        let Ok(data) = tokio::fs::read(self.checkpoint_file_path(index)).await else {
-            return Ok(None);
+        let data = match tokio::fs::read(self.checkpoint_file_path(index)).await {
+            Ok(data) => data,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err.into()),
         };
         let checkpoint = serde_json::from_slice(&data)?;
         Ok(Some(checkpoint))
@@ -143,11 +179,7 @@ impl CheckpointSyncer for LocalStorage {
                     content: None,
                 });
             }
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("Reading reorg status from {:?}", self.reorg_flag_path())
-                });
-            }
+            Err(err) => return Err(err).context("Reading local reorg status"),
         };
         match serde_json::from_slice(&data) {
             Ok(s) => Ok(ReorgEventResponse {
@@ -172,5 +204,87 @@ impl CheckpointSyncer for LocalStorage {
             .await
             .with_context(|| format!("Writing log to {path:?}"))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hyperlane_core::{accumulator::incremental::IncrementalMerkle, H256};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn checkpoint_read_failure_is_not_treated_as_absence() {
+        let directory = tempfile::tempdir().expect("temporary checkpoint directory");
+        let storage =
+            LocalStorage::new(directory.path().to_owned(), None).expect("local checkpoint storage");
+        assert_eq!(
+            storage
+                .fetch_checkpoint(7)
+                .await
+                .expect("missing checkpoint"),
+            None
+        );
+
+        // A directory at the object path produces a real read error even when
+        // tests run as a user whose permissions bypass read-only file fixtures.
+        tokio::fs::create_dir(storage.checkpoint_file_path(7))
+            .await
+            .unwrap();
+        assert!(storage.fetch_checkpoint(7).await.is_err());
+        tokio::fs::remove_dir(storage.checkpoint_file_path(7))
+            .await
+            .unwrap();
+        tokio::fs::write(storage.checkpoint_file_path(7), b"invalid checkpoint")
+            .await
+            .unwrap();
+        assert!(storage.fetch_checkpoint(7).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn merkle_snapshot_reads_are_bounded_before_decoding() {
+        let directory = tempfile::tempdir().expect("temporary checkpoint directory");
+        let storage =
+            LocalStorage::new(directory.path().to_owned(), None).expect("local checkpoint storage");
+        assert_eq!(
+            storage.read_merkle_snapshot().await.expect("missing file"),
+            None
+        );
+
+        let mut tree = IncrementalMerkle::default();
+        tree.ingest(H256::from_low_u64_be(1));
+        let snapshot = MerkleTreeSnapshot::capture(&tree).expect("snapshot");
+        storage
+            .write_merkle_snapshot(&snapshot)
+            .await
+            .expect("write snapshot");
+        assert_eq!(
+            storage
+                .read_merkle_snapshot()
+                .await
+                .expect("valid snapshot"),
+            Some(snapshot.clone())
+        );
+
+        for size in [
+            MAX_CHECKPOINT_OBJECT_SIZE - 1,
+            MAX_CHECKPOINT_OBJECT_SIZE,
+            MAX_CHECKPOINT_OBJECT_SIZE + 1,
+        ] {
+            let mut bytes = serde_json::to_vec(&snapshot).expect("serialized snapshot");
+            bytes.resize(size, b' ');
+            tokio::fs::write(storage.merkle_snapshot_file_path(), bytes)
+                .await
+                .expect("write bounded fixture");
+            let result = storage.read_merkle_snapshot().await;
+            if size < MAX_CHECKPOINT_OBJECT_SIZE {
+                assert_eq!(result.expect("below limit"), Some(snapshot.clone()));
+            } else {
+                assert!(result
+                    .expect_err("oversized snapshot")
+                    .to_string()
+                    .contains("size limit"));
+            }
+        }
     }
 }

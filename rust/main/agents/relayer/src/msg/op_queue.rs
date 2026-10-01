@@ -1,10 +1,16 @@
-use std::{cmp::Reverse, collections::BinaryHeap, sync::Arc};
+use std::{cmp::Reverse, collections::BinaryHeap, sync::Arc, time::Instant};
 
 use derive_new::new;
 use hyperlane_core::{PendingOperation, PendingOperationStatus, QueueOperation, ReprepareReason};
 use prometheus::{IntGauge, IntGaugeVec};
-use tokio::sync::{broadcast::Receiver, Mutex};
-use tracing::{debug, instrument};
+use tokio::{
+    sync::{
+        broadcast::{error::RecvError, Receiver},
+        Mutex, Notify,
+    },
+    time::sleep_until,
+};
+use tracing::{instrument, trace};
 
 use crate::server::operations::message_retry::{MessageRetryQueueResponse, MessageRetryRequest};
 use crate::settings::matching_list::MatchingListExt;
@@ -18,6 +24,10 @@ pub struct OpQueue {
     metrics: IntGaugeVec,
     queue_metrics_label: String,
     retry_receiver: Arc<Mutex<Receiver<MessageRetryRequest>>>,
+    #[new(default)]
+    notify: Arc<Notify>,
+    #[new(default)]
+    space_available: Arc<Notify>,
     #[new(default)]
     pub queue: OperationPriorityQueue,
 }
@@ -34,9 +44,11 @@ impl OpQueue {
         op.set_status_and_update_metrics(new_status, new_metric);
 
         self.queue.lock().await.push(Reverse(op));
+        self.notify.notify_one();
     }
 
     /// Pop an element from the queue and update metrics
+    #[allow(dead_code)] // only used in tests
     #[instrument(skip(self), ret, fields(queue_label=%self.queue_metrics_label), level = "trace")]
     pub async fn pop(&mut self) -> Option<QueueOperation> {
         let pop_attempt = self.pop_many(1).await;
@@ -55,17 +67,95 @@ impl OpQueue {
                 break;
             }
         }
+        drop(queue);
+        if !popped.is_empty() {
+            self.space_available.notify_one();
+        }
 
         // This function is called very often by the message processor tasks, so only log when there are operations to pop
         // to avoid spamming the logs
         if !popped.is_empty() {
-            debug!(
+            trace!(
                 queue_label = %self.queue_metrics_label,
                 operations = ?popped,
                 "Popped OpQueue operations"
             );
         }
         popped
+    }
+
+    pub async fn pop_many_ready(&mut self, limit: usize) -> (Vec<QueueOperation>, Option<Instant>) {
+        self.process_retry_requests().await;
+        let now = Instant::now();
+        let mut queue = self.queue.lock().await;
+        let mut popped = Vec::with_capacity(limit.min(queue.len()));
+        while popped.len() < limit {
+            let Some(Reverse(next)) = queue.peek() else {
+                break;
+            };
+            if next
+                .next_attempt_after()
+                .is_some_and(|deadline| deadline > now)
+            {
+                break;
+            }
+            if let Some(Reverse(op)) = queue.pop() {
+                popped.push(op);
+            }
+        }
+        let next_deadline = queue
+            .peek()
+            .and_then(|Reverse(operation)| operation.next_attempt_after());
+        drop(queue);
+        if !popped.is_empty() {
+            self.space_available.notify_one();
+        }
+        (popped, next_deadline)
+    }
+
+    pub async fn wait_for_len_below(&self, limit: usize) {
+        loop {
+            let notified = self.space_available.notified();
+            if self.len().await < limit {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub async fn wait_for_ready(&mut self, deadline: Option<Instant>) {
+        let notify = self.notify.clone();
+        let retry_receiver = self.retry_receiver.clone();
+        let retry_request = async move {
+            let result = {
+                let mut receiver = retry_receiver.lock().await;
+                receiver.recv().await
+            };
+            match result {
+                Ok(request) => Some(request),
+                Err(RecvError::Lagged(_)) => None,
+                Err(RecvError::Closed) => std::future::pending().await,
+            }
+        };
+
+        let retry_request = match deadline {
+            Some(deadline) => {
+                tokio::select! {
+                    _ = notify.notified() => None,
+                    _ = sleep_until(deadline.into()) => None,
+                    request = retry_request => request,
+                }
+            }
+            None => {
+                tokio::select! {
+                    _ = notify.notified() => None,
+                    request = retry_request => request,
+                }
+            }
+        };
+        if let Some(retry_request) = retry_request {
+            self.process_retry_request_batch(vec![retry_request]).await;
+        }
     }
 
     pub async fn process_retry_requests(&mut self) {
@@ -84,6 +174,14 @@ impl OpQueue {
             return;
         }
 
+        self.process_retry_request_batch(message_retry_requests)
+            .await;
+    }
+
+    async fn process_retry_request_batch(
+        &mut self,
+        message_retry_requests: Vec<MessageRetryRequest>,
+    ) {
         let (retry_responses, queue_length) = {
             let mut queue = self.queue.lock().await;
             let responses = Self::reprioritize_matching(&mut queue, &message_retry_requests);
@@ -134,21 +232,31 @@ impl OpQueue {
             .drain()
             .map(|Reverse(mut op)| {
                 let mut matched = false;
-                retry_responses
-                    .iter_mut()
+                let matching_requests = retry_responses
+                    .iter()
                     .enumerate()
-                    .for_each(|(i, retry_response)| {
+                    .filter_map(|(i, _)| {
                         let retry_req = &retry_requests[i];
                         if !retry_req.pattern.op_matches(&op) {
-                            return;
+                            return None;
                         }
-                        // update retry metrics
-                        retry_response.matched = retry_response.matched.saturating_add(1);
                         matched = true;
-                    });
+                        Some(i)
+                    })
+                    .collect::<Vec<_>>();
                 if matched {
-                    op.set_status(PendingOperationStatus::Retry(ReprepareReason::Manual));
-                    op.reset_attempts();
+                    let reset_succeeded = op.reset_attempts();
+                    if reset_succeeded {
+                        op.set_status(PendingOperationStatus::Retry(ReprepareReason::Manual));
+                    }
+                    for i in matching_requests {
+                        let retry_response = &mut retry_responses[i];
+                        if reset_succeeded {
+                            retry_response.matched = retry_response.matched.saturating_add(1);
+                        } else {
+                            retry_response.failed = retry_response.failed.saturating_add(1);
+                        }
+                    }
                 }
                 Reverse(op)
             })

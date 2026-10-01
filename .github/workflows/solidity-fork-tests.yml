@@ -25,10 +25,11 @@ env:
 
 jobs:
   fork-tests:
+    if: github.repository_owner == 'hyperlane-xyz'
     runs-on: depot-ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           persist-credentials: false
@@ -49,6 +50,8 @@ jobs:
 
       - name: pnpm-build
         uses: ./.github/actions/pnpm-build-with-cache
+        with:
+          build-filter: '@hyperlane-xyz/core...'
 
       - name: Run Fork Tests
         working-directory: ./solidity

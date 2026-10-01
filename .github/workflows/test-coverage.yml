@@ -2,11 +2,6 @@ name: test-coverage
 
 on:
   workflow_call:
-    inputs:
-      base_sha:
-        type: string
-      current_sha:
-        type: string
 
 env:
   TURBO_TELEMETRY_DISABLED: 1
@@ -20,16 +15,20 @@ jobs:
     outputs:
       has_solidity_changes: ${{ steps.check-solidity.outputs.has_changes }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+
+      - name: Determine BASE_SHA
+        id: determine-sha
+        uses: ./.github/actions/determine-base-sha
 
       - name: Check for Solidity changes
         id: check-solidity
         uses: ./.github/actions/check-path-changes
         with:
-          base_sha: ${{ inputs.base_sha }}
-          head_sha: ${{ inputs.current_sha }}
+          base_sha: ${{ steps.determine-sha.outputs.base_sha }}
+          head_sha: ${{ steps.determine-sha.outputs.current_sha }}
           path_pattern: 'solidity/'
 
   coverage-run:
@@ -37,11 +36,11 @@ jobs:
     needs: [check-solidity-changes]
     if: needs.check-solidity-changes.outputs.has_solidity_changes == 'true'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version-file: .nvmrc
 

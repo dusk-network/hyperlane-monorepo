@@ -1,5 +1,248 @@
 # @hyperlane-xyz/relayer
 
+## 4.0.2
+
+### Patch Changes
+
+- Updated dependencies [16df6ee]
+  - @hyperlane-xyz/sdk@44.0.2
+  - @hyperlane-xyz/metrics@1.0.2
+  - @hyperlane-xyz/utils@44.0.2
+  - @hyperlane-xyz/core@12.1.0
+
+## 4.0.1
+
+### Patch Changes
+
+- f269e03: Zod was updated to 4.5.4 to prevent function-valued default factories from running during schema cycle detection and compilation.
+- Updated dependencies [f269e03]
+  - @hyperlane-xyz/sdk@44.0.1
+  - @hyperlane-xyz/metrics@1.0.1
+  - @hyperlane-xyz/utils@44.0.1
+  - @hyperlane-xyz/core@12.1.0
+
+## 4.0.0
+
+### Major Changes
+
+- 6fbe5ad: The Starknet TypeScript stack was upgraded from starknet.js v7 to v8.9.2 to support the JSON-RPC v0.9 endpoints. Account and Contract call sites were migrated to the v8 options-object constructors, fee estimation was updated to the new resourceBounds shape, and dispatch-event parsing now passes the required ABI parser. Starknet wallet dependencies were upgraded for starknet.js v8 compatibility, and the minimum supported Node.js version is now 22 across published runtime dependents.
+
+### Patch Changes
+
+- Updated dependencies [85c44af]
+- Updated dependencies [6fbe5ad]
+  - @hyperlane-xyz/sdk@44.0.0
+  - @hyperlane-xyz/utils@44.0.0
+  - @hyperlane-xyz/metrics@1.0.0
+  - @hyperlane-xyz/core@12.1.0
+
+## 3.0.0
+
+### Major Changes
+
+- 8bcc7ab: Zod was upgraded to 4.5.2 across the TypeScript workspace. Public schemas and validation types were migrated to Zod 4, recursive fee configuration types were made explicit, application entrypoints adopted compiled parsing, and validation errors were changed to use Zod 4's built-in formatting.
+
+### Patch Changes
+
+- 3c65f58: Multisig metadata builders were updated to read validator checkpoints from GCS announcements in addition to S3.
+- Updated dependencies [0848474]
+- Updated dependencies [e76189e]
+- Updated dependencies [3ced099]
+- Updated dependencies [a00b342]
+- Updated dependencies [b58c7eb]
+- Updated dependencies [60fc463]
+- Updated dependencies [8bcc7ab]
+- Updated dependencies [7cf9c01]
+- Updated dependencies [8d91ef8]
+- Updated dependencies [11f2dee]
+  - @hyperlane-xyz/sdk@43.0.0
+  - @hyperlane-xyz/utils@43.0.0
+  - @hyperlane-xyz/metrics@0.2.40
+  - @hyperlane-xyz/core@12.1.0
+
+## 2.0.0
+
+### Major Changes
+
+- 1b136e1: Added SDK support for the new EVM warp-route flow-limiting ISM contracts:
+
+  - `DefaultIsm` was modeled as `IsmType.MAILBOX_DEFAULT`, deployed with its mailbox, derived through a contract-specific probe, and matched against that mailbox.
+  - `NetFlowRateLimitedHookIsm` and `DelayedFlowRouterHookIsm` were modeled as shared hook/ISM instances with typed config, deployment, derivation, matching, mutable ownership, and delayed-flow counterpart enrollment support. The hook side remains read-only so only the ISM deployment path creates the shared instance.
+  - Hybrid configs were required to sit in an exhaustive aggregation with a supported authenticating sibling. Core default-ISM configs and random mutable-ISM tests reject the warp-route-only hybrids.
+  - Hook and ISM readers use contract-specific probes so NULL-module hybrids are not mistaken for test ISMs and the net-flow hybrid is not mistaken for a plain rate-limited hook.
+  - Delayed-flow `maxDelay` values were bounded to a conservative operational maximum so adding the delay to the on-chain `uint48` timestamp cannot overflow in practical use.
+  - The relayer gained metadata building and decoding for all three types. `RoutingMetadata['type']` now includes `MAILBOX_DEFAULT`; because that exported union widening is breaking, the relayer package receives a major bump.
+  - `HookConfig` was expressed as an explicit union to avoid downstream TypeScript union-complexity failures.
+
+### Patch Changes
+
+- Updated dependencies [1713edd]
+- Updated dependencies [9003bab]
+- Updated dependencies [aa29187]
+- Updated dependencies [f0f8a56]
+- Updated dependencies [1b136e1]
+- Updated dependencies [1b136e1]
+- Updated dependencies [1b136e1]
+- Updated dependencies [9a8bb17]
+  - @hyperlane-xyz/sdk@42.0.0
+  - @hyperlane-xyz/metrics@0.2.39
+  - @hyperlane-xyz/utils@42.0.0
+  - @hyperlane-xyz/core@12.1.0
+
+## 1.1.45
+
+### Patch Changes
+
+- Updated dependencies [c201794]
+  - @hyperlane-xyz/sdk@41.3.1
+  - @hyperlane-xyz/metrics@0.2.38
+  - @hyperlane-xyz/utils@41.3.1
+  - @hyperlane-xyz/core@12.1.0
+
+## 1.1.44
+
+### Patch Changes
+
+- Updated dependencies [4a21153]
+- Updated dependencies [c328efa]
+- Updated dependencies [4a21153]
+- Updated dependencies [4a21153]
+- Updated dependencies [322a418]
+- Updated dependencies [d5d7d1a]
+  - @hyperlane-xyz/sdk@41.3.0
+  - @hyperlane-xyz/metrics@0.2.37
+  - @hyperlane-xyz/utils@41.3.0
+  - @hyperlane-xyz/core@12.1.0
+
+## 1.1.43
+
+### Patch Changes
+
+- Updated dependencies [e7666ef]
+- Updated dependencies [5fac94d]
+- Updated dependencies [5899416]
+- Updated dependencies [5fac94d]
+  - @hyperlane-xyz/sdk@41.2.0
+  - @hyperlane-xyz/core@12.1.0
+  - @hyperlane-xyz/metrics@0.2.36
+  - @hyperlane-xyz/utils@41.2.0
+
+## 1.1.42
+
+### Patch Changes
+
+- @hyperlane-xyz/sdk@41.1.0
+- @hyperlane-xyz/metrics@0.2.35
+- @hyperlane-xyz/utils@41.1.0
+- @hyperlane-xyz/core@12.0.0
+
+## 1.1.41
+
+### Patch Changes
+
+- 72738e2: Added SDK support for the Blacklist ISM:
+
+  - Blacklist ISM configs can now be deployed, derived from on-chain state (including the full list of blacklisted message IDs) and matched against existing deployments using exact set equality.
+  - Updates that only add message IDs are applied in-place by submitting a single `blacklist` transaction with the missing IDs.
+  - Updates that drop a currently blacklisted message ID redeploy a fresh ISM, since on-chain entries are append-only and cannot be removed.
+  - Blacklisted message IDs are validated as 32-byte hex strings and normalized to lowercase at config parse time.
+  - The relayer now treats the blacklist ISM as a null-metadata ISM when building message metadata.
+  - `moduleCanCertainlyVerify` reports that a Blacklist ISM cannot certainly verify a message whose ID is in the blacklisted set.
+  - Blacklist ISM configs are validated at parse time to require a mandatory composition: they must be a member of an aggregation whose threshold equals its module count, and are rejected when used standalone, as a routing target, or under a non-exhaustive aggregation.
+
+- Updated dependencies [0057c5d]
+- Updated dependencies [fa19409]
+- Updated dependencies [1a32515]
+- Updated dependencies [1ba623d]
+- Updated dependencies [fcb4331]
+- Updated dependencies [eb24243]
+- Updated dependencies [72738e2]
+- Updated dependencies [fa19409]
+- Updated dependencies [7846658]
+- Updated dependencies [0765fe0]
+- Updated dependencies [b1c6b7e]
+- Updated dependencies [a09ba71]
+- Updated dependencies [d9426bc]
+  - @hyperlane-xyz/sdk@41.0.0
+  - @hyperlane-xyz/utils@41.0.0
+  - @hyperlane-xyz/metrics@0.2.34
+  - @hyperlane-xyz/core@12.0.0
+
+## 1.1.40
+
+### Patch Changes
+
+- Updated dependencies [745fb77]
+- Updated dependencies [745fb77]
+- Updated dependencies [469da6d]
+- Updated dependencies [745fb77]
+- Updated dependencies [74f3760]
+- Updated dependencies [abeeb52]
+- Updated dependencies [8944dd2]
+- Updated dependencies [eb9c37c]
+- Updated dependencies [3a74600]
+- Updated dependencies [57b1e14]
+- Updated dependencies [f3a6a4e]
+- Updated dependencies [d6e923f]
+- Updated dependencies [4c4f3f9]
+- Updated dependencies [4c4f3f9]
+- Updated dependencies [5830b8e]
+- Updated dependencies [d3bbedf]
+- Updated dependencies [e5908e9]
+- Updated dependencies [8944dd2]
+- Updated dependencies [89e6a8e]
+- Updated dependencies [c2301b2]
+- Updated dependencies [de37b68]
+- Updated dependencies [1cac66f]
+- Updated dependencies [c0ca851]
+- Updated dependencies [a7f757b]
+- Updated dependencies [4acd9a6]
+- Updated dependencies [c6a2f61]
+  - @hyperlane-xyz/core@12.0.0
+  - @hyperlane-xyz/sdk@40.0.0
+  - @hyperlane-xyz/metrics@0.2.33
+  - @hyperlane-xyz/utils@40.0.0
+
+## 1.1.39
+
+### Patch Changes
+
+- Updated dependencies [4976bb1]
+- Updated dependencies [6c9210b]
+- Updated dependencies [086ec59]
+  - @hyperlane-xyz/sdk@39.1.0
+  - @hyperlane-xyz/utils@39.1.0
+  - @hyperlane-xyz/metrics@0.2.32
+  - @hyperlane-xyz/core@11.3.1
+
+## 1.1.38
+
+### Patch Changes
+
+- Updated dependencies [f41f9fd]
+- Updated dependencies [ba0e9c1]
+- Updated dependencies [4ef1fde]
+- Updated dependencies [43eb24a]
+- Updated dependencies [406b5c7]
+- Updated dependencies [11e215e]
+- Updated dependencies [bf7c658]
+- Updated dependencies [7e40466]
+- Updated dependencies [496198d]
+- Updated dependencies [4bebbbf]
+- Updated dependencies [735793b]
+- Updated dependencies [2d398b9]
+- Updated dependencies [15b249c]
+- Updated dependencies [6967bef]
+- Updated dependencies [213f626]
+- Updated dependencies [3811ba9]
+- Updated dependencies [6c2ca1d]
+- Updated dependencies [1a31d04]
+- Updated dependencies [9997aee]
+  - @hyperlane-xyz/sdk@39.0.0
+  - @hyperlane-xyz/metrics@0.2.31
+  - @hyperlane-xyz/utils@39.0.0
+  - @hyperlane-xyz/core@11.3.1
+
 ## 1.1.37
 
 ### Patch Changes

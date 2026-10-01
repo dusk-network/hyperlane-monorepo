@@ -1,36 +1,43 @@
 #![allow(dead_code)] // TODO: `rustc` 1.80.1 clippy issue
 
-use eyre::Result;
+use std::collections::HashSet;
+
+use eyre::{ensure, Result};
 use itertools::Itertools;
-use sea_orm::{
-    prelude::*, ActiveValue::*, DeriveColumn, EnumIter, Insert, QuerySelect, TransactionTrait,
-};
+use sea_orm::{prelude::*, ActiveValue::*, Insert, QuerySelect, QueryTrait, TransactionTrait};
 use tracing::{debug, instrument, trace};
 
 use hyperlane_core::{
     address_to_bytes, bytes_to_address, h256_to_bytes, Delivery, HyperlaneMessage, LogMeta, H256,
 };
-use migration::OnConflict;
+use migration::{Alias, Expr, Func, OnConflict};
 
 use crate::date_time;
 use crate::db::ScraperDb;
 
-use super::generated::{delivered_message, message};
+use super::{
+    confirmed_event,
+    generated::{delivered_message, message},
+};
 
 #[derive(Debug, Clone)]
 pub struct StorableDelivery<'a> {
     pub message_id: H256,
     pub sequence: Option<i64>,
     pub meta: &'a LogMeta,
-    /// The database id of the transaction the delivery event occurred in
-    pub txn_id: i64,
+    /// The database id of the transaction the delivery event occurred in, or
+    /// `None` if the transaction could not be resolved on-chain (e.g. Sealevel
+    /// basic log meta fallback).
+    pub txn_id: Option<i64>,
 }
 
 pub struct StorableMessage<'a> {
     pub msg: HyperlaneMessage,
     pub meta: &'a LogMeta,
-    /// The database id of the transaction the message was sent in
-    pub txn_id: i64,
+    /// The database id of the transaction the message was sent in, or `None`
+    /// if the transaction could not be resolved on-chain (e.g. Sealevel basic
+    /// log meta fallback).
+    pub txn_id: Option<i64>,
     /// Override for the stored message ID. When `None`, uses `msg.id()`.
     /// Used by synthetic messages (e.g. same-chain CCR swaps) that need a
     /// recognizable ID format distinct from real keccak256 message hashes.
@@ -46,6 +53,9 @@ impl ScraperDb {
     /// have for Postgres. So 65000 / 20 = 3250
     const STORE_MESSAGE_CHUNK_SIZE: usize = 3250;
 
+    // Six bound columns per delivery; conflict expressions add no parameters.
+    const STORE_DELIVERY_CHUNK_SIZE: usize = 10_000;
+
     /// Get the delivered message associated with a sequence.
     #[instrument(skip(self))]
     pub async fn retrieve_delivery_by_sequence(
@@ -54,50 +64,67 @@ impl ScraperDb {
         destination_mailbox: &H256,
         sequence: u32,
     ) -> Result<Option<Delivery>> {
-        if let Some(delivery) = delivered_message::Entity::find()
+        if let Some(msg_id) = delivered_message::Entity::find()
+            .filter(confirmed_event(
+                "delivered_message",
+                "domain",
+                "block_number",
+            ))
+            .select_only()
+            .column(delivered_message::Column::MsgId)
             .filter(delivered_message::Column::Domain.eq(destination_domain))
             .filter(
                 delivered_message::Column::DestinationMailbox
                     .eq(address_to_bytes(destination_mailbox)),
             )
             .filter(delivered_message::Column::Sequence.eq(sequence))
+            .into_tuple::<Vec<u8>>()
             .one(&self.0)
             .await?
         {
-            let delivery = H256::from_slice(&delivery.msg_id);
+            let delivery = H256::from_slice(&msg_id);
             Ok(Some(delivery))
         } else {
             Ok(None)
         }
     }
 
-    /// Get the tx id of a delivered message associated with a sequence.
+    /// Get the block height of a delivered message associated with a sequence.
+    /// Also returns `None` for deliveries stored with a NULL transaction id
+    /// (unresolvable log meta fallback).
     #[instrument(skip(self))]
-    pub async fn retrieve_delivered_message_tx_id(
+    pub async fn retrieve_delivered_message_block_number(
         &self,
         destination_domain: u32,
         destination_mailbox: &H256,
         sequence: u32,
-    ) -> Result<Option<i64>> {
-        if let Some(delivery) = delivered_message::Entity::find()
+    ) -> Result<Option<u64>> {
+        let tx_id_query = delivered_message::Entity::find()
+            .filter(confirmed_event(
+                "delivered_message",
+                "domain",
+                "block_number",
+            ))
             .filter(delivered_message::Column::Domain.eq(destination_domain))
             .filter(
                 delivered_message::Column::DestinationMailbox
                     .eq(address_to_bytes(destination_mailbox)),
             )
             .filter(delivered_message::Column::Sequence.eq(sequence))
-            .one(&self.0)
-            .await?
-        {
-            let txn_id = delivery.destination_tx_id;
-            Ok(Some(txn_id))
-        } else {
-            Ok(None)
-        }
+            .select_only()
+            .column(delivered_message::Column::DestinationTxId)
+            .limit(1)
+            .into_query();
+        self.retrieve_block_number_by_tx_query(tx_id_query).await
     }
 
     async fn latest_deliveries_id(&self, domain: u32, destination_mailbox: Vec<u8>) -> Result<i64> {
         let result = delivered_message::Entity::find()
+            .filter(confirmed_event(
+                "delivered_message",
+                "domain",
+                "block_number",
+            ))
             .select_only()
             .column_as(delivered_message::Column::Id.max(), "max_id")
             .filter(delivered_message::Column::Domain.eq(domain))
@@ -121,6 +148,11 @@ impl ScraperDb {
         prev_id: i64,
     ) -> Result<u64> {
         Ok(delivered_message::Entity::find()
+            .filter(confirmed_event(
+                "delivered_message",
+                "domain",
+                "block_number",
+            ))
             .filter(delivered_message::Column::Domain.eq(domain))
             .filter(delivered_message::Column::DestinationMailbox.eq(destination_mailbox))
             .filter(delivered_message::Column::Id.gt(prev_id))
@@ -138,42 +170,61 @@ impl ScraperDb {
         deliveries: impl Iterator<Item = StorableDelivery<'_>>,
     ) -> Result<u64> {
         let destination_mailbox = address_to_bytes(&destination_mailbox);
-        let latest_id_before = self
-            .latest_deliveries_id(domain, destination_mailbox.clone())
-            .await?;
         // we have a race condition where a message may not have been scraped yet even
         // though we have received news of delivery on this chain, so the
         // message IDs are looked up in a separate "thread".
-        let models: Vec<delivered_message::ActiveModel> = deliveries
-            .map(|delivery| delivered_message::ActiveModel {
-                id: NotSet,
-                time_created: Set(date_time::now()),
-                msg_id: Unchanged(h256_to_bytes(&delivery.message_id)),
-                domain: Unchanged(domain as i32),
-                destination_mailbox: Unchanged(destination_mailbox.clone()),
-                destination_tx_id: Set(delivery.txn_id),
-                sequence: Set(delivery.sequence),
+        let mut message_ids = HashSet::new();
+        let models = deliveries
+            .map(|delivery| {
+                // Preserve single-upsert rejection across chunk boundaries.
+                ensure!(
+                    message_ids.insert(delivery.message_id),
+                    "Duplicate delivery message id in one batch"
+                );
+                Ok(delivered_message::ActiveModel {
+                    id: NotSet,
+                    time_created: Set(date_time::now()),
+                    msg_id: Unchanged(h256_to_bytes(&delivery.message_id)),
+                    domain: Unchanged(domain as i32),
+                    destination_mailbox: Unchanged(destination_mailbox.clone()),
+                    destination_tx_id: Set(delivery.txn_id),
+                    sequence: Set(delivery.sequence),
+                })
             })
-            .collect_vec();
+            .collect::<Result<Vec<_>>>()?;
+        drop(message_ids);
+        if models.is_empty() {
+            return Ok(0);
+        }
+        let latest_id_before = self
+            .latest_deliveries_id(domain, destination_mailbox.clone())
+            .await?;
 
         trace!(?models, "Writing delivered messages to database");
 
-        if models.is_empty() {
-            debug!("Wrote zero new delivered messages to database");
-            return Ok(0);
+        if models.len() <= Self::STORE_DELIVERY_CHUNK_SIZE {
+            delivery_insert_query(models)
+                .exec_without_returning(&self.0)
+                .await?;
+        } else {
+            self.0
+                .transaction::<_, (), DbErr>(|txn| {
+                    Box::pin(async move {
+                        let mut models = models.into_iter();
+                        while !models.as_slice().is_empty() {
+                            let chunk = models
+                                .by_ref()
+                                .take(Self::STORE_DELIVERY_CHUNK_SIZE)
+                                .collect();
+                            delivery_insert_query(chunk)
+                                .exec_without_returning(txn)
+                                .await?;
+                        }
+                        Ok(())
+                    })
+                })
+                .await?;
         }
-
-        Insert::many(models)
-            .on_conflict(
-                OnConflict::columns([delivered_message::Column::MsgId])
-                    .update_columns([
-                        delivered_message::Column::TimeCreated,
-                        delivered_message::Column::DestinationTxId,
-                    ])
-                    .to_owned(),
-            )
-            .exec(&self.0)
-            .await?;
 
         let new_deliveries_count = self
             .deliveries_count_since_id(domain, destination_mailbox, latest_id_before)
@@ -194,106 +245,70 @@ impl ScraperDb {
         origin_mailbox: &H256,
         nonce: u32,
     ) -> Result<Option<HyperlaneMessage>> {
-        #[derive(Copy, Clone, Debug, EnumIter, DeriveColumn)]
-        enum QueryAs {
-            Nonce,
-        }
-        if let Some(message) = message::Entity::find()
+        if let Some((origin, destination, nonce, sender, recipient, body)) = message::Entity::find()
+            .select_only()
+            .columns([
+                message::Column::Origin,
+                message::Column::Destination,
+                message::Column::Nonce,
+                message::Column::Sender,
+                message::Column::Recipient,
+                message::Column::MsgBody,
+            ])
             .filter(message::Column::Origin.eq(origin_domain))
             .filter(message::Column::OriginMailbox.eq(address_to_bytes(origin_mailbox)))
             .filter(message::Column::Nonce.eq(nonce))
+            .into_tuple::<(i32, i32, i32, Vec<u8>, Vec<u8>, Option<Vec<u8>>)>()
             .one(&self.0)
             .await?
         {
             Ok(Some(HyperlaneMessage {
                 // We do not write version to the DB.
                 version: 3,
-                origin: message.origin as u32,
-                destination: message.destination as u32,
-                nonce: message.nonce as u32,
-                sender: bytes_to_address(message.sender)?,
-                recipient: bytes_to_address(message.recipient)?,
-                body: message.msg_body.unwrap_or(Vec::new()),
+                origin: origin as u32,
+                destination: destination as u32,
+                nonce: nonce as u32,
+                sender: bytes_to_address(sender)?,
+                recipient: bytes_to_address(recipient)?,
+                body: body.unwrap_or(Vec::new()),
             }))
         } else {
             Ok(None)
         }
     }
 
-    /// Get the tx id associated with a dispatched message.
+    /// Get the block height associated with a dispatched message.
+    /// Also returns `None` for messages stored with a NULL transaction id
+    /// (unresolvable log meta fallback).
     #[instrument(skip(self))]
-    pub async fn retrieve_dispatched_tx_id(
+    pub async fn retrieve_dispatched_block_number(
         &self,
         origin_domain: u32,
         origin_mailbox: &H256,
         nonce: u32,
-    ) -> Result<Option<i64>> {
-        #[derive(Copy, Clone, Debug, EnumIter, DeriveColumn)]
-        enum QueryAs {
-            Nonce,
-        }
-
-        let tx_id = message::Entity::find()
+    ) -> Result<Option<u64>> {
+        let tx_id_query = message::Entity::find()
             .filter(message::Column::Origin.eq(origin_domain))
             .filter(message::Column::OriginMailbox.eq(address_to_bytes(origin_mailbox)))
             .filter(message::Column::Nonce.eq(nonce))
             .select_only()
-            .column_as(message::Column::OriginTxId.max(), QueryAs::Nonce)
+            .column_as(message::Column::OriginTxId.max(), "tx_id")
             .group_by(message::Column::Origin)
-            .into_values::<i64, QueryAs>()
-            .one(&self.0)
-            .await?;
-        Ok(tx_id)
-    }
-
-    async fn latest_dispatched_id(&self, domain: u32, origin_mailbox: Vec<u8>) -> Result<i64> {
-        let result = message::Entity::find()
-            .select_only()
-            .column_as(message::Column::Id.max(), "max_id")
-            .filter(message::Column::Origin.eq(domain))
-            .filter(message::Column::OriginMailbox.eq(origin_mailbox))
-            .into_tuple::<Option<i64>>()
-            .one(&self.0)
-            .await?;
-
-        Ok(result
-            // Top level Option indicates some kind of error
-            .ok_or_else(|| eyre::eyre!("Error getting latest dispatched id"))?
-            // Inner Option indicates whether there was any data in the filter -
-            // just default to 0 if there was no data
-            .unwrap_or(0))
-    }
-
-    async fn dispatch_count_since_id(
-        &self,
-        domain: u32,
-        origin_mailbox: Vec<u8>,
-        prev_id: i64,
-    ) -> Result<u64> {
-        Ok(message::Entity::find()
-            .filter(message::Column::Origin.eq(domain))
-            .filter(message::Column::OriginMailbox.eq(origin_mailbox))
-            .filter(message::Column::Id.gt(prev_id))
-            .count(&self.0)
-            .await?)
+            .into_query();
+        self.retrieve_block_number_by_tx_query(tx_id_query).await
     }
 
     /// Store messages from a mailbox into the database (or update an existing
-    /// one).
+    /// one). Return only this operation's inserted row count, excluding updates.
     #[instrument(skip_all)]
     pub async fn store_dispatched_messages(
         &self,
-        domain: u32,
+        _domain: u32,
         origin_mailbox: &H256,
         messages: impl Iterator<Item = StorableMessage<'_>>,
     ) -> Result<u64> {
         let origin_mailbox = address_to_bytes(origin_mailbox);
 
-        let latest_id_before = self
-            .latest_dispatched_id(domain, origin_mailbox.clone())
-            .await?;
-
-        // we have a race condition where a message may not have been scraped yet even
         let models = messages
             .map(|storable| message::ActiveModel {
                 id: NotSet,
@@ -316,20 +331,41 @@ impl ScraperDb {
             })
             .collect_vec();
 
-        trace!(?models, "Writing messages to database");
-
         if models.is_empty() {
-            debug!("Wrote zero new messages to database");
             return Ok(0);
         }
-
         // ensure all chunks are inserted or none at all
-        self.0
-            .transaction::<_, (), DbErr>(|txn| {
+        let new_dispatch_count = self
+            .0
+            .transaction::<_, u64, DbErr>(|txn| {
                 Box::pin(async move {
+                    let mut inserted_count = 0u64;
                     // insert messages in chunks, to not run into
                     // "Too many arguments" error
                     for chunk in models.chunks(Self::STORE_MESSAGE_CHUNK_SIZE) {
+                        // The live indexer and reconciler can write concurrently.
+                        // Count only rows inserted by this statement, never rows
+                        // another writer inserted between a MAX(id) and COUNT.
+                        let inserted = Insert::many(chunk.to_vec())
+                            .on_conflict(
+                                OnConflict::columns([
+                                    message::Column::Origin,
+                                    message::Column::OriginMailbox,
+                                    message::Column::Nonce,
+                                ])
+                                .do_nothing()
+                                .to_owned(),
+                            )
+                            .exec_without_returning(txn)
+                            .await?;
+                        inserted_count = inserted_count.checked_add(inserted).ok_or_else(|| {
+                            DbErr::Custom("Dispatch insertion count overflow".to_owned())
+                        })?;
+                        if inserted == chunk.len() as u64 {
+                            continue;
+                        }
+                        // Preserve enrichment/replay updates, without counting
+                        // those updates as newly inserted dispatches.
                         Insert::many(chunk.to_vec())
                             .on_conflict(
                                 OnConflict::columns([
@@ -338,25 +374,34 @@ impl ScraperDb {
                                     message::Column::Nonce,
                                 ])
                                 .update_columns([
-                                    message::Column::TimeCreated,
                                     message::Column::Destination,
                                     message::Column::Sender,
                                     message::Column::Recipient,
                                     message::Column::MsgBody,
-                                    message::Column::OriginTxId,
                                 ])
+                                // Prefer resolved transaction metadata over a
+                                // NULL value from a later fallback replay.
+                                .value(
+                                    message::Column::OriginTxId,
+                                    Func::if_null(
+                                        Expr::col((
+                                            Alias::new("excluded"),
+                                            message::Column::OriginTxId,
+                                        )),
+                                        Expr::col((
+                                            Alias::new("message"),
+                                            message::Column::OriginTxId,
+                                        )),
+                                    ),
+                                )
                                 .to_owned(),
                             )
                             .exec(txn)
                             .await?;
                     }
-                    Ok(())
+                    Ok(inserted_count)
                 })
             })
-            .await?;
-
-        let new_dispatch_count = self
-            .dispatch_count_since_id(domain, origin_mailbox, latest_id_before)
             .await?;
 
         debug!(
@@ -367,142 +412,122 @@ impl ScraperDb {
     }
 }
 
+fn delivery_insert_query(
+    models: Vec<delivered_message::ActiveModel>,
+) -> Insert<delivered_message::ActiveModel> {
+    Insert::many(models).on_conflict(
+        OnConflict::columns([delivered_message::Column::MsgId])
+            // A fallback replay must not discard transaction metadata
+            // that was resolved by an earlier scrape. This still lets
+            // a later resolved scrape enrich an existing NULL row.
+            .value(
+                delivered_message::Column::DestinationTxId,
+                Func::if_null(
+                    Expr::col((
+                        Alias::new("excluded"),
+                        delivered_message::Column::DestinationTxId,
+                    )),
+                    Expr::col((
+                        Alias::new("delivered_message"),
+                        delivered_message::Column::DestinationTxId,
+                    )),
+                ),
+            )
+            // Replays with no new transaction metadata must not rewrite the
+            // row or emit another Explorer notification. PostgreSQL still
+            // locks the conflict row before evaluating this condition.
+            .action_and_where(Expr::cust(
+                "excluded.destination_tx_id IS NOT NULL AND \"delivered_message\".destination_tx_id IS DISTINCT FROM excluded.destination_tx_id",
+            ))
+            .to_owned(),
+    )
+}
+
+#[cfg(test)]
+mod delivery_replays;
+
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use time::macros::*;
-
     use hyperlane_core::{HyperlaneMessage, LogMeta, H256};
-    use sea_orm::{Database, DatabaseBackend, DbErr, MockDatabase, RuntimeErr, Value};
-    use time::PrimitiveDateTime;
+    use sea_orm::{Database, DatabaseBackend, DbErr, MockDatabase, MockExecResult, RuntimeErr};
 
-    use crate::db::{generated::message, ScraperDb, StorableMessage};
+    use crate::db::{ScraperDb, StorableMessage};
 
-    /// Tests store_dispatched_messages() a transaction works
+    #[tokio::test]
+    async fn store_dispatched_messages_empty_input_executes_no_queries() {
+        let mock_db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let scraper_db = ScraperDb::with_connection(mock_db);
+
+        let stored = scraper_db
+            .store_dispatched_messages(0, &H256::zero(), std::iter::empty::<StorableMessage<'_>>())
+            .await
+            .expect("empty stores should be a no-op");
+
+        assert_eq!(stored, 0);
+    }
+
     #[tokio::test]
     async fn test_store_dispatched_messages_transaction() {
         const MESSAGE_AMOUNT: usize = 10000;
-
-        let query_results: Vec<Vec<_>> = (0..10000)
-            .map(|i| message::Model {
-                id: i as i64,
-                time_created: PrimitiveDateTime::new(date!(2019 - 01 - 01), time!(0:00)),
-                msg_id: vec![],
-                origin: 0,
-                destination: 0,
-                nonce: 0,
-                sender: vec![],
-                recipient: vec![],
-                msg_body: None,
-                origin_mailbox: vec![],
-                origin_tx_id: 0,
-            })
+        let results = (0..MESSAGE_AMOUNT)
             .collect::<Vec<_>>()
             .chunks(ScraperDb::STORE_MESSAGE_CHUNK_SIZE)
-            .map(|v| v.to_vec())
-            .collect();
-
-        let mock_result: BTreeMap<&str, _> = [
-            ("num_items", Into::<Value>::into(10000i64)),
-            ("last_insert_id", Into::<Value>::into(10000i64)),
-        ]
-        .into_iter()
-        .collect();
-        let mock_db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([[message::Model {
-                id: 0,
-                time_created: PrimitiveDateTime::new(date!(2019 - 01 - 01), time!(0:00)),
-                msg_id: vec![],
-                origin: 0,
-                destination: 0,
-                nonce: 0,
-                sender: vec![],
-                recipient: vec![],
-                msg_body: None,
-                origin_mailbox: vec![],
-                origin_tx_id: 0,
-            }]])
-            .append_query_results(query_results)
-            .append_query_results([[mock_result.clone()]])
-            .into_connection();
-        let scraper_db = ScraperDb::with_connection(mock_db);
-
-        let logs_meta: Vec<_> = (0..MESSAGE_AMOUNT).map(|_| LogMeta::default()).collect();
-        let messages: Vec<_> = (0..MESSAGE_AMOUNT)
-            .map(|i| StorableMessage {
-                msg: HyperlaneMessage::default(),
-                meta: &logs_meta[i],
-                txn_id: i as i64,
-                id_override: None,
+            .map(|chunk| MockExecResult {
+                last_insert_id: 0,
+                rows_affected: chunk.len() as u64,
             })
-            .collect();
-        let res = scraper_db
-            .store_dispatched_messages(0, &H256::zero(), messages.into_iter())
-            .await;
-        assert!(res.is_ok());
+            .collect::<Vec<_>>();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_results(results)
+            .into_connection();
+        let scraper_db = ScraperDb::with_connection(db);
+        let meta = LogMeta::default();
+        let messages = (0..MESSAGE_AMOUNT).map(|nonce| StorableMessage {
+            msg: HyperlaneMessage {
+                nonce: nonce as u32,
+                ..Default::default()
+            },
+            meta: &meta,
+            txn_id: None,
+            id_override: None,
+        });
+        assert_eq!(
+            scraper_db
+                .store_dispatched_messages(0, &H256::zero(), messages)
+                .await
+                .unwrap(),
+            MESSAGE_AMOUNT as u64
+        );
     }
 
-    /// Tests store_dispatched_messages() fails if one of the queries
-    /// within the transaction fails
     #[tokio::test]
     async fn test_store_dispatched_messages_fail() {
-        const MESSAGE_AMOUNT: usize = 5000;
-
-        let query_results: Vec<Vec<_>> = (0..MESSAGE_AMOUNT)
-            .map(|i| message::Model {
-                id: i as i64,
-                time_created: PrimitiveDateTime::new(date!(2019 - 01 - 01), time!(0:00)),
-                msg_id: vec![],
-                origin: 0,
-                destination: 0,
-                nonce: 0,
-                sender: vec![],
-                recipient: vec![],
-                msg_body: None,
-                origin_mailbox: vec![],
-                origin_tx_id: 0,
-            })
-            .collect::<Vec<_>>()
-            .chunks(ScraperDb::STORE_MESSAGE_CHUNK_SIZE)
-            .map(|v| v.to_vec())
-            .collect();
-
-        let mock_db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([[message::Model {
-                id: 0,
-                time_created: PrimitiveDateTime::new(date!(2019 - 01 - 01), time!(0:00)),
-                msg_id: vec![],
-                origin: 0,
-                destination: 0,
-                nonce: 0,
-                sender: vec![],
-                recipient: vec![],
-                msg_body: None,
-                origin_mailbox: vec![],
-                origin_tx_id: 0,
-            }]])
-            .append_query_results(query_results)
-            // fail halfway through the transaction
-            .append_query_errors([DbErr::Exec(RuntimeErr::Internal(
-                "Unknown error".to_string(),
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_results([MockExecResult {
+                last_insert_id: 0,
+                rows_affected: ScraperDb::STORE_MESSAGE_CHUNK_SIZE as u64,
+            }])
+            .append_exec_errors([DbErr::Exec(RuntimeErr::Internal(
+                "injected insert failure".to_owned(),
             ))])
             .into_connection();
-        let scraper_db = ScraperDb::with_connection(mock_db);
-
-        let logs_meta: Vec<_> = (0..MESSAGE_AMOUNT).map(|_| LogMeta::default()).collect();
-        let messages: Vec<_> = (0..MESSAGE_AMOUNT)
-            .map(|i| StorableMessage {
-                msg: HyperlaneMessage::default(),
-                meta: &logs_meta[i],
-                txn_id: i as i64,
-                id_override: None,
-            })
-            .collect();
-        let res = scraper_db
-            .store_dispatched_messages(0, &H256::zero(), messages.into_iter())
-            .await;
-        assert!(res.is_err());
+        let scraper_db = ScraperDb::with_connection(db);
+        let meta = LogMeta::default();
+        let messages = (0..5000).map(|nonce| StorableMessage {
+            msg: HyperlaneMessage {
+                nonce,
+                ..Default::default()
+            },
+            meta: &meta,
+            txn_id: None,
+            id_override: None,
+        });
+        assert!(scraper_db
+            .store_dispatched_messages(0, &H256::zero(), messages)
+            .await
+            .is_err());
+        let log = scraper_db.0.into_transaction_log();
+        assert!(format!("{log:?}").contains("ROLLBACK"));
     }
 
     /// Tests store_dispatched_messages() with a real postgres instance
@@ -525,7 +550,7 @@ mod tests {
                 StorableMessage {
                     msg,
                     meta: &logs_meta[i],
-                    txn_id: 0_i64,
+                    txn_id: Some(0_i64),
                     id_override: None,
                 }
             })

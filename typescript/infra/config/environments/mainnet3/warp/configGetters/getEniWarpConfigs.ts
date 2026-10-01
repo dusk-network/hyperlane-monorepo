@@ -4,7 +4,10 @@ import {
   RouterConfigWithoutOwner,
   tokens,
 } from '../../../../../src/config/warp.js';
-import { getWarpFeeOwner } from '../../governance/utils.js';
+import {
+  WARP_FEES_TURNKEY_OWNER,
+  getWarpFeeOwner,
+} from '../../governance/utils.js';
 import { WarpRouteIds } from '../warpIds.js';
 
 import {
@@ -23,9 +26,13 @@ const owners = {
   eni: '0xf0004476DDC8985C067b6BDf94a1759f7b230809',
   optimism: '0xd1219aef6eA190f6aD48525664C33ceE0169c7a8',
   polygon: '0x3211A1Fea94cd4000Bd82D7C9E9334E51938De1b',
+  tron: '0x5ac5e2cf5A0Bb92D1Ca5B8D02a069eC874294976',
 } as const;
 
 const WARP_FEE_BPS = 8;
+// Moonpay offchain quote signer for the inter-collateral fees added on the USDT/eni route
+const QUOTE_SIGNER = '0xEd1829805De615eEFC7303766D395Ea0a1B2b04d';
+const USDT_INTER_COLLATERAL_FEE_BPS = 5;
 
 const usdcTokenAddresses = {
   arbitrum: tokens.arbitrum.USDC,
@@ -43,6 +50,7 @@ const usdtTokenAddresses = {
   ethereum: tokens.ethereum.USDT,
   optimism: tokens.optimism.USDT,
   polygon: tokens.polygon.USDT,
+  tron: tokens.tron.USDT,
 } as const;
 
 const usdcDecimals = {
@@ -63,6 +71,17 @@ const usdtDecimals = {
   eni: 6,
   optimism: 6,
   polygon: 6,
+  tron: 6,
+} as const;
+
+// ENI's collateral routers use route-specific TokenBridgeCctpV2
+// adapters for the fast CCTP path instead of the fast warp-router addresses.
+const eniUsdcFastCctpAdapters = {
+  arbitrum: '0xb0B8D4C6EF212D76d5079df5Ff7A0888A27e9b32',
+  base: '0x584244d02b0fBf9054A5D5C9e9cE9A2E8adA0e28',
+  ethereum: '0xEE4a09db2C25592C04b8b342CB89f9a7f5E20BD2',
+  optimism: '0xb0B8D4C6EF212D76d5079df5Ff7A0888A27e9b32',
+  polygon: '0x8dadbDE67eD0589d90cdE3C940045F10092AcC11',
 } as const;
 
 function getScaledTokenConfig(
@@ -154,7 +173,7 @@ export async function getEniUsdcWarpConfig(
 
   const rebalancingConfigByChain = getUSDCRebalancingBridgesConfigFor(
     rebalanceableChains,
-    [WarpRouteIds.MainnetCCTPV2Standard, WarpRouteIds.MainnetCCTPV2Fast],
+    [WarpRouteIds.MainnetCCTPV2Standard],
   );
 
   const maxDecimals = 18;
@@ -171,6 +190,14 @@ export async function getEniUsdcWarpConfig(
 
   for (const chain of rebalanceableChains) {
     const rebalancingConfig = rebalancingConfigByChain[chain];
+    const allowedRebalancingBridges = Object.fromEntries(
+      Object.entries(rebalancingConfig.allowedRebalancingBridges).map(
+        ([destination, bridges]) => [
+          destination,
+          [...bridges, { bridge: eniUsdcFastCctpAdapters[chain] }],
+        ],
+      ),
+    );
     const config: HypTokenRouterConfig = {
       ...routerConfig[chain],
       owner: owners[chain],
@@ -183,6 +210,7 @@ export async function getEniUsdcWarpConfig(
         maxDecimals,
       ),
       ...rebalancingConfig,
+      allowedRebalancingBridges,
     };
     configs.push([chain, config]);
   }
@@ -223,6 +251,7 @@ export async function getEniUsdtWarpConfig(
     'ethereum',
     'optimism',
     'polygon',
+    'tron',
   ] as const;
 
   const configs: Array<[string, HypTokenRouterConfig]> = [];
@@ -239,6 +268,16 @@ export async function getEniUsdtWarpConfig(
         usdtDecimals[chain],
         maxDecimals,
       ),
+      tokenFee: getFixedRoutingFeeConfig(
+        // Fee contracts on every leg except tron were rotated to Turnkey
+        // treasury custody; tron still uses its WarpFees ICA.
+        chain === 'tron' ? getWarpFeeOwner(chain) : WARP_FEES_TURNKEY_OWNER,
+        allCollateralChains.filter((otherChain) => otherChain !== chain),
+        USDT_INTER_COLLATERAL_FEE_BPS,
+        undefined,
+        // tron's fee contract charges the flat fee directly, without an offchain quote
+        chain === 'tron' ? undefined : [QUOTE_SIGNER],
+      ),
     };
     configs.push([chain, config]);
   }
@@ -254,7 +293,8 @@ export async function getEniUsdtWarpConfig(
       maxDecimals,
     ),
     tokenFee: getFixedRoutingFeeConfig(
-      getWarpFeeOwner('eni'),
+      // eni synthetic fee contract was rotated to Turnkey treasury custody.
+      WARP_FEES_TURNKEY_OWNER,
       allCollateralChains,
       WARP_FEE_BPS,
     ),

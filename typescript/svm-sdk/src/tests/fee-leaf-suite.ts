@@ -17,6 +17,7 @@ import { ASSOCIATED_TOKEN_PROGRAM_ADDRESS } from '../constants.js';
 import type { SvmDeployedFee } from '../fee/types.js';
 import { deriveAssociatedTokenAddress } from '../pda.js';
 import type { createRpc } from '../rpc.js';
+import { TEST_SVM_CHAIN_METADATA } from '../testing/constants.js';
 import { airdropSol, createSplMint } from '../testing/setup.js';
 
 /** Any fee config with params — covers leaf types and offchainQuotedLinear. */
@@ -40,7 +41,7 @@ export function defineLeafFeeTests<C extends ParamsFeeConfig>(
   ): Promise<void> {
     const { signer } = getContext();
     for (const tx of txs) {
-      await signer.send({ instructions: tx.instructions });
+      await signer.send({ instructions: tx['instructions'] });
     }
   }
 
@@ -137,7 +138,7 @@ export function defineLeafFeeTests<C extends ParamsFeeConfig>(
     expect(updateTxs).to.have.length(1);
     const [updateTx] = updateTxs;
     assert(updateTx, 'expected one update tx');
-    expect(updateTx.instructions).to.have.length(1);
+    expect(updateTx['instructions']).to.have.length(1);
     await executeUpdateTxs(updateTxs);
 
     const readResult = await reader.read(deployed.deployed.programId);
@@ -158,8 +159,8 @@ export function defineLeafFeeTests<C extends ParamsFeeConfig>(
     expect(updateTxs).to.have.length(1);
     const [updateTx] = updateTxs;
     assert(updateTx, 'expected one update tx');
-    expect(updateTx.instructions).to.have.length(1);
-    expect(updateTx.instructions[0]?.programAddress).to.equal(
+    expect(updateTx['instructions']).to.have.length(1);
+    expect(updateTx['instructions'][0]?.programAddress).to.equal(
       ASSOCIATED_TOKEN_PROGRAM_ADDRESS,
     );
     await executeUpdateTxs(updateTxs);
@@ -198,8 +199,8 @@ export function defineLeafFeeTests<C extends ParamsFeeConfig>(
     const [updateTx] = updateTxs;
     assert(updateTx, 'expected one update tx');
     // ATA-idempotent ix prepended to the SetBeneficiary ix in the same tx.
-    expect(updateTx.instructions).to.have.length(2);
-    expect(updateTx.instructions[0]?.programAddress).to.equal(
+    expect(updateTx['instructions']).to.have.length(2);
+    expect(updateTx['instructions'][0]?.programAddress).to.equal(
       ASSOCIATED_TOKEN_PROGRAM_ADDRESS,
     );
     await executeUpdateTxs(updateTxs);
@@ -218,15 +219,14 @@ export function defineLeafFeeTests<C extends ParamsFeeConfig>(
   });
 
   it('should transfer ownership and new owner can update', async () => {
-    const { writer, reader, rpc, rpcUrl, makeConfig, makeWriter } =
-      getContext();
+    const { writer, reader, rpc, makeConfig, makeWriter } = getContext();
     const [deployed] = await writer.create({ config: makeConfig() });
 
     // Create a new owner signer and fund it
     const newOwnerKey =
       '0x0000000000000000000000000000000000000000000000000000000000000002';
     const newOwnerSigner = await SvmSigner.connectWithSigner(
-      [rpcUrl],
+      TEST_SVM_CHAIN_METADATA,
       newOwnerKey,
     );
     await airdropSol(
@@ -263,7 +263,7 @@ export function defineLeafFeeTests<C extends ParamsFeeConfig>(
     });
     expect(paramUpdateTxs.length).to.be.greaterThan(0);
     for (const tx of paramUpdateTxs) {
-      await newOwnerSigner.send({ instructions: tx.instructions });
+      await newOwnerSigner.send({ instructions: tx['instructions'] });
     }
 
     const afterUpdate = await reader.read(deployed.deployed.programId);

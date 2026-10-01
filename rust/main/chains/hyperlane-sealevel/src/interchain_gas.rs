@@ -1,4 +1,8 @@
-use std::{ops::RangeInclusive, sync::Arc};
+use std::{
+    future::Future,
+    ops::RangeInclusive,
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
 use derive_new::new;
@@ -7,7 +11,7 @@ use hyperlane_sealevel_igp::{
     igp_gas_payment_pda_seeds, igp_program_data_pda_seeds,
 };
 use solana_sdk::{account::Account, clock::Slot, pubkey::Pubkey};
-use tracing::{info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 use hyperlane_core::{
     config::StrOrIntParseError, ChainCommunicationError, ChainResult, ContractLocator,
@@ -16,6 +20,7 @@ use hyperlane_core::{
 };
 
 use crate::account::{search_accounts_by_discriminator, search_and_validate_account};
+use crate::error::is_get_block_unresolvable_after_retries;
 use crate::fallback::SubmitSealevelRpc;
 use crate::log_meta_composer::{is_interchain_payment_instruction, LogMetaComposer};
 use crate::SealevelProvider;
@@ -24,6 +29,77 @@ use crate::SealevelProvider;
 /// The account data includes prefixes that are accounted for here: a 1 byte initialized flag
 /// and an 8 byte discriminator.
 const UNIQUE_GAS_PAYMENT_PUBKEY_OFFSET: usize = 1 + 8 + 8 + 32 + 4 + 32 + 8 + 8;
+
+#[derive(Debug, Default)]
+struct RangeScanResume {
+    range: Option<RangeInclusive<u32>>,
+    next_sequence: Option<u32>,
+}
+
+impl RangeScanResume {
+    fn ranges_overlap(left: &RangeInclusive<u32>, right: &RangeInclusive<u32>) -> bool {
+        left.start() <= right.end() && right.start() <= left.end()
+    }
+
+    fn next_sequence_for(&self, range: &RangeInclusive<u32>) -> Option<u32> {
+        self.range
+            .as_ref()
+            .filter(|previous| Self::ranges_overlap(previous, range))
+            .and(self.next_sequence)
+    }
+
+    fn record(&mut self, range: RangeInclusive<u32>, next_sequence: Option<u32>) {
+        if let Some(next_sequence) = next_sequence {
+            self.range = Some(range);
+            self.next_sequence = Some(next_sequence);
+        } else if self
+            .range
+            .as_ref()
+            .is_some_and(|previous| Self::ranges_overlap(previous, &range))
+        {
+            *self = Self::default();
+        }
+    }
+}
+
+// Bound each attempt at the first failed RPC, then rotate the next attempt so a
+// permanently unavailable sequence does not hide later payments. The sequence
+// cursor still requires exact range coverage before it advances.
+async fn scan_range_until_error<T, F, Fut>(
+    range: RangeInclusive<u32>,
+    resume_at: Option<u32>,
+    mut fetch: F,
+) -> (Vec<(u32, T)>, Option<u32>)
+where
+    F: FnMut(u32) -> Fut,
+    Fut: Future<Output = ChainResult<T>>,
+{
+    let range_start = *range.start();
+    let range_end = *range.end();
+    let scan_start = resume_at
+        .filter(|sequence| range.contains(sequence))
+        .unwrap_or(range_start);
+    let mut values =
+        Vec::with_capacity(range_end.saturating_sub(range_start).saturating_add(1) as usize);
+
+    for sequence in (scan_start..=range_end).chain(range_start..scan_start) {
+        match fetch(sequence).await {
+            Ok(value) => values.push((sequence, value)),
+            Err(_) => {
+                let next_sequence = if sequence == range_end {
+                    range_start
+                } else {
+                    sequence.saturating_add(1)
+                };
+                values.sort_unstable_by_key(|(sequence, _)| *sequence);
+                return (values, Some(next_sequence));
+            }
+        }
+    }
+
+    values.sort_unstable_by_key(|(sequence, _)| *sequence);
+    (values, None)
+}
 
 /// A reference to an IGP contract on some Sealevel chain
 #[derive(Debug)]
@@ -94,6 +170,7 @@ pub struct SealevelInterchainGasPaymasterIndexer {
     igp: SealevelInterchainGasPaymaster,
     log_meta_composer: LogMetaComposer,
     advanced_log_meta: bool,
+    range_scan_resume: Mutex<RangeScanResume>,
 }
 
 /// IGP payment data on Sealevel
@@ -125,6 +202,7 @@ impl SealevelInterchainGasPaymasterIndexer {
             igp,
             log_meta_composer,
             advanced_log_meta,
+            range_scan_resume: Mutex::new(RangeScanResume::default()),
         })
     }
 
@@ -175,6 +253,16 @@ impl SealevelInterchainGasPaymasterIndexer {
             gas_amount: gas_payment_account.gas_amount.into(),
         };
 
+        let basic_log_meta = LogMeta {
+            address: self.igp.program_id.to_bytes().into(),
+            block_number: gas_payment_account.slot,
+            // TODO: get these when building out scraper support.
+            // It's inconvenient to get these :|
+            block_hash: H256::zero(),
+            transaction_id: H512::zero(),
+            transaction_index: 0,
+            log_index: sequence_number.into(),
+        };
         let log_meta = if self.advanced_log_meta {
             self.interchain_payment_log_meta(
                 U256::from(sequence_number),
@@ -182,17 +270,9 @@ impl SealevelInterchainGasPaymasterIndexer {
                 &gas_payment_account.slot,
             )
             .await?
+            .unwrap_or(basic_log_meta)
         } else {
-            LogMeta {
-                address: self.igp.program_id.to_bytes().into(),
-                block_number: gas_payment_account.slot,
-                // TODO: get these when building out scraper support.
-                // It's inconvenient to get these :|
-                block_hash: H256::zero(),
-                transaction_id: H512::zero(),
-                transaction_index: 0,
-                log_index: sequence_number.into(),
-            }
+            basic_log_meta
         };
 
         Ok(SealevelGasPayment::new(
@@ -227,16 +307,55 @@ impl SealevelInterchainGasPaymasterIndexer {
         log_index: U256,
         payment_pda_pubkey: &Pubkey,
         payment_pda_slot: &Slot,
-    ) -> ChainResult<LogMeta> {
-        let block = self
+    ) -> ChainResult<Option<LogMeta>> {
+        let block = match self
             .provider
             .rpc_client()
             .get_block(*payment_pda_slot)
-            .await?;
+            .await
+        {
+            Ok(block) => block,
+            Err(err) if is_get_block_unresolvable_after_retries(&err) => {
+                warn!(
+                    ?err,
+                    ?payment_pda_pubkey,
+                    ?payment_pda_slot,
+                    "Block for interchain gas payment is unavailable after provider retries; \
+                     falling back to basic log meta",
+                );
+                return Ok(None);
+            }
+            Err(err) => return Err(err),
+        };
 
-        self.log_meta_composer
-            .log_meta(block, log_index, payment_pda_pubkey, payment_pda_slot)
-            .map_err(Into::<ChainCommunicationError>::into)
+        let rpc_client = self.provider.rpc_client();
+        match self
+            .log_meta_composer
+            .log_meta_at_or_before(
+                block,
+                log_index,
+                payment_pda_pubkey,
+                payment_pda_slot,
+                |previous_slot| rpc_client.get_block(previous_slot),
+            )
+            .await?
+        {
+            Ok(log_meta) => Ok(Some(log_meta)),
+            // The block will never contain the expected transaction after filtering, so falling
+            // back to basic log meta lets the sequence-aware cursor advance instead of rewinding
+            // on the same sequence forever.
+            Err(err) if err.is_log_meta_unresolvable() => {
+                warn!(
+                    ?err,
+                    ?payment_pda_pubkey,
+                    ?payment_pda_slot,
+                    "Could not resolve advanced log meta for interchain gas payment, \
+                     falling back to basic log meta",
+                );
+                Ok(None)
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 }
 
@@ -252,10 +371,30 @@ impl Indexer<InterchainGasPayment> for SealevelInterchainGasPaymasterIndexer {
             "Fetching SealevelInterchainGasPaymasterIndexer InterchainGasPayment logs"
         );
 
-        let payments_capacity = range.end().saturating_sub(*range.start());
-        let mut payments = Vec::with_capacity(payments_capacity as usize);
-        for nonce in range {
-            if let Ok(sealevel_payment) = self.get_payment_with_sequence(nonce.into()).await {
+        let resume_at = self
+            .range_scan_resume
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .next_sequence_for(&range);
+        let (sealevel_payments, next_sequence) =
+            scan_range_until_error(range.clone(), resume_at, |nonce| {
+                self.get_payment_with_sequence(nonce.into())
+            })
+            .await;
+        self.range_scan_resume
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record(range.clone(), next_sequence);
+        if let Some(next_sequence) = next_sequence {
+            debug!(
+                ?range,
+                next_sequence, "Stopped IGP range scan after first sequence error"
+            );
+        }
+
+        let payments = sealevel_payments
+            .into_iter()
+            .map(|(nonce, sealevel_payment)| {
                 let igp_account_filter = self.igp.igp_account;
                 let mut payment = *sealevel_payment.payment.inner();
                 // If fees is paid to a different IGP account, we zero out the payment to make sure the db entries are contiguous, but at the same time, gasEnforcer will reject the message (if not set to none policy)
@@ -264,12 +403,12 @@ impl Indexer<InterchainGasPayment> for SealevelInterchainGasPaymasterIndexer {
 
                     payment.payment = U256::from(0);
                 }
-                payments.push((
+                (
                     Indexed::new(payment).with_sequence(nonce),
                     sealevel_payment.log_meta,
-                ));
-            }
-        }
+                )
+            })
+            .collect();
         Ok(payments)
     }
 
@@ -342,5 +481,134 @@ mod tests {
             expected_unique_gas_payment_pubkey,
             sliced_unique_gas_payment_pubkey
         );
+    }
+
+    #[tokio::test]
+    async fn range_scan_stops_at_first_error_and_resumes_after_it() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let first_calls = calls.clone();
+        let (values, resume_at) = scan_range_until_error(10..=12, None, move |sequence| {
+            let calls = first_calls.clone();
+            async move {
+                calls.lock().expect("calls mutex poisoned").push(sequence);
+                if sequence == 10 {
+                    Err(ChainCommunicationError::from_other_str("unavailable"))
+                } else {
+                    Ok(sequence)
+                }
+            }
+        })
+        .await;
+
+        assert!(values.is_empty());
+        assert_eq!(resume_at, Some(11));
+        assert_eq!(*calls.lock().expect("calls mutex poisoned"), vec![10]);
+
+        calls.lock().expect("calls mutex poisoned").clear();
+        let second_calls = calls.clone();
+        let (values, resume_at) = scan_range_until_error(10..=12, resume_at, move |sequence| {
+            let calls = second_calls.clone();
+            async move {
+                calls.lock().expect("calls mutex poisoned").push(sequence);
+                Ok(sequence)
+            }
+        })
+        .await;
+
+        assert_eq!(
+            values
+                .into_iter()
+                .map(|(sequence, _)| sequence)
+                .collect::<Vec<_>>(),
+            vec![10, 11, 12]
+        );
+        assert_eq!(resume_at, None);
+        assert_eq!(
+            *calls.lock().expect("calls mutex poisoned"),
+            vec![11, 12, 10]
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_prefix_is_returned_before_rotating_past_the_failure() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let first_calls = calls.clone();
+        let (values, resume_at) = scan_range_until_error(10..=13, None, move |sequence| {
+            let calls = first_calls.clone();
+            async move {
+                calls.lock().expect("calls mutex poisoned").push(sequence);
+                if sequence == 11 {
+                    Err(ChainCommunicationError::from_other_str("unavailable"))
+                } else {
+                    Ok(sequence)
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(values, vec![(10, 10)]);
+        assert_eq!(resume_at, Some(12));
+        assert_eq!(*calls.lock().expect("calls mutex poisoned"), vec![10, 11]);
+
+        calls.lock().expect("calls mutex poisoned").clear();
+        let second_calls = calls.clone();
+        let (values, resume_at) = scan_range_until_error(10..=13, resume_at, move |sequence| {
+            let calls = second_calls.clone();
+            async move {
+                calls.lock().expect("calls mutex poisoned").push(sequence);
+                Ok(sequence)
+            }
+        })
+        .await;
+
+        assert_eq!(values, vec![(10, 10), (11, 11), (12, 12), (13, 13)]);
+        assert_eq!(resume_at, None);
+        assert_eq!(
+            *calls.lock().expect("calls mutex poisoned"),
+            vec![12, 13, 10, 11]
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_failures_rotate_across_the_full_range() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut resume_at = None;
+
+        for expected in [20, 21, 22, 20] {
+            let attempt_calls = calls.clone();
+            let (values, next) = scan_range_until_error(20..=22, resume_at, move |sequence| {
+                let calls = attempt_calls.clone();
+                async move {
+                    calls.lock().expect("calls mutex poisoned").push(sequence);
+                    Err::<u32, _>(ChainCommunicationError::from_other_str("unavailable"))
+                }
+            })
+            .await;
+            assert!(values.is_empty());
+            assert_eq!(
+                calls.lock().expect("calls mutex poisoned").last(),
+                Some(&expected)
+            );
+            resume_at = next;
+        }
+
+        assert_eq!(
+            *calls.lock().expect("calls mutex poisoned"),
+            vec![20, 21, 22, 20]
+        );
+    }
+
+    #[test]
+    fn unrelated_range_success_does_not_clear_resume_state() {
+        let mut state = RangeScanResume::default();
+        state.record(20..=22, Some(21));
+
+        state.record(100..=102, None);
+
+        assert_eq!(state.next_sequence_for(&(20..=22)), Some(21));
+        assert_eq!(state.next_sequence_for(&(100..=102)), None);
+
+        state.record(21..=23, None);
+        assert_eq!(state.next_sequence_for(&(20..=22)), None);
     }
 }

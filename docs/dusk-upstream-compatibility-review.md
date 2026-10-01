@@ -1,5 +1,57 @@
 # Dusk Upstream Compatibility Review
 
+Date: 2026-10-01
+
+## October fork synchronization
+
+The Dusk integration PRs are merged in both Dusk repositories. This fork sync
+merges Hyperlane upstream `0ba2eb34de748d2b2ae31bdcadb5fb0267e9a7ee` while
+preserving the Dusk commits and the immutable companion-types reference. It
+is not an upstream submission or production deployment.
+
+The integration preserves these boundaries across upstream's Rust changes:
+
+- Dusk checkpoint quorum readers use every configured RPC endpoint. Each reader
+  validates the native chain ID and contract domains without opening the
+  indexer's exclusive event database; indexers retain durable event storage.
+- Upstream's shared reorg halt and cancellation paths remain in place. A local
+  tombstone is persisted before remote checkpoint storage or diagnostics, and
+  local persistence failures keep signing halted while retrying. Startup still
+  refuses an existing tombstone.
+- Bounded, credential-redacted reorg diagnostics use upstream's shared endpoint
+  selection. Dusk metrics use the new height-based `ChainInfo` API, and the
+  shared native-token default remains nine decimals for Dusk.
+- GCP signer support and the Fuel removal are retained from upstream. The Dusk
+  lockfile additions retain `dusk-bytes` 0.1.7 and `derive-hex` 0.1.2, compatible
+  with the repository's Rust 1.88 toolchain.
+- Hyperlane-owned CI jobs retain their owner guards, including the new node
+  services image, Solidity fork-test, and SVM integration jobs that require
+  upstream app credentials or Depot runners. Change detection uses a
+  GitHub-hosted runner in this fork. The proposal boundary includes those
+  guarded workflows and upstream's new validator `rpc.rs`, where Dusk endpoint
+  selection is integrated.
+
+Fresh validation on macOS arm64 with Rust 1.88 passed the six affected-package
+check, 32 Dusk adapter tests, 167 validator tests, focused Dusk/parser/reorg and
+core-chain tests, whole-main-workspace formatting, Dusk all-target Clippy,
+validator production Clippy, and lockfile stability. One pre-existing core-chain
+test remains ignored. Removing the state-only provider fix makes the new Dusk
+quorum regression fail on the exclusive event-store lock; restoring it passes.
+
+Dusk workflow actionlint passed. Structural lint passed for the adapted
+upstream workflows; their unchanged shell blocks still contain upstream
+ShellCheck warnings. An additional validator test-target Clippy pass reports
+denied unwrap/arithmetic/style lints in test fixtures, including unchanged
+upstream tests. That extra pass is not claimed as green. Hosted check results
+must be read from the sync PR's exact head. No fresh live cross-chain run was
+performed.
+
+Current source inputs and the evidence boundary are recorded in
+[`dusk-companion-compatibility.md`](dusk-companion-compatibility.md). The July
+notes below are historical receipts and decisions, not current branch status.
+
+## Historical July review
+
 Date: 2026-07-21
 
 This note records the upstream Hyperlane areas checked before keeping the Dusk

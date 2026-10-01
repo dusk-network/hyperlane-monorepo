@@ -11,10 +11,12 @@ import {
   IsmCacheConfig,
   MatchingList,
   RelayerConfig as RelayerAgentConfig,
+  type WarpCoreConfig,
 } from '@hyperlane-xyz/sdk';
 import {
   Address,
   addressToBytes32,
+  assert,
   isEVMLike,
   isValidAddressEvm,
   objMap,
@@ -61,9 +63,51 @@ export interface RelayerBatchConfig {
   maxSubmitQueueLength?: ChainMap<number>;
 }
 
-export interface AddressLookupTableOverride {
-  matchingList: MatchingList;
-  addressLookupTable: string;
+export type AddressLookupTableOverride = { matchingList: MatchingList } & (
+  | { addressLookupTable: string; addressLookupTables?: never }
+  | {
+      addressLookupTable?: never;
+      addressLookupTables: [string, ...string[]];
+    }
+);
+
+/**
+ * Builds destination-process ALT overrides from registered warp routes.
+ * Routes without SVM ALT metadata are ignored. Each generated override matches
+ * the destination warp program and supplies the complete ordered ALT bundle.
+ */
+export function buildWarpRouteProcessAltOverrides(
+  warpRoutes: readonly WarpCoreConfig[],
+): ChainMap<AddressLookupTableOverride[]> {
+  const overrides: ChainMap<AddressLookupTableOverride[]> = {};
+
+  for (const route of warpRoutes) {
+    const altAddresses = route.options?.sealevel?.altAddresses;
+    if (!altAddresses) continue;
+
+    for (const [chainName, alts] of Object.entries(altAddresses)) {
+      const destinationToken = route.tokens.find(
+        (token) => token.chainName === chainName,
+      );
+      assert(
+        destinationToken?.addressOrDenom,
+        `Warp ALT metadata references missing token on ${chainName}`,
+      );
+
+      const chainOverrides = overrides[chainName] ?? [];
+      chainOverrides.push({
+        matchingList: [
+          {
+            recipientAddress: addressToBytes32(destinationToken.addressOrDenom),
+          },
+        ],
+        addressLookupTables: [alts.core, ...alts.warpSpecific],
+      });
+      overrides[chainName] = chainOverrides;
+    }
+  }
+
+  return overrides;
 }
 
 // Incomplete basic relayer agent config
@@ -84,6 +128,8 @@ export interface BaseRelayerConfig {
   batch?: RelayerBatchConfig;
   txIdIndexingEnabled?: boolean;
   igpIndexingEnabled?: boolean;
+  websocketUrl?: string;
+  websocketAuthorityEnabled?: boolean;
   reorgPeriodOverrides?: ChainMap<number>;
   interval?: number;
   relayApi?: RelayApiConfig;
@@ -196,6 +242,13 @@ export class RelayerConfigHelper extends AgentConfigHelper<RelayerConfig> {
     relayerConfig.allowContractCallCaching = baseConfig.cache?.enabled ?? false;
     relayerConfig.txIdIndexingEnabled = baseConfig.txIdIndexingEnabled ?? true;
     relayerConfig.igpIndexingEnabled = baseConfig.igpIndexingEnabled ?? true;
+    if (baseConfig.websocketUrl !== undefined) {
+      relayerConfig.websocketUrl = baseConfig.websocketUrl;
+    }
+    if (baseConfig.websocketAuthorityEnabled !== undefined) {
+      relayerConfig.websocketAuthorityEnabled =
+        baseConfig.websocketAuthorityEnabled;
+    }
     if (baseConfig.relayApi !== undefined) {
       relayerConfig.relayApiEnabled = baseConfig.relayApi.enabled;
       if (baseConfig.relayApi.port !== undefined) {

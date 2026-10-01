@@ -10,7 +10,7 @@
  * Usage:
  *   pnpm tsx scripts/sealevel-helpers/deploy-svm-ism.ts \
  *     -e mainnet3 \
- *     --chains sonicsvm soon eclipsemainnet
+ *     --chains sonicsvm eclipsemainnet
  *
  * Steps per chain:
  *   1. Deploy ISM program from embedded bytes
@@ -148,7 +148,7 @@ async function processChain(
 
   // Connect svm-sdk signer
   const signer = await SealevelSigner.connectWithSigner(
-    rpcUrls,
+    chainMeta,
     deployerKeyBase58,
   );
   const rpc = createRpc(rpcUrls[0]);

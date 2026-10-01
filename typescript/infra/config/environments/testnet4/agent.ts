@@ -1,4 +1,5 @@
 import {
+  ChainName,
   GasPaymentEnforcement,
   GasPaymentEnforcementPolicyType,
   IsmCacheConfig,
@@ -15,14 +16,12 @@ import {
   RootAgentConfig,
   getAgentChainNamesFromConfig,
 } from '../../../src/config/agent/agent.js';
-import {
-  BaseRelayerConfig,
-  MetricAppContext,
-} from '../../../src/config/agent/relayer.js';
+import { BaseRelayerConfig } from '../../../src/config/agent/relayer.js';
 import { ALL_KEY_ROLES, Role } from '../../../src/roles.js';
-import { Contexts } from '../../contexts.js';
+import { Contexts, RELEASE_CANDIDATE_INDEX_FROM } from '../../contexts.js';
 import { DockerImageRepos, testnetDockerTags } from '../../docker.js';
 import { getDomainId } from '../../registry.js';
+import { fallbackHedgeConfig } from '../utils.js';
 
 import { environment, ethereumChainNames } from './chains.js';
 import {
@@ -47,25 +46,14 @@ export const hyperlaneContextAgentChainConfig: AgentChainConfig<
     arbitrumsepolia: true,
     basesepolia: true,
     bsctestnet: true,
-    celestiatestnet: false,
-    celosepolia: true,
-    cotitestnet: true,
-    eclipsetestnet: false,
-    fuji: true,
     hyperliquidevmtestnet: true,
-    kyvetestnet: false,
-    modetestnet: true,
     optimismsepolia: true,
-    paradexsepolia: true,
     polygonamoy: true,
-    radixtestnet: false,
     seismictestnet: true,
     sepolia: true,
     solanadevnet: true,
     solanatestnet: true,
     somniatestnet: true,
-    sonicsvmtestnet: false,
-    starknetsepolia: false,
     tronshasta: true,
   },
   [Role.Relayer]: {
@@ -73,25 +61,14 @@ export const hyperlaneContextAgentChainConfig: AgentChainConfig<
     arbitrumsepolia: true,
     basesepolia: true,
     bsctestnet: true,
-    celestiatestnet: false,
-    celosepolia: true,
-    cotitestnet: true,
-    eclipsetestnet: false,
-    fuji: true,
     hyperliquidevmtestnet: true,
-    kyvetestnet: false,
-    modetestnet: true,
     optimismsepolia: true,
-    paradexsepolia: true,
     polygonamoy: true,
-    radixtestnet: false,
     seismictestnet: true,
     sepolia: true,
     solanadevnet: true,
     solanatestnet: true,
     somniatestnet: true,
-    sonicsvmtestnet: false,
-    starknetsepolia: false,
     tronshasta: true,
   },
   [Role.Scraper]: {
@@ -99,26 +76,15 @@ export const hyperlaneContextAgentChainConfig: AgentChainConfig<
     arbitrumsepolia: true,
     basesepolia: true,
     bsctestnet: true,
-    celestiatestnet: false,
-    celosepolia: true,
-    cotitestnet: true,
-    eclipsetestnet: false,
-    fuji: true,
     hyperliquidevmtestnet: true,
-    kyvetestnet: false,
-    modetestnet: true,
     optimismsepolia: true,
-    paradexsepolia: true,
     polygonamoy: true,
-    radixtestnet: false,
     // disabled temporarily until timestamps change from ms to secs (soon)
     seismictestnet: false,
     sepolia: true,
     solanadevnet: true,
     solanatestnet: true,
     somniatestnet: true,
-    sonicsvmtestnet: false,
-    starknetsepolia: false,
     tronshasta: true,
   },
 };
@@ -135,21 +101,20 @@ const contextBase = {
   aws: {
     region: 'us-east-1',
   },
+  gcp: {
+    project: 'abacus-labs-dev',
+    location: 'us-east1',
+  },
+  sealevel: {
+    maxSupportedTransactionVersionGetter: (chain: ChainName): 0 | 1 =>
+      chain === 'solanadevnet' || chain === 'solanatestnet' ? 1 : 0,
+  },
 } as const;
 
+const scraperWebsocketUrl =
+  'ws://scraper-proxy.testnet4.svc.cluster.local:8383/agents';
+
 const gasPaymentEnforcement: GasPaymentEnforcement[] = [
-  {
-    type: GasPaymentEnforcementPolicyType.None,
-    matchingList: [
-      // Temporary workaround due to IGP not being implemented on starknet chain.
-      // starknetsepolia
-      { originDomain: getDomainId('starknetsepolia') },
-      { destinationDomain: getDomainId('starknetsepolia') },
-      // paradexsepolia
-      { originDomain: getDomainId('paradexsepolia') },
-      { destinationDomain: getDomainId('paradexsepolia') },
-    ],
-  },
   {
     type: GasPaymentEnforcementPolicyType.Minimum,
     payment: '1',
@@ -189,45 +154,6 @@ const scraperResources = {
   },
 };
 
-// Kessel is a load test, these are contracts involved in the load
-// test that we want to have certain relayers focus on or ignore.
-const kesselMatchingList: MatchingList = [
-  // classic kessel test recipient
-  {
-    recipientAddress: '0x492b3653A38e229482Bab2f7De4A094B18017246',
-  },
-  // kessel run spice route
-  {
-    destinationDomain: getDomainId('basesepolia'),
-    recipientAddress: '0x4Cd2d5deD9D1ef5013fddCDceBeaCB32DFb5ad47',
-  },
-  {
-    destinationDomain: getDomainId('bsctestnet'),
-    recipientAddress: '0x975B8Cf9501cBaD717812fcdE3b51a390AD77540',
-  },
-  {
-    destinationDomain: getDomainId('optimismsepolia'),
-    recipientAddress: '0x554B0724432Ef42CB4a2C12E756F6F022e37aD8F',
-  },
-  {
-    destinationDomain: getDomainId('arbitrumsepolia'),
-    recipientAddress: '0xdED2d823A5e4E82AfbBB68A3e9D947eE03EFbA9d',
-  },
-  {
-    destinationDomain: getDomainId('sepolia'),
-    recipientAddress: '0x51BB50884Ec21063DEC3DCA0B2d4aCeF2559E65a',
-  },
-];
-
-const kesselAppContext = 'kessel';
-
-const metricAppContextsGetter = (): MetricAppContext[] => [
-  {
-    name: kesselAppContext,
-    matchingList: kesselMatchingList,
-  },
-];
-
 const ismCacheConfigs: Array<IsmCacheConfig> = [
   {
     selector: {
@@ -239,24 +165,6 @@ const ismCacheConfigs: Array<IsmCacheConfig> = [
       ModuleType.AGGREGATION,
       ModuleType.MERKLE_ROOT_MULTISIG,
       ModuleType.MESSAGE_ID_MULTISIG,
-    ],
-    // SVM is explicitly not cached as the default ISM is a multisig ISM
-    // that routes internally.
-    chains: ethereumChainNames,
-    cachePolicy: IsmCachePolicy.IsmSpecific,
-  },
-  {
-    selector: {
-      type: IsmCacheSelectorType.AppContext,
-      context: kesselAppContext,
-    },
-    // Default ISM Routing ISMs change configs based off message content,
-    // so they are not specified here.
-    moduleTypes: [
-      ModuleType.AGGREGATION,
-      ModuleType.MERKLE_ROOT_MULTISIG,
-      ModuleType.MESSAGE_ID_MULTISIG,
-      ModuleType.ROUTING,
     ],
     // SVM is explicitly not cached as the default ISM is a multisig ISM
     // that routes internally.
@@ -280,10 +188,34 @@ const processAltOverrides: BaseRelayerConfig['processAltOverrides'] = {
   ],
 };
 
+const retiredLoadTestBlacklist: MatchingList = [
+  {
+    recipientAddress: '0x492b3653A38e229482Bab2f7De4A094B18017246',
+  },
+  {
+    destinationDomain: getDomainId('basesepolia'),
+    recipientAddress: '0x4Cd2d5deD9D1ef5013fddCDceBeaCB32DFb5ad47',
+  },
+  {
+    destinationDomain: getDomainId('bsctestnet'),
+    recipientAddress: '0x975B8Cf9501cBaD717812fcdE3b51a390AD77540',
+  },
+  {
+    destinationDomain: getDomainId('optimismsepolia'),
+    recipientAddress: '0x554B0724432Ef42CB4a2C12E756F6F022e37aD8F',
+  },
+  {
+    destinationDomain: getDomainId('arbitrumsepolia'),
+    recipientAddress: '0xdED2d823A5e4E82AfbBB68A3e9D947eE03EFbA9d',
+  },
+  {
+    destinationDomain: getDomainId('sepolia'),
+    recipientAddress: '0x51BB50884Ec21063DEC3DCA0B2d4aCeF2559E65a',
+  },
+];
+
 const relayBlacklist: BaseRelayerConfig['blacklist'] = [
-  // Ignore kessel runner test recipients.
-  // All 5 test recipients have the same address.
-  ...kesselMatchingList,
+  ...retiredLoadTestBlacklist,
   {
     // In an effort to reduce some giant retry queues that resulted
     // from spam txs to the old TestRecipient before we were charging for
@@ -313,21 +245,17 @@ const hyperlane: RootAgentConfig = {
   rolesWithKeys: ALL_KEY_ROLES,
   relayer: {
     rpcConsensusType: RpcConsensusType.Fallback,
+    ...fallbackHedgeConfig,
+    websocketUrl: scraperWebsocketUrl,
+    websocketAuthorityEnabled: true,
     docker: {
       repo: DockerImageRepos.AGENT,
       tag: testnetDockerTags.relayer,
     },
     blacklist: relayBlacklist,
     gasPaymentEnforcement,
-    metricAppContextsGetter,
     ismCacheConfigs,
     processAltOverrides,
-    batch: {
-      batchSizeOverrides: {
-        starknetsepolia: 16,
-        paradexsepolia: 16,
-      },
-    },
     cache: {
       enabled: true,
     },
@@ -341,7 +269,8 @@ const hyperlane: RootAgentConfig = {
     resources: relayerResources,
   },
   validators: {
-    rpcConsensusType: RpcConsensusType.Fallback,
+    rpcConsensusType: RpcConsensusType.Majority,
+    websocketUrl: scraperWebsocketUrl,
     docker: {
       repo: DockerImageRepos.AGENT,
       tag: testnetDockerTags.validator,
@@ -351,11 +280,26 @@ const hyperlane: RootAgentConfig = {
   },
   scraper: {
     rpcConsensusType: RpcConsensusType.Fallback,
+    ...fallbackHedgeConfig,
     docker: {
       repo: DockerImageRepos.AGENT,
       tag: testnetDockerTags.scraper,
     },
     resources: scraperResources,
+  },
+  scraperProxy: {
+    docker: {
+      repo: DockerImageRepos.NODE_SERVICES,
+      tag: testnetDockerTags.scraperProxy,
+    },
+    enabled: true,
+    maxAgentClients: 100,
+    port: 8383,
+    replicas: 1,
+    tunnel: { enabled: false },
+    resources: {
+      requests: { cpu: '500m', memory: '1Gi' },
+    },
   },
 };
 
@@ -366,21 +310,18 @@ const releaseCandidate: RootAgentConfig = {
   rolesWithKeys: [Role.Relayer, Role.Validator],
   relayer: {
     rpcConsensusType: RpcConsensusType.Fallback,
+    ...fallbackHedgeConfig,
+    index: { from: RELEASE_CANDIDATE_INDEX_FROM },
+    websocketUrl: scraperWebsocketUrl,
+    websocketAuthorityEnabled: true,
     docker: {
       repo: DockerImageRepos.AGENT,
       tag: testnetDockerTags.relayerRC,
     },
     blacklist: relayBlacklist,
     gasPaymentEnforcement,
-    metricAppContextsGetter,
     ismCacheConfigs,
     processAltOverrides,
-    batch: {
-      batchSizeOverrides: {
-        starknetsepolia: 16,
-        paradexsepolia: 16,
-      },
-    },
     cache: {
       enabled: true,
     },
@@ -394,56 +335,8 @@ const releaseCandidate: RootAgentConfig = {
     resources: relayerResources,
   },
   validators: {
-    rpcConsensusType: RpcConsensusType.Fallback,
-    docker: {
-      repo: DockerImageRepos.AGENT,
-      tag: testnetDockerTags.validatorRC,
-    },
-    chains: validatorChainConfig(Contexts.ReleaseCandidate),
-    resources: validatorResources,
-  },
-};
-
-export const kesselRunnerNetworks = [
-  'basesepolia',
-  'arbitrumsepolia',
-  'sepolia',
-  'bsctestnet',
-  'optimismsepolia',
-];
-
-// Relayer Neutron Testnet is not running at the moment, but we keep the config
-// If you would like to run it for testing purposes, you should configure it
-// only for chains you would like to run it.
-const neutron: RootAgentConfig = {
-  ...contextBase,
-  context: Contexts.Neutron,
-  contextChainNames: hyperlaneContextAgentChainNames,
-  rolesWithKeys: [Role.Relayer],
-  relayer: {
-    rpcConsensusType: RpcConsensusType.Fallback,
-    docker: {
-      repo: DockerImageRepos.AGENT,
-      tag: testnetDockerTags.relayerRC,
-    },
-    blacklist: relayBlacklist,
-    gasPaymentEnforcement,
-    metricAppContextsGetter,
-    ismCacheConfigs,
-    processAltOverrides,
-    batch: {
-      batchSizeOverrides: {
-        starknetsepolia: 16,
-        paradexsepolia: 16,
-      },
-    },
-    cache: {
-      enabled: true,
-    },
-    resources: relayerResources,
-  },
-  validators: {
-    rpcConsensusType: RpcConsensusType.Fallback,
+    rpcConsensusType: RpcConsensusType.Majority,
+    websocketUrl: scraperWebsocketUrl,
     docker: {
       repo: DockerImageRepos.AGENT,
       tag: testnetDockerTags.validatorRC,
@@ -457,13 +350,15 @@ const fastPath: RootAgentConfig = {
   ...contextBase,
   context: Contexts.FastPath,
   contextChainNames: {
-    [Role.Validator]: [],
+    [Role.Validator]: ['arbitrumsepolia', 'basesepolia', 'sepolia'],
     [Role.Relayer]: ['arbitrumsepolia', 'basesepolia', 'sepolia'],
     [Role.Scraper]: [],
   },
-  rolesWithKeys: [Role.Relayer],
+  rolesWithKeys: [Role.Relayer, Role.Validator],
   relayer: {
     rpcConsensusType: RpcConsensusType.Fallback,
+    ...fallbackHedgeConfig,
+    // Use RPC indexing until the scraper proxy supports fastpath streaming.
     docker: {
       repo: DockerImageRepos.AGENT,
       tag: testnetDockerTags.relayerFastPath,
@@ -475,14 +370,25 @@ const fastPath: RootAgentConfig = {
     cache: {
       enabled: true,
     },
-    interval: 1,
+    // Halve steady-state index polling RPCs while keeping fastpath detection
+    // within one additional second (0.5s average).
+    interval: 2,
     resources: relayerResources,
+  },
+  validators: {
+    rpcConsensusType: RpcConsensusType.Majority,
+    // Use RPC indexing until the scraper proxy supports fastpath streaming.
+    docker: {
+      repo: DockerImageRepos.AGENT,
+      tag: testnetDockerTags.validatorFastPath,
+    },
+    chains: validatorChainConfig(Contexts.FastPath),
+    resources: validatorResources,
   },
 };
 
 export const agents = {
   [Contexts.Hyperlane]: hyperlane,
   [Contexts.ReleaseCandidate]: releaseCandidate,
-  [Contexts.Neutron]: neutron,
   [Contexts.FastPath]: fastPath,
 };

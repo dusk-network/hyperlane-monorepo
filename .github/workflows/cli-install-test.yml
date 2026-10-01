@@ -24,11 +24,13 @@ jobs:
         os: ${{ (github.event_name == 'schedule' || inputs.include-windows) && fromJson('["depot-ubuntu-24.04", "depot-macos-15", "depot-windows-2025-8"]') || fromJson('["depot-ubuntu-24.04", "depot-macos-15"]') }}
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
-          node-version-file: .nvmrc
+          # Verify the CLI at its minimum supported runtime. Other workflows
+          # continue to exercise the repository's current Node version.
+          node-version: 22
 
       - name: install-hyperlane-cli
         id: install-hyperlane-cli

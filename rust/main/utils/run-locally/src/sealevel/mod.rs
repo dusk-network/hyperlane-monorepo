@@ -1,12 +1,13 @@
 pub mod composite_ism;
 pub mod sealevel_termination_invariants;
 pub mod solana;
+#[cfg(test)]
+pub mod warp_route_composite_ism;
 
 use std::{
     fs,
     path::Path,
     sync::atomic::Ordering,
-    thread::sleep,
     time::{Duration, Instant},
 };
 
@@ -24,7 +25,7 @@ use crate::{
     sealevel::{sealevel_termination_invariants::*, solana::*},
     utils::{
         concat_path, get_sealevel_path, get_ts_infra_path, get_workspace_path, make_static,
-        TaskHandle,
+        poll_until, start_postgres, TaskHandle,
     },
     wait_for_condition, State, AGENT_LOGGING_DIR, RELAYER_METRICS_PORT, SCRAPER_METRICS_PORT,
 };
@@ -38,7 +39,7 @@ pub const SOL_MESSAGES_WITH_NON_MATCHING_IGP: u32 = 1;
 pub const SUBMITTER_TYPE: SubmitterType = SubmitterType::Lander;
 
 /// These private keys are from the solana-test-validator network
-const RELAYER_KEYS: &[&str] = &[
+pub(super) const RELAYER_KEYS: &[&str] = &[
     // sealeveltest1
     "0x892bf6949af4233e62f854cb3618bc1a3ee3341dc71ada08c4d5deca239acf4f",
     // sealeveltest2
@@ -48,7 +49,7 @@ const RELAYER_KEYS: &[&str] = &[
 ];
 
 // Single validator on sealeveltest1 only - signs checkpoints for messages to both destinations
-const SEALEVEL_VALIDATOR_KEYS: &[&str] =
+pub(super) const SEALEVEL_VALIDATOR_KEYS: &[&str] =
     &["0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"];
 
 type DynPath = Box<dyn AsRef<Path>>;
@@ -181,7 +182,20 @@ fn run_locally() {
     // Ready to run...
     //
 
-    // Install Solana CLI tools once (both contract and network CLI use the same version)
+    // Compile agents alongside SBF setup in the separate Sealevel workspace.
+    log!("Building rust agents...");
+    let build_main = Program::new("cargo")
+        .cmd("build")
+        .working_dir(&workspace_path)
+        .arg("features", "test-utils")
+        .arg("bin", "relayer")
+        .arg("bin", "validator")
+        .arg("bin", "scraper")
+        .arg("bin", "init-db")
+        .filter_logs(|l| !l.contains("workspace-inheritance"))
+        .run();
+
+    // Install once: both contract compilation and the node use this version.
     let solana_path_tempdir = tempdir().expect("Failed to create solana temp dir");
     let solana_cli_tools_path = install_solana_cli_tools(
         SOLANA_CONTRACTS_CLI_RELEASE_URL.to_owned(),
@@ -194,19 +208,6 @@ fn run_locally() {
     let hyperlane_solana_programs_path =
         build_solana_programs(solana_cli_tools_path.clone()).join();
 
-    // Build agent binaries and sealevel-client in parallel (separate workspaces)
-    log!("Building rust...");
-    let build_main = Program::new("cargo")
-        .cmd("build")
-        .working_dir(&workspace_path)
-        .arg("features", "test-utils")
-        .arg("bin", "relayer")
-        .arg("bin", "validator")
-        .arg("bin", "scraper")
-        .arg("bin", "init-db")
-        .filter_logs(|l| !l.contains("workspace-inheritance"))
-        .run();
-
     log!("Building hyperlane-sealevel-client...");
     let build_sealevel_client = Program::new("cargo")
         .working_dir(&sealevel_path)
@@ -216,14 +217,7 @@ fn run_locally() {
         .run();
 
     log!("Running postgres db...");
-    let postgres = Program::new("docker")
-        .cmd("run")
-        .flag("rm")
-        .arg("name", "scraper-testnet-postgres")
-        .arg("env", "POSTGRES_PASSWORD=47221c18c610")
-        .arg("publish", "5432:5432")
-        .cmd("postgres:14")
-        .spawn("SQL", None);
+    let postgres = start_postgres();
     state.push_agent(postgres);
 
     build_main.join();
@@ -251,9 +245,6 @@ fn run_locally() {
         .join();
     state.push_agent(scraper_env.spawn("SCR", None));
 
-    // sleep some more to avoid flakes when sending transfers below
-    sleep(Duration::from_secs(10));
-
     // Send messages BEFORE agents start (test backward indexing cursor)
     // Half to sealeveltest2 (will use versioned tx with ALT)
     for _i in 0..(SOL_MESSAGES_EXPECTED_SEALEVELTEST2 / 2) {
@@ -271,6 +262,9 @@ fn run_locally() {
         )
         .join();
     }
+
+    // Agents index at finalized; wait so the messages above are only reachable by backfill.
+    wait_for_finalized(&solana_cli_tools_path, &solana_config_path);
 
     // spawn validators (single validator on sealeveltest1 only)
     for (i, validator_env) in validator_envs.into_iter().enumerate() {
@@ -316,14 +310,10 @@ fn run_locally() {
     log!("Ctrl+C to end execution...");
 
     let loop_start = Instant::now();
-    // give things a chance to fully start.
-    sleep(Duration::from_secs(10));
-
-    if !post_startup_invariants(&checkpoints_dirs) {
-        panic!("Failure: Post startup invariants are not met");
-    } else {
-        log!("Success: Post startup invariants are met");
-    }
+    poll_until("post startup invariants", Duration::from_secs(60), || {
+        post_startup_invariants(&checkpoints_dirs)
+    });
+    log!("Success: Post startup invariants are met");
 
     let starting_relayer_balance: f64 = agent_balance_sum(9092).unwrap();
 

@@ -43,14 +43,21 @@ jobs:
       matrix:
         test:
           - core-deploy
+          - http-signer
           - warp-deploy-1
           - warp-deploy-predicate
+          - warp-delayed-flow
+          - warp-net-flow
           - warp-apply-simple-updates
           - warp-apply-predicate-updates
+          - warp-apply-delayed-flow-1
+          - warp-apply-delayed-flow-2
+          - warp-apply-delayed-flow-3
           - warp-check-1
           - warp-send
+          - warp-fork
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: recursive
@@ -61,6 +68,9 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Checkout registry
         uses: ./.github/actions/checkout-registry
+      - name: Install Arc Anvil
+        if: matrix.test == 'warp-fork'
+        uses: ./.github/actions/install-arc-anvil
       - name: CLI e2e tests (${{ matrix.test }})
         run: pnpm -C typescript/cli test:ethereum:e2e
         env:
@@ -85,12 +95,16 @@ jobs:
           # ISM Commands
           - ism
           # Other commands
+          - http-signer
           - relay
           - status
           - submit
           # ICA
           - ica-deploy
           # Warp Apply Commands
+          - warp-apply-delayed-flow-1
+          - warp-apply-delayed-flow-2
+          - warp-apply-delayed-flow-3
           - warp-apply-hook-updates
           - warp-apply-ism-updates
           - warp-apply-ownership-updates
@@ -105,6 +119,8 @@ jobs:
           # deploy
           - warp-bridge-1
           - warp-bridge-2
+          - warp-delayed-flow
+          - warp-net-flow
           - warp-deploy-1
           - warp-deploy-2
           - warp-deploy-predicate
@@ -116,6 +132,8 @@ jobs:
           - warp-check-4
           - warp-check-5
           - warp-check-ica
+          # fork
+          - warp-fork
           # other
           - warp-init
           - warp-quote
@@ -125,8 +143,9 @@ jobs:
           - warp-send-predicate
           # xerc20
           - xerc20
+          - warp-xerc20-fee
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: recursive
@@ -137,6 +156,9 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Checkout registry
         uses: ./.github/actions/checkout-registry
+      - name: Install Arc Anvil
+        if: matrix.test == 'warp-fork'
+        uses: ./.github/actions/install-arc-anvil
       - name: CLI e2e tests (${{ matrix.test }})
         run: pnpm -C typescript/cli test:ethereum:e2e
         env:
@@ -153,9 +175,10 @@ jobs:
       matrix:
         test:
           - core-deploy
+          - submit
           - warp-deploy
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: recursive
@@ -193,7 +216,7 @@ jobs:
           - warp-deploy
           - warp-read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: recursive
@@ -222,7 +245,7 @@ jobs:
           - core-deploy
           - warp-deploy
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: recursive
@@ -241,7 +264,7 @@ jobs:
   cli-radix-e2e-matrix:
     runs-on: depot-ubuntu-24.04
     if: (inputs.run_cli_e2e == 'true' || inputs.has_radix == 'true') && inputs.ci_tier == 'full'
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -258,7 +281,7 @@ jobs:
           - warp-apply-ownership-updates
           - warp-apply-route-extension
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: recursive
@@ -287,7 +310,7 @@ jobs:
           - core-deploy
           - warp-deploy
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: recursive
@@ -334,7 +357,7 @@ jobs:
           - warp-deploy
           - warp-read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: recursive
@@ -364,8 +387,9 @@ jobs:
           - core-deploy
           - warp-deploy-1
           - warp-deploy-2
+          - warp-net-flow
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: recursive
@@ -392,12 +416,13 @@ jobs:
       matrix:
         test:
           - warp-apply
-          - warp-cc-evm-svm
+          - warp-cc-evm-svm-1
+          - warp-cc-evm-svm-2
           - warp-deploy
           - warp-send
           - warp-send-evm-svm
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: recursive
@@ -424,7 +449,7 @@ jobs:
           - warp-apply-starknet
           - warp-deploy-starknet
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: recursive
@@ -454,7 +479,7 @@ jobs:
           - warp-deploy
           - warp-apply-ism-updates
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: recursive
@@ -494,7 +519,7 @@ jobs:
           - warp-deploy
           - warp-read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: recursive
@@ -522,8 +547,9 @@ jobs:
         test:
           - core-deploy
           - core-composite-ism
+          - http-signer
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: recursive
@@ -542,7 +568,7 @@ jobs:
   cli-svm-e2e-matrix:
     runs-on: depot-ubuntu-24.04
     if: (inputs.run_cli_e2e == 'true' || inputs.has_svm == 'true') && inputs.ci_tier == 'full'
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -550,16 +576,19 @@ jobs:
           - core-deploy
           - core-apply
           - core-composite-ism
+          - http-signer
           - hook-igp
           - warp-alt
+          - warp-composite-ism
           - warp-cross-collateral
           - warp-fee
           - warp-fee-apply
+          - warp-fork
           - warp-legacy-upgrade-fee
           - warp-quote
           - warp-read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: recursive
@@ -570,6 +599,22 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Checkout registry
         uses: ./.github/actions/checkout-registry
+      - name: Install surfpool
+        if: matrix.test == 'warp-fork'
+        env:
+          # Pinned, checksum-verified download — don't pipe a mutable remote
+          # installer to a shell, and don't expose the Turbo token to this step.
+          TURBO_TOKEN: ''
+          SURFPOOL_VERSION: '1.5.0'
+          SURFPOOL_SHA256: '5b20a3b46e60c4f819af7b4da5c3ea211f76041710617841cc23247d15887ddc'
+        run: |
+          URL="https://github.com/txtx/surfpool/releases/download/v${SURFPOOL_VERSION}/surfpool-linux-x64.tar.gz"
+          curl -sSfL "$URL" -o /tmp/surfpool.tar.gz
+          echo "${SURFPOOL_SHA256}  /tmp/surfpool.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf /tmp/surfpool.tar.gz -C "$HOME/.local/bin" surfpool
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/surfpool" --version
       - name: CLI sealevel e2e tests (${{ matrix.test }})
         run: pnpm -C typescript/cli test:sealevel:e2e
         env:
@@ -584,7 +629,7 @@ jobs:
     if: inputs.has_relayer == 'true'
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: recursive
@@ -605,7 +650,7 @@ jobs:
     if: inputs.has_rebalancer == 'true'
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           submodules: recursive

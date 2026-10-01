@@ -12,6 +12,12 @@ import {
 import { type CometClient, connectComet } from '@cosmjs/tendermint-rpc';
 
 import { type AltVM } from '@hyperlane-xyz/provider-sdk';
+import type { ChainMetadataForAltVM } from '@hyperlane-xyz/provider-sdk/chain';
+import {
+  composeWarpDeployGas,
+  nativeAmountFromGasUnits,
+  type WarpArtifactConfig,
+} from '@hyperlane-xyz/provider-sdk/warp';
 import { assert, strip0x } from '@hyperlane-xyz/utils';
 
 import { type MsgRemoteTransferEncodeObject } from '../hyperlane/warp/messages.js';
@@ -32,6 +38,20 @@ import {
   shouldCacheStargateClient,
 } from './stargate.js';
 
+// Warp-deploy cost breakdown for Cosmos-native. Composed additively in
+// getMinGasForWarpDeploy() based on the WarpConfig shape. Unlike rent-metered
+// protocols, these are gas UNITS (ugas) that get multiplied by the chain's
+// gas price to yield a native-denom amount.
+//
+// TODO: fill from observed deploy — we don't have a measured breakdown for
+// feature-heavy warp deploys on Cosmos-native yet, so all extras currently
+// contribute nothing.
+const WARP_DEPLOY_BASE_UGAS = BigInt(3e6); // base router deploy
+const WARP_DEPLOY_CROSS_COLLATERAL_EXTRA_UGAS = 0n; // + crossCollateral router extras
+const WARP_DEPLOY_FEE_PROGRAM_UGAS = 0n; // + fee program (config.fee object)
+const WARP_DEPLOY_CUSTOM_ISM_UGAS = 0n; // + custom ISM (config.interchainSecurityModule object)
+const WARP_DEPLOY_CUSTOM_HOOK_UGAS = 0n; // + custom hook / IGP (config.hook object)
+
 export class CosmosNativeProvider implements AltVM.IProvider<EncodeObject> {
   private readonly query: QueryClient &
     BankExtension &
@@ -39,20 +59,30 @@ export class CosmosNativeProvider implements AltVM.IProvider<EncodeObject> {
     WarpExtension;
   private readonly registry: Registry;
   private readonly cometClient: CometClient;
-  private readonly rpcUrls: string[];
+  private readonly rpcUrls: [string, ...string[]];
+  protected readonly chainMetadata: ChainMetadataForAltVM;
   private readonly stargateClients = new StargateClientCache(1);
 
   static async connect(
-    rpcUrls: string[],
-    _chainId: string | number,
+    metadata: ChainMetadataForAltVM,
   ): Promise<CosmosNativeProvider> {
-    assert(rpcUrls.length > 0, `got no rpcUrls`);
+    const rpcUrls = (metadata.rpcUrls ?? []).map((rpc) => rpc.http);
+    const [rpcUrl, ...otherRpcUrls] = rpcUrls;
+    assert(rpcUrl, `${CosmosNativeProvider.name} got no rpcUrls`);
 
-    const client = await connectComet(rpcUrls[0]);
-    return new CosmosNativeProvider(client, rpcUrls);
+    const client = await connectComet(rpcUrl);
+    return new CosmosNativeProvider(
+      client,
+      [rpcUrl, ...otherRpcUrls],
+      metadata,
+    );
   }
 
-  protected constructor(cometClient: CometClient, rpcUrls: string[]) {
+  protected constructor(
+    cometClient: CometClient,
+    rpcUrls: [string, ...string[]],
+    chainMetadata: ChainMetadataForAltVM,
+  ) {
     this.query = QueryClient.withExtensions(
       cometClient,
       setupBankExtension,
@@ -69,6 +99,24 @@ export class CosmosNativeProvider implements AltVM.IProvider<EncodeObject> {
 
     this.cometClient = cometClient;
     this.rpcUrls = rpcUrls;
+    this.chainMetadata = chainMetadata;
+  }
+
+  async getMinGasForWarpDeploy(
+    warpConfig: WarpArtifactConfig,
+  ): Promise<bigint> {
+    const units = composeWarpDeployGas(warpConfig, {
+      base: WARP_DEPLOY_BASE_UGAS,
+      crossCollateralExtra: WARP_DEPLOY_CROSS_COLLATERAL_EXTRA_UGAS,
+      feeProgram: WARP_DEPLOY_FEE_PROGRAM_UGAS,
+      customIsm: WARP_DEPLOY_CUSTOM_ISM_UGAS,
+      customHook: WARP_DEPLOY_CUSTOM_HOOK_UGAS,
+    });
+    assert(
+      this.chainMetadata.gasPrice,
+      `gasPrice not defined on chain ${this.chainMetadata.name}`,
+    );
+    return nativeAmountFromGasUnits(units, this.chainMetadata.gasPrice);
   }
 
   // ### QUERY BASE ###
@@ -78,7 +126,7 @@ export class CosmosNativeProvider implements AltVM.IProvider<EncodeObject> {
     return status.syncInfo.latestBlockHeight > 0;
   }
 
-  getRpcUrls(): string[] {
+  getRpcUrls(): [string, ...string[]] {
     return this.rpcUrls;
   }
 

@@ -13,7 +13,7 @@ import type {
   MerkleTreeHookConfig,
   IgpHookConfig,
 } from '@hyperlane-xyz/provider-sdk/hook';
-import { sleep } from '@hyperlane-xyz/utils';
+import { assert, sleep } from '@hyperlane-xyz/utils';
 
 import { SvmSigner } from '../clients/signer.js';
 import { SvmHookArtifactManager } from '../hook/hook-artifact-manager.js';
@@ -45,7 +45,7 @@ describe('SVM Hook E2E Tests', function () {
   before(async () => {
     rpc = createRpc(TEST_SVM_CHAIN_METADATA.rpcUrl);
     signer = await SvmSigner.connectWithSigner(
-      [TEST_SVM_CHAIN_METADATA.rpcUrl],
+      TEST_SVM_CHAIN_METADATA,
       TEST_PRIVATE_KEY,
     );
 
@@ -197,7 +197,9 @@ describe('SVM Hook E2E Tests', function () {
       });
 
       expect(updateTxs).to.have.length.greaterThan(0);
-      expect(updateTxs[0].annotation).to.include('oracle');
+      const [updateTx] = updateTxs;
+      assert(updateTx, 'expected at least one update tx');
+      expect(updateTx.annotation).to.include('oracle');
     });
   });
 

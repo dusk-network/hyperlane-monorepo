@@ -4,7 +4,7 @@ import { before, describe, it } from 'mocha';
 
 import { ArtifactState } from '@hyperlane-xyz/provider-sdk/artifact';
 import type { MailboxOnChain } from '@hyperlane-xyz/provider-sdk/mailbox';
-import { ZERO_ADDRESS_HEX_32 } from '@hyperlane-xyz/utils';
+import { assert, ZERO_ADDRESS_HEX_32 } from '@hyperlane-xyz/utils';
 
 import { SvmSigner } from '../clients/signer.js';
 import { SvmMailboxArtifactManager } from '../core/mailbox-artifact-manager.js';
@@ -65,7 +65,7 @@ describe('SVM Mailbox E2E Tests', function () {
   before(async () => {
     rpc = createRpc(TEST_SVM_CHAIN_METADATA.rpcUrl);
     signer = await SvmSigner.connectWithSigner(
-      [TEST_SVM_CHAIN_METADATA.rpcUrl],
+      TEST_SVM_CHAIN_METADATA,
       TEST_PRIVATE_KEY,
     );
     await airdropSol(rpc, address(signer.getSignerAddress()), 50_000_000_000n);
@@ -167,7 +167,9 @@ describe('SVM Mailbox E2E Tests', function () {
         }),
       });
       expect(updateTxs.length).to.be.greaterThan(0);
-      expect(updateTxs[0].annotation).to.include('set default ISM');
+      const [updateTx] = updateTxs;
+      assert(updateTx, 'expected at least one update tx');
+      expect(updateTx.annotation).to.include('set default ISM');
       await executeUpdateTxs(updateTxs);
 
       // Verify on-chain.
@@ -191,7 +193,7 @@ describe('SVM Mailbox E2E Tests', function () {
 
     it('should transfer ownership and allow new owner to update', async () => {
       const newOwnerSigner = await SvmSigner.connectWithSigner(
-        [TEST_SVM_CHAIN_METADATA.rpcUrl],
+        TEST_SVM_CHAIN_METADATA,
         TEST_PRIVATE_KEY_2,
       );
       await airdropSol(
@@ -240,7 +242,7 @@ describe('SVM Mailbox E2E Tests', function () {
     it('should renounce ownership via update', async () => {
       // Use a throwaway owner since renouncing is irreversible.
       const throwawayOwner = await SvmSigner.connectWithSigner(
-        [TEST_SVM_CHAIN_METADATA.rpcUrl],
+        TEST_SVM_CHAIN_METADATA,
         TEST_PRIVATE_KEY_3,
       );
       await airdropSol(

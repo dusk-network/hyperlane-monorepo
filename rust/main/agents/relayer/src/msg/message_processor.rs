@@ -1,12 +1,14 @@
 #![allow(clippy::doc_markdown)] // TODO: `rustc` 1.80.1 clippy issue
 #![allow(clippy::doc_lazy_continuation)] // TODO: `rustc` 1.80.1 clippy issue
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::join_all;
 use futures_util::future::try_join_all;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use maplit::hashmap;
 use num_traits::Zero;
 use prometheus::{IntCounterVec, IntGaugeVec};
@@ -32,8 +34,7 @@ use crate::msg::pending_message::CONFIRM_DELAY;
 use crate::server::operations::message_retry::MessageRetryRequest;
 
 use super::op_batch::OperationBatch;
-use super::op_queue::OpQueue;
-use super::op_queue::OperationPriorityQueue;
+use super::{op_queue::OpQueue, QueueOperationBatch};
 
 use stage::prepare;
 use stage::submit::filter_operations_for_submit;
@@ -46,6 +47,24 @@ mod stage;
 /// This value needs to be manually updated if we ever
 /// update the number of queues an MessageProcessor has.
 pub const MESSAGE_PROCESSOR_QUEUE_COUNT: usize = 3;
+
+/// Ingress only bridges producers into the destination priority queue. Keeping
+/// one slot avoids a duplicate backlog while still decoupling task scheduling.
+pub const MESSAGE_PROCESSOR_INGRESS_CAPACITY: usize = 1;
+
+const CONFIRM_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+#[async_trait::async_trait]
+trait RecoveryWaiter: Send + Sync {
+    async fn wait_for_recovery(&self);
+}
+
+#[async_trait::async_trait]
+impl RecoveryWaiter for DispatcherEntrypoint {
+    async fn wait_for_recovery(&self) {
+        DispatcherEntrypoint::wait_for_recovery(self).await;
+    }
+}
 
 /// MessageProcessor accepts operations over a channel, prepares them for submission,
 /// and if successful, sends them to the destination chain via a submitter.
@@ -86,7 +105,7 @@ pub struct MessageProcessor {
     /// Domain this processor delivers to.
     domain: HyperlaneDomain,
     /// Receiver for new messages to submit.
-    rx: Option<mpsc::UnboundedReceiver<QueueOperation>>,
+    rx: Option<mpsc::Receiver<QueueOperationBatch>>,
     /// Metrics for message processor.
     metrics: MessageProcessorMetrics,
     /// Max batch size for submitting messages
@@ -105,7 +124,7 @@ impl MessageProcessor {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         domain: HyperlaneDomain,
-        rx: mpsc::UnboundedReceiver<QueueOperation>,
+        rx: mpsc::Receiver<QueueOperationBatch>,
         retry_op_transmitter: &Sender<MessageRetryRequest>,
         metrics: MessageProcessorMetrics,
         max_batch_size: u32,
@@ -146,8 +165,8 @@ impl MessageProcessor {
         }
     }
 
-    pub async fn prepare_queue(&self) -> OperationPriorityQueue {
-        self.prepare_queue.queue.clone()
+    pub async fn prepare_queue(&self) -> OpQueue {
+        self.prepare_queue.clone()
     }
 
     pub fn spawn(self) -> JoinHandle<()> {
@@ -167,6 +186,9 @@ impl MessageProcessor {
         let rx_prepare = self.rx.take().expect("rx should be initialised");
 
         let entrypoint = self.payload_dispatcher_entrypoint.take().map(Arc::new);
+        let recovery_waiter = entrypoint
+            .as_ref()
+            .map(|entrypoint| -> Arc<dyn RecoveryWaiter> { entrypoint.clone() });
 
         let prepare_task = match &entrypoint {
             None => self.create_classic_prepare_task(),
@@ -178,10 +200,10 @@ impl MessageProcessor {
             Some(entrypoint) => self.create_lander_submit_task(entrypoint.clone()),
         };
 
-        let confirm_task = self.create_classic_confirm_task();
+        let confirm_task = self.create_classic_confirm_task(entrypoint);
 
         let tasks = [
-            self.create_receive_task(rx_prepare),
+            self.create_receive_task(rx_prepare, recovery_waiter),
             prepare_task,
             submit_task,
             confirm_task,
@@ -198,14 +220,20 @@ impl MessageProcessor {
 
     fn create_receive_task(
         &self,
-        rx_prepare: mpsc::UnboundedReceiver<QueueOperation>,
+        rx_prepare: mpsc::Receiver<QueueOperationBatch>,
+        recovery_waiter: Option<Arc<dyn RecoveryWaiter>>,
     ) -> JoinHandle<()> {
         let name = Self::task_name("receive::", &self.domain);
         tokio::task::Builder::new()
             .name(&name)
             .spawn(TaskMonitor::instrument(
                 &self.task_monitor,
-                receive_task(self.domain.clone(), rx_prepare, self.prepare_queue.clone()),
+                receive_task(
+                    self.domain.clone(),
+                    rx_prepare,
+                    self.prepare_queue.clone(),
+                    recovery_waiter,
+                ),
             ))
             .expect("spawning tokio task from Builder is infallible")
     }
@@ -247,7 +275,10 @@ impl MessageProcessor {
             .expect("spawning tokio task from Builder is infallible")
     }
 
-    fn create_classic_confirm_task(&self) -> JoinHandle<()> {
+    fn create_classic_confirm_task(
+        &self,
+        entrypoint: Option<Arc<DispatcherEntrypoint>>,
+    ) -> JoinHandle<()> {
         let name = Self::task_name("confirm_classic::", &self.domain);
         tokio::task::Builder::new()
             .name(&name)
@@ -259,6 +290,8 @@ impl MessageProcessor {
                     self.confirm_queue.clone(),
                     self.max_batch_size,
                     self.metrics.clone(),
+                    entrypoint,
+                    self.db.clone(),
                 ),
             ))
             .expect("spawning tokio task from Builder is infallible")
@@ -334,17 +367,24 @@ impl MessageProcessor {
 #[instrument(skip_all, fields(%domain))]
 async fn receive_task(
     domain: HyperlaneDomain,
-    mut rx: mpsc::UnboundedReceiver<QueueOperation>,
+    mut rx: mpsc::Receiver<QueueOperationBatch>,
     prepare_queue: OpQueue,
+    recovery_waiter: Option<Arc<dyn RecoveryWaiter>>,
 ) {
+    if let Some(recovery_waiter) = recovery_waiter {
+        recovery_waiter.wait_for_recovery().await;
+    }
+
     // Pull any messages sent to this message processor
-    while let Some(op) = rx.recv().await {
-        trace!(?op, "Received new operation");
-        // make sure things are getting wired up correctly; if this works in testing it
-        // should also be valid in production.
-        debug_assert_eq!(*op.destination_domain(), domain);
-        let op_status = op.status();
-        prepare_queue.push(op, Some(op_status)).await;
+    while let Some(operations) = rx.recv().await {
+        for op in operations {
+            trace!(?op, "Received new operation");
+            // make sure things are getting wired up correctly; if this works in testing it
+            // should also be valid in production.
+            debug_assert_eq!(*op.destination_domain(), domain);
+            let op_status = op.status();
+            prepare_queue.push(op, Some(op_status)).await;
+        }
     }
 }
 
@@ -365,9 +405,7 @@ async fn prepare_classic_task(
             continue;
         }
 
-        let Some(batch) = get_batch_or_wait(&mut prepare_queue, max_batch_size).await else {
-            continue;
-        };
+        let batch = get_batch_or_wait(&mut prepare_queue, max_batch_size).await;
 
         process_batch(
             domain.clone(),
@@ -401,9 +439,7 @@ async fn prepare_lander_task(
             continue;
         }
 
-        let Some(batch) = get_batch_or_wait(&mut prepare_queue, max_batch_size).await else {
-            continue;
-        };
+        let batch = get_batch_or_wait(&mut prepare_queue, max_batch_size).await;
 
         let batch_to_process = prepare::filter_operations_for_preparation(
             entrypoint.clone() as Arc<dyn Entrypoint + Send + Sync>,
@@ -443,80 +479,122 @@ async fn apply_backpressure(submit_queue: &OpQueue, max_len: &Option<u32>) -> bo
 }
 
 /// Helper method to get a batch from the queue or wait if the queue is empty.
-async fn get_batch_or_wait(queue: &mut OpQueue, batch_size: u32) -> Option<Vec<QueueOperation>> {
-    let batch = queue.pop_many(batch_size as usize).await;
-    if batch.is_empty() {
-        // Queue is empty, wait before retrying to prevent burning CPU.
-        sleep(Duration::from_millis(100)).await;
-        None
-    } else {
-        Some(batch)
+async fn get_batch_or_wait(queue: &mut OpQueue, batch_size: u32) -> Vec<QueueOperation> {
+    loop {
+        let (batch, next_deadline) = queue.pop_many_ready(batch_size as usize).await;
+        if !batch.is_empty() {
+            return batch;
+        }
+        queue.wait_for_ready(next_deadline).await;
     }
 }
 
 async fn process_batch(
     domain: HyperlaneDomain,
-    mut batch: Vec<QueueOperation>,
+    batch: Vec<QueueOperation>,
     prepare_queue: &mut OpQueue,
     submit_queue: &OpQueue,
     confirm_queue: &OpQueue,
     metrics: &MessageProcessorMetrics,
 ) {
-    let mut task_prep_futures = vec![];
-    let op_refs = batch.iter_mut().map(|op| op.as_mut()).collect::<Vec<_>>();
-    for op in op_refs {
+    let mut next_sequence_by_origin = HashMap::<u32, usize>::new();
+    let mut prepare_futures = FuturesUnordered::new();
+
+    for mut op in batch {
         trace!(?op, "Preparing operation");
         debug_assert_eq!(*op.destination_domain(), domain);
-        task_prep_futures.push(op.prepare());
+
+        let origin = op.origin_domain_id();
+        let next_sequence = next_sequence_by_origin.entry(origin).or_default();
+        let sequence = *next_sequence;
+        *next_sequence = (*next_sequence).saturating_add(1);
+        prepare_futures.push(async move {
+            let result = op.prepare().await;
+            (origin, sequence, op, result)
+        });
     }
-    let res = join_all(task_prep_futures).await;
-    let not_ready_count = res
-        .iter()
-        .filter(|r| {
-            matches!(
-                r,
-                PendingOperationResult::NotReady | PendingOperationResult::Reprepare(_)
+    let mut next_disposition_by_origin = HashMap::<u32, usize>::new();
+    let mut completed_by_origin =
+        HashMap::<u32, HashMap<usize, (QueueOperation, PendingOperationResult)>>::new();
+
+    while let Some((origin, sequence, op, result)) = prepare_futures.next().await {
+        // Route completed work immediately unless an earlier operation from the
+        // same origin is still preparing. Operations from other origins remain
+        // independent and can make progress in the meantime.
+        completed_by_origin
+            .entry(origin)
+            .or_default()
+            .insert(sequence, (op, result));
+
+        loop {
+            let next_sequence = *next_disposition_by_origin.entry(origin).or_default();
+            let Some((op, result)) = completed_by_origin
+                .get_mut(&origin)
+                .and_then(|completed| completed.remove(&next_sequence))
+            else {
+                break;
+            };
+
+            dispose_prepared_operation(
+                op,
+                result,
+                prepare_queue,
+                submit_queue,
+                confirm_queue,
+                metrics,
             )
-        })
-        .count();
-
-    let batch_len = batch.len();
-    for (op, prepare_result) in batch.into_iter().zip(res.into_iter()) {
-        let app_context = op.app_context();
-        match prepare_result {
-            PendingOperationResult::Success => {
-                debug!(?op, "Operation prepared");
-
-                metrics.inc_prepared(app_context);
-                // TODO: push multiple messages at once
-                submit_queue
-                    .push(op, Some(PendingOperationStatus::ReadyToSubmit))
-                    .await;
-            }
-            PendingOperationResult::NotReady => {
-                prepare_queue.push(op, None).await;
-            }
-            PendingOperationResult::Reprepare(reason) => {
-                metrics.inc_failed(app_context);
-                prepare_queue
-                    .push(op, Some(PendingOperationStatus::Retry(reason)))
-                    .await;
-            }
-            PendingOperationResult::Drop => {
-                metrics.inc_dropped(app_context);
-                op.decrement_metric_if_exists();
-            }
-            PendingOperationResult::Confirm(reason) => {
-                debug!(?op, "Pushing operation to confirm queue");
-                confirm_queue
-                    .push(op, Some(PendingOperationStatus::Confirm(reason)))
-                    .await;
-            }
+            .await;
+            next_disposition_by_origin.insert(origin, next_sequence.saturating_add(1));
         }
     }
-    if not_ready_count == batch_len {
-        // none of the operations are ready yet, so wait for a little bit
-        sleep(Duration::from_millis(500)).await;
+
+    debug_assert!(completed_by_origin.values().all(HashMap::is_empty));
+}
+
+/// Routes a prepared operation and returns whether it remains unready.
+async fn dispose_prepared_operation(
+    op: QueueOperation,
+    prepare_result: PendingOperationResult,
+    prepare_queue: &mut OpQueue,
+    submit_queue: &OpQueue,
+    confirm_queue: &OpQueue,
+    metrics: &MessageProcessorMetrics,
+) -> bool {
+    let app_context = op.app_context();
+    match prepare_result {
+        PendingOperationResult::Success => {
+            debug!(?op, "Operation prepared");
+
+            metrics.inc_prepared(app_context);
+            // TODO: push multiple messages at once
+            submit_queue
+                .push(op, Some(PendingOperationStatus::ReadyToSubmit))
+                .await;
+            false
+        }
+        PendingOperationResult::NotReady => {
+            prepare_queue.push(op, None).await;
+            true
+        }
+        PendingOperationResult::Reprepare(reason) => {
+            metrics.inc_failed(app_context);
+            prepare_queue
+                .push(op, Some(PendingOperationStatus::Retry(reason)))
+                .await;
+            true
+        }
+        PendingOperationResult::Drop => {
+            metrics.inc_dropped(app_context);
+            op.decrement_metric_if_exists();
+            false
+        }
+        PendingOperationResult::Confirm(reason) => {
+            debug!(?op, "Pushing operation to confirm queue");
+            confirm_queue
+                .push(op, Some(PendingOperationStatus::Confirm(reason)))
+                .await;
+            false
+        }
     }
 }
 
@@ -737,12 +815,14 @@ async fn confirm_op(
 }
 
 #[instrument(skip_all, fields(%domain))]
-async fn confirm_classic_task(
+async fn confirm_classic_task<E: Entrypoint + Send + Sync + 'static>(
     domain: HyperlaneDomain,
     prepare_queue: OpQueue,
     mut confirm_queue: OpQueue,
     max_batch_size: u32,
     metrics: MessageProcessorMetrics,
+    entrypoint: Option<Arc<E>>,
+    db: Arc<dyn HyperlaneDb>,
 ) {
     let recv_limit = max_batch_size as usize;
     loop {
@@ -755,7 +835,30 @@ async fn confirm_classic_task(
             continue;
         }
 
-        let futures = batch.into_iter().map(|op| {
+        let futures = batch.into_iter().map(|mut op| async {
+            if op.is_ready() && domain.domain_protocol() == HyperlaneDomainProtocol::Sealevel {
+                if let Some(entrypoint) = &entrypoint {
+                    if disposition::awaiting_transaction_finality(
+                        entrypoint.clone(),
+                        db.clone(),
+                        &op,
+                    )
+                    .await
+                    {
+                        // Advance the queue deadline without counting a failed attempt.
+                        // Otherwise this expired operation can starve later confirmations.
+                        op.set_next_attempt_after(CONFIRM_POLL_INTERVAL);
+                        return process_confirm_result(
+                            op,
+                            prepare_queue.clone(),
+                            confirm_queue.clone(),
+                            metrics.clone(),
+                            PendingOperationResult::NotReady,
+                        )
+                        .await;
+                    }
+                }
+            }
             confirm_operation(
                 op,
                 domain.clone(),
@@ -763,6 +866,7 @@ async fn confirm_classic_task(
                 confirm_queue.clone(),
                 metrics.clone(),
             )
+            .await
         });
         let op_results = join_all(futures).await;
         if op_results.iter().all(|op_result| {
@@ -773,7 +877,7 @@ async fn confirm_classic_task(
         }) {
             // None of the operations are ready, so wait for a little bit
             // before checking again to prevent burning CPU
-            sleep(Duration::from_millis(500)).await;
+            sleep(CONFIRM_POLL_INTERVAL).await;
         }
     }
 }

@@ -1,25 +1,62 @@
 import { ethers } from 'ethers';
 import { Provider as ZKSyncProvider } from 'zksync-ethers';
+import { z } from 'zod';
 
 import { ProxyAdmin__factory } from '@hyperlane-xyz/core';
-import { Address, ChainId, eqAddress, retryAsync } from '@hyperlane-xyz/utils';
+import {
+  Address,
+  ChainId,
+  assert,
+  eqAddress,
+  isValidAddressEvm,
+  retryAsync,
+} from '@hyperlane-xyz/utils';
 
 import { transferOwnershipTransactions } from '../contracts/contracts.js';
+import { ZNzUint } from '../metadata/customZodTypes.js';
 import { AnnotatedEV5Transaction } from '../providers/ProviderType.js';
 import { DeployedOwnableConfig } from '../types.js';
 
 export type EthersLikeProvider = ethers.providers.Provider | ZKSyncProvider;
 
-export type UpgradeConfig = {
-  timelock: {
-    delay: number;
+export const EIP1967_IMPLEMENTATION_SLOT =
+  '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc';
+export const EIP1967_ADMIN_SLOT =
+  '0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103';
+// keccak256('eip1967.proxy.beacon') - 1. Computed from its spec name instead of
+// written out because the pre-commit private key check flags any 32-byte hex
+// literal, including this public constant.
+export const EIP1967_BEACON_SLOT = ethers.utils.hexZeroPad(
+  ethers.BigNumber.from(ethers.utils.id('eip1967.proxy.beacon'))
+    .sub(1)
+    .toHexString(),
+  32,
+);
+
+const ZEvmAddress = z
+  .string()
+  .refine(isValidAddressEvm, 'Must be a valid EVM address');
+const ZEvmNonZeroAddress = ZEvmAddress.refine(
+  (address) => !eqAddress(address, ethers.constants.AddressZero),
+  'Must be a non-zero EVM address',
+);
+const ZSafeNzUint = ZNzUint.refine(
+  (value) => Number.isSafeInteger(value),
+  'Must be a safe integer',
+);
+
+export const UpgradeConfigSchema = z.object({
+  timelock: z.object({
+    delay: ZSafeNzUint,
     // canceller inherited from proposer and admin not supported
-    roles: {
-      executor: Address;
-      proposer: Address;
-    };
-  };
-};
+    roles: z.object({
+      executor: ZEvmAddress,
+      proposer: ZEvmNonZeroAddress,
+    }),
+  }),
+});
+
+export type UpgradeConfig = z.infer<typeof UpgradeConfigSchema>;
 
 /**
  * Checks if a storage value represents empty/uninitialized storage.
@@ -32,21 +69,41 @@ export function isStorageEmpty(rawValue: string): boolean {
   return rawValue === '0x' || rawValue === '' || rawValue === '0x0';
 }
 
+class MissingContractCodeError extends Error {}
+
+export async function contractHasCode(
+  provider: EthersLikeProvider,
+  contract: Address,
+): Promise<boolean> {
+  // Retry to handle RPC lag where a just-confirmed tx isn't yet visible on
+  // all nodes in a load-balanced pool.
+  try {
+    await retryAsync(
+      async () => {
+        const code = await provider.getCode(contract);
+        if (code === '0x') {
+          throw new MissingContractCodeError(
+            `Contract at ${contract} has no code`,
+          );
+        }
+      },
+      5,
+      500,
+    );
+    return true;
+  } catch (error) {
+    if (error instanceof MissingContractCodeError) return false;
+    throw error;
+  }
+}
+
 async function assertCodeExists(
   provider: EthersLikeProvider,
   contract: Address,
 ): Promise<void> {
-  // Retry to handle RPC lag where a just-confirmed tx isn't yet visible on
-  // all nodes in a load-balanced pool.
-  await retryAsync(
-    async () => {
-      const code = await provider.getCode(contract);
-      if (code === '0x') {
-        throw new Error(`Contract at ${contract} has no code`);
-      }
-    },
-    5,
-    500,
+  assert(
+    await contractHasCode(provider, contract),
+    `Contract at ${contract} has no code`,
   );
 }
 
@@ -55,10 +112,9 @@ export async function proxyImplementation(
   proxy: Address,
 ): Promise<Address> {
   await assertCodeExists(provider, proxy);
-  // Hardcoded storage slot for implementation per EIP-1967
   const storageValue = await provider.getStorageAt(
     proxy,
-    '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc',
+    EIP1967_IMPLEMENTATION_SLOT,
   );
   if (isStorageEmpty(storageValue)) {
     return ethers.constants.AddressZero;
@@ -85,11 +141,7 @@ export async function proxyAdmin(
   proxy: Address,
 ): Promise<Address> {
   await assertCodeExists(provider, proxy);
-  // Hardcoded storage slot for admin per EIP-1967
-  const storageValue = await provider.getStorageAt(
-    proxy,
-    '0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103',
-  );
+  const storageValue = await provider.getStorageAt(proxy, EIP1967_ADMIN_SLOT);
   if (isStorageEmpty(storageValue)) {
     return ethers.constants.AddressZero;
   }

@@ -6,6 +6,7 @@ import { ChainMap, ChainName } from '@hyperlane-xyz/sdk';
 import {
   Address,
   ProtocolType,
+  assert,
   deepEquals,
   objMap,
   rootLogger,
@@ -32,6 +33,7 @@ import {
 
 import { AgentAwsKey } from './aws/key.js';
 import { AgentGCPKey } from './gcp.js';
+import { AgentGcpKmsKey } from './gcp-kms/kms-key.js';
 import { CloudAgentKey } from './keys.js';
 
 export type LocalRoleAddresses = Record<
@@ -46,6 +48,24 @@ const logger = rootLogger.child({ module: 'infra:agents:key-utils' });
 export interface KeyAsAddress {
   identifier: string;
   address: string;
+}
+
+function isKeyAsAddressArray(value: unknown): value is KeyAsAddress[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (entry) =>
+        typeof entry === 'object' &&
+        entry !== null &&
+        typeof (entry as KeyAsAddress).identifier === 'string' &&
+        typeof (entry as KeyAsAddress).address === 'string',
+    )
+  );
+}
+
+function isSecretNotFoundError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /not[_\s]?found/i.test(message);
 }
 
 const CONFIG_DIRECTORY_PATH = join(getInfraPath(), 'config');
@@ -85,9 +105,15 @@ export function getRoleKeysPerChain(
 // }
 function getRoleKeyMapPerChain(
   agentConfig: RootAgentConfig,
+  deployedRoles?: Role[],
 ): ChainMap<Record<Role, Record<string, CloudAgentKey>>> {
   const keysPerChain: ChainMap<Record<Role, Record<string, CloudAgentKey>>> =
     {};
+
+  // Validator keys are Cloud KMS keys whose read access is restricted; only
+  // reconcile them when validators are actually being deployed.
+  const includeValidatorKeys =
+    !deployedRoles || deployedRoles.includes(Role.Validator);
 
   const setValidatorKeys = () => {
     const validators = agentConfig.validators;
@@ -180,7 +206,9 @@ function getRoleKeyMapPerChain(
   for (const role of agentConfig.rolesWithKeys) {
     switch (role) {
       case Role.Validator:
-        setValidatorKeys();
+        if (includeValidatorKeys) {
+          setValidatorKeys();
+        }
         break;
       case Role.Relayer:
         setRelayerKeys();
@@ -208,9 +236,10 @@ function getRoleKeyMapPerChain(
 // Gets a big array of all keys.
 export function getAllCloudAgentKeys(
   agentConfig: RootAgentConfig,
+  deployedRoles?: Role[],
 ): Array<CloudAgentKey> {
   logger.debug('Retrieving all cloud agent keys');
-  const keysPerChain = getRoleKeyMapPerChain(agentConfig);
+  const keysPerChain = getRoleKeyMapPerChain(agentConfig, deployedRoles);
 
   const keysByIdentifier = Object.keys(keysPerChain).reduce(
     (acc, chainName) => {
@@ -365,15 +394,18 @@ export function getValidatorKeysForChain(
   chainSigner: CloudAgentKey;
 } {
   logger.debug(`Retrieving validator keys for ${chainName}`);
-  const validator = agentConfig.aws
-    ? new AgentAwsKey(agentConfig, Role.Validator, chainName, index)
-    : new AgentGCPKey(
-        agentConfig.runEnv,
-        agentConfig.context,
-        Role.Validator,
-        chainName,
-        index,
-      );
+  // GCP-KMS key is per index, not per chain (see AgentGcpKmsKey).
+  const validator = agentConfig.gcp
+    ? new AgentGcpKmsKey(agentConfig, Role.Validator, index)
+    : agentConfig.aws
+      ? new AgentAwsKey(agentConfig, Role.Validator, chainName, index)
+      : new AgentGCPKey(
+          agentConfig.runEnv,
+          agentConfig.context,
+          Role.Validator,
+          chainName,
+          index,
+        );
 
   // If the chain is Ethereum-based, we can just use the validator key (even if it's AWS-based)
   // as the chain signer. Otherwise, we need to use a GCP key.
@@ -403,8 +435,12 @@ export function getValidatorKeysForChain(
 
 export async function createAgentKeysIfNotExistsWithPrompt(
   agentConfig: RootAgentConfig,
+  deployedRoles?: Role[],
 ) {
-  const agentKeysToCreate = await agentKeysToBeCreated(agentConfig);
+  const agentKeysToCreate = await agentKeysToBeCreated(
+    agentConfig,
+    deployedRoles,
+  );
   const shouldCreateKeys = agentKeysToCreate.length > 0;
 
   if (shouldCreateKeys) {
@@ -420,18 +456,21 @@ export async function createAgentKeysIfNotExistsWithPrompt(
     }
 
     console.log(chalk.blue.bold('Creating new agent keys if needed.'));
-    await createAgentKeys(agentConfig, agentKeysToCreate);
+    await createAgentKeys(agentConfig, agentKeysToCreate, deployedRoles);
   } else {
     console.log(chalk.gray.bold('No new agent keys will be created.'));
     // Persist all keys, even if no new ones were created
-    await persistAddresses(agentConfig);
+    await persistAddresses(agentConfig, deployedRoles);
   }
   return shouldCreateKeys;
 }
 
 // We can create or delete keys if they are not Starknet keys.
-function getModifiableKeys(agentConfig: RootAgentConfig): CloudAgentKey[] {
-  const keys = getAllCloudAgentKeys(agentConfig);
+function getModifiableKeys(
+  agentConfig: RootAgentConfig,
+  deployedRoles?: Role[],
+): CloudAgentKey[] {
+  const keys = getAllCloudAgentKeys(agentConfig, deployedRoles);
   // if the key has a chainName and it is a Starknet chain, filter it out
   return keys.filter(
     (key) => !(key.chainName && isStarknetChain(key.chainName)),
@@ -441,10 +480,11 @@ function getModifiableKeys(agentConfig: RootAgentConfig): CloudAgentKey[] {
 async function createAgentKeys(
   agentConfig: RootAgentConfig,
   agentKeysToCreate: string[],
+  deployedRoles?: Role[],
 ) {
   logger.debug('Creating agent keys if none exist');
 
-  const keys = getAllCloudAgentKeys(agentConfig);
+  const keys = getAllCloudAgentKeys(agentConfig, deployedRoles);
 
   const keysToCreate = keys.filter((key) =>
     agentKeysToCreate.includes(key.identifier),
@@ -458,18 +498,21 @@ async function createAgentKeys(
     }),
   );
 
-  await persistAddresses(agentConfig);
+  await persistAddresses(agentConfig, deployedRoles);
 }
 
-async function persistAddresses(agentConfig: RootAgentConfig) {
-  const keys = getModifiableKeys(agentConfig);
+async function persistAddresses(
+  agentConfig: RootAgentConfig,
+  deployedRoles?: Role[],
+) {
+  const keys = getModifiableKeys(agentConfig, deployedRoles);
   const addresses = await Promise.all(
     keys.map(async (key) => {
       await key.fetch();
       return key.serializeAsAddress();
     }),
   );
-  await persistAddressesLocally(agentConfig, keys);
+  await persistAddressesLocally(agentConfig, keys, deployedRoles);
   await persistAddressesInGcp(
     agentConfig.runEnv,
     agentConfig.context,
@@ -480,8 +523,9 @@ async function persistAddresses(agentConfig: RootAgentConfig) {
 
 async function agentKeysToBeCreated(
   agentConfig: RootAgentConfig,
+  deployedRoles?: Role[],
 ): Promise<string[]> {
-  const keysToCreateIfNotExist = getModifiableKeys(agentConfig);
+  const keysToCreateIfNotExist = getModifiableKeys(agentConfig, deployedRoles);
   return (
     await Promise.all(
       keysToCreateIfNotExist.map(async (key) =>
@@ -577,22 +621,47 @@ async function persistAddressesInGcp(
   context: Contexts,
   keys: KeyAsAddress[],
 ) {
+  // Upsert by identifier into the existing secret rather than overwriting it.
+  // Key reconciliation may be scoped to a subset of roles (e.g. a relayer-only
+  // deploy), so a wholesale overwrite would drop addresses for the roles that
+  // were not reconciled this run.
+  let existingKeys: KeyAsAddress[] = [];
   try {
-    const existingSecret = (await fetchGCPSecret(
+    const existingSecret = await fetchGCPSecret(
       addressesIdentifier(environment, context),
       true,
-    )) as KeyAsAddress[];
-    if (deepEquals(keys, existingSecret)) {
-      logger.debug(
-        `Addresses already persisted to GCP for ${context} context in ${environment} environment`,
-      );
-      return;
+    );
+    assert(
+      isKeyAsAddressArray(existingSecret),
+      `Unexpected shape for ${context} addresses secret in ${environment}`,
+    );
+    existingKeys = existingSecret;
+  } catch (error) {
+    // Only a confirmed missing secret is safe to treat as empty. Any other
+    // failure (transient, permission, malformed) must abort: proceeding would
+    // overwrite the secret with a reduced, role-scoped set and drop the
+    // addresses of roles that were not reconciled this run.
+    if (!isSecretNotFoundError(error)) {
+      throw error;
     }
-  } catch {
-    // If the secret doesn't exist, we'll create it below.
     logger.debug(
       `No existing secret found for ${context} context in ${environment} environment`,
     );
+  }
+
+  const mergedByIdentifier = new Map<string, KeyAsAddress>(
+    existingKeys.map((key) => [key.identifier, key]),
+  );
+  for (const key of keys) {
+    mergedByIdentifier.set(key.identifier, key);
+  }
+  const mergedKeys = [...mergedByIdentifier.values()];
+
+  if (deepEquals(mergedKeys, existingKeys)) {
+    logger.debug(
+      `Addresses already persisted to GCP for ${context} context in ${environment} environment`,
+    );
+    return;
   }
 
   logger.debug(
@@ -600,7 +669,7 @@ async function persistAddressesInGcp(
   );
   await setGCPSecretUsingClient(
     addressesIdentifier(environment, context),
-    JSON.stringify(keys),
+    JSON.stringify(mergedKeys),
     {
       environment,
       context,
@@ -611,6 +680,7 @@ async function persistAddressesInGcp(
 async function persistAddressesLocally(
   agentConfig: RootAgentConfig,
   keys: CloudAgentKey[],
+  deployedRoles?: Role[],
 ) {
   logger.debug(
     `Persisting addresses locally for ${agentConfig.context} context in ${agentConfig.runEnv} environment`,
@@ -641,7 +711,13 @@ async function persistAddressesLocally(
   }
 
   const validators = agentConfig.validators;
-  if (validators && agentConfig.rolesWithKeys.includes(Role.Validator)) {
+  const includeValidatorKeys =
+    !deployedRoles || deployedRoles.includes(Role.Validator);
+  if (
+    validators &&
+    includeValidatorKeys &&
+    agentConfig.rolesWithKeys.includes(Role.Validator)
+  ) {
     for (const chainName of agentConfig.contextChainNames.validator) {
       const validatorCount =
         validators.chains[chainName]?.validators.length ?? 1;

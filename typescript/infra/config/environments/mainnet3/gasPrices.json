@@ -15,16 +15,12 @@
     "amount": "25.42069",
     "decimals": 9
   },
-  "appchain": {
-    "amount": "0.01",
-    "decimals": 9
-  },
   "arbitrum": {
     "amount": "0.02",
     "decimals": 9
   },
-  "arcadia": {
-    "amount": "0.000000008",
+  "arc": {
+    "amount": "40.0",
     "decimals": 9
   },
   "avalanche": {
@@ -39,24 +35,12 @@
     "amount": "1.030812584",
     "decimals": 9
   },
-  "bitlayer": {
-    "amount": "0.050000007",
-    "decimals": 9
-  },
   "blast": {
     "amount": "0.001001723",
     "decimals": 9
   },
   "bob": {
     "amount": "0.001000252",
-    "decimals": 9
-  },
-  "boba": {
-    "amount": "0.001000252",
-    "decimals": 9
-  },
-  "botanix": {
-    "amount": "0.00375",
     "decimals": 9
   },
   "bsc": {
@@ -100,11 +84,7 @@
     "decimals": 9
   },
   "ethereum": {
-    "amount": "0.04210292",
-    "decimals": 9
-  },
-  "flowmainnet": {
-    "amount": "10.038",
+    "amount": "2.0",
     "decimals": 9
   },
   "fluent": {
@@ -127,24 +107,12 @@
     "amount": "0.004298706",
     "decimals": 9
   },
-  "hashkey": {
-    "amount": "0.001000252",
-    "decimals": 9
-  },
-  "hemi": {
-    "amount": "0.001000252",
-    "decimals": 9
-  },
   "hyperevm": {
     "amount": "4.174817029",
     "decimals": 9
   },
   "igra": {
     "amount": "1000.0",
-    "decimals": 9
-  },
-  "immutablezkevmmainnet": {
-    "amount": "11.000000049",
     "decimals": 9
   },
   "ink": {
@@ -183,20 +151,12 @@
     "amount": "1.0",
     "decimals": 9
   },
-  "lumiaprism": {
-    "amount": "1.0",
-    "decimals": 9
-  },
   "mantle": {
     "amount": "0.02",
     "decimals": 9
   },
   "mantra": {
     "amount": "11.25",
-    "decimals": 9
-  },
-  "matchain": {
-    "amount": "0.001",
     "decimals": 9
   },
   "megaeth": {
@@ -227,28 +187,16 @@
     "amount": "102.0",
     "decimals": 9
   },
-  "morph": {
-    "amount": "0.1375",
+  "nesa": {
+    "amount": "1.125",
     "decimals": 9
   },
-  "nesa": {
+  "nesachain": {
     "amount": "1.125",
     "decimals": 9
   },
   "nexus": {
     "amount": "1.000000007",
-    "decimals": 9
-  },
-  "nibiru": {
-    "amount": "1000.0",
-    "decimals": 9
-  },
-  "noble": {
-    "amount": "0.1",
-    "decimals": 1
-  },
-  "oortmainnet": {
-    "amount": "100.0",
     "decimals": 9
   },
   "optimism": {
@@ -259,24 +207,12 @@
     "amount": "5000",
     "decimals": 1
   },
-  "peaq": {
-    "amount": "100.0",
-    "decimals": 9
-  },
   "plasma": {
     "amount": "0.0000999",
     "decimals": 9
   },
-  "plume": {
-    "amount": "1000.0",
-    "decimals": 9
-  },
   "polygon": {
     "amount": "116.87204498",
-    "decimals": 9
-  },
-  "prom": {
-    "amount": "45.0",
     "decimals": 9
   },
   "pulsechain": {
@@ -287,16 +223,8 @@
     "amount": "50.0",
     "decimals": 9
   },
-  "reactive": {
-    "amount": "600.0",
-    "decimals": 9
-  },
   "robinhood": {
     "amount": "0.1",
-    "decimals": 9
-  },
-  "ronin": {
-    "amount": "21.492605086",
     "decimals": 9
   },
   "sei": {
@@ -327,10 +255,6 @@
     "amount": "0.1",
     "decimals": 1
   },
-  "soon": {
-    "amount": "0.0000001",
-    "decimals": 1
-  },
   "stable": {
     "amount": "1.125",
     "decimals": 9
@@ -341,10 +265,6 @@
   },
   "subtensor": {
     "amount": "10.0",
-    "decimals": 9
-  },
-  "superseed": {
-    "amount": "0.001000252",
     "decimals": 9
   },
   "tac": {
@@ -365,10 +285,6 @@
   },
   "unichain": {
     "amount": "0.0015",
-    "decimals": 9
-  },
-  "vana": {
-    "amount": "0.009999743",
     "decimals": 9
   },
   "viction": {

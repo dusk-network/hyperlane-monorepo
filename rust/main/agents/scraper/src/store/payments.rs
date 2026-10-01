@@ -6,18 +6,21 @@ use itertools::Itertools;
 use tracing::debug;
 
 use hyperlane_core::{
-    unwrap_or_none_result, HyperlaneLogStore, HyperlaneSequenceAwareIndexerStoreReader, Indexed,
-    InterchainGasPayment, LogMeta, H512,
+    HyperlaneLogStore, HyperlaneSequenceAwareIndexerStoreReader, Indexed, InterchainGasPayment,
+    LogMeta, H512,
 };
 
 use crate::db::StorablePayment;
-use crate::store::storage::HyperlaneDbStore;
+use crate::store::storage::{ensure_event_enrichment_complete, txn_id_for_meta, HyperlaneDbStore};
 
 #[async_trait]
 impl HyperlaneLogStore<InterchainGasPayment> for HyperlaneDbStore {
     /// Store interchain gas payments into the database.
-    /// We store only interchain gas payments from blocks and transaction which we could
-    /// successfully insert into database.
+    /// Payments whose transaction could not be resolved on-chain (zero block
+    /// and transaction hashes, e.g. Sealevel basic log meta fallback) are
+    /// stored with a NULL transaction relation. Failed required transaction
+    /// enrichment returns an error after storing available siblings, so the
+    /// cursor retries the range without withholding resolvable events.
     async fn store_logs(
         &self,
         payments: &[(Indexed<InterchainGasPayment>, LogMeta)],
@@ -25,20 +28,19 @@ impl HyperlaneLogStore<InterchainGasPayment> for HyperlaneDbStore {
         if payments.is_empty() {
             return Ok(0);
         }
-        let txns: HashMap<H512, crate::store::storage::TxnWithId> = self
+        let txns: HashMap<H512, i64> = self
             .ensure_blocks_and_txns(payments.iter().map(|r| &r.1))
             .await?
-            .map(|t| (t.hash, t))
             .collect();
         let storable = payments
             .iter()
             .filter_map(|(payment, meta)| {
-                txns.get(&meta.transaction_id).map(|txn| {
+                txn_id_for_meta(&txns, meta).map(|txn_id| {
                     (
                         payment.inner(),
                         payment.sequence.map(|v| v as i64),
                         meta,
-                        txn.id,
+                        txn_id,
                     )
                 })
             })
@@ -65,6 +67,7 @@ impl HyperlaneLogStore<InterchainGasPayment> for HyperlaneDbStore {
                 &storable,
             )
             .await?;
+        ensure_event_enrichment_complete(&txns, payments.iter().map(|r| &r.1))?;
         Ok(stored as u32)
     }
 }
@@ -86,16 +89,47 @@ impl HyperlaneSequenceAwareIndexerStoreReader<InterchainGasPayment> for Hyperlan
 
     /// Gets the block number at which the log occurred.
     async fn retrieve_log_block_number_by_sequence(&self, sequence: u32) -> Result<Option<u64>> {
-        let tx_id = unwrap_or_none_result!(
-            self.db
-                .retrieve_payment_tx_id(
-                    self.domain.id(),
-                    &self.interchain_gas_paymaster_address,
-                    sequence,
-                )
-                .await?
-        );
-        let block_id = unwrap_or_none_result!(self.db.retrieve_block_id(tx_id).await?);
-        Ok(self.db.retrieve_block_number(block_id).await?)
+        self.db
+            .retrieve_payment_block_number(
+                self.domain.id(),
+                &self.interchain_gas_paymaster_address,
+                sequence,
+            )
+            .await
+    }
+}
+
+#[async_trait]
+impl hyperlane_core::HyperlaneBackwardCursorStore<InterchainGasPayment> for HyperlaneDbStore {
+    async fn retrieve_backward_cursors(
+        &self,
+    ) -> Result<Vec<hyperlane_core::BackwardCursorProgress>> {
+        self.db
+            .retrieve_backward_cursors(self.domain.id(), "gas_payment")
+            .await
+    }
+
+    async fn store_backward_cursor(
+        &self,
+        progress: hyperlane_core::BackwardCursorProgress,
+    ) -> Result<()> {
+        self.db
+            .store_backward_cursor(self.domain.id(), "gas_payment", progress)
+            .await
+    }
+
+    async fn reset_backward_cursor(
+        &self,
+        progress: hyperlane_core::BackwardCursorProgress,
+    ) -> Result<()> {
+        self.db
+            .reset_backward_cursor(self.domain.id(), "gas_payment", progress)
+            .await
+    }
+
+    async fn delete_backward_cursor(&self, sequence: u32) -> Result<()> {
+        self.db
+            .delete_backward_cursor(self.domain.id(), "gas_payment", sequence)
+            .await
     }
 }

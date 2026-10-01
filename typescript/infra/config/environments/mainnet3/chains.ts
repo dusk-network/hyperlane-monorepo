@@ -17,13 +17,6 @@ export const ethereumChainNames = supportedChainNames.filter(
 export const agentSpecificChainMetadataOverrides: ChainMap<
   Partial<ChainMetadata>
 > = {
-  ronin: {
-    transactionOverrides: {
-      minGasPrice: 20 * 10 ** 9, // 20 gwei
-      minFeePerGas: 20 * 10 ** 9, // 20 gwei
-      minPriorityFeePerGas: 20 * 10 ** 9, // 20 gwei
-    },
-  },
   ink: {
     transactionOverrides: {
       minGasPrice: 1, // 1 wei
@@ -69,12 +62,6 @@ export const chainMetadataOverrides: ChainMap<Partial<ChainMetadata>> = {
       denom: 'ukyve',
     },
   },
-  noble: {
-    gasPrice: {
-      amount: '0.1',
-      denom: 'uusdn',
-    },
-  },
   bsc: {
     transactionOverrides: {
       gasPrice: 1 * 10 ** 8, // 0.1 gwei
@@ -88,33 +75,23 @@ export const chainMetadataOverrides: ChainMap<Partial<ChainMetadata>> = {
       gasPrice: 101 * 10 ** 9, // 101 gwei
     },
   },
-  morph: {
-    transactionOverrides: {
-      gasPrice: 1 * 10 ** 6, // 0.001 gwei
-    },
-  },
   // nexus: {
   //   transactionOverrides: {
   //     gasPrice: 2 * 10 ** 9, // 2 gwei
   //   },
   // },
   // Deploy-only overrides, set when deploying contracts
-  // immutablezkevmmainnet: {
-  //   blocks: {
-  //     confirmations: 5,
-  //   },
-  // },
   // xlayer: {
   //   blocks: {
   //     confirmations: 5,
   //   },
   // },
-  // soneium: {
+  // citrea: {
   //   blocks: {
-  //     confirmations: 3,
+  //     confirmations: 5,
   //   },
   // },
-  // flowmainnet: {
+  // soneium: {
   //   blocks: {
   //     confirmations: 3,
   //   },
@@ -132,11 +109,6 @@ export const chainMetadataOverrides: ChainMap<Partial<ChainMetadata>> = {
   // optimism: {
   //   blocks: {
   //     confirmations: 5,
-  //   },
-  // },
-  // prom: {
-  //   blocks: {
-  //     confirmations: 3,
   //   },
   // },
 };

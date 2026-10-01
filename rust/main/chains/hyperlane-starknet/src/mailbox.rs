@@ -13,7 +13,7 @@ use hyperlane_core::{
     HyperlaneMessage, HyperlaneProvider, Mailbox, TxCostEstimate, TxOutcome, H256, U256,
 };
 use starknet::accounts::{Account, ExecutionV3, SingleOwnerAccount};
-use starknet::core::types::Felt;
+use starknet::core::types::{BlockId, BlockTag, Felt};
 
 use starknet::signers::LocalWallet;
 use tracing::instrument;
@@ -48,7 +48,11 @@ impl StarknetMailbox {
 
         let mailbox_address: Felt = HyH256(locator.address).into();
 
-        let contract = StarknetMailboxInternal::new(mailbox_address, account);
+        // Read at the latest accepted block. `latest` is the only block tag valid
+        // across all Starknet JSON-RPC spec versions; `pending` was renamed to
+        // `pre_confirmed` in RPC v0.9+, so providers on newer specs reject it.
+        let contract = StarknetMailboxInternal::new(mailbox_address, account)
+            .with_block(BlockId::Tag(BlockTag::Latest));
 
         Ok(Self {
             contract,
@@ -111,6 +115,7 @@ impl Mailbox for StarknetMailbox {
         Ok(self
             .contract
             .delivered(&StarknetU256 { low, high })
+            .block_id(BlockId::Tag(BlockTag::Latest))
             .call()
             .await
             .map_err(Into::<HyperlaneStarknetError>::into)?)
@@ -121,6 +126,7 @@ impl Mailbox for StarknetMailbox {
         let address = self
             .contract
             .get_default_ism()
+            .block_id(BlockId::Tag(BlockTag::Latest))
             .call()
             .await
             .map_err(Into::<HyperlaneStarknetError>::into)?;
@@ -132,6 +138,7 @@ impl Mailbox for StarknetMailbox {
         let address = self
             .contract
             .recipient_ism(&StarknetU256::from_bytes_be(&recipient.to_fixed_bytes()))
+            .block_id(BlockId::Tag(BlockTag::Latest))
             .call()
             .await
             .map_err(Into::<HyperlaneStarknetError>::into)?;
@@ -221,5 +228,83 @@ impl Mailbox for StarknetMailbox {
             outcome: Some(outcome),
             failed_indexes,
         })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use serde::{de::DeserializeOwned, Serialize};
+    use serde_json::{json, Value};
+    use starknet::providers::{
+        jsonrpc::{JsonRpcMethod, JsonRpcResponse, JsonRpcTransport},
+        JsonRpcClient, ProviderRequestData,
+    };
+
+    use super::*;
+    use crate::contracts::mailbox::MailboxReader;
+
+    #[derive(Clone, Debug, Default)]
+    struct RecordingTransport {
+        params: Arc<Mutex<Vec<Value>>>,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error(transparent)]
+    struct RecordingTransportError(#[from] serde_json::Error);
+
+    #[async_trait]
+    impl JsonRpcTransport for RecordingTransport {
+        type Error = RecordingTransportError;
+
+        async fn send_request<P, R>(
+            &self,
+            _method: JsonRpcMethod,
+            params: P,
+        ) -> Result<JsonRpcResponse<R>, Self::Error>
+        where
+            P: Serialize + Send + Sync,
+            R: DeserializeOwned + Send,
+        {
+            self.params
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(params)?);
+            Ok(JsonRpcResponse::Success {
+                id: 1,
+                result: serde_json::from_value(json!(["0x0"]))?,
+            })
+        }
+
+        async fn send_requests<R>(
+            &self,
+            _requests: R,
+        ) -> Result<Vec<JsonRpcResponse<Value>>, Self::Error>
+        where
+            R: AsRef<[ProviderRequestData]> + Send + Sync,
+        {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn generated_read_sends_latest_block_tag() {
+        let transport = RecordingTransport::default();
+        let provider = JsonRpcClient::new(transport.clone());
+        let mailbox = MailboxReader::new(Felt::ONE, provider);
+
+        mailbox
+            .delivered(&StarknetU256 { low: 0, high: 0 })
+            .block_id(BlockId::Tag(BlockTag::Latest))
+            .call()
+            .await
+            .unwrap();
+
+        let params = transport.params.lock().unwrap();
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0]["block_id"], json!("latest"));
     }
 }

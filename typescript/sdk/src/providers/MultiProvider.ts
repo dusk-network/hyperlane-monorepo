@@ -23,6 +23,7 @@ import {
   assert,
   pick,
   rootLogger,
+  sleep,
   timeout,
 } from '@hyperlane-xyz/utils';
 
@@ -34,7 +35,6 @@ import {
   EthJsonRpcBlockParameterTag,
 } from '../metadata/chainMetadataTypes.js';
 import { ChainMap, ChainName, ChainNameOrId } from '../types.js';
-import { ZKSyncDeployer } from '../zksync/ZKSyncDeployer.js';
 
 import { AnnotatedEV5Transaction } from './ProviderType.js';
 import { ProviderBuilderFn } from './builders/types.js';
@@ -46,7 +46,48 @@ import { SeismicSigner } from './SeismicSigner.js';
 type Provider = providers.Provider | ZKSyncProvider;
 
 const DEFAULT_CONFIRMATION_TIMEOUT_MS = 300_000;
-const MIN_CONFIRMATION_TIMEOUT_MS = 30_000;
+const DEFAULT_MIN_CONFIRMATION_TIMEOUT_MS = 300_000;
+const INITIAL_RECEIPT_POLL_INTERVAL_MS = 100;
+
+// Preserve ethers' replacement detection while polling its non-blocking
+// zero-confirmation receipt probe more frequently than the default interval.
+async function waitForInitialReceipt(
+  response: ContractTransaction,
+  provider: Provider,
+  timeoutMs: number,
+): Promise<ContractReceipt> {
+  let shouldPoll = true;
+  const replacementAwareReceipt = response.wait(1);
+  const fastReceipt = async (): Promise<ContractReceipt> => {
+    while (shouldPoll) {
+      // ContractTransaction.wait(0) attempts to parse receipt.logs even when
+      // ethers' provider-level wait returns null. Probe the provider first so
+      // the contract wrapper only runs after the transaction is included.
+      const receipt = await provider.getTransactionReceipt(response.hash);
+      if (receipt) {
+        const contractReceipt = await response.wait(0);
+        assert(
+          contractReceipt,
+          `Transaction ${response.hash} was not included`,
+        );
+        return contractReceipt;
+      }
+      await sleep(INITIAL_RECEIPT_POLL_INTERVAL_MS);
+    }
+
+    return replacementAwareReceipt;
+  };
+
+  try {
+    return await timeout(
+      Promise.race([fastReceipt(), replacementAwareReceipt]),
+      timeoutMs,
+      `Timeout (${timeoutMs}ms) waiting for initial inclusion for tx ${response.hash}`,
+    );
+  } finally {
+    shouldPoll = false;
+  }
+}
 
 export interface MultiProviderOptions {
   logger?: Logger;
@@ -122,7 +163,7 @@ export class MultiProvider<MetaExt = {}> extends ChainMetadataManager<MetaExt> {
   tryGetProvider(chainNameOrId: ChainNameOrId): Provider | null {
     const metadata = this.tryGetChainMetadata(chainNameOrId);
     if (!metadata) return null;
-    const { name, chainId, rpcUrls, protocol, technicalStack } = metadata;
+    const { name, rpcUrls, protocol, technicalStack } = metadata;
 
     if (this.providers[name]) return this.providers[name];
 
@@ -137,14 +178,11 @@ export class MultiProvider<MetaExt = {}> extends ChainMetadataManager<MetaExt> {
       }
     } else if (rpcUrls.length) {
       if (technicalStack === ChainTechnicalStack.ZkSync) {
-        this.providers[name] = defaultZKProviderBuilder(rpcUrls, chainId);
+        this.providers[name] = defaultZKProviderBuilder(metadata);
       } else if (protocol === ProtocolType.Tron) {
-        this.providers[name] = defaultTronEthersProviderBuilder(
-          rpcUrls,
-          chainId,
-        );
+        this.providers[name] = defaultTronEthersProviderBuilder(metadata);
       } else {
-        this.providers[name] = this.providerBuilder(rpcUrls, chainId);
+        this.providers[name] = this.providerBuilder(metadata);
       }
     } else {
       return null;
@@ -423,6 +461,7 @@ export class MultiProvider<MetaExt = {}> extends ChainMetadataManager<MetaExt> {
     if (technicalStack === ChainTechnicalStack.ZkSync) {
       if (!artifact) throw new Error(`No ZkSync contract artifact provided!`);
 
+      const { ZKSyncDeployer } = await import('../zksync/ZKSyncDeployer.js');
       const deployer = new ZKSyncDeployer(signer as ZKSyncWallet);
       estimatedGas = await deployer.estimateDeployGas(artifact, params);
       contract = await deployer.deploy(artifact, params, {
@@ -521,7 +560,8 @@ export class MultiProvider<MetaExt = {}> extends ChainMetadataManager<MetaExt> {
 
     const estimateBlockTime = metadata.blocks?.estimateBlockTime;
     const minTimeout =
-      this.options.minConfirmationTimeoutMs ?? MIN_CONFIRMATION_TIMEOUT_MS;
+      this.options.minConfirmationTimeoutMs ??
+      DEFAULT_MIN_CONFIRMATION_TIMEOUT_MS;
     const dynamicTimeout =
       typeof confirmations === 'number' && estimateBlockTime
         ? Math.max(confirmations * estimateBlockTime * 1000 * 2, minTimeout)
@@ -541,6 +581,14 @@ export class MultiProvider<MetaExt = {}> extends ChainMetadataManager<MetaExt> {
       );
     }
 
+    if (confirmations === 0) {
+      return waitForInitialReceipt(
+        response,
+        this.getProvider(chainNameOrId),
+        timeoutMs,
+      );
+    }
+
     // Handle numeric confirmations
     this.logger.info(
       `Pending ${txUrl || response.hash} (waiting ${confirmations} blocks for confirmation)`,
@@ -551,19 +599,8 @@ export class MultiProvider<MetaExt = {}> extends ChainMetadataManager<MetaExt> {
       `Timeout (${timeoutMs}ms) waiting for ${confirmations} block confirmations for tx ${response.hash}`,
     );
 
-    // ethers v5 can return null for wait(0) if tx is still pending.
-    if (receipt) return receipt;
-
-    this.logger.info(
-      `Pending ${txUrl || response.hash} (wait(0) returned pending, waiting for initial inclusion)`,
-    );
-    const inclusionReceipt = await timeout(
-      response.wait(1),
-      timeoutMs,
-      `Timeout (${timeoutMs}ms) waiting for initial inclusion for tx ${response.hash}`,
-    );
-    assert(inclusionReceipt, `Transaction ${response.hash} was not included`);
-    return inclusionReceipt;
+    assert(receipt, `Transaction ${response.hash} was not included`);
+    return receipt;
   }
 
   /**

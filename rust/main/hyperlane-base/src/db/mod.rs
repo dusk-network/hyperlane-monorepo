@@ -1,4 +1,6 @@
-pub use self::storage_types::{InterchainGasExpenditureData, InterchainGasPaymentData};
+pub use self::storage_types::{
+    InterchainGasExpenditureData, InterchainGasPaymentData, PendingMessageRetryState,
+};
 pub use error::*;
 pub use rocks::*;
 
@@ -17,6 +19,9 @@ pub(crate) mod storage_types;
 pub trait HyperlaneDb: Send + Sync {
     /// Retrieve the nonce of the highest processed message we're aware of
     fn retrieve_highest_seen_message_nonce(&self) -> DbResult<Option<u32>>;
+
+    /// Retrieve the greatest nonce with a stored message ID.
+    fn retrieve_highest_message_nonce(&self) -> DbResult<Option<u32>>;
 
     /// Retrieve a message by its nonce
     fn retrieve_message_by_nonce(&self, nonce: u32) -> DbResult<Option<HyperlaneMessage>>;
@@ -45,6 +50,11 @@ pub trait HyperlaneDb: Send + Sync {
 
     /// Store whether a message was processed by its nonce
     fn store_processed_by_nonce(&self, nonce: &u32, processed: &bool) -> DbResult<()>;
+
+    /// Mark a message processed, optionally removing it from pending loading atomically.
+    fn store_message_processed(&self, message: &HyperlaneMessage) -> DbResult<()> {
+        self.store_processed_by_nonce(&message.nonce, &true)
+    }
 
     fn store_processed_by_gas_payment_meta(
         &self,
@@ -123,6 +133,30 @@ pub trait HyperlaneDb: Send + Sync {
         &self,
         message_id: &H256,
     ) -> DbResult<Option<u32>>;
+
+    /// Atomically store retry state and its legacy retry-count mirror.
+    ///
+    /// Status is normally persisted separately by the operation queue. The retry state
+    /// carries its reason to close that write boundary while its deadline is active.
+    fn store_pending_message_retry_state_by_message_id(
+        &self,
+        message_id: &H256,
+        state: &PendingMessageRetryState,
+    ) -> DbResult<()>;
+
+    /// Atomically store retry state, its legacy count mirror, and message status.
+    fn store_pending_message_retry_state_and_status_by_message_id(
+        &self,
+        message_id: &H256,
+        state: &PendingMessageRetryState,
+        status: &PendingOperationStatus,
+    ) -> DbResult<()>;
+
+    /// Retrieve durable retry state for a pending message.
+    fn retrieve_pending_message_retry_state_by_message_id(
+        &self,
+        message_id: &H256,
+    ) -> DbResult<Option<PendingMessageRetryState>>;
 
     fn store_merkle_tree_insertion_by_leaf_index(
         &self,

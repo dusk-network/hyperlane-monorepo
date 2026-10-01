@@ -10,6 +10,7 @@ version.workspace = true
 [dependencies]
 # Main block
 async-trait.workspace = true
+crc32c.workspace = true
 dashmap.workspace = true
 derive-new.workspace = true
 ethers-contract.workspace = true
@@ -18,12 +19,17 @@ ethers-signers.workspace = true
 ethers.workspace = true
 eyre.workspace = true
 futures-util.workspace = true
+google-cloud-kms-v1.workspace = true
 hex.workspace = true
 hex-literal.workspace = true
 itertools.workspace = true
+# Deliberately independent of ethers-core's own internal k256 - the two never
+# interconvert, only the final ethers::types::Signature crosses crates.
+k256 = { workspace = true, features = ["pem"] }
 num.workspace = true
 num-traits.workspace = true
-reqwest.workspace = true
+rand.workspace = true
+reqwest = { workspace = true, features = ["rustls-tls-native-roots"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -44,6 +50,8 @@ abigen = { path = "../../utils/abigen", features = ["ethers"] }
 hyperlane-core = { path = "../../hyperlane-core", features = ["test-utils"] }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+prometheus.workspace = true
 tracing-test.workspace = true
 
 [features]

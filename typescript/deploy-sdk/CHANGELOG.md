@@ -1,5 +1,223 @@
 # @hyperlane-xyz/deploy-sdk
 
+## 10.0.2
+
+### Patch Changes
+
+- 16df6ee: Bumped the @hyperlane-xyz/registry catalog pin to 26.1.0 and released the exact-pin cascade through tron-sdk, deploy-sdk, sdk, and widgets.
+- Updated dependencies [16df6ee]
+  - @hyperlane-xyz/tron-sdk@25.0.2
+  - @hyperlane-xyz/aleo-sdk@44.0.2
+  - @hyperlane-xyz/cosmos-sdk@44.0.2
+  - @hyperlane-xyz/radix-sdk@44.0.2
+  - @hyperlane-xyz/sealevel-sdk@44.0.2
+  - @hyperlane-xyz/utils@44.0.2
+  - @hyperlane-xyz/starknet-sdk@30.0.2
+  - @hyperlane-xyz/provider-sdk@10.0.2
+
+## 10.0.1
+
+### Patch Changes
+
+- f269e03: Zod was updated to 4.5.4 to prevent function-valued default factories from running during schema cycle detection and compilation.
+- Updated dependencies [f269e03]
+  - @hyperlane-xyz/provider-sdk@10.0.1
+  - @hyperlane-xyz/sealevel-sdk@44.0.1
+  - @hyperlane-xyz/aleo-sdk@44.0.1
+  - @hyperlane-xyz/cosmos-sdk@44.0.1
+  - @hyperlane-xyz/radix-sdk@44.0.1
+  - @hyperlane-xyz/starknet-sdk@30.0.1
+  - @hyperlane-xyz/tron-sdk@25.0.1
+  - @hyperlane-xyz/utils@44.0.1
+
+## 10.0.0
+
+### Major Changes
+
+- 6fbe5ad: The Starknet TypeScript stack was upgraded from starknet.js v7 to v8.9.2 to support the JSON-RPC v0.9 endpoints. Account and Contract call sites were migrated to the v8 options-object constructors, fee estimation was updated to the new resourceBounds shape, and dispatch-event parsing now passes the required ABI parser. Starknet wallet dependencies were upgraded for starknet.js v8 compatibility, and the minimum supported Node.js version is now 22 across published runtime dependents.
+
+### Patch Changes
+
+- Updated dependencies [6fbe5ad]
+  - @hyperlane-xyz/starknet-sdk@30.0.0
+  - @hyperlane-xyz/utils@44.0.0
+  - @hyperlane-xyz/provider-sdk@10.0.0
+  - @hyperlane-xyz/tron-sdk@25.0.0
+  - @hyperlane-xyz/aleo-sdk@44.0.0
+  - @hyperlane-xyz/cosmos-sdk@44.0.0
+  - @hyperlane-xyz/radix-sdk@44.0.0
+  - @hyperlane-xyz/sealevel-sdk@44.0.0
+
+## 9.0.0
+
+### Major Changes
+
+- 8bcc7ab: Zod was upgraded to 4.5.2 across the TypeScript workspace. Public schemas and validation types were migrated to Zod 4, recursive fee configuration types were made explicit, application entrypoints adopted compiled parsing, and validation errors were changed to use Zod 4's built-in formatting.
+
+### Patch Changes
+
+- Updated dependencies [60fc463]
+- Updated dependencies [8bcc7ab]
+- Updated dependencies [7cf9c01]
+  - @hyperlane-xyz/sealevel-sdk@43.0.0
+  - @hyperlane-xyz/provider-sdk@9.0.0
+  - @hyperlane-xyz/utils@43.0.0
+  - @hyperlane-xyz/aleo-sdk@43.0.0
+  - @hyperlane-xyz/cosmos-sdk@43.0.0
+  - @hyperlane-xyz/radix-sdk@43.0.0
+  - @hyperlane-xyz/starknet-sdk@29.1.8
+  - @hyperlane-xyz/tron-sdk@24.2.1
+
+## 8.1.3
+
+### Patch Changes
+
+- Updated dependencies [f0f8a56]
+  - @hyperlane-xyz/tron-sdk@24.2.0
+  - @hyperlane-xyz/aleo-sdk@42.0.0
+  - @hyperlane-xyz/cosmos-sdk@42.0.0
+  - @hyperlane-xyz/radix-sdk@42.0.0
+  - @hyperlane-xyz/sealevel-sdk@42.0.0
+  - @hyperlane-xyz/utils@42.0.0
+  - @hyperlane-xyz/starknet-sdk@29.1.7
+  - @hyperlane-xyz/provider-sdk@8.1.3
+
+## 8.1.2
+
+### Patch Changes
+
+- @hyperlane-xyz/aleo-sdk@41.3.1
+- @hyperlane-xyz/cosmos-sdk@41.3.1
+- @hyperlane-xyz/radix-sdk@41.3.1
+- @hyperlane-xyz/sealevel-sdk@41.3.1
+- @hyperlane-xyz/utils@41.3.1
+- @hyperlane-xyz/starknet-sdk@29.1.6
+- @hyperlane-xyz/provider-sdk@8.1.2
+- @hyperlane-xyz/tron-sdk@24.1.5
+
+## 8.1.1
+
+### Patch Changes
+
+- @hyperlane-xyz/aleo-sdk@41.3.0
+- @hyperlane-xyz/cosmos-sdk@41.3.0
+- @hyperlane-xyz/radix-sdk@41.3.0
+- @hyperlane-xyz/sealevel-sdk@41.3.0
+- @hyperlane-xyz/utils@41.3.0
+- @hyperlane-xyz/starknet-sdk@29.1.5
+- @hyperlane-xyz/provider-sdk@8.1.1
+- @hyperlane-xyz/tron-sdk@24.1.4
+
+## 8.1.0
+
+### Minor Changes
+
+- bd4e5f0: Added a VM-agnostic impersonated submitter so `warp apply` can apply owner-authorized governance transactions against a fork without holding the impersonated authority's key. As with the EVM impersonated submitter, `warp apply` still requires an operator signer key — impersonation only removes the need for the impersonated account's own key.
+
+  - Added `SvmImpersonatingSigner` (exported as `SealevelImpersonatingSigner`) to `@hyperlane-xyz/sealevel-sdk`: it pays fees from a fixed public fork-only account and leaves the impersonated account's signature slot empty, which only a skip-signature-verification fork accepts. It is scoped to the configured `userAddress` — every unsigned required-signer slot must belong to that account, so it is not an unrestricted signature bypass. Sealevel signer internals moved to a shared `BaseSvmSigner`; `SvmSigner` behavior is unchanged.
+  - Relocated `AltVMJsonRpcSubmitter` and `AltVMImpersonatedSubmitter` into `@hyperlane-xyz/provider-sdk` (browser-safe) as sibling subclasses of a shared base, and added an `impersonatedAccount` submitter config variant. `@hyperlane-xyz/deploy-sdk` re-exports `AltVMJsonRpcSubmitter` for backwards compatibility.
+  - Implemented `createSubmitter` for Sealevel (`jsonRpc` and `impersonatedAccount`) and wired the `impersonatedAccount` submitter into the CLI AltVM submitter factories.
+
+### Patch Changes
+
+- Updated dependencies [bd4e5f0]
+  - @hyperlane-xyz/provider-sdk@8.1.0
+  - @hyperlane-xyz/sealevel-sdk@41.2.0
+  - @hyperlane-xyz/aleo-sdk@41.2.0
+  - @hyperlane-xyz/cosmos-sdk@41.2.0
+  - @hyperlane-xyz/radix-sdk@41.2.0
+  - @hyperlane-xyz/starknet-sdk@29.1.4
+  - @hyperlane-xyz/tron-sdk@24.1.3
+  - @hyperlane-xyz/utils@41.2.0
+
+## 8.0.4
+
+### Patch Changes
+
+- Updated dependencies [0adcbb2]
+  - @hyperlane-xyz/sealevel-sdk@41.1.0
+  - @hyperlane-xyz/aleo-sdk@41.1.0
+  - @hyperlane-xyz/cosmos-sdk@41.1.0
+  - @hyperlane-xyz/radix-sdk@41.1.0
+  - @hyperlane-xyz/utils@41.1.0
+  - @hyperlane-xyz/starknet-sdk@29.1.3
+  - @hyperlane-xyz/provider-sdk@8.0.4
+  - @hyperlane-xyz/tron-sdk@24.1.2
+
+## 8.0.3
+
+### Patch Changes
+
+- Updated dependencies [178614d]
+- Updated dependencies [fa19409]
+  - @hyperlane-xyz/aleo-sdk@41.0.0
+  - @hyperlane-xyz/utils@41.0.0
+  - @hyperlane-xyz/cosmos-sdk@41.0.0
+  - @hyperlane-xyz/provider-sdk@8.0.3
+  - @hyperlane-xyz/radix-sdk@41.0.0
+  - @hyperlane-xyz/starknet-sdk@29.1.2
+  - @hyperlane-xyz/sealevel-sdk@41.0.0
+  - @hyperlane-xyz/tron-sdk@24.1.1
+
+## 8.0.2
+
+### Patch Changes
+
+- Updated dependencies [745fb77]
+- Updated dependencies [4acd9a6]
+  - @hyperlane-xyz/tron-sdk@24.1.0
+  - @hyperlane-xyz/aleo-sdk@40.0.0
+  - @hyperlane-xyz/cosmos-sdk@40.0.0
+  - @hyperlane-xyz/radix-sdk@40.0.0
+  - @hyperlane-xyz/sealevel-sdk@40.0.0
+  - @hyperlane-xyz/utils@40.0.0
+  - @hyperlane-xyz/starknet-sdk@29.1.1
+  - @hyperlane-xyz/provider-sdk@8.0.2
+
+## 8.0.1
+
+### Patch Changes
+
+- 086ec59: Kept Starknet deployment artifacts out of browser runtime paths by publishing ABI and class-hash data through dedicated runtime exports.
+- Updated dependencies [4976bb1]
+- Updated dependencies [6c9210b]
+- Updated dependencies [086ec59]
+  - @hyperlane-xyz/utils@39.1.0
+  - @hyperlane-xyz/radix-sdk@39.1.0
+  - @hyperlane-xyz/starknet-sdk@29.1.0
+  - @hyperlane-xyz/aleo-sdk@39.1.0
+  - @hyperlane-xyz/cosmos-sdk@39.1.0
+  - @hyperlane-xyz/provider-sdk@8.0.1
+  - @hyperlane-xyz/sealevel-sdk@39.1.0
+  - @hyperlane-xyz/tron-sdk@24.0.1
+
+## 8.0.0
+
+### Patch Changes
+
+- 6793396: Fixed SVM warp-route program upgrades failing transaction simulation on clusters where the `enable_extend_program_checked` feature gate is inactive (e.g. Solana mainnet-beta). `prepareProgramUpgrade` queried the feature gate and emitted the legacy `ExtendProgram` (variant 6) instruction when the checked variant was unavailable, and clamped the program-data extend up to the loader's 10240-byte minimum instead of requesting the exact deficit (which the loader rejects). Added a generic `isFeatureActive` gate checker and a `program-extend-upgrade` e2e that exercised the unchecked extend path end-to-end against a feature-deactivated validator.
+
+  Fixed the extend and upgrade racing the same slot when a `warp apply` both bumped `contractVersion` and set a fee: the loader rejects an Upgrade in the slot its program-data was extended ("Program was deployed in this block already"), and a program is not invocable in the slot it is upgraded. A generic `waitForSlotAdvance` hint was added to `SvmTransaction` and honored in `SvmSigner.send` — it polls until the cluster slot advances past the confirmed transaction's slot before reporting the send done, so the next transaction executes in a strictly later slot. `prepareProgramUpgrade` set the hint on the extend and upgrade transactions, guaranteeing extend → upgrade → config each land in separate slots. The signer stayed protocol-generic (no upgrade-specific logic) and the transactions remained emitted for export/multisig flows.
+
+  `SvmSigner.signAndSend` surfaced the on-chain program logs from a failed preflight simulation (logged at `error` before rethrowing) so a failed apply shows why the transaction reverted (e.g. insufficient lamports, custom program errors) instead of a bare "Transaction simulation failed". `AltVMJsonRpcSubmitter` logged each transaction's annotation at `info` while submitting, matching the EVM `MultiProvider.sendTransaction` output.
+
+  `prepareProgramUpgrade` clamped the program-data extend down to the remaining account headroom when growing to the loader's 10240-byte minimum would exceed Solana's 10 MiB account-data limit — the loader permits a sub-minimum extend that consumes exactly the remaining space — and failed fast with a clear message only when the new binary cannot fit the account at all, instead of letting an over-cap request produce an opaque on-chain loader error. `transactionToPrintableJson` carried the `waitForSlotAdvance` sequencing hint into its exported JSON, so file/Squads flows — where an external executor signs and submits the extend, upgrade, and config transactions — retained the directive to wait for the cluster slot to advance past each hinted transaction's confirmation slot before submitting the next one.
+
+- Updated dependencies [f41f9fd]
+- Updated dependencies [4ef1fde]
+- Updated dependencies [6f61265]
+- Updated dependencies [6793396]
+- Updated dependencies [1a31d04]
+- Updated dependencies [735793b]
+  - @hyperlane-xyz/aleo-sdk@39.0.0
+  - @hyperlane-xyz/provider-sdk@8.0.0
+  - @hyperlane-xyz/sealevel-sdk@39.0.0
+  - @hyperlane-xyz/tron-sdk@24.0.0
+  - @hyperlane-xyz/cosmos-sdk@39.0.0
+  - @hyperlane-xyz/radix-sdk@39.0.0
+  - @hyperlane-xyz/starknet-sdk@29.0.0
+  - @hyperlane-xyz/utils@39.0.0
+
 ## 7.2.0
 
 ### Patch Changes

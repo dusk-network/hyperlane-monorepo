@@ -16,6 +16,7 @@ import {
 import { type CometClient, connectComet } from '@cosmjs/tendermint-rpc';
 
 import { type AltVM } from '@hyperlane-xyz/provider-sdk';
+import type { ChainMetadataForAltVM } from '@hyperlane-xyz/provider-sdk/chain';
 import { assert, isUrl, strip0x } from '@hyperlane-xyz/utils';
 
 import { COSMOS_MODULE_MESSAGE_REGISTRY as R } from '../registry.js';
@@ -36,29 +37,25 @@ export class CosmosNativeSigner
   private readonly options: TxOptions;
 
   static async connectWithSigner(
-    rpcUrls: string[],
+    metadata: ChainMetadataForAltVM,
     privateKey: string | OfflineSigner,
-    extraParams?: Record<string, any>,
   ): Promise<CosmosNativeSigner> {
-    assert(rpcUrls.length > 0, `got no rpcUrls`);
+    const rpcUrls = (metadata.rpcUrls ?? []).map((rpc) => rpc.http);
+    const [rpcUrl, ...otherRpcUrls] = rpcUrls;
+    assert(rpcUrl, `${CosmosNativeSigner.name} got no rpcUrls`);
     assert(
       rpcUrls.every((rpc) => isUrl(rpc)),
       `invalid rpc urls: ${rpcUrls.join(', ')}`,
     );
 
-    assert(extraParams, `extra params not defined`);
-    assert(extraParams.metadata, `metadata not defined in extra params`);
-    assert(
-      extraParams.metadata.gasPrice,
-      `gasPrice not defined in metadata extra params`,
-    );
+    assert(metadata.gasPrice, `gasPrice not defined in chain metadata`);
 
     let wallet: OfflineSigner;
 
     if (typeof privateKey === 'string') {
       assert(
-        extraParams.metadata.bech32Prefix,
-        `bech32Prefix not defined in metadata extra params`,
+        metadata.bech32Prefix,
+        `bech32Prefix not defined in chain metadata`,
       );
 
       const isPrivateKey = new RegExp(/(^|\b)(0x)?[0-9a-fA-F]{64}(\b|$)/).test(
@@ -68,11 +65,11 @@ export class CosmosNativeSigner
       if (isPrivateKey) {
         wallet = await DirectSecp256k1Wallet.fromKey(
           new Uint8Array(Buffer.from(strip0x(privateKey), 'hex')),
-          extraParams.metadata.bech32Prefix,
+          metadata.bech32Prefix,
         );
       } else {
         wallet = await DirectSecp256k1HdWallet.fromMnemonic(privateKey, {
-          prefix: extraParams.metadata.bech32Prefix,
+          prefix: metadata.bech32Prefix,
         });
       }
     } else {
@@ -95,14 +92,14 @@ export class CosmosNativeSigner
       );
 
     const signer = await SigningStargateClient.connectWithSigner(
-      rpcUrls[0],
+      rpcUrl,
       wallet,
       {
         aminoTypes: new AminoTypes({
           ...aminoTypes,
         }),
         gasPrice: GasPrice.fromString(
-          `${extraParams.metadata.gasPrice.amount}${extraParams.metadata.gasPrice.denom}`,
+          `${metadata.gasPrice.amount}${metadata.gasPrice.denom}`,
         ),
       },
     );
@@ -112,23 +109,32 @@ export class CosmosNativeSigner
       signer.registry.register(proto.type, proto.converter);
     });
 
-    const cometClient = await connectComet(rpcUrls[0]);
-    const account = await wallet.getAccounts();
+    const cometClient = await connectComet(rpcUrl);
+    const [account] = await wallet.getAccounts();
+    assert(account, 'Expected to retrieve at least one account');
 
-    return new CosmosNativeSigner(cometClient, signer, account[0], rpcUrls, {
-      fee: 2,
-      memo: '',
-    });
+    return new CosmosNativeSigner(
+      cometClient,
+      signer,
+      account,
+      [rpcUrl, ...otherRpcUrls],
+      metadata,
+      {
+        fee: 2,
+        memo: '',
+      },
+    );
   }
 
   protected constructor(
     cometClient: CometClient,
     signer: SigningStargateClient,
     account: AccountData,
-    rpcUrls: string[],
+    rpcUrls: [string, ...string[]],
+    chainMetadata: ChainMetadataForAltVM,
     options: TxOptions,
   ) {
-    super(cometClient, rpcUrls);
+    super(cometClient, rpcUrls, chainMetadata);
     this.signer = signer;
     this.account = account;
     this.options = options;
@@ -138,7 +144,7 @@ export class CosmosNativeSigner
     return this.account.address;
   }
 
-  disconnect(): void {
+  override disconnect(): void {
     super.disconnect();
     this.signer.disconnect();
   }

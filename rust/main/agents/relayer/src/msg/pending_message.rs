@@ -1,14 +1,16 @@
 #![allow(clippy::clone_on_ref_ptr)] // TODO: `rustc` 1.80.1 clippy issue
 
 use std::{
+    collections::HashSet,
     fmt::{Debug, Formatter},
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
 use derive_new::new;
 use eyre::Result;
+use parking_lot::Mutex;
 use prometheus::IntGauge;
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::sync::RwLock;
@@ -16,7 +18,7 @@ use tracing::{debug, error, info, info_span, instrument, trace, warn, Instrument
 
 use hyperlane_base::{
     cache::{FunctionCallCache, LocalCache, MeteredCache, OptionalCache},
-    db::HyperlaneDb,
+    db::{HyperlaneDb, HyperlaneRocksDB, PendingMessageRetryState},
 };
 use hyperlane_core::{
     gas_used_by_operation, BatchItem, ChainCommunicationError, ChainResult, ConfirmReason,
@@ -24,10 +26,13 @@ use hyperlane_core::{
     MessageSubmissionData, Metadata, PendingOperation, PendingOperationResult,
     PendingOperationStatus, ReprepareReason, TryBatchAs, TxCostEstimate, TxOutcome, H256, U256,
 };
+use hyperlane_metric::rpc_operation::{with_rpc_operation, RpcOperation};
 use hyperlane_operation_verifier::ApplicationOperationVerifier;
 
 use crate::{
-    metrics::message_submission::{MessageSubmissionMetrics, MetadataBuildMetric},
+    metrics::message_submission::{
+        MessageSubmissionMetrics, MetadataBuildMetric, MetadataWaitObservation,
+    },
     msg::metadata::{MessageMetadataBuildParams, MetadataBuildError},
 };
 
@@ -53,6 +58,9 @@ pub const USE_CACHE_METADATA_LOG: &str = "Reusing cached metadata";
 pub const INVALIDATE_CACHE_METADATA_LOG: &str = "Invalidating cached metadata";
 pub const ISM_MAX_DEPTH: u32 = 13;
 pub const ISM_MAX_COUNT: u32 = 100;
+
+const VALIDATOR_SIGNATURE_FAST_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+const VALIDATOR_SIGNATURE_FAST_RETRY_MAX: u32 = 3;
 
 /// Revert string emitted by the ICA router when the originating commit has not
 /// yet been confirmed on-chain. There is no typed error variant for this today —
@@ -97,6 +105,40 @@ pub struct MessageContext {
     pub metrics: MessageSubmissionMetrics,
     /// Application operation verifier
     pub application_operation_verifier: Arc<dyn ApplicationOperationVerifier>,
+}
+
+/// Keeps an indexed message from being loaded again while its operation is alive.
+pub(super) struct LoadedMessageGuard {
+    message_id: H256,
+    loaded_messages: Arc<Mutex<HashSet<H256>>>,
+    db: HyperlaneRocksDB,
+}
+
+impl LoadedMessageGuard {
+    pub(super) fn try_acquire(
+        message_id: H256,
+        loaded_messages: Arc<Mutex<HashSet<H256>>>,
+        db: HyperlaneRocksDB,
+    ) -> Option<Self> {
+        if !loaded_messages.lock().insert(message_id) {
+            return None;
+        }
+        Some(Self {
+            message_id,
+            loaded_messages,
+            db,
+        })
+    }
+
+    fn mark_terminal(&self) -> hyperlane_base::db::DbResult<()> {
+        self.db.store_terminally_dropped_message(&self.message_id)
+    }
+}
+
+impl Drop for LoadedMessageGuard {
+    fn drop(&mut self) {
+        self.loaded_messages.lock().remove(&self.message_id);
+    }
 }
 
 /// A message that is pending processing and submission.
@@ -152,6 +194,35 @@ pub struct PendingMessage {
     #[new(default)]
     #[serde(skip_serializing)]
     ica_reveal_attempts: u32,
+    #[new(default)]
+    #[serde(skip_serializing)]
+    loaded_message_guard: Option<LoadedMessageGuard>,
+}
+
+impl PendingMessage {
+    pub(super) fn set_loaded_message_guard(&mut self, guard: LoadedMessageGuard) {
+        self.loaded_message_guard = Some(guard);
+    }
+
+    pub(super) fn terminal_drop(&mut self) -> PendingOperationResult {
+        if let Some(guard) = self.loaded_message_guard.as_ref() {
+            if let Err(err) = guard.mark_terminal() {
+                return self
+                    .on_reprepare(Some(err), ReprepareReason::ErrorPersistingTerminalMessage);
+            }
+        }
+        PendingOperationResult::Drop
+    }
+}
+
+impl Drop for PendingMessage {
+    fn drop(&mut self) {
+        self.ctx.metrics.finish_metadata_wait(
+            self.message.id(),
+            self.app_context.as_deref(),
+            false,
+        );
+    }
 }
 
 impl Debug for PendingMessage {
@@ -212,12 +283,15 @@ impl PendingOperation for PendingMessage {
     }
 
     fn set_status(&mut self, status: PendingOperationStatus) {
-        if let Err(e) = self
-            .ctx
-            .origin_db
-            .store_status_by_message_id(&self.message.id(), &status)
-        {
-            warn!(message_id = ?self.message.id(), err = %e, status = %status, "Persisting `status` failed for message");
+        // Manual status commits atomically with the cleared retry deadline.
+        if status != PendingOperationStatus::Retry(ReprepareReason::Manual) {
+            if let Err(e) = self
+                .ctx
+                .origin_db
+                .store_status_by_message_id(&self.message.id(), &status)
+            {
+                warn!(message_id = ?self.message.id(), err = %e, status = %status, "Persisting `status` failed for message");
+            }
         }
         self.status = status;
     }
@@ -270,11 +344,11 @@ impl PendingOperation for PendingMessage {
         // If the message has already been processed, e.g. due to another relayer having
         // already processed, then mark it as already-processed, and move on to
         // the next tick.
-        let is_already_delivered = match self
-            .ctx
-            .destination_mailbox
-            .delivered(self.message.id())
-            .await
+        let is_already_delivered = match with_rpc_operation(
+            RpcOperation::RelayerDelivery,
+            self.ctx.destination_mailbox.delivered(self.message.id()),
+        )
+        .await
         {
             Ok(is_delivered) => is_delivered,
             Err(err) => {
@@ -290,16 +364,19 @@ impl PendingOperation for PendingMessage {
         }
 
         // We cannot deliver to an address that is not a contract so check and drop if it isn't.
-        let is_contract = match self.is_recipient_contract().await {
-            Ok(is_contract) => is_contract,
-            Err(reprepare_reason) => return reprepare_reason,
-        };
+        let is_contract =
+            match with_rpc_operation(RpcOperation::RelayerRecipient, self.is_recipient_contract())
+                .await
+            {
+                Ok(is_contract) => is_contract,
+                Err(reprepare_reason) => return reprepare_reason,
+            };
         if !is_contract {
             info!(
                 recipient=?self.message.recipient,
                 "Dropping message because recipient is not a contract"
             );
-            return PendingOperationResult::Drop;
+            return self.terminal_drop();
         }
 
         // Perform a preflight check to see if we can short circuit the gas
@@ -319,11 +396,13 @@ impl PendingOperation for PendingMessage {
         // re-fetched on every 1s poll cycle.
         let tx_cost_estimate = match self.metadata.as_ref() {
             Some(metadata) => {
-                match self
-                    .ctx
-                    .destination_mailbox
-                    .process_estimate_costs(&self.message, metadata)
-                    .await
+                match with_rpc_operation(
+                    RpcOperation::RelayerEstimate,
+                    self.ctx
+                        .destination_mailbox
+                        .process_estimate_costs(&self.message, metadata),
+                )
+                .await
                 {
                     Ok(s) => {
                         self.ica_reveal_attempts = 0;
@@ -345,21 +424,19 @@ impl PendingOperation for PendingMessage {
             None => None,
         };
 
-        let metadata = match self.metadata.as_ref() {
-            Some(metadata) => {
-                tracing::debug!(USE_CACHE_METADATA_LOG);
-                metadata.clone()
-            }
-            _ => match self.build_metadata().await {
-                Ok(metadata) => {
-                    self.metadata = Some(metadata.clone());
-                    metadata
-                }
-                Err(err) => {
-                    return err;
-                }
+        match self.metadata.as_ref() {
+            Some(_) => tracing::debug!(USE_CACHE_METADATA_LOG),
+            None => match with_rpc_operation(RpcOperation::RelayerMetadata, self.build_metadata())
+                .await
+            {
+                Ok(metadata) => self.metadata = Some(metadata),
+                Err(err) => return err,
             },
-        };
+        }
+        let metadata = self
+            .metadata
+            .as_ref()
+            .expect("Metadata was cached or successfully built");
 
         // Estimate transaction costs for the process call. If there are issues, it's
         // likely that gas estimation has failed because the message is
@@ -373,11 +450,13 @@ impl PendingOperation for PendingMessage {
                     message_id = ?self.message.id(),
                     "Dry-run simulating process call before submission"
                 );
-                match self
-                    .ctx
-                    .destination_mailbox
-                    .process_estimate_costs(&self.message, &metadata)
-                    .await
+                match with_rpc_operation(
+                    RpcOperation::RelayerEstimate,
+                    self.ctx
+                        .destination_mailbox
+                        .process_estimate_costs(&self.message, metadata),
+                )
+                .await
                 {
                     Ok(cost) => {
                         self.ica_reveal_attempts = 0;
@@ -441,7 +520,12 @@ impl PendingOperation for PendingMessage {
         }
 
         self.submission_data = Some(Box::new(MessageSubmissionData {
-            metadata,
+            // Retries above only need the cached metadata. Copy it once admission
+            // succeeds and the submission data needs its own owned buffer.
+            metadata: self
+                .metadata
+                .clone()
+                .expect("Successful preparation retains its metadata"),
             gas_limit,
         }));
         PendingOperationResult::Success
@@ -456,8 +540,9 @@ impl PendingOperation for PendingMessage {
 
         let state = self
             .submission_data
-            .clone()
+            .as_ref()
             .expect("Pending message must be prepared before it can be submitted");
+        let gas_limit = state.gas_limit;
 
         // To avoid spending gas on a tx that will revert, dry-run just before submitting.
         // Note: fail_fast (relay-API) messages never reach this method — they go through
@@ -467,11 +552,13 @@ impl PendingOperation for PendingMessage {
                 message_id = ?self.message.id(),
                 "Dry-run simulating process call before submission"
             );
-            if let Err(e) = self
-                .ctx
-                .destination_mailbox
-                .process_estimate_costs(&self.message, metadata)
-                .await
+            if let Err(e) = with_rpc_operation(
+                RpcOperation::RelayerEstimate,
+                self.ctx
+                    .destination_mailbox
+                    .process_estimate_costs(&self.message, metadata),
+            )
+            .await
             {
                 warn!(
                     message_id = ?self.message.id(),
@@ -489,14 +576,16 @@ impl PendingOperation for PendingMessage {
 
         // We use the estimated gas limit from the prior call to
         // `process_estimate_costs` to avoid a second gas estimation.
-        let tx_outcome = self
-            .ctx
-            .destination_mailbox
-            .process(&self.message, &state.metadata, Some(state.gas_limit))
-            .await;
+        let tx_outcome = with_rpc_operation(
+            RpcOperation::TransactionLifecycle,
+            self.ctx
+                .destination_mailbox
+                .process(&self.message, &state.metadata, Some(gas_limit)),
+        )
+        .await;
         match tx_outcome {
             Ok(outcome) => {
-                self.set_operation_outcome(outcome, state.gas_limit).await;
+                self.set_operation_outcome(outcome, gas_limit).await;
                 self.ctx
                     .destination_mailbox
                     .on_submitted_success(&self.message);
@@ -505,7 +594,7 @@ impl PendingOperation for PendingMessage {
             Err(e) => {
                 error!(error=?e, "Error when processing message");
                 self.clear_metadata();
-                return PendingOperationResult::Reprepare(ReprepareReason::ErrorSubmitting);
+                return self.on_reprepare::<String>(None, ReprepareReason::ErrorSubmitting);
             }
         }
     }
@@ -523,11 +612,11 @@ impl PendingOperation for PendingMessage {
             return PendingOperationResult::NotReady;
         }
 
-        let is_delivered = match self
-            .ctx
-            .destination_mailbox
-            .delivered(self.message.id())
-            .await
+        let is_delivered = match with_rpc_operation(
+            RpcOperation::RelayerDelivery,
+            self.ctx.destination_mailbox.delivered(self.message.id()),
+        )
+        .await
         {
             Ok(is_delivered) => is_delivered,
             Err(err) => {
@@ -611,10 +700,11 @@ impl PendingOperation for PendingMessage {
 
     fn set_next_attempt_after(&mut self, delay: Duration) {
         self.next_attempt_after = Instant::now().checked_add(delay);
+        self.persist_retry_state(Some(delay), None);
     }
 
-    fn reset_attempts(&mut self) {
-        self.reset_attempts();
+    fn reset_attempts(&mut self) -> bool {
+        self.reset_attempts()
     }
 
     fn set_retries(&mut self, retries: u32) {
@@ -680,20 +770,86 @@ impl PendingMessage {
         app_context: Option<String>,
         max_retries: u32,
     ) -> Option<Self> {
-        let num_retries = Self::get_retries_or_skip(ctx.origin_db.clone(), &message, max_retries)?;
-        let message_status = Self::get_message_status(ctx.origin_db.clone(), &message);
+        let retry_state = Self::get_retry_state(ctx.origin_db.clone(), &message);
+        let legacy_num_retries = Self::get_num_retries(ctx.origin_db.clone(), &message);
+        let (mut num_retries, mut retry_state) =
+            Self::reconcile_retry_state(retry_state, legacy_num_retries, &message.id());
+        let mut message_status = Self::get_message_status(ctx.origin_db.clone(), &message);
+        // Old binaries persist Manual status without clearing the versioned deadline. On
+        // roll-forward the operator's manual retry remains authoritative, including at
+        // the retry ceiling. Normalize it to the same zero-count state as new binaries.
+        let manual_retry = message_status == PendingOperationStatus::Retry(ReprepareReason::Manual);
+        if manual_retry
+            && (num_retries != 0
+                || retry_state
+                    .as_ref()
+                    .is_some_and(|state| state.next_attempt_at_millis.is_some()))
+        {
+            let normalized = PendingMessageRetryState::new(0, None, None, None);
+            if let Err(err) = ctx
+                .origin_db
+                .store_pending_message_retry_state_and_status_by_message_id(
+                    &message.id(),
+                    &normalized,
+                    &message_status,
+                )
+            {
+                warn!(message_id = ?message.id(), %err, "Failed to normalize legacy manual retry state");
+            } else {
+                num_retries = 0;
+                retry_state = Some(normalized);
+            }
+        }
+        if Self::should_skip(num_retries, max_retries) && !manual_retry {
+            return None;
+        }
         let reprepare_reason = match &message_status {
             PendingOperationStatus::Retry(r) => Some(r.clone()),
             _ => None,
         };
-        let mut pending_message = Self::new(message, ctx, message_status, app_context, max_retries);
-        if num_retries > 0 {
-            let next_attempt_after =
-                Self::next_attempt_after(num_retries, max_retries, reprepare_reason.as_ref());
-            pending_message.num_retries = num_retries;
-            pending_message.next_attempt_after = next_attempt_after;
+        let next_attempt_after = retry_state
+            .as_ref()
+            .and_then(|state| {
+                Self::restore_retry_deadline(state, SystemTime::now(), Instant::now())
+            })
+            .or_else(|| {
+                if retry_state.is_some() || num_retries == 0 {
+                    None
+                } else {
+                    Self::next_attempt_after(num_retries, max_retries, reprepare_reason.as_ref())
+                }
+            });
+        // While a deadline remains active, the retry record is the atomic source of its
+        // reason too. This closes the crash window before the queue persists Retry(status).
+        if next_attempt_after.is_some() {
+            if let Some(reason) = retry_state.as_ref().and_then(|state| state.reason.clone()) {
+                message_status = PendingOperationStatus::Retry(reason);
+            }
         }
+        let mut pending_message = Self::new(message, ctx, message_status, app_context, max_retries);
+        pending_message.num_retries = num_retries;
+        pending_message.next_attempt_after = next_attempt_after;
         Some(pending_message)
+    }
+
+    fn reconcile_retry_state(
+        retry_state: Option<PendingMessageRetryState>,
+        legacy_num_retries: u32,
+        message_id: &H256,
+    ) -> (u32, Option<PendingMessageRetryState>) {
+        let Some(retry_state) = retry_state else {
+            return (legacy_num_retries, None);
+        };
+        if legacy_num_retries > retry_state.retry_count {
+            warn!(
+                ?message_id,
+                legacy_num_retries,
+                retry_state_num_retries = retry_state.retry_count,
+                "Ignoring stale durable retry state after legacy retry count advanced"
+            );
+            return (legacy_num_retries, None);
+        }
+        (retry_state.retry_count, Some(retry_state))
     }
 
     /// Set fail-fast mode: drop the message immediately when `num_retries` exceeds
@@ -713,6 +869,32 @@ impl PendingMessage {
             .and_then(|dur| Instant::now().checked_add(dur))
     }
 
+    fn restore_retry_deadline(
+        state: &PendingMessageRetryState,
+        wall_now: SystemTime,
+        monotonic_now: Instant,
+    ) -> Option<Instant> {
+        let deadline =
+            UNIX_EPOCH.checked_add(Duration::from_millis(state.next_attempt_at_millis?))?;
+        let remaining = deadline.duration_since(wall_now).ok()?;
+        let original_delay = Duration::from_millis(state.retry_delay_millis?);
+        monotonic_now.checked_add(remaining.min(original_delay))
+    }
+
+    fn get_retry_state(
+        origin_db: Arc<dyn HyperlaneDb>,
+        message: &HyperlaneMessage,
+    ) -> Option<PendingMessageRetryState> {
+        match origin_db.retrieve_pending_message_retry_state_by_message_id(&message.id()) {
+            Ok(state) => state,
+            Err(err) => {
+                warn!(message_id = ?message.id(), %err, "Failed to read durable retry state; falling back to legacy retry count");
+                None
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn get_retries_or_skip(
         origin_db: Arc<dyn HyperlaneDb>,
         message: &HyperlaneMessage,
@@ -747,16 +929,11 @@ impl PendingMessage {
         if let Ok(Some(status)) = origin_db.retrieve_status_by_message_id(&message.id()) {
             // This event is used for E2E tests to ensure message statuses
             // are being properly loaded from the db
-            tracing::event!(
-                if cfg!(feature = "test-utils") {
-                    Level::DEBUG
-                } else {
-                    Level::TRACE
-                },
-                ?status,
-                id=?message.id(),
-                RETRIEVED_MESSAGE_LOG,
-            );
+            if cfg!(feature = "test-utils") {
+                tracing::event!(Level::DEBUG, ?status, id=?message.id(), RETRIEVED_MESSAGE_LOG);
+            } else {
+                tracing::event!(Level::TRACE, ?status, id=?message.id(), RETRIEVED_MESSAGE_LOG);
+            }
             return status;
         }
 
@@ -782,8 +959,6 @@ impl PendingMessage {
         let domain_name = mailbox.domain().name();
         let fn_key = "is_contract";
         let fn_params = self.message.recipient;
-        let provider = self.ctx.destination_mailbox.provider();
-
         // Check cache for recipient contract status
         if let Some(is_contract) = self
             .get_from_cache::<bool>(domain_name, fn_key, &fn_params)
@@ -792,6 +967,8 @@ impl PendingMessage {
             return Ok(is_contract);
         }
 
+        // Construct the provider only when the cached status cannot answer.
+        let provider = mailbox.provider();
         // Check if the recipient is a contract
         let is_contract = provider.is_contract(&fn_params).await.map_err(|err| {
             self.on_reprepare(
@@ -827,11 +1004,13 @@ impl PendingMessage {
         }
 
         // Fetch the recipient ISM address
-        let ism_address = match self
-            .ctx
-            .destination_mailbox
-            .recipient_ism(self.message.recipient)
-            .await
+        let ism_address = match with_rpc_operation(
+            RpcOperation::RelayerRecipient,
+            self.ctx
+                .destination_mailbox
+                .recipient_ism(self.message.recipient),
+        )
+        .await
         {
             Ok(ism_address) => ism_address,
             Err(err) => {
@@ -976,6 +1155,7 @@ impl PendingMessage {
         self.submitted = false;
         self.last_attempted_at = Instant::now();
         self.next_attempt_after = self.last_attempted_at.checked_add(delay);
+        self.persist_retry_state(Some(delay), Some(reason.clone()));
         PendingOperationResult::Reprepare(reason)
     }
 
@@ -991,6 +1171,36 @@ impl PendingMessage {
         } else {
             warn!("Repreparing message: {}", reason.clone());
         }
+        self.reprepare_or_drop(reason)
+    }
+
+    fn on_metadata_wait(&mut self, observation: MetadataWaitObservation) -> PendingOperationResult {
+        let reason = ReprepareReason::AwaitingValidatorSignatures;
+        self.inc_attempts(Some(&reason));
+        self.submitted = false;
+        if observation.first_observation {
+            warn!(
+                wait_seconds = observation.elapsed.as_secs_f64(),
+                "Waiting for validator signatures"
+            );
+        } else {
+            debug!(
+                wait_seconds = observation.elapsed.as_secs_f64(),
+                "Still waiting for validator signatures"
+            );
+        }
+        let result = self.reprepare_or_drop(reason);
+        if Self::should_skip(self.num_retries, self.max_retries) {
+            self.ctx.metrics.finish_metadata_wait(
+                self.message.id(),
+                self.app_context.as_deref(),
+                false,
+            );
+        }
+        result
+    }
+
+    fn reprepare_or_drop(&mut self, reason: ReprepareReason) -> PendingOperationResult {
         // For fail-fast messages (relay API), drop immediately once the retry budget is
         // exceeded. Without this check, a small max_retries value (e.g. 3) would still
         // hit the fixed early-backoff arms (1 => 5s, 2 => 10s, ...) rather than dropping.
@@ -1002,7 +1212,7 @@ impl PendingMessage {
                 max_retries = self.max_retries,
                 "Relay API message exceeded max retries, dropping"
             );
-            return PendingOperationResult::Drop;
+            return self.terminal_drop();
         }
         PendingOperationResult::Reprepare(reason)
     }
@@ -1025,43 +1235,96 @@ impl PendingMessage {
     /// re-attempt processing for this message again, even after the relayer
     /// restarts.
     fn record_message_process_success(&mut self) -> Result<()> {
-        self.ctx
-            .origin_db
-            .store_processed_by_nonce(&self.message.nonce, &true)?;
+        if let Some(wait_duration) = self.ctx.metrics.finish_metadata_wait(
+            self.message.id(),
+            self.app_context.as_deref(),
+            true,
+        ) {
+            info!(
+                wait_seconds = wait_duration.as_secs_f64(),
+                "Validator signature wait recovered after message delivery"
+            );
+        }
+        self.ctx.origin_db.store_message_processed(&self.message)?;
         self.ctx.metrics.update_nonce(&self.message);
         self.ctx.metrics.messages_processed.inc();
         Ok(())
     }
 
-    fn reset_attempts(&mut self) {
+    fn reset_attempts(&mut self) -> bool {
+        let status = PendingOperationStatus::Retry(ReprepareReason::Manual);
+        let state = PendingMessageRetryState::new(0, None, None, None);
+        if let Err(e) = self
+            .ctx
+            .origin_db
+            .store_pending_message_retry_state_and_status_by_message_id(
+                &self.message.id(),
+                &state,
+                &status,
+            )
+        {
+            warn!(message_id = ?self.message.id(), err = %e, "Persisting manual retry reset failed for message");
+            return false;
+        }
+        self.status = status;
+        self.num_retries = 0;
         self.next_attempt_after = None;
         self.last_attempted_at = Instant::now();
+        true
     }
 
     fn inc_attempts(&mut self, reason: Option<&ReprepareReason>) {
-        self.set_retries(self.num_retries.saturating_add(1));
+        self.num_retries = self.num_retries.saturating_add(1);
         self.last_attempted_at = Instant::now();
-        self.next_attempt_after = PendingMessage::calculate_msg_backoff(
+        let delay = PendingMessage::calculate_msg_backoff(
             self.num_retries,
             self.max_retries,
             Some(self.message.id()),
             reason,
-        )
-        .and_then(|dur| self.last_attempted_at.checked_add(dur));
+        );
+        self.next_attempt_after = delay.and_then(|dur| self.last_attempted_at.checked_add(dur));
+        self.persist_retry_state(delay, reason.cloned());
     }
 
     fn set_retries(&mut self, retries: u32) {
         self.num_retries = retries;
-        self.persist_retries();
+        let reason = match &self.status {
+            PendingOperationStatus::Retry(reason) => Some(reason.clone()),
+            _ => None,
+        };
+        let delay = Self::calculate_msg_backoff(
+            self.num_retries,
+            self.max_retries,
+            Some(self.message.id()),
+            reason.as_ref(),
+        );
+        self.next_attempt_after = delay.and_then(|delay| Instant::now().checked_add(delay));
+        self.persist_retry_state(delay, reason);
     }
 
-    fn persist_retries(&self) {
+    fn persist_retry_state(&self, delay: Option<Duration>, reason: Option<ReprepareReason>) {
+        let next_attempt_at_millis = delay.and_then(|delay| {
+            SystemTime::now()
+                .checked_add(delay)?
+                .duration_since(UNIX_EPOCH)
+                .ok()?
+                .as_millis()
+                .try_into()
+                .ok()
+        });
+        let retry_delay_millis = delay.and_then(|delay| delay.as_millis().try_into().ok());
+        let state = PendingMessageRetryState::new(
+            self.num_retries,
+            next_attempt_at_millis,
+            retry_delay_millis,
+            reason,
+        );
         if let Err(e) = self
             .ctx
             .origin_db
-            .store_pending_message_retry_count_by_message_id(&self.message.id(), &self.num_retries)
+            .store_pending_message_retry_state_by_message_id(&self.message.id(), &state)
         {
-            warn!(message_id = ?self.message.id(), err = %e, "Persisting the `num_retries` failed for message");
+            warn!(message_id = ?self.message.id(), err = %e, "Persisting durable retry state failed for message");
         }
     }
 
@@ -1075,22 +1338,21 @@ impl PendingMessage {
         reason: Option<&ReprepareReason>,
     ) -> Option<Duration> {
         // Signatures are simply not yet available (validator hasn't signed past the reorg
-        // period yet). Use a 2s fast-path for the first ~10 retries so the relayer picks
-        // them up within ~2s of the validator writing them, rather than waiting through the
-        // normal 5s→10s→30s→60s exponential backoff. Note: num_retries is the total persisted
-        // retry counter across all reasons, not a per-reason count — messages that burned through
-        // >10 retries before reaching metadata-wait won't get this fast-path.
+        // period yet). Use a short 2s fast-path so the relayer can pick them up promptly
+        // without repeatedly rebuilding aggregation metadata for up to 20 seconds. Note:
+        // num_retries is the total persisted retry counter across all reasons, not a
+        // per-reason count.
         //
         // After the fast-path budget is spent, restart the normal gentle ramp (5s→10s→30s…)
         // from the beginning rather than landing mid-table at the 3-min arm.
         if matches!(reason, Some(ReprepareReason::AwaitingValidatorSignatures)) {
-            if (1..=10).contains(&num_retries) {
-                return Some(Duration::from_secs(2));
+            if (1..=VALIDATOR_SIGNATURE_FAST_RETRY_MAX).contains(&num_retries) {
+                return Some(VALIDATOR_SIGNATURE_FAST_RETRY_INTERVAL);
             }
-            // Offset retries so 11→1, 12→2, … resuming the normal ramp.
+            // Offset retries so the first retry after the fast path resumes the normal ramp.
             // Pass reason=None to avoid recursing into this branch again.
             return Self::calculate_msg_backoff(
-                num_retries.saturating_sub(10),
+                num_retries.saturating_sub(VALIDATOR_SIGNATURE_FAST_RETRY_MAX),
                 max_retries,
                 message_id,
                 None,
@@ -1186,50 +1448,79 @@ impl PendingMessage {
 
         tracing::debug!(?self.message, ?metadata_res, "Metadata build result");
 
-        let metadata_res = metadata_res.map_err(|err| match &err {
-            MetadataBuildError::FailedToBuild(_) | MetadataBuildError::FastPathError(_) => {
-                self.on_reprepare(Some(err), ReprepareReason::ErrorBuildingMetadata)
+        let metadata_res = match metadata_res {
+            Ok(metadata) => {
+                if let Some(wait_duration) = self.ctx.metrics.finish_metadata_wait(
+                    self.message.id(),
+                    self.app_context.as_deref(),
+                    true,
+                ) {
+                    info!(
+                        wait_seconds = wait_duration.as_secs_f64(),
+                        "Validator signatures became available"
+                    );
+                }
+                Ok(metadata)
             }
-            MetadataBuildError::CouldNotFetch => {
-                self.on_reprepare::<String>(None, ReprepareReason::CouldNotFetchMetadata)
+            Err(err) => {
+                if !matches!(err, MetadataBuildError::AwaitingValidatorSignatures) {
+                    self.ctx.metrics.finish_metadata_wait(
+                        self.message.id(),
+                        self.app_context.as_deref(),
+                        false,
+                    );
+                }
+                let reprepare = match &err {
+                    MetadataBuildError::FailedToBuild(_) | MetadataBuildError::FastPathError(_) => {
+                        self.on_reprepare(Some(&err), ReprepareReason::ErrorBuildingMetadata)
+                    }
+                    MetadataBuildError::CouldNotFetch => {
+                        self.on_reprepare::<String>(None, ReprepareReason::CouldNotFetchMetadata)
+                    }
+                    // If metadata building is refused, allow it to be retried later.
+                    MetadataBuildError::Refused(reason) => {
+                        warn!(?reason, "Metadata building refused");
+                        self.on_reprepare::<String>(None, ReprepareReason::MessageMetadataRefused)
+                    }
+                    // These errors cannot be recovered from, so we drop them.
+                    MetadataBuildError::UnsupportedModuleType(reason) => {
+                        warn!(?reason, "Unsupported module type");
+                        self.on_reprepare(Some(&err), ReprepareReason::ErrorBuildingMetadata)
+                    }
+                    MetadataBuildError::MaxIsmDepthExceeded(depth) => {
+                        warn!(depth, "Max ISM depth reached");
+                        self.on_reprepare(Some(&err), ReprepareReason::ErrorBuildingMetadata)
+                    }
+                    MetadataBuildError::MaxIsmCountReached(count) => {
+                        warn!(count, "Max ISM count reached");
+                        self.on_reprepare(Some(&err), ReprepareReason::ErrorBuildingMetadata)
+                    }
+                    MetadataBuildError::AggregationThresholdNotMet(threshold) => {
+                        warn!(threshold, "Aggregation threshold not met");
+                        self.on_reprepare(Some(&err), ReprepareReason::CouldNotFetchMetadata)
+                    }
+                    MetadataBuildError::MaxValidatorCountReached(count) => {
+                        warn!(count, "Max validator count reached");
+                        self.on_reprepare(Some(&err), ReprepareReason::ErrorBuildingMetadata)
+                    }
+                    MetadataBuildError::MerkleRootMismatch {
+                        root,
+                        canonical_root,
+                    } => {
+                        warn!(?root, ?canonical_root, "Merkle root mismatch");
+                        self.on_reprepare(Some(&err), ReprepareReason::ErrorBuildingMetadata)
+                    }
+                    MetadataBuildError::AwaitingValidatorSignatures => {
+                        let observation = self
+                            .ctx
+                            .metrics
+                            .record_metadata_wait(self.message.id(), self.app_context.as_deref());
+                        self.on_metadata_wait(observation)
+                    }
+                };
+                Err(reprepare)
             }
-            MetadataBuildError::AwaitingValidatorSignatures => {
-                self.on_reprepare::<String>(None, ReprepareReason::AwaitingValidatorSignatures)
-            }
-            // If the metadata building is refused, we still allow it to be retried later.
-            MetadataBuildError::Refused(reason) => {
-                warn!(?reason, "Metadata building refused");
-                self.on_reprepare::<String>(None, ReprepareReason::MessageMetadataRefused)
-            }
-            // These errors cannot be recovered from, so we drop them
-            MetadataBuildError::UnsupportedModuleType(reason) => {
-                warn!(?reason, "Unsupported module type");
-                self.on_reprepare(Some(err), ReprepareReason::ErrorBuildingMetadata)
-            }
-            MetadataBuildError::MaxIsmDepthExceeded(depth) => {
-                warn!(depth, "Max ISM depth reached");
-                self.on_reprepare(Some(err), ReprepareReason::ErrorBuildingMetadata)
-            }
-            MetadataBuildError::MaxIsmCountReached(count) => {
-                warn!(count, "Max ISM count reached");
-                self.on_reprepare(Some(err), ReprepareReason::ErrorBuildingMetadata)
-            }
-            MetadataBuildError::AggregationThresholdNotMet(threshold) => {
-                warn!(threshold, "Aggregation threshold not met");
-                self.on_reprepare(Some(err), ReprepareReason::CouldNotFetchMetadata)
-            }
-            MetadataBuildError::MaxValidatorCountReached(count) => {
-                warn!(count, "Max validator count reached");
-                self.on_reprepare(Some(err), ReprepareReason::ErrorBuildingMetadata)
-            }
-            MetadataBuildError::MerkleRootMismatch {
-                root,
-                canonical_root,
-            } => {
-                warn!(?root, ?canonical_root, "Merkle root mismatch");
-                self.on_reprepare(Some(err), ReprepareReason::ErrorBuildingMetadata)
-            }
-        });
+        };
         let build_metadata_end = Instant::now();
 
         let metrics_params = MetadataBuildMetric {
@@ -1254,19 +1545,843 @@ impl PendingMessage {
 
 #[cfg(test)]
 mod test {
+    use std::io::Write;
     use std::{
         sync::Arc,
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     use chrono::TimeDelta;
     use hyperlane_base::tests::mock_hyperlane_db::MockHyperlaneDb as MockDb;
     use hyperlane_base::{cache::OptionalCache, db::*};
     use hyperlane_core::*;
+    use hyperlane_test::mocks::MockMailboxContract;
 
     use crate::test_utils::dummy_data::{dummy_message_context, dummy_metadata_builder};
 
-    use super::{PendingMessage, DEFAULT_MAX_MESSAGE_RETRIES};
+    use super::{PendingMessage, DEFAULT_MAX_MESSAGE_RETRIES, VALIDATOR_SIGNATURE_FAST_RETRY_MAX};
+
+    fn unix_millis(time: SystemTime) -> u64 {
+        time.duration_since(UNIX_EPOCH)
+            .expect("test time must follow Unix epoch")
+            .as_millis()
+            .try_into()
+            .expect("test timestamp must fit in u64")
+    }
+
+    struct RawRetryState(&'static [u8]);
+
+    impl Encode for RawRetryState {
+        fn write_to<W: Write>(&self, writer: &mut W) -> std::io::Result<usize> {
+            writer.write(self.0)
+        }
+    }
+
+    #[test]
+    fn retry_state_reconciliation_uses_authoritative_count() {
+        let message_id = H256::zero();
+        let stale_state = PendingMessageRetryState::new(
+            1,
+            Some(60_000),
+            Some(60_000),
+            Some(ReprepareReason::CouldNotFetchMetadata),
+        );
+        assert_eq!(
+            PendingMessage::reconcile_retry_state(Some(stale_state), 2, &message_id),
+            (2, None)
+        );
+
+        let ahead_state = PendingMessageRetryState::new(
+            3,
+            Some(60_000),
+            Some(60_000),
+            Some(ReprepareReason::ErrorSubmitting),
+        );
+        assert_eq!(
+            PendingMessage::reconcile_retry_state(Some(ahead_state.clone()), 2, &message_id),
+            (3, Some(ahead_state))
+        );
+    }
+
+    #[test]
+    fn restores_remaining_retry_delay_and_bounds_backward_clock_skew() {
+        let wall_now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let monotonic_now = Instant::now();
+        let state = PendingMessageRetryState::new(
+            8,
+            Some(unix_millis(wall_now + Duration::from_secs(10))),
+            Some(60_000),
+            Some(ReprepareReason::CouldNotFetchMetadata),
+        );
+
+        assert_eq!(
+            PendingMessage::restore_retry_deadline(&state, wall_now, monotonic_now),
+            monotonic_now.checked_add(Duration::from_secs(10))
+        );
+
+        let skewed_wall_now = wall_now - Duration::from_secs(3_600);
+        assert_eq!(
+            PendingMessage::restore_retry_deadline(&state, skewed_wall_now, monotonic_now),
+            monotonic_now.checked_add(Duration::from_secs(60))
+        );
+    }
+
+    #[test]
+    fn expired_retry_deadline_runs_immediately() {
+        let wall_now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let state = PendingMessageRetryState::new(
+            8,
+            Some(unix_millis(wall_now - Duration::from_secs(1))),
+            Some(60_000),
+            Some(ReprepareReason::CouldNotFetchMetadata),
+        );
+
+        assert_eq!(
+            PendingMessage::restore_retry_deadline(&state, wall_now, Instant::now()),
+            None
+        );
+    }
+
+    #[test]
+    fn failed_manual_retry_commit_leaves_memory_unchanged() {
+        let origin_domain = HyperlaneDomain::Known(KnownHyperlaneDomain::Arbitrum);
+        let destination_domain = HyperlaneDomain::Known(KnownHyperlaneDomain::Ethereum);
+        let cache = OptionalCache::new(None);
+        let temp_dir = tempfile::tempdir().expect("temp db directory");
+        let db = DB::from_path(temp_dir.path()).expect("open temp db");
+        let base_db = HyperlaneRocksDB::new(&origin_domain, db);
+        let base_metadata_builder =
+            dummy_metadata_builder(&origin_domain, &destination_domain, &base_db, cache.clone());
+        let mut ctx = dummy_message_context(Arc::new(base_metadata_builder), &base_db, cache);
+        let mut failing_db = MockDb::new();
+        failing_db
+            .expect_store_pending_message_retry_state_and_status_by_message_id()
+            .withf(|_, state, status| {
+                state.retry_count == 0
+                    && *status == PendingOperationStatus::Retry(ReprepareReason::Manual)
+            })
+            .returning(|_, _, _| Err(DbError::Other("injected failure".to_owned())));
+        ctx.origin_db = Arc::new(failing_db);
+
+        let original_status = PendingOperationStatus::Retry(ReprepareReason::ErrorSubmitting);
+        let mut pending = PendingMessage::new(
+            HyperlaneMessage::default(),
+            Arc::new(ctx),
+            original_status.clone(),
+            None,
+            DEFAULT_MAX_MESSAGE_RETRIES,
+        );
+        pending.num_retries = 5;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        pending.next_attempt_after = Some(deadline);
+        let attempted_at = pending.last_attempted_at;
+
+        assert!(!pending.reset_attempts());
+        assert_eq!(pending.status, original_status);
+        assert_eq!(pending.num_retries, 5);
+        assert_eq!(pending.next_attempt_after, Some(deadline));
+        assert_eq!(pending.last_attempted_at, attempted_at);
+    }
+
+    #[tokio::test]
+    async fn restores_durable_deadline_and_falls_back_from_malformed_state() {
+        let origin_domain = HyperlaneDomain::Known(KnownHyperlaneDomain::Arbitrum);
+        let destination_domain = HyperlaneDomain::Known(KnownHyperlaneDomain::Ethereum);
+        let cache = OptionalCache::new(None);
+        let temp_dir = tempfile::tempdir().expect("temp db directory");
+        let db = DB::from_path(temp_dir.path()).expect("open temp db");
+        let base_db = HyperlaneRocksDB::new(&origin_domain, db);
+        let message = HyperlaneMessage {
+            nonce: 7,
+            origin: KnownHyperlaneDomain::Arbitrum as u32,
+            destination: KnownHyperlaneDomain::Ethereum as u32,
+            ..Default::default()
+        };
+        let base_metadata_builder =
+            dummy_metadata_builder(&origin_domain, &destination_domain, &base_db, cache.clone());
+        let ctx = Arc::new(dummy_message_context(
+            Arc::new(base_metadata_builder),
+            &base_db,
+            cache,
+        ));
+        let mut pending = PendingMessage::new(
+            message.clone(),
+            ctx.clone(),
+            PendingOperationStatus::FirstPrepareAttempt,
+            None,
+            DEFAULT_MAX_MESSAGE_RETRIES,
+        );
+        assert!(matches!(
+            pending.on_reprepare::<String>(None, ReprepareReason::CouldNotFetchMetadata),
+            PendingOperationResult::Reprepare(ReprepareReason::CouldNotFetchMetadata)
+        ));
+        let persisted = PendingMessage::maybe_from_persisted_retries(
+            message.clone(),
+            ctx.clone(),
+            None,
+            DEFAULT_MAX_MESSAGE_RETRIES,
+        )
+        .expect("restore production retry state");
+        assert_eq!(persisted.get_retries(), 1);
+        assert_eq!(
+            persisted.status(),
+            PendingOperationStatus::Retry(ReprepareReason::CouldNotFetchMetadata)
+        );
+        assert!(persisted.next_attempt_after().is_some());
+
+        // Simulate rollback to an old binary, which advances only the legacy count,
+        // followed by rolling forward to this version.
+        base_db
+            .store_pending_message_retry_count_by_message_id(&message.id(), &2)
+            .expect("advance legacy retry count");
+        base_db
+            .store_status_by_message_id(
+                &message.id(),
+                &PendingOperationStatus::Retry(ReprepareReason::ErrorSubmitting),
+            )
+            .expect("store legacy retry reason");
+        let rolled_forward = PendingMessage::maybe_from_persisted_retries(
+            message.clone(),
+            ctx.clone(),
+            None,
+            DEFAULT_MAX_MESSAGE_RETRIES,
+        )
+        .expect("restore after rollback");
+        let remaining = rolled_forward
+            .next_attempt_after()
+            .expect("legacy schedule");
+        assert_eq!(rolled_forward.get_retries(), 2);
+        assert_eq!(
+            rolled_forward.status(),
+            PendingOperationStatus::Retry(ReprepareReason::ErrorSubmitting)
+        );
+        assert!(remaining.duration_since(Instant::now()) <= Duration::from_secs(10));
+
+        // Simulate an old binary applying a manual retry after the v1 record was
+        // written at the same count. Roll-forward must not restore its stale deadline.
+        let stale_manual_state = PendingMessageRetryState::new(
+            2,
+            Some(unix_millis(SystemTime::now() + Duration::from_secs(60))),
+            Some(60_000),
+            Some(ReprepareReason::ErrorSubmitting),
+        );
+        base_db
+            .store_pending_message_retry_state_by_message_id(&message.id(), &stale_manual_state)
+            .expect("store stale manual retry state");
+        base_db
+            .store_status_by_message_id(
+                &message.id(),
+                &PendingOperationStatus::Retry(ReprepareReason::Manual),
+            )
+            .expect("store legacy manual status");
+        let manual_roll_forward = PendingMessage::maybe_from_persisted_retries(
+            message.clone(),
+            ctx.clone(),
+            None,
+            DEFAULT_MAX_MESSAGE_RETRIES,
+        )
+        .expect("restore legacy manual retry");
+        assert_eq!(manual_roll_forward.next_attempt_after(), None);
+        assert_eq!(
+            manual_roll_forward.status(),
+            PendingOperationStatus::Retry(ReprepareReason::Manual)
+        );
+        let normalized = base_db
+            .retrieve_pending_message_retry_state_by_message_id(&message.id())
+            .expect("read normalized manual state")
+            .expect("normalized manual state");
+        assert_eq!(normalized.next_attempt_at_millis, None);
+        assert_eq!(normalized.reason, None);
+
+        let deadline = SystemTime::now() + Duration::from_secs(60);
+        let state = PendingMessageRetryState::new(
+            3,
+            Some(unix_millis(deadline)),
+            Some(60_000),
+            Some(ReprepareReason::CouldNotFetchMetadata),
+        );
+        base_db
+            .store_pending_message_retry_state_by_message_id(&message.id(), &state)
+            .expect("store retry state");
+        base_db
+            .store_status_by_message_id(
+                &message.id(),
+                &PendingOperationStatus::Retry(ReprepareReason::CouldNotFetchMetadata),
+            )
+            .expect("store retry reason");
+        // Simulate the historical write-order fault where the combined state landed
+        // before its legacy mirror. The higher combined count must remain authoritative.
+        base_db
+            .store_pending_message_retry_count_by_message_id(&message.id(), &2)
+            .expect("store lagging legacy retry count");
+
+        let mut restored = PendingMessage::maybe_from_persisted_retries(
+            message.clone(),
+            ctx.clone(),
+            None,
+            DEFAULT_MAX_MESSAGE_RETRIES,
+        )
+        .expect("restore pending message");
+        let remaining = restored
+            .next_attempt_after()
+            .expect("future deadline")
+            .duration_since(Instant::now());
+        assert_eq!(restored.get_retries(), 3);
+        assert_eq!(
+            restored.status(),
+            PendingOperationStatus::Retry(ReprepareReason::CouldNotFetchMetadata)
+        );
+        assert!(remaining > Duration::from_secs(58));
+        assert!(remaining <= Duration::from_secs(60));
+
+        assert!(restored.reset_attempts());
+        assert_eq!(
+            base_db
+                .retrieve_status_by_message_id(&message.id())
+                .expect("read manual retry status"),
+            Some(PendingOperationStatus::Retry(ReprepareReason::Manual))
+        );
+        let manual_state = base_db
+            .retrieve_pending_message_retry_state_by_message_id(&message.id())
+            .expect("read manual retry state")
+            .expect("manual retry state");
+        assert_eq!(manual_state.retry_count, 0);
+        assert_eq!(manual_state.next_attempt_at_millis, None);
+        assert_eq!(manual_state.retry_delay_millis, None);
+        assert_eq!(manual_state.reason, None);
+        let manual = PendingMessage::maybe_from_persisted_retries(
+            message.clone(),
+            ctx.clone(),
+            None,
+            DEFAULT_MAX_MESSAGE_RETRIES,
+        )
+        .expect("restore manual retry");
+        assert_eq!(
+            manual.status(),
+            PendingOperationStatus::Retry(ReprepareReason::Manual)
+        );
+        assert_eq!(manual.next_attempt_after(), None);
+        assert_eq!(manual.get_retries(), 0);
+
+        // A manual retry written by an old binary at the retry ceiling must also
+        // survive restart and normalize to the new zero-count representation.
+        let ceiling_state = PendingMessageRetryState::new(
+            DEFAULT_MAX_MESSAGE_RETRIES,
+            Some(unix_millis(SystemTime::now() + Duration::from_secs(60))),
+            Some(60_000),
+            Some(ReprepareReason::ErrorSubmitting),
+        );
+        base_db
+            .store_pending_message_retry_state_and_status_by_message_id(
+                &message.id(),
+                &ceiling_state,
+                &PendingOperationStatus::Retry(ReprepareReason::Manual),
+            )
+            .expect("store ceiling manual retry");
+        let ceiling_manual = PendingMessage::maybe_from_persisted_retries(
+            message.clone(),
+            ctx.clone(),
+            None,
+            DEFAULT_MAX_MESSAGE_RETRIES,
+        )
+        .expect("restore ceiling manual retry");
+        assert_eq!(ceiling_manual.get_retries(), 0);
+        assert_eq!(ceiling_manual.next_attempt_after(), None);
+        assert_eq!(
+            ceiling_manual.status(),
+            PendingOperationStatus::Retry(ReprepareReason::Manual)
+        );
+
+        let expired_state = PendingMessageRetryState::new(
+            3,
+            Some(unix_millis(SystemTime::now() - Duration::from_secs(1))),
+            Some(60_000),
+            Some(ReprepareReason::CouldNotFetchMetadata),
+        );
+        base_db
+            .store_pending_message_retry_state_and_status_by_message_id(
+                &message.id(),
+                &expired_state,
+                &PendingOperationStatus::Retry(ReprepareReason::CouldNotFetchMetadata),
+            )
+            .expect("store expired retry state");
+        let expired = PendingMessage::maybe_from_persisted_retries(
+            message.clone(),
+            ctx.clone(),
+            None,
+            DEFAULT_MAX_MESSAGE_RETRIES,
+        )
+        .expect("restore expired pending message");
+        assert_eq!(expired.get_retries(), 3);
+        assert_eq!(expired.next_attempt_after(), None);
+
+        base_db
+            .store_value_by_key(
+                "pending_message_retry_state_for_message_id_v1_",
+                &message.id(),
+                &H256::zero(),
+            )
+            .expect("store malformed retry state");
+        base_db
+            .store_pending_message_retry_count_by_message_id(&message.id(), &2)
+            .expect("store legacy retry count");
+        let fallback = PendingMessage::maybe_from_persisted_retries(
+            message,
+            ctx,
+            None,
+            DEFAULT_MAX_MESSAGE_RETRIES,
+        )
+        .expect("fallback to legacy retry state");
+        assert_eq!(fallback.get_retries(), 2);
+        assert!(fallback.next_attempt_after().is_some());
+
+        let message = fallback.message.clone();
+        let ctx = fallback.ctx.clone();
+        base_db
+            .store_value_by_key(
+                "pending_message_retry_state_for_message_id_v1_",
+                &message.id(),
+                &RawRetryState(
+                    br#"{"version":2,"retry_count":9,"next_attempt_at_millis":null,"retry_delay_millis":null,"reason":null}"#,
+                ),
+            )
+            .expect("store unsupported retry state");
+        base_db
+            .store_pending_message_retry_count_by_message_id(&message.id(), &3)
+            .expect("store fallback retry count");
+        let mut unsupported = PendingMessage::maybe_from_persisted_retries(
+            message.clone(),
+            ctx.clone(),
+            None,
+            DEFAULT_MAX_MESSAGE_RETRIES,
+        )
+        .expect("fallback from unsupported retry state");
+        assert_eq!(unsupported.get_retries(), 3);
+        assert!(unsupported.next_attempt_after().is_some());
+
+        // An intentional lower/manual reset must replace both records; otherwise
+        // monotonic reconciliation would resurrect the older higher v1 count.
+        unsupported.set_retries(0);
+        assert_eq!(
+            base_db
+                .retrieve_pending_message_retry_count_by_message_id(&message.id())
+                .expect("read reset legacy count"),
+            Some(0)
+        );
+        assert_eq!(
+            base_db
+                .retrieve_pending_message_retry_state_by_message_id(&message.id())
+                .expect("read reset durable state")
+                .expect("reset durable state")
+                .retry_count,
+            0
+        );
+        let reset = PendingMessage::maybe_from_persisted_retries(
+            message,
+            ctx,
+            None,
+            DEFAULT_MAX_MESSAGE_RETRIES,
+        )
+        .expect("restore manually reset state");
+        assert_eq!(reset.get_retries(), 0);
+        assert_eq!(reset.next_attempt_after(), None);
+    }
+
+    #[derive(Debug)]
+    struct ContractProvider {
+        result: Option<bool>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl HyperlaneChain for ContractProvider {
+        fn domain(&self) -> &HyperlaneDomain {
+            unimplemented!()
+        }
+        fn provider(&self) -> Box<dyn HyperlaneProvider> {
+            unimplemented!()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HyperlaneProvider for ContractProvider {
+        async fn get_block_by_height(&self, _: u64) -> ChainResult<BlockInfo> {
+            unimplemented!()
+        }
+        async fn get_txn_by_hash(&self, _: &H512) -> ChainResult<TxnInfo> {
+            unimplemented!()
+        }
+        async fn get_balance(&self, _: String) -> ChainResult<U256> {
+            unimplemented!()
+        }
+        async fn get_chain_metrics(&self) -> ChainResult<Option<ChainInfo>> {
+            unimplemented!()
+        }
+        async fn is_contract(&self, _: &H256) -> ChainResult<bool> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.result.ok_or_else(|| {
+                ChainCommunicationError::from_other_str("contract lookup unavailable")
+            })
+        }
+    }
+
+    fn pending_with_mailbox(
+        mailbox: hyperlane_test::mocks::MockMailboxContract,
+        max_gas: Option<U256>,
+    ) -> (tempfile::TempDir, PendingMessage) {
+        use crate::{
+            msg::gas_payment::GasPaymentEnforcer,
+            settings::{GasPaymentEnforcementConf, GasPaymentEnforcementPolicy},
+        };
+        use hyperlane_base::cache::{
+            LocalCache, MeteredCache, MeteredCacheConfig, MeteredCacheMetricsBuilder,
+        };
+        let domain = HyperlaneDomain::Known(KnownHyperlaneDomain::Arbitrum);
+        let dir = tempfile::tempdir().unwrap();
+        let db = HyperlaneRocksDB::new(&domain, DB::from_path(dir.path()).unwrap());
+        let cache = OptionalCache::new(Some(MeteredCache::new(
+            LocalCache::new("pending-allocation-tests"),
+            MeteredCacheMetricsBuilder::default()
+                .build()
+                .expect("cache metrics should build"),
+            MeteredCacheConfig {
+                cache_name: "pending-allocation-tests".to_owned(),
+            },
+        )));
+        let base = dummy_metadata_builder(&domain, &domain, &db, cache.clone());
+        let mut context = dummy_message_context(Arc::new(base), &db, cache);
+        context.destination_mailbox = Arc::new(mailbox);
+        context.transaction_gas_limit = max_gas;
+        context.origin_gas_payment_enforcer =
+            Arc::new(tokio::sync::RwLock::new(GasPaymentEnforcer::new(
+                [GasPaymentEnforcementConf {
+                    policy: GasPaymentEnforcementPolicy::None,
+                    matching_list: Default::default(),
+                }],
+                db,
+            )));
+        let message = HyperlaneMessage {
+            origin: domain.id(),
+            destination: domain.id(),
+            ..Default::default()
+        };
+        (
+            dir,
+            PendingMessage::new(
+                message,
+                Arc::new(context),
+                PendingOperationStatus::FirstPrepareAttempt,
+                None,
+                DEFAULT_MAX_MESSAGE_RETRIES,
+            ),
+        )
+    }
+
+    fn contract_test_mailbox() -> hyperlane_test::mocks::MockMailboxContract {
+        let mut mailbox = hyperlane_test::mocks::MockMailboxContract::new();
+        mailbox
+            .expect__domain()
+            .return_const(HyperlaneDomain::Known(KnownHyperlaneDomain::Arbitrum));
+        mailbox
+    }
+
+    #[tokio::test]
+    async fn cached_contract_status_skips_provider_construction() {
+        for expected in [false, true] {
+            let mut mailbox = contract_test_mailbox();
+            mailbox.expect__provider().times(0);
+            let (_dir, mut pending) = pending_with_mailbox(mailbox, None);
+            pending
+                .store_to_cache(
+                    "arbitrum",
+                    "is_contract",
+                    &pending.message.recipient,
+                    &expected,
+                )
+                .await;
+            for _ in 0..10 {
+                assert_eq!(pending.is_recipient_contract().await.unwrap(), expected);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn contract_status_miss_fetches_once_and_caches_both_results() {
+        for expected in [false, true] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let provider_calls = calls.clone();
+            let mut mailbox = contract_test_mailbox();
+            mailbox.expect__provider().times(1).returning(move || {
+                Box::new(ContractProvider {
+                    result: Some(expected),
+                    calls: provider_calls.clone(),
+                })
+            });
+            let (_dir, mut pending) = pending_with_mailbox(mailbox, None);
+            for _ in 0..10 {
+                assert_eq!(pending.is_recipient_contract().await.unwrap(), expected);
+            }
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn contract_status_error_reprepares_and_does_not_cache() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider_calls = calls.clone();
+        let mut mailbox = contract_test_mailbox();
+        mailbox.expect__provider().times(2).returning(move || {
+            Box::new(ContractProvider {
+                result: None,
+                calls: provider_calls.clone(),
+            })
+        });
+        let (_dir, mut pending) = pending_with_mailbox(mailbox, None);
+        for _ in 0..2 {
+            assert!(matches!(
+                pending.is_recipient_contract().await,
+                Err(PendingOperationResult::Reprepare(
+                    ReprepareReason::ErrorCheckingIfRecipientIsContract
+                ))
+            ));
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(pending.num_retries, 2);
+    }
+
+    #[tokio::test]
+    async fn prepare_retains_metadata_on_success_and_clears_it_above_gas_limit() {
+        for max_gas in [None, Some(U256::one())] {
+            let mut mailbox = contract_test_mailbox();
+            mailbox.expect__provider().times(0);
+            mailbox
+                .expect__delivered()
+                .times(1)
+                .returning(|_| Ok(false));
+            mailbox
+                .expect_process_estimate_costs()
+                .times(1)
+                .withf(|_, metadata| metadata == vec![7; 1291].as_slice())
+                .returning(|_, _| {
+                    Ok(TxCostEstimate {
+                        gas_limit: U256::from(100),
+                        gas_price: FixedPointNumber::zero(),
+                        l2_gas_limit: None,
+                    })
+                });
+            let (_dir, mut pending) = pending_with_mailbox(mailbox, max_gas);
+            pending
+                .store_to_cache("arbitrum", "is_contract", &pending.message.recipient, &true)
+                .await;
+            pending.metadata = Some(Metadata::new(vec![7; 1291]));
+            let original_buffer = pending.metadata.as_ref().unwrap().as_ptr();
+            let result = pending.prepare().await;
+            if max_gas.is_some() {
+                assert!(matches!(
+                    result,
+                    PendingOperationResult::Reprepare(ReprepareReason::ExceedsMaxGasLimit)
+                ));
+                assert!(pending.metadata.is_none());
+                assert!(pending.submission_data.is_none());
+            } else {
+                assert!(matches!(result, PendingOperationResult::Success));
+                assert_eq!(pending.metadata.as_ref().unwrap().as_ptr(), original_buffer);
+                let submission = pending.submission_data.as_ref().unwrap();
+                assert_eq!(
+                    submission.metadata.as_ref(),
+                    pending.metadata.as_ref().unwrap().as_ref()
+                );
+                assert_ne!(submission.metadata.as_ptr(), original_buffer);
+                assert_eq!(submission.gas_limit, U256::from(100));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn newly_built_metadata_preserves_success_reveal_and_failure_behavior() {
+        use crate::test_utils::{
+            mock_base_builder::build_mock_base_builder, mock_ism::MockInterchainSecurityModule,
+        };
+        for outcome in ["success", "ICA: Invalid Reveal", "simulation failed"] {
+            let mut mailbox = contract_test_mailbox();
+            mailbox.expect__provider().times(0);
+            mailbox
+                .expect__delivered()
+                .times(1)
+                .returning(|_| Ok(false));
+            mailbox
+                .expect__recipient_ism()
+                .times(1)
+                .returning(|_| Ok(H256::zero()));
+            mailbox
+                .expect_process_estimate_costs()
+                .times(1)
+                .withf(|_, metadata| metadata.is_empty())
+                .returning(move |_, _| {
+                    if outcome == "success" {
+                        Ok(TxCostEstimate {
+                            gas_limit: U256::from(100),
+                            gas_price: FixedPointNumber::zero(),
+                            l2_gas_limit: None,
+                        })
+                    } else {
+                        Err(ChainCommunicationError::from_other_str(outcome))
+                    }
+                });
+            let (_dir, mut pending) = pending_with_mailbox(mailbox, None);
+            let domain = HyperlaneDomain::Known(KnownHyperlaneDomain::Arbitrum);
+            let base = build_mock_base_builder(domain.clone(), domain.clone());
+            base.responses.push_build_ism_response(
+                H256::zero(),
+                Ok(Box::new(MockInterchainSecurityModule::new(
+                    H256::zero(),
+                    domain,
+                    ModuleType::Null,
+                ))),
+            );
+            Arc::get_mut(&mut pending.ctx).unwrap().metadata_builder = Arc::new(base);
+            pending
+                .store_to_cache("arbitrum", "is_contract", &pending.message.recipient, &true)
+                .await;
+            assert!(pending.metadata.is_none());
+            let result = pending.prepare().await;
+            match outcome {
+                "success" => {
+                    assert!(matches!(result, PendingOperationResult::Success));
+                    assert!(pending.metadata.as_ref().unwrap().is_empty());
+                    assert!(pending
+                        .submission_data
+                        .as_ref()
+                        .unwrap()
+                        .metadata
+                        .is_empty());
+                }
+                "ICA: Invalid Reveal" => {
+                    assert!(matches!(result, PendingOperationResult::Reprepare(_)));
+                    assert!(pending.metadata.as_ref().unwrap().is_empty());
+                    assert!(pending.submission_data.is_none());
+                    assert_eq!(pending.ica_reveal_attempts, 1);
+                    assert_eq!(pending.num_retries, 0);
+                }
+                _ => {
+                    assert!(matches!(
+                        result,
+                        PendingOperationResult::Reprepare(ReprepareReason::ErrorEstimatingGas)
+                    ));
+                    assert!(pending.metadata.is_none());
+                    assert!(pending.submission_data.is_none());
+                    assert_eq!(pending.num_retries, 1);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn classic_submit_borrows_metadata_and_preserves_outcomes() {
+        for outcome in ["success", "process failure", "dry-run failure"] {
+            let metadata = Metadata::new(vec![7; 1291]);
+            let original_pointer = metadata.as_ptr() as usize;
+            let mut sequence = mockall::Sequence::new();
+            let mut mailbox = contract_test_mailbox();
+            mailbox
+                .expect_process_estimate_costs()
+                .once()
+                .in_sequence(&mut sequence)
+                .withf(|_, metadata| metadata == [9; 32])
+                .returning(move |_, _| {
+                    if outcome == "dry-run failure" {
+                        Err(ChainCommunicationError::from_other_str(outcome))
+                    } else {
+                        Ok(TxCostEstimate {
+                            gas_limit: U256::from(200),
+                            gas_price: FixedPointNumber::zero(),
+                            l2_gas_limit: None,
+                        })
+                    }
+                });
+            if outcome == "dry-run failure" {
+                mailbox.expect_process().times(0);
+            } else {
+                mailbox
+                    .expect_process()
+                    .once()
+                    .in_sequence(&mut sequence)
+                    .withf(move |_, metadata, gas| {
+                        metadata.as_ptr() as usize == original_pointer
+                            && metadata == [7; 1291]
+                            && *gas == Some(U256::from(100))
+                    })
+                    .returning(move |_, _, _| {
+                        if outcome == "process failure" {
+                            Err(ChainCommunicationError::from_other_str(outcome))
+                        } else {
+                            Ok(TxOutcome {
+                                transaction_id: H512::zero(),
+                                executed: true,
+                                gas_used: U256::from(50),
+                                gas_price: FixedPointNumber::zero(),
+                            })
+                        }
+                    });
+            }
+            let (_dir, mut pending) = pending_with_mailbox(mailbox, None);
+            pending.metadata = Some(Metadata::new(vec![9; 32]));
+            pending.submission_data = Some(Box::new(MessageSubmissionData {
+                metadata,
+                gas_limit: U256::from(100),
+            }));
+            let result = pending.submit().await;
+            assert_eq!(
+                pending.submission_data.as_ref().unwrap().metadata.as_ptr() as usize,
+                original_pointer
+            );
+            match outcome {
+                "success" => {
+                    assert!(matches!(
+                        result,
+                        PendingOperationResult::Confirm(ConfirmReason::SubmittedBySelf)
+                    ));
+                    assert!(pending.metadata.is_some());
+                    assert!(pending.submission_outcome.is_some());
+                    assert_eq!(pending.num_retries, 0);
+                }
+                "process failure" => {
+                    assert!(matches!(
+                        result,
+                        PendingOperationResult::Reprepare(ReprepareReason::ErrorSubmitting)
+                    ));
+                    assert!(pending.metadata.is_none());
+                    assert!(pending.submission_outcome.is_none());
+                    assert_eq!(pending.num_retries, 1);
+                }
+                _ => {
+                    assert!(matches!(
+                        result,
+                        PendingOperationResult::Reprepare(ReprepareReason::ErrorEstimatingGas)
+                    ));
+                    assert!(pending.metadata.is_none());
+                    assert!(pending.submission_outcome.is_none());
+                    assert_eq!(pending.num_retries, 1);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn classic_submit_already_submitted_needs_no_prepared_state() {
+        let (_dir, mut pending) = pending_with_mailbox(contract_test_mailbox(), None);
+        pending.submitted = true;
+        assert!(matches!(
+            pending.submit().await,
+            PendingOperationResult::Success
+        ));
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "Pending message must be prepared before it can be submitted")]
+    async fn classic_submit_requires_prepared_state_before_dry_run() {
+        let (_dir, mut pending) = pending_with_mailbox(contract_test_mailbox(), None);
+        pending.submit().await;
+    }
 
     #[test]
     fn test_calculate_msg_backoff_does_not_overflow() {
@@ -1374,11 +2489,11 @@ mod test {
     }
 
     #[test]
-    fn test_could_not_fetch_metadata_backoff() {
+    fn test_awaiting_validator_signatures_backoff() {
         let reason = ReprepareReason::AwaitingValidatorSignatures;
 
-        // Fast-path: retries 1–10 always return 2s
-        for i in 1..=10 {
+        // Fast path: the bounded initial retries always return 2s.
+        for i in 1..=VALIDATOR_SIGNATURE_FAST_RETRY_MAX {
             assert_eq!(
                 PendingMessage::calculate_msg_backoff(
                     i,
@@ -1391,20 +2506,21 @@ mod test {
             );
         }
 
-        // After fast-path: resumes gentle ramp (retry 11 → effective 1 → 5s)
+        // After the fast path, resume the gentle ramp from its first step.
+        let first_normal_retry = VALIDATOR_SIGNATURE_FAST_RETRY_MAX.saturating_add(1);
         assert_eq!(
             PendingMessage::calculate_msg_backoff(
-                11,
+                first_normal_retry,
                 DEFAULT_MAX_MESSAGE_RETRIES,
                 None,
                 Some(&reason)
             ),
             Some(Duration::from_secs(5)),
-            "retry 11 should resume normal ramp at 5s, not jump to 180s"
+            "first retry after the fast path should resume the normal ramp at 5s"
         );
         assert_eq!(
             PendingMessage::calculate_msg_backoff(
-                12,
+                first_normal_retry.saturating_add(1),
                 DEFAULT_MAX_MESSAGE_RETRIES,
                 None,
                 Some(&reason)
@@ -1413,7 +2529,7 @@ mod test {
         );
         assert_eq!(
             PendingMessage::calculate_msg_backoff(
-                13,
+                first_normal_retry.saturating_add(2),
                 DEFAULT_MAX_MESSAGE_RETRIES,
                 None,
                 Some(&reason)
@@ -1528,6 +2644,58 @@ mod test {
         assert_eq!(db_status, expected_status);
     }
 
+    #[tokio::test]
+    async fn submit_failure_advances_retry_backoff() {
+        let origin_domain = HyperlaneDomain::Known(KnownHyperlaneDomain::Arbitrum);
+        let destination_domain = HyperlaneDomain::Known(KnownHyperlaneDomain::Optimism);
+        let cache = OptionalCache::new(None);
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = DB::from_path(temp_dir.path()).unwrap();
+        let base_db = HyperlaneRocksDB::new(&origin_domain, db);
+        let base_metadata_builder =
+            dummy_metadata_builder(&origin_domain, &destination_domain, &base_db, cache.clone());
+        let mut message_context =
+            dummy_message_context(Arc::new(base_metadata_builder), &base_db, cache);
+
+        let mut mailbox = MockMailboxContract::new();
+        mailbox
+            .expect__domain()
+            .return_const(destination_domain.clone());
+        mailbox.expect_process().once().returning(|_, _, _| {
+            Err(ChainCommunicationError::from_other_str(
+                "delegated prover unavailable",
+            ))
+        });
+        message_context.destination_mailbox = Arc::new(mailbox);
+
+        let message = HyperlaneMessage {
+            origin: origin_domain.id(),
+            destination: destination_domain.id(),
+            ..Default::default()
+        };
+        let mut pending_message = PendingMessage::new(
+            message,
+            Arc::new(message_context),
+            PendingOperationStatus::ReadyToSubmit,
+            None,
+            DEFAULT_MAX_MESSAGE_RETRIES,
+        );
+        pending_message.submission_data = Some(Box::new(MessageSubmissionData {
+            metadata: Metadata::new(vec![]),
+            gas_limit: U256::zero(),
+        }));
+
+        let result = PendingOperation::submit(&mut pending_message).await;
+
+        assert!(matches!(
+            result,
+            PendingOperationResult::Reprepare(ReprepareReason::ErrorSubmitting)
+        ));
+        assert_eq!(pending_message.num_retries, 1);
+        assert!(pending_message.next_attempt_after > Some(Instant::now()));
+    }
+
     #[test]
     fn check_debug_print() {
         let origin_domain = HyperlaneDomain::Known(hyperlane_core::KnownHyperlaneDomain::Arbitrum);
@@ -1562,5 +2730,139 @@ mod test {
         let pending_message_debug = format!("{pending_message:?}");
         let expected = r#"PendingMessage { num_retries: 0, since_last_attempt_s: 0, next_attempt_after_s: 0, message_id: 0xaeafdd9f018e66a50d30bb141184d10e57bd956e839f70213c163eb41a3c0d87, status: FirstPrepareAttempt, app_context: Some("test-0") }"#;
         assert_eq!(pending_message_debug, expected);
+    }
+
+    #[test]
+    fn metadata_wait_ends_at_normal_message_retry_limit() {
+        let origin_domain = HyperlaneDomain::Known(KnownHyperlaneDomain::Arbitrum);
+        let destination_domain = HyperlaneDomain::Known(KnownHyperlaneDomain::Arbitrum);
+        let cache = OptionalCache::new(None);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = DB::from_path(temp_dir.path()).unwrap();
+        let base_db = HyperlaneRocksDB::new(&origin_domain, db);
+        let message = HyperlaneMessage {
+            origin: KnownHyperlaneDomain::Arbitrum as u32,
+            destination: KnownHyperlaneDomain::Arbitrum as u32,
+            ..Default::default()
+        };
+        let message_id = message.id();
+        let app_context = "test-app";
+        let base_metadata_builder =
+            dummy_metadata_builder(&origin_domain, &destination_domain, &base_db, cache.clone());
+        let message_context =
+            dummy_message_context(Arc::new(base_metadata_builder), &base_db, cache);
+        let mut pending_message = PendingMessage::new(
+            message,
+            Arc::new(message_context),
+            PendingOperationStatus::FirstPrepareAttempt,
+            Some(app_context.to_owned()),
+            1,
+        );
+        let labels = [app_context, "ethereum", "arbitrum"];
+        let observation = pending_message
+            .ctx
+            .metrics
+            .record_metadata_wait(message_id, Some(app_context));
+
+        let result = pending_message.on_metadata_wait(observation);
+
+        assert!(matches!(result, PendingOperationResult::Reprepare(_)));
+        assert_eq!(
+            pending_message
+                .ctx
+                .metrics
+                .metadata_wait_active
+                .with_label_values(&labels)
+                .get(),
+            0
+        );
+        assert_eq!(
+            pending_message
+                .ctx
+                .metrics
+                .metadata_wait_oldest_timestamp_seconds
+                .with_label_values(&labels)
+                .get(),
+            0
+        );
+        assert_eq!(
+            pending_message
+                .ctx
+                .metrics
+                .metadata_wait_event_count
+                .with_label_values(&[app_context, "ethereum", "arbitrum", "ended"])
+                .get(),
+            1
+        );
+    }
+
+    #[test]
+    fn process_success_finishes_metadata_wait_and_deletes_pending_index() {
+        let origin_domain = HyperlaneDomain::Known(KnownHyperlaneDomain::Arbitrum);
+        let destination_domain = HyperlaneDomain::Known(KnownHyperlaneDomain::Ethereum);
+        let cache = OptionalCache::new(None);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = DB::from_path(temp_dir.path()).unwrap();
+        let base_db = HyperlaneRocksDB::new(&origin_domain, db);
+        let message = HyperlaneMessage {
+            nonce: 7,
+            origin: origin_domain.id(),
+            destination: destination_domain.id(),
+            ..Default::default()
+        };
+        base_db
+            .store_message(&message, Default::default())
+            .expect("store pending message and index");
+        let app_context = "test-app";
+        let base_metadata_builder =
+            dummy_metadata_builder(&origin_domain, &destination_domain, &base_db, cache.clone());
+        let message_context =
+            dummy_message_context(Arc::new(base_metadata_builder), &base_db, cache);
+        let mut pending_message = PendingMessage::new(
+            message.clone(),
+            Arc::new(message_context),
+            PendingOperationStatus::FirstPrepareAttempt,
+            Some(app_context.to_owned()),
+            DEFAULT_MAX_MESSAGE_RETRIES,
+        );
+        pending_message
+            .ctx
+            .metrics
+            .record_metadata_wait(message.id(), Some(app_context));
+
+        pending_message
+            .record_message_process_success()
+            .expect("commit process success");
+
+        assert_eq!(
+            pending_message
+                .ctx
+                .metrics
+                .metadata_wait_active
+                .with_label_values(&[app_context, "ethereum", "arbitrum"])
+                .get(),
+            0
+        );
+        assert_eq!(
+            pending_message
+                .ctx
+                .metrics
+                .metadata_wait_event_count
+                .with_label_values(&[app_context, "ethereum", "arbitrum", "recovered"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            base_db
+                .retrieve_pending_message_at_or_after(destination_domain.id(), message.nonce)
+                .expect("read pending index"),
+            None
+        );
+        assert_eq!(
+            base_db
+                .retrieve_processed_by_nonce(&message.nonce)
+                .expect("read processed marker"),
+            Some(true)
+        );
     }
 }
