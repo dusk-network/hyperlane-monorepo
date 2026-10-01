@@ -150,7 +150,9 @@ The resulting implementation decisions are:
   a non-null ledger record fail immediately as authoritative schema drift. The
   transaction ID remains immutable across retries. The external `dusk-tx`
   helper has its own 120-second deadline and is killed when that deadline
-  expires.
+  expires. If the helper already emitted its prepared transaction hash, the
+  timeout remains outcome-unknown and the adapter reconciles that exact hash;
+  it does not discard the identity with the interrupted output streams.
 - Preserve semantic errors across the chain adapter: signer unavailability is
   no longer collapsed into a generic retryable communication error, an ISM
   rejection remains distinct from a query failure, and unknown ISM module

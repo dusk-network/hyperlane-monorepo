@@ -12,6 +12,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
+use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
 use hyperlane_core::H512;
@@ -160,8 +161,13 @@ async fn wait_for_child_output(
     let stderr = child.stderr.take().ok_or_else(|| {
         HyperlaneDuskError::Other("dusk-tx stderr pipe was not configured".into())
     })?;
-    let stdout_task = tokio::spawn(read_bounded_stream(stdout, "stdout"));
-    let stderr_task = tokio::spawn(read_bounded_stream(stderr, "stderr"));
+    let (prepared_tx_sender, mut prepared_tx_receiver) = oneshot::channel();
+    let stdout_task = tokio::spawn(read_bounded_stream(stdout, "stdout", None));
+    let stderr_task = tokio::spawn(read_bounded_stream(
+        stderr,
+        "stderr",
+        Some(prepared_tx_sender),
+    ));
 
     let status = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(result) => result.map_err(|error| {
@@ -174,10 +180,17 @@ async fn wait_for_child_output(
             let _ = child.wait().await;
             stdout_task.abort();
             stderr_task.abort();
-            return Err(HyperlaneDuskError::Other(format!(
+            let detail = format!(
                 "dusk-tx call {fn_name} exceeded the {}s helper deadline",
                 timeout.as_secs()
-            )));
+            );
+            // The helper emits its locally computed hash before propagation.
+            // Once observed, killing the helper cannot establish whether the
+            // transaction landed. Let the caller reconcile that exact hash.
+            return Err(match prepared_tx_receiver.try_recv() {
+                Ok(tx_id) => HyperlaneDuskError::SubmissionOutcomeUnknown { tx_id, detail },
+                Err(_) => HyperlaneDuskError::Other(detail),
+            });
         }
     };
 
@@ -197,21 +210,43 @@ async fn wait_for_child_output(
 async fn read_bounded_stream(
     reader: impl AsyncRead + Unpin,
     stream_name: &'static str,
+    mut prepared_tx_sender: Option<oneshot::Sender<String>>,
 ) -> Result<Vec<u8>, HyperlaneDuskError> {
+    let mut reader = reader.take((MAX_DUSK_TX_STREAM_BYTES + 1) as u64);
     let mut bytes = Vec::new();
-    reader
-        .take((MAX_DUSK_TX_STREAM_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .await
-        .map_err(|error| {
+    let mut chunk = [0u8; 8192];
+    loop {
+        let count = reader.read(&mut chunk).await.map_err(|error| {
             HyperlaneDuskError::Other(format!("Failed to read dusk-tx {stream_name}: {error}"))
         })?;
-    if bytes.len() > MAX_DUSK_TX_STREAM_BYTES {
-        return Err(HyperlaneDuskError::Other(format!(
-            "dusk-tx {stream_name} exceeds {MAX_DUSK_TX_STREAM_BYTES} bytes"
-        )));
+        if count == 0 {
+            return Ok(bytes);
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+        if prepared_tx_sender.is_some() {
+            if let Some(tx_id) = prepared_tx_id(&bytes) {
+                if let Some(sender) = prepared_tx_sender.take() {
+                    let _ = sender.send(tx_id);
+                }
+            }
+        }
+        if bytes.len() > MAX_DUSK_TX_STREAM_BYTES {
+            return Err(HyperlaneDuskError::Other(format!(
+                "dusk-tx {stream_name} exceeds {MAX_DUSK_TX_STREAM_BYTES} bytes"
+            )));
+        }
     }
-    Ok(bytes)
+}
+
+fn prepared_tx_id(stderr: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(stderr).lines().find_map(|line| {
+        let (tx_id, _) = line
+            .trim_start()
+            .strip_prefix("Prepared TX ")?
+            .split_once(';')?;
+        (tx_id.len() == 64 && tx_id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .then(|| tx_id.to_ascii_lowercase())
+    })
 }
 
 /// Convert a 32-byte Dusk transaction ID (hex) into a `H512` by left-padding with zeros.
@@ -354,6 +389,62 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("helper deadline"));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_helper_preserves_prepared_transaction_for_reconciliation() {
+        let tx_id = "ab".repeat(32);
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!(
+                "printf '  Prepared TX {tx_id}; reconcile this exact hash before retrying if submission is interrupted\\n' >&2; exec sleep 10"
+            ))
+            .kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = command.spawn().unwrap();
+        let error = wait_for_child_output(child, "process", Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            HyperlaneDuskError::SubmissionOutcomeUnknown { tx_id: observed, .. }
+                if observed == tx_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn prepared_transaction_is_retained_before_stderr_closes() {
+        let tx_id = "AB".repeat(32);
+        let (mut writer, reader) = tokio::io::duplex(256);
+        let (sender, mut receiver) = oneshot::channel();
+        let reader_task = tokio::spawn(read_bounded_stream(reader, "stderr", Some(sender)));
+        writer.write_all(b"  Prepared TX ").await.unwrap();
+        writer.write_all(&tx_id.as_bytes()[..32]).await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        writer.write_all(&tx_id.as_bytes()[32..]).await.unwrap();
+        writer
+            .write_all(b"; reconcile this exact hash\n")
+            .await
+            .unwrap();
+        let observed = tokio::time::timeout(Duration::from_secs(1), receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(observed, tx_id.to_ascii_lowercase());
+        drop(writer);
+        reader_task.await.unwrap().unwrap();
+        assert!(prepared_tx_id(b"Prepared TX abc; reconcile").is_none());
+        assert!(
+            prepared_tx_id(format!("Prepared TX {}; reconcile", "z".repeat(64)).as_bytes())
+                .is_none()
+        );
     }
 
     #[cfg(unix)]
