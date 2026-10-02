@@ -118,9 +118,9 @@ struct FinalizedEventPage {
 
 #[derive(Debug, Clone, Default)]
 struct FinalizedEventCache {
-    /// Each requested topic scans the contract stream independently. This
-    /// prevents one topic from skipping unrequested peers without retaining an
-    /// unbounded pending-event buffer. All endpoint-owned scan state is
+    /// Each topic retains only a cursor before its last requested block.
+    /// Same-block peers can then be found in any archive order without an
+    /// unbounded pending-event buffer. These endpoint-owned hints are
     /// process-local and rebuilt from genesis after restart.
     scans: HashMap<String, FinalizedEventScan>,
 }
@@ -129,7 +129,8 @@ struct FinalizedEventCache {
 struct FinalizedEventScan {
     cursor: Option<String>,
     last_id: Option<i64>,
-    replayed: usize,
+    /// Every row before this cursor had a height below this bound.
+    before_block: u64,
 }
 
 /// Row-owned provenance for one finalized, state-matched contract event.
@@ -407,8 +408,11 @@ impl RuesClient {
         Ok(payload.get("data").cloned().unwrap_or(payload))
     }
 
-    /// Return one finalized contract event by its topic-local sequence and
-    /// prove its row-owned provenance against finalized block state.
+    /// Match one contract-state record to its finalized archive event.
+    ///
+    /// Archive IDs order transactions by hash within a block, not by contract
+    /// execution sequence. Only the expected height, topic and complete event
+    /// data identify the requested row; sequence names its durable local key.
     pub(crate) async fn finalized_contract_event(
         &self,
         contract_id: &[u8; 32],
@@ -417,38 +421,46 @@ impl RuesClient {
         expected_block_height: u64,
         expected_data: &[u8],
     ) -> Result<FinalizedEventProvenance, HyperlaneDuskError> {
-        loop {
-            if let Some(event) = self.load_finalized_event(contract_id, topic, sequence)? {
-                let result = self
-                    .validate_finalized_event(
-                        contract_id,
-                        topic,
-                        sequence,
-                        expected_block_height,
-                        expected_data,
-                        event,
-                    )
-                    .await;
-                if result.is_err() {
-                    self.invalidate_finalized_event(contract_id, topic, sequence)
-                        .await?;
-                }
-                return result;
+        if let Some(event) = self.load_finalized_event(contract_id, topic, sequence)? {
+            let result = self
+                .validate_finalized_event(
+                    contract_id,
+                    topic,
+                    sequence,
+                    expected_block_height,
+                    expected_data,
+                    event,
+                )
+                .await;
+            if result.is_err() {
+                self.invalidate_finalized_event(contract_id, topic, sequence)
+                    .await?;
             }
+            return result;
+        }
 
-            let scan = {
-                let mut caches = self.finalized_event_caches.lock().await;
-                let cache = caches.entry(*contract_id).or_default();
-                let scan = cache.scans.entry(topic.to_owned()).or_default();
-                // Exact rows are cached independently, so callers may begin at
-                // any sequence. Rewind a transient scan when asked to move
-                // behind it rather than trusting a remote cursor as authority.
-                if sequence < scan.replayed {
-                    *scan = FinalizedEventScan::default();
-                }
-                scan.clone()
-            };
+        let original_scan = {
+            let mut caches = self.finalized_event_caches.lock().await;
+            caches
+                .entry(*contract_id)
+                .or_default()
+                .scans
+                .entry(topic.to_owned())
+                .or_default()
+                .clone()
+        };
+        // A cursor before a later block says nothing about an earlier request.
+        let mut scan = if expected_block_height < original_scan.before_block {
+            FinalizedEventScan::default()
+        } else {
+            original_scan.clone()
+        };
+        let mut anchor = scan.clone();
+        anchor.before_block = expected_block_height;
+        let mut reached_block = false;
+        let expected_hex = hex::encode(expected_data);
 
+        loop {
             let page = self
                 .finalized_event_page(contract_id, scan.cursor.as_deref())
                 .await?;
@@ -459,57 +471,40 @@ impl RuesClient {
                 &page,
             )?;
             let has_next_page = page.has_next_page;
-
-            // Only one concurrent fetch may advance a contract cursor. If
-            // another task won the race, discard this page and retry from the
-            // now-current cache rather than duplicating rows.
-            let mut caches = self.finalized_event_caches.lock().await;
-            let cache = caches.entry(*contract_id).or_default();
-            let current_scan = cache.scans.get(topic).cloned().unwrap_or_default();
-            if current_scan != scan {
-                continue;
-            }
-            let mut candidate_scan = scan;
-            let mut cached = None;
+            let mut candidate = None;
             for event in page.events {
-                candidate_scan.last_id = Some(event.id);
-                if !event.reverted && event.topic == topic {
-                    let replayed = candidate_scan.replayed;
-                    // Only the caller-requested row becomes a candidate.
-                    // Prefix and page-peer rows remain endpoint assertions and
-                    // never acquire durable authority transitively.
-                    if replayed == sequence {
-                        let mut durable_event = event.clone();
-                        durable_event.id = i64::try_from(sequence).map_err(|_| {
-                            HyperlaneDuskError::Other(
-                                "Dusk finalized-event sequence exceeds i64 provenance range".into(),
-                            )
-                        })?;
-                        cached = Some(durable_event);
-                    }
-                    let next_replayed = replayed.checked_add(1).ok_or_else(|| {
-                        HyperlaneDuskError::Other(
-                            "Dusk finalized-event replay sequence overflow".into(),
-                        )
-                    })?;
-                    candidate_scan.replayed = next_replayed;
+                scan.last_id = Some(event.id);
+                scan.cursor = Some(canonical_event_cursor(event.id));
 
-                    // Keep the transient cursor immediately after the target
-                    // row. Advancing to the end of this page would skip
-                    // uncommitted later rows on the next request.
-                    if cached.is_some() {
-                        break;
+                // Advance only over a prefix entirely below the target height.
+                // Freeze the anchor before its first same-height (or later)
+                // peer, even if the matching row is on a later page. Subsequent
+                // requests for this block must still see earlier archive rows.
+                if !reached_block {
+                    if event.block_height < expected_block_height {
+                        anchor.last_id = scan.last_id;
+                        anchor.cursor = scan.cursor.clone();
+                    } else {
+                        reached_block = true;
                     }
                 }
+                if !event.reverted
+                    && event.topic == topic
+                    && event.block_height == expected_block_height
+                    && strip_hex_prefix(&event.data).eq_ignore_ascii_case(&expected_hex)
+                {
+                    let mut event = event;
+                    event.id = i64::try_from(sequence).map_err(|_| {
+                        HyperlaneDuskError::Other(
+                            "Dusk finalized-event sequence exceeds i64 provenance range".into(),
+                        )
+                    })?;
+                    candidate = Some(event);
+                    break;
+                }
             }
-            // This cursor is locally encoded but still derived from an
-            // endpoint-owned row ID. It is useful only in this process and is
-            // omitted from durable state.
-            candidate_scan.cursor = candidate_scan.last_id.map(canonical_event_cursor);
-            cache.scans.insert(topic.to_owned(), candidate_scan);
 
-            if let Some(event) = cached {
-                drop(caches);
+            if let Some(event) = candidate {
                 let result = self
                     .validate_finalized_event(
                         contract_id,
@@ -528,18 +523,42 @@ impl RuesClient {
                         return Err(error);
                     }
                 };
-                // Contract state and checkBlock have authenticated this exact
-                // row. Persist it independently; no prefix or page peer is
-                // promoted by association.
+                // Only this independently state/checkBlock-validated row is
+                // durable. Page peers and cursor hints never gain authority.
                 self.persist_finalized_event(contract_id, topic, sequence, &event)?;
+                self.remember_finalized_event_scan(contract_id, topic, &original_scan, anchor)
+                    .await;
                 return Ok(provenance);
             }
             if !has_next_page {
+                self.remember_finalized_event_scan(contract_id, topic, &original_scan, anchor)
+                    .await;
                 return Err(HyperlaneDuskError::Other(format!(
-                    "Finalized Dusk event {}/{topic} sequence {sequence} is not archived yet",
+                    "Finalized Dusk event {}/{topic} sequence {sequence} matching contract state is not archived yet",
                     hex::encode(contract_id)
                 )));
             }
+        }
+    }
+
+    /// Save a bounded replay hint without overwriting a concurrent lookup's
+    /// progress or moving an existing hint back for an older-block request.
+    async fn remember_finalized_event_scan(
+        &self,
+        contract_id: &[u8; 32],
+        topic: &str,
+        original: &FinalizedEventScan,
+        anchor: FinalizedEventScan,
+    ) {
+        let mut caches = self.finalized_event_caches.lock().await;
+        let current = caches
+            .entry(*contract_id)
+            .or_default()
+            .scans
+            .entry(topic.to_owned())
+            .or_default();
+        if current == original && anchor.before_block >= current.before_block {
+            *current = anchor;
         }
     }
 
@@ -1569,6 +1588,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replayed, provenance);
+    }
+
+    #[tokio::test]
+    async fn reverse_archive_rows_keep_exact_provenance_after_store_reopen() {
+        let contract_id = [7u8; 32];
+        let page = serde_json::json!({
+            "finalizedEvents": { "json": {
+                "events": ([2u8, 1u8].into_iter().enumerate().map(|(id, value)| {
+                    serde_json::json!({
+                        "id": id as i64, "block_height": 7,
+                        "block_hash": hex::encode([8u8; 32]),
+                        "origin": hex::encode([value; 32]),
+                        "topic": "dispatch", "source": hex::encode(contract_id),
+                        "data": hex::encode([value]), "reverted": false
+                    })
+                }).collect::<Vec<_>>()),
+                "startCursor": canonical_event_cursor(0),
+                "endCursor": canonical_event_cursor(1),
+                "hasNextPage": false
+            }}
+        })
+        .to_string();
+        let page: &'static str = Box::leak(page.into_boxed_str());
+        let directory = tempfile::tempdir().unwrap();
+        let store = directory.path().join("event-store");
+        let client = test_client_with_event_store(
+            test_server(vec![
+                (200, page),
+                (200, r#"{"checkBlock":true}"#),
+                (200, page),
+                (200, r#"{"checkBlock":true}"#),
+            ]),
+            &store,
+        );
+        for (sequence, value) in [1u8, 2].into_iter().enumerate() {
+            let row = client
+                .finalized_contract_event(&contract_id, "dispatch", sequence, 7, &[value])
+                .await
+                .unwrap();
+            assert_eq!(row.event_id, sequence as i64);
+            assert_eq!(&row.transaction_id.as_bytes()[32..], &[value; 32]);
+            if sequence == 0 {
+                assert!(client
+                    .load_finalized_event(&contract_id, "dispatch", 1)
+                    .unwrap()
+                    .is_none());
+            }
+        }
+        drop(client);
+        // Reopen the actual store with no archive pages available. Each row
+        // still requires its own finalized-block validation on cache replay.
+        let reopened = test_client_with_event_store(
+            test_server(vec![
+                (200, r#"{"checkBlock":true}"#),
+                (200, r#"{"checkBlock":true}"#),
+            ]),
+            &store,
+        );
+        for (sequence, value) in [(1usize, 2u8), (0, 1)] {
+            let row = reopened
+                .finalized_contract_event(&contract_id, "dispatch", sequence, 7, &[value])
+                .await
+                .unwrap();
+            assert_eq!(row.event_id, sequence as i64);
+            assert_eq!(&row.transaction_id.as_bytes()[32..], &[value; 32]);
+        }
     }
 
     #[tokio::test]
