@@ -555,7 +555,7 @@ impl ChainConf {
                 Ok(Box::new(hook) as Box<dyn MerkleTreeHook>)
             }
             ChainConnectionConf::Dusk(conf) => {
-                let provider = Arc::new(build_dusk_state_provider(self, conf).await?);
+                let provider = Arc::new(build_dusk_state_provider(self, conf)?);
                 let rues = provider.rues().clone();
                 let mailbox = h_dusk::DuskMailbox::new(
                     provider,
@@ -566,7 +566,10 @@ impl ChainConf {
                     None,
                     conf.clone(),
                 );
-                let hook = h_dusk::DuskMerkleTreeHook::new(mailbox);
+                let hook = h_dusk::DuskMerkleTreeHook::new_with_identity_validation(
+                    mailbox,
+                    self.addresses.validator_announce,
+                );
                 Ok(Box::new(hook) as Box<dyn MerkleTreeHook>)
             }
             #[cfg(feature = "aleo")]
@@ -1878,14 +1881,16 @@ async fn build_dusk_provider(
     validate_dusk_provider(chain_conf, connection_conf, rues).await
 }
 
-async fn build_dusk_state_provider(
+fn build_dusk_state_provider(
     chain_conf: &ChainConf,
     connection_conf: &h_dusk::ConnectionConf,
 ) -> Result<h_dusk::DuskProvider> {
     // Checkpoint readers query contract state only. Each quorum endpoint needs
     // its own client, without competing for the indexer's exclusive event DB.
     let rues = Arc::new(h_dusk::RuesClient::new(connection_conf.url.clone())?);
-    validate_dusk_provider(chain_conf, connection_conf, rues).await
+    // The state hook validates identity on its first read, inside the quorum's
+    // deadline. One unavailable endpoint must not veto construction of the pool.
+    Ok(h_dusk::DuskProvider::new(chain_conf.domain.clone(), rues))
 }
 
 async fn validate_dusk_provider(

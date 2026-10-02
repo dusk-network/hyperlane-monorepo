@@ -531,7 +531,10 @@ impl RuesClient {
                 return Ok(provenance);
             }
             if !has_next_page {
-                self.remember_finalized_event_scan(contract_id, topic, &original_scan, anchor)
+                // Archive IDs are endpoint-local hints. A repaired or replaced
+                // endpoint may assign lower IDs; exhaustion must let the next
+                // retry replay from genesis on this same client.
+                self.forget_finalized_event_scan(contract_id, topic, &original_scan)
                     .await;
                 return Err(HyperlaneDuskError::Other(format!(
                     "Finalized Dusk event {}/{topic} sequence {sequence} matching contract state is not archived yet",
@@ -559,6 +562,25 @@ impl RuesClient {
             .or_default();
         if current == original && anchor.before_block >= current.before_block {
             *current = anchor;
+        }
+    }
+
+    async fn forget_finalized_event_scan(
+        &self,
+        contract_id: &[u8; 32],
+        topic: &str,
+        original: &FinalizedEventScan,
+    ) {
+        let mut caches = self.finalized_event_caches.lock().await;
+        let current = caches
+            .entry(*contract_id)
+            .or_default()
+            .scans
+            .entry(topic.to_owned())
+            .or_default();
+        // Do not discard progress installed by a concurrent successful lookup.
+        if current == original {
+            *current = FinalizedEventScan::default();
         }
     }
 

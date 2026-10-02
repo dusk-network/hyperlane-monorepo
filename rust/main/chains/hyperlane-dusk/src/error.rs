@@ -40,6 +40,15 @@ pub enum HyperlaneDuskError {
         /// Original helper diagnostic.
         detail: String,
     },
+    /// The helper observed an included execution failure. Reconcile its exact
+    /// receipt so callers can account for gas despite unsuccessful execution.
+    #[error("Dusk transaction {tx_id} execution failed: {detail}")]
+    TransactionExecutionFailed {
+        /// Canonical 32-byte Dusk transaction hash (lowercase hex).
+        tx_id: String,
+        /// Original helper diagnostic.
+        detail: String,
+    },
     /// The configured BLS secret key is invalid.
     #[error("Invalid BLS secret key: {0}")]
     InvalidBlsSecretKey(String),

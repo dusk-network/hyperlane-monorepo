@@ -1021,3 +1021,7 @@ mod test {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "dusk_rpc_tests.rs"]
+mod dusk_rpc_tests;

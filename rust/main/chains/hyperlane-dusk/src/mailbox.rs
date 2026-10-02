@@ -214,12 +214,52 @@ impl HyperlaneContract for DuskMailbox {
 #[derive(Debug, Clone)]
 pub struct DuskMerkleTreeHook {
     inner: DuskMailbox,
+    identity: Option<Arc<HookIdentity>>,
+}
+
+#[derive(Debug)]
+struct HookIdentity {
+    validator_announce_id: [u8; 32],
+    validated: tokio::sync::OnceCell<()>,
 }
 
 impl DuskMerkleTreeHook {
     /// Create a hook adapter over the same Dusk connection and topology.
     pub fn new(inner: DuskMailbox) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            identity: None,
+        }
+    }
+
+    /// Defer endpoint identity queries until the first state read. An offline
+    /// quorum endpoint retains its voting slot and can recover on a later read.
+    /// No state read succeeds until chain, mailbox and announce identities match.
+    pub fn new_with_identity_validation(inner: DuskMailbox, validator_announce_id: H256) -> Self {
+        Self {
+            inner,
+            identity: Some(Arc::new(HookIdentity {
+                validator_announce_id: validator_announce_id.into(),
+                validated: tokio::sync::OnceCell::new(),
+            })),
+        }
+    }
+
+    async fn ensure_identity(&self) -> ChainResult<()> {
+        if let Some(identity) = &self.identity {
+            identity
+                .validated
+                .get_or_try_init(|| {
+                    self.inner.rues.validate_chain_identity(
+                        self.inner.conn.chain_id,
+                        self.inner.domain.id(),
+                        &self.inner.mailbox_id,
+                        &identity.validator_announce_id,
+                    )
+                })
+                .await?;
+        }
+        Ok(())
     }
 }
 
@@ -332,8 +372,9 @@ impl Mailbox for DuskMailbox {
                     ))
                 })?
                 .to_owned(),
-            Err(HyperlaneDuskError::SubmissionOutcomeUnknown { tx_id, detail }) => {
-                warn!(%tx_id, %detail, "Reconciling outcome-unknown Dusk submission by exact hash");
+            Err(HyperlaneDuskError::SubmissionOutcomeUnknown { tx_id, detail })
+            | Err(HyperlaneDuskError::TransactionExecutionFailed { tx_id, detail }) => {
+                warn!(%tx_id, %detail, "Reconciling Dusk submission receipt by exact hash");
                 tx_id
             }
             Err(error) => return Err(error.into()),
@@ -403,10 +444,12 @@ impl MerkleTreeHook for DuskMerkleTreeHook {
         // Rusk does not expose historical contract-state queries. Reconstruct
         // the one-time validator start tree from hook-owned insertion history,
         // capped at consensus finality, and verify it against the stored root.
+        self.ensure_identity().await?;
         self.inner.finalized_tree(reorg_period).await
     }
 
     async fn count(&self, reorg_period: &ReorgPeriod) -> ChainResult<u32> {
+        self.ensure_identity().await?;
         Ok(self.inner.finalized_merkle_view(reorg_period).await?.0)
     }
 
@@ -414,6 +457,7 @@ impl MerkleTreeHook for DuskMerkleTreeHook {
         &self,
         reorg_period: &ReorgPeriod,
     ) -> ChainResult<CheckpointAtBlock> {
+        self.ensure_identity().await?;
         let finalized_height = self
             .inner
             .rues
@@ -423,6 +467,7 @@ impl MerkleTreeHook for DuskMerkleTreeHook {
     }
 
     async fn latest_checkpoint_at_block(&self, height: u64) -> ChainResult<CheckpointAtBlock> {
+        self.ensure_identity().await?;
         self.inner.checkpoint_at_height(height).await
     }
 }

@@ -116,6 +116,7 @@ struct Fixture {
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     archive_requests: Arc<Mutex<Vec<i64>>>,
+    archive_rows: Arc<Mutex<Vec<Value>>>,
 }
 impl Fixture {
     fn start(kind: Kind, reversed: bool, prefix_rows: usize) -> Self {
@@ -135,25 +136,27 @@ impl Fixture {
         let worker_stop = stop.clone();
         let archive_requests = Arc::new(Mutex::new(Vec::new()));
         let worker_requests = archive_requests.clone();
-        let worker = thread::spawn(move || {
-            // Match frozen Rusk's BTreeMap<EventIdentifier,...> grouping followed
-            // by ID assignment (transformer.rs:89, sqlite.rs:925 and 976).
-            let mut by_origin = std::collections::BTreeMap::new();
-            for index in 0..2 {
-                by_origin.insert(tx_hash(index, reversed), index);
-            }
-            let mut rows: Vec<Value> = (0..prefix_rows).map(|index| json!({
+        // Match frozen Rusk's BTreeMap<EventIdentifier,...> grouping followed
+        // by ID assignment (transformer.rs:89, sqlite.rs:925 and 976).
+        let mut by_origin = std::collections::BTreeMap::new();
+        for index in 0..2 {
+            by_origin.insert(tx_hash(index, reversed), index);
+        }
+        let mut rows: Vec<Value> = (0..prefix_rows).map(|index| json!({
                 "id": index as i64, "block_height": prefix_height, "block_hash": hex::encode([9;32]),
                 "origin": hex::encode([0;32]), "topic": "admin", "source": hex::encode(CONTRACT),
                 "data": "00", "reverted": false,
             })).collect();
-            for (origin, index) in by_origin {
-                rows.push(json!({
+        for (origin, index) in by_origin {
+            rows.push(json!({
                     "id": rows.len() as i64, "block_height": HEIGHT, "block_hash": hex::encode([9;32]),
                     "origin": hex::encode(origin), "topic": kind.topic(), "source": hex::encode(CONTRACT),
                     "data": hex::encode(kind.event(index)), "reverted": false,
                 }));
-            }
+        }
+        let archive_rows = Arc::new(Mutex::new(rows));
+        let worker_rows = archive_rows.clone();
+        let worker = thread::spawn(move || {
             while !worker_stop.load(Ordering::SeqCst) {
                 let (mut stream, _) = match listener.accept() {
                     Ok(c) => c,
@@ -205,7 +208,9 @@ impl Fixture {
                             })
                             .unwrap_or(-1);
                         worker_requests.lock().unwrap().push(after);
-                        let pending: Vec<_> = rows
+                        let pending: Vec<_> = worker_rows
+                            .lock()
+                            .unwrap()
                             .iter()
                             .filter(|r| r["id"].as_i64().unwrap() > after)
                             .cloned()
@@ -264,6 +269,7 @@ impl Fixture {
             stop,
             worker: Some(worker),
             archive_requests,
+            archive_rows,
         }
     }
     fn client(&self) -> Arc<RuesClient> {
@@ -459,4 +465,55 @@ async fn same_block_replay_reuses_the_cursor_after_older_blocks() {
         vec![-1, 15, 31, 39],
         "same-block lookup must retain earlier peers without replaying older-block history"
     );
+}
+
+#[tokio::test]
+async fn a_missing_row_cannot_pin_a_cursor_past_repaired_archive_rows() {
+    for kind in [Kind::Dispatch, Kind::Process, Kind::Merkle, Kind::Igp] {
+        let fixture = Fixture::start(kind, true, 0);
+        let correct = fixture.archive_rows.lock().unwrap().clone();
+        *fixture.archive_rows.lock().unwrap() = vec![json!({
+            "id": 1000, "block_height": HEIGHT - 1, "block_hash": hex::encode([9;32]),
+            "origin": hex::encode([0;32]), "topic": "admin", "source": hex::encode(CONTRACT),
+            "data": "00", "reverted": false,
+        })];
+        let rues = fixture.client();
+        assert!(read(kind, rues.clone(), 0..=0, None).await.is_err());
+        *fixture.archive_rows.lock().unwrap() = correct;
+        let logs = read(kind, rues, 0..=0, None)
+            .await
+            .unwrap_or_else(|e| panic!("{kind:?} must recover after a failed archive lookup: {e}"));
+        assert_eq!(logs[0].transaction_id, h512(tx_hash(0, true)));
+        assert_eq!(*fixture.archive_requests.lock().unwrap(), vec![-1, -1]);
+    }
+}
+
+#[tokio::test]
+async fn a_successful_lookup_hint_is_discarded_when_archive_ids_are_rebuilt() {
+    for kind in [Kind::Dispatch, Kind::Process, Kind::Merkle, Kind::Igp] {
+        let fixture = Fixture::start_with_prefix_height(kind, true, 40, HEIGHT - 1);
+        let rues = fixture.client();
+        assert_eq!(
+            read(kind, rues.clone(), 0..=0, None).await.unwrap().len(),
+            1
+        );
+        {
+            let mut rows = fixture.archive_rows.lock().unwrap();
+            rows.retain(|row| row["topic"] == kind.topic());
+            for (index, row) in rows.iter_mut().enumerate() {
+                row["id"] = json!(index);
+            }
+        }
+        // The bounded first lookup may exhaust the stale prefix, but the next
+        // retry on this same client must replay the repaired endpoint.
+        assert!(read(kind, rues.clone(), 1..=1, None).await.is_err());
+        let logs = read(kind, rues, 1..=1, None)
+            .await
+            .unwrap_or_else(|e| panic!("{kind:?} stale successful hint must not pin retries: {e}"));
+        assert_eq!(logs[0].transaction_id, h512(tx_hash(1, true)));
+        assert_eq!(
+            *fixture.archive_requests.lock().unwrap(),
+            vec![-1, 15, 31, 39, -1]
+        );
+    }
 }

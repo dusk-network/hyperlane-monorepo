@@ -119,6 +119,12 @@ pub async fn dusk_tx_call(
         // Try to parse error from JSON output
         if let Ok(json) = serde_json::from_str::<Value>(&stdout) {
             if let Some(err) = json.get("error").and_then(|e| e.as_str()) {
+                if let Some(tx_id) = included_failure_tx_id(err) {
+                    return Err(HyperlaneDuskError::TransactionExecutionFailed {
+                        tx_id,
+                        detail: err.to_owned(),
+                    });
+                }
                 if let Some(tx_id) = outcome_unknown_tx_id(err) {
                     return Err(HyperlaneDuskError::SubmissionOutcomeUnknown {
                         tx_id,
@@ -303,6 +309,16 @@ pub fn process_args(
     Ok(args)
 }
 
+// The helper's confirmed-failure diagnostic starts with its locally computed
+// hash. Do not accept a hash merely quoted inside a pre-submission RPC error.
+fn included_failure_tx_id(error: &str) -> Option<String> {
+    let (tx_id, _) = error
+        .strip_prefix("Transaction ")?
+        .split_once(" failed: ")?;
+    (tx_id.len() == 64 && tx_id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| tx_id.to_ascii_lowercase())
+}
+
 fn outcome_unknown_tx_id(error: &str) -> Option<String> {
     if !error.contains("submission failed: Propagation outcome unknown")
         && !error.contains("confirmation outcome unknown")
@@ -356,6 +372,23 @@ mod tests {
             "Transaction {tx_id} submission failed: Propagation rejected; retain tx_id={tx_id}"
         );
         assert_eq!(outcome_unknown_tx_id(&rejected), None);
+    }
+
+    #[test]
+    fn only_included_failures_yield_an_execution_failure_hash() {
+        let tx_id = "AB".repeat(32);
+        assert_eq!(
+            included_failure_tx_id(&format!("Transaction {tx_id} failed: recipient rejected")),
+            Some(tx_id.to_ascii_lowercase())
+        );
+        for error in [
+            format!("Transaction {tx_id} submission failed: preverify rejected"),
+            format!("Preverify rejected: Transaction {tx_id} failed: quoted node error"),
+            "Transaction short failed: recipient rejected".into(),
+            format!("Transaction {} failed: recipient rejected", "zz".repeat(32)),
+        ] {
+            assert_eq!(included_failure_tx_id(&error), None);
+        }
     }
 
     #[test]

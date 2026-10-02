@@ -163,8 +163,9 @@ impl ValidatorAnnounce for DuskValidatorAnnounce {
                     ))
                 })?
                 .to_owned(),
-            Err(HyperlaneDuskError::SubmissionOutcomeUnknown { tx_id, detail }) => {
-                warn!(%tx_id, %detail, "Reconciling outcome-unknown Dusk announcement by exact hash");
+            Err(HyperlaneDuskError::SubmissionOutcomeUnknown { tx_id, detail })
+            | Err(HyperlaneDuskError::TransactionExecutionFailed { tx_id, detail }) => {
+                warn!(%tx_id, %detail, "Reconciling Dusk announcement receipt by exact hash");
                 tx_id
             }
             Err(error) => return Err(error.into()),
