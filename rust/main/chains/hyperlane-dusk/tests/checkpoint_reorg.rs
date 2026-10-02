@@ -1,6 +1,6 @@
 //! Exercise checkpoint reads through the public adapter and binary RUES boundary.
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -48,6 +48,9 @@ impl ArchiveFixture {
                     }
                     Err(error) => panic!("fixture accept failed: {error}"),
                 };
+                // macOS accepted sockets inherit the listener's nonblocking
+                // mode. Request reads must wait for bytes within the timeout.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(3)))
                     .unwrap();
@@ -147,8 +150,42 @@ impl ArchiveFixture {
 impl Drop for ArchiveFixture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        self.worker.take().unwrap().join().unwrap();
+        if let Err(panic) = self.worker.take().unwrap().join() {
+            // Preserve the original test failure instead of panicking twice.
+            if !thread::panicking() {
+                std::panic::resume_unwind(panic);
+            }
+        }
     }
+}
+
+#[test]
+fn archive_fixture_reads_delayed_request_bytes() {
+    let fixture = ArchiveFixture::start();
+    let mut client = TcpStream::connect(("127.0.0.1", fixture.url.port().unwrap())).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    // TCP acceptance need not coincide with delivery of the HTTP request.
+    thread::sleep(Duration::from_millis(100));
+    let body = b"query { lastBlockPair { json } }";
+    write!(
+        client,
+        "POST /on/graphql/query HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .unwrap();
+    thread::sleep(Duration::from_millis(100));
+    client.write_all(body).unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    let (_, body) = response.split_once("\r\n\r\n").unwrap();
+    let archive: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(
+        archive["lastBlockPair"]["json"]["last_finalized_block"],
+        serde_json::json!([90, "final"])
+    );
 }
 
 #[tokio::test]
