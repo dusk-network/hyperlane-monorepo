@@ -248,3 +248,5 @@ The locally prepared transaction ID remains authoritative if helper output disag
 Validator checkpoint and reorg endpoint lists remove known Dusk request aliases before counting votes: trailing pathname slashes and URL fragments do not create another endpoint. Query values and authentication remain significant. Operators still need independently operated providers; URL normalization cannot establish provider independence.
 
 Validator self-announcement uses strict storage-location reads. Transport, schema and validation failures remain unknown observations; the validator waits and reads again without submitting. Relayer aggregation retains per-validator partial results so one unavailable record does not hide healthy validators.
+
+Self-announcement also retries failed identity observations while constructing its read and submission clients. These retries wait at least one second, including when the configured ordinary polling interval is zero. A client is used only after the deployment identity checks succeed.

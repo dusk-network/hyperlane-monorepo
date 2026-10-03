@@ -1,15 +1,49 @@
-//! Shared endpoint isolation for checkpoint verification and reorg diagnostics.
+//! RPC clients for checkpoint verification, reorg diagnostics and announcements.
 use futures_util::future::try_join_all;
 use hyperlane_base::{
     settings::{ChainConf, ChainConnectionConf},
     CoreMetrics,
 };
-use hyperlane_core::{ChainResult, MerkleTreeHook};
+use hyperlane_core::{ChainResult, MerkleTreeHook, ValidatorAnnounce};
 use hyperlane_ethereum::RpcConnectionConf;
 use hyperlane_metric::prometheus_metric::RpcRole;
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 use tracing::warn;
 use url::Url;
+
+/// Distinguishes strict observation from the signer-backed submission client.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AnnouncementClientKind {
+    Reader,
+    Submission,
+}
+
+/// Dusk identity reads happen during construction as well as ordinary queries.
+/// Keep startup waiting for a validated client when those observations fail.
+pub(crate) async fn build_announcement_client(
+    chain: &ChainConf,
+    metrics: &CoreMetrics,
+    kind: AnnouncementClientKind,
+    retry_interval: Duration,
+) -> eyre::Result<Box<dyn ValidatorAnnounce>> {
+    loop {
+        let result = match kind {
+            AnnouncementClientKind::Reader => {
+                chain.build_validator_self_announce_reader(metrics).await
+            }
+            AnnouncementClientKind::Submission => chain.build_validator_announce(metrics).await,
+        };
+        match result {
+            Ok(client) => return Ok(client),
+            Err(error) if matches!(chain.connection, ChainConnectionConf::Dusk(_)) => {
+                warn!(%error, ?kind, "Could not construct validated Dusk announcement client; retrying without submitting");
+                // Bound retries even when the ordinary polling interval is zero.
+                tokio::time::sleep(retry_interval.max(Duration::from_secs(1))).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 /// Removes exact duplicate URLs (order-preserving). A duplicated endpoint would
 /// otherwise count as two independent votes, undermining the quorum's independence

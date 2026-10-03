@@ -1077,6 +1077,7 @@ mod dusk_rpc_tests {
         fault: Arc<AtomicU8>,
         identity_reads: Arc<AtomicUsize>,
         state_reads: Arc<AtomicUsize>,
+        unavailable_responses: Arc<AtomicUsize>,
         stop: Arc<AtomicBool>,
         worker: Option<JoinHandle<()>>,
     }
@@ -1095,6 +1096,8 @@ mod dusk_rpc_tests {
             let fault = Arc::new(AtomicU8::new(initial as u8));
             let identity_reads = Arc::new(AtomicUsize::new(0));
             let state_reads = Arc::new(AtomicUsize::new(0));
+            let unavailable_responses = Arc::new(AtomicUsize::new(0));
+            let observed_unavailable = unavailable_responses.clone();
             let stop = Arc::new(AtomicBool::new(false));
             let observed_fault = fault.clone();
             let observed_identity = identity_reads.clone();
@@ -1223,6 +1226,9 @@ mod dusk_rpc_tests {
                     } else {
                         panic!("unexpected fixture path {path}");
                     };
+                    if status == 503 {
+                        observed_unavailable.fetch_add(1, Ordering::SeqCst);
+                    }
                     write!(
                         stream,
                         "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1237,6 +1243,7 @@ mod dusk_rpc_tests {
                 fault,
                 identity_reads,
                 state_reads,
+                unavailable_responses,
                 stop,
                 worker: Some(worker),
             }
@@ -1355,7 +1362,7 @@ mod dusk_rpc_tests {
             "https://rpc.example/encoded%2Fpath",
         ]
         .iter()
-        .map(|url| Url::parse(url).unwrap())
+        .map(|url| Url::parse(url).expect("parse fixture URL"))
         .collect();
         let configuration = Configuration::new(&urls);
         let (source, selected) = state_read_urls(&configuration.chain, urls.clone());
@@ -1373,6 +1380,55 @@ mod dusk_rpc_tests {
     }
 
     #[tokio::test]
+    async fn dusk_announcement_factories_retry_initial_observation_errors() {
+        use crate::rpc::{build_announcement_client, AnnouncementClientKind};
+        for kind in [
+            AnnouncementClientKind::Reader,
+            AnnouncementClientKind::Submission,
+        ] {
+            let node = Node::start(Fault::Unavailable);
+            let configuration = Configuration::new(&[node.url.clone()]);
+            let metrics = metrics();
+            let build = build_announcement_client(
+                &configuration.chain,
+                &metrics,
+                kind,
+                Duration::from_millis(10),
+            );
+            tokio::pin!(build);
+            let observe_failure = async {
+                while node.unavailable_responses.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            };
+            tokio::select! {
+                result = &mut build => panic!("construction must wait for identity recovery: {result:?}"),
+                observed = tokio::time::timeout(READ_DEADLINE, observe_failure) => {
+                    observed.expect("fixture receives initial identity request");
+                },
+            }
+            assert!(node.unavailable_responses.load(Ordering::SeqCst) >= 1);
+            assert_eq!(
+                node.state_reads.load(Ordering::SeqCst),
+                0,
+                "unverified construction cannot reach announcement reads or writes"
+            );
+            node.set_fault(Fault::None);
+            let client = tokio::time::timeout(READ_DEADLINE, &mut build)
+                .await
+                .expect("factory recovers after the endpoint")
+                .expect("validated client");
+            assert_eq!(
+                client
+                    .get_announced_storage_locations(&[H256::repeat_byte(7)])
+                    .await
+                    .expect("valid Dusk announcement fixture result"),
+                vec![Vec::<String>::new()]
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn dusk_self_announce_reader_preserves_observation_errors_and_recovers() {
         let node = Node::start(Fault::None);
         let configuration = Configuration::new(&[node.url.clone()]);
@@ -1381,12 +1437,12 @@ mod dusk_rpc_tests {
             .chain
             .build_validator_self_announce_reader(&metrics)
             .await
-            .unwrap();
+            .expect("valid Dusk announcement fixture result");
         let partial = configuration
             .chain
             .build_validator_announce_reader(&metrics)
             .await
-            .unwrap();
+            .expect("valid Dusk announcement fixture result");
         node.set_fault(Fault::AnnounceUnavailable);
         let validators = [H256::repeat_byte(7)];
         assert!(strict
@@ -1397,7 +1453,7 @@ mod dusk_rpc_tests {
             partial
                 .get_announced_storage_locations(&validators)
                 .await
-                .unwrap(),
+                .expect("valid Dusk announcement fixture result"),
             vec![Vec::<String>::new()]
         );
         node.set_fault(Fault::None);
@@ -1405,7 +1461,7 @@ mod dusk_rpc_tests {
             strict
                 .get_announced_storage_locations(&validators)
                 .await
-                .unwrap(),
+                .expect("valid Dusk announcement fixture result"),
             vec![Vec::<String>::new()]
         );
     }

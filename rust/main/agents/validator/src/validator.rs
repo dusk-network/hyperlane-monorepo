@@ -47,7 +47,10 @@ use crate::reorg_reporter::{
     LatestCheckpointReorgReporter, LatestCheckpointReorgReporterWithStorageWriter, ReorgReporter,
 };
 use crate::reorg_tombstone;
-use crate::rpc::{build_validator_per_url_hooks, dedupe_rpc_urls, state_read_urls};
+use crate::rpc::{
+    build_announcement_client, build_validator_per_url_hooks, dedupe_rpc_urls, state_read_urls,
+    AnnouncementClientKind,
+};
 use crate::server::{self as validator_server, merkle_tree_insertions, ValidatorReadiness};
 use crate::{
     settings::ValidatorSettings,
@@ -1034,10 +1037,13 @@ impl Validator {
         // the main validator submit loop. This is to avoid a situation in
         // which the validator is signing checkpoints but has not announced
         // their locations, which makes them functionally unusable.
-        let validator_announce = self
-            .origin_chain_conf
-            .build_validator_self_announce_reader(&self.core.metrics)
-            .await?;
+        let validator_announce = build_announcement_client(
+            &self.origin_chain_conf,
+            &self.core.metrics,
+            AnnouncementClientKind::Reader,
+            self.interval,
+        )
+        .await?;
         // Only a real submission needs a signer, gas oracle, or escalator.
         let mut submission_contract: Option<Box<dyn ValidatorAnnounce>> = None;
         let validators: [H256; 1] = [address.into()];
@@ -1126,10 +1132,22 @@ impl Validator {
                             info!(eth_validator_address=?announcement.validator, ?chain_signer_string, ?chain_signer_h256, "Attempting self announce");
                             if submission_contract.is_none() {
                                 submission_contract = Some(
-                                    self.origin_chain_conf
-                                        .build_validator_announce(&self.core.metrics)
-                                        .await?,
+                                    build_announcement_client(
+                                        &self.origin_chain_conf,
+                                        &self.core.metrics,
+                                        AnnouncementClientKind::Submission,
+                                        self.interval,
+                                    )
+                                    .await?,
                                 );
+                                if matches!(
+                                    self.origin_chain_conf.connection,
+                                    hyperlane_base::settings::ChainConnectionConf::Dusk(_)
+                                ) {
+                                    // Construction may have waited for RPC recovery.
+                                    // Observe announcement state again before writing.
+                                    continue;
+                                }
                             }
                             let result = submission_contract
                                 .as_ref()

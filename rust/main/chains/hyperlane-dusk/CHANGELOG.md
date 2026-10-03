@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Announcement-client construction retried failed identity observations before validator startup continued ([Dusk invariant review]).
+
 - Prepared transaction IDs remained authoritative when helper diagnostics or results disagreed ([Dusk invariant review]).
 - Equivalent Dusk request URLs counted as one validator checkpoint endpoint ([Dusk invariant review]).
 - Self-announcement required a successful state read before submitting a transaction ([Dusk invariant review]).
