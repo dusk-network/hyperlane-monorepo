@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Validator indexer and metrics-provider startup recovered from unavailable identity reads before announcement ([Dusk invariant review]).
+
 - Announcement-client construction retried failed identity observations before validator startup continued ([Dusk invariant review]).
 
 - Prepared transaction IDs remained authoritative when helper diagnostics or results disagreed ([Dusk invariant review]).

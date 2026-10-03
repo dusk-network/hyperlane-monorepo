@@ -7,7 +7,7 @@ use hyperlane_base::{
 use hyperlane_core::{ChainResult, MerkleTreeHook, ValidatorAnnounce};
 use hyperlane_ethereum::RpcConnectionConf;
 use hyperlane_metric::prometheus_metric::RpcRole;
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{collections::HashSet, future::Future, sync::Arc, time::Duration};
 use tracing::warn;
 use url::Url;
 
@@ -26,17 +26,35 @@ pub(crate) async fn build_announcement_client(
     kind: AnnouncementClientKind,
     retry_interval: Duration,
 ) -> eyre::Result<Box<dyn ValidatorAnnounce>> {
-    loop {
-        let result = match kind {
+    build_with_dusk_rpc_retry(chain, "announcement client", retry_interval, || async {
+        match kind {
             AnnouncementClientKind::Reader => {
                 chain.build_validator_self_announce_reader(metrics).await
             }
             AnnouncementClientKind::Submission => chain.build_validator_announce(metrics).await,
-        };
-        match result {
+        }
+    })
+    .await
+}
+
+/// Dusk factories authenticate deployment identity through RPC. Keep every
+/// startup factory waiting for a validated result when that observation fails.
+/// Other protocols retain their existing one-attempt initialization behavior.
+pub(crate) async fn build_with_dusk_rpc_retry<T, F, Fut>(
+    chain: &ChainConf,
+    component: &'static str,
+    retry_interval: Duration,
+    mut build: F,
+) -> eyre::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = eyre::Result<T>>,
+{
+    loop {
+        match build().await {
             Ok(client) => return Ok(client),
             Err(error) if matches!(chain.connection, ChainConnectionConf::Dusk(_)) => {
-                warn!(%error, ?kind, "Could not construct validated Dusk announcement client; retrying without submitting");
+                warn!(%error, component, "Could not initialize validated Dusk RPC component; retrying");
                 // Bound retries even when the ordinary polling interval is zero.
                 tokio::time::sleep(retry_interval.max(Duration::from_secs(1))).await;
             }

@@ -1380,6 +1380,102 @@ mod dusk_rpc_tests {
     }
 
     #[tokio::test]
+    async fn dusk_validator_startup_recovers_before_announcement() {
+        use crate::validator::{Validator, ValidatorMetadata};
+        use hyperlane_base::{
+            metrics::AgentMetrics, BaseAgent, ChainMetrics, MetadataFromSettings, RuntimeMetrics,
+        };
+
+        // Classic RPC indexing, WebSocket with RPC recovery, and lightweight
+        // WebSocket startup all use the real validator construction sequence.
+        for mode in 0..3 {
+            let node = Node::start(Fault::Unavailable);
+            let mut configuration = Configuration::new(&[node.url.clone()]);
+            configuration.validator.interval = Duration::from_millis(10);
+            if mode > 0 {
+                configuration.validator.websocket_url = Some(
+                    "ws://127.0.0.1:1/fixture"
+                        .parse()
+                        .expect("fixture websocket URL"),
+                );
+            }
+            configuration.validator.lightweight = mode == 2;
+            let metrics = metrics();
+            let agent_metrics = AgentMetrics::new(&metrics).expect("agent metrics");
+            let chain_metrics = ChainMetrics::new(&metrics).expect("chain metrics");
+            let runtime_metrics =
+                RuntimeMetrics::new(&metrics, Default::default()).expect("runtime metrics");
+            let (_, console_server) = console_subscriber::ConsoleLayer::builder().build();
+            let metadata = ValidatorMetadata::build_metadata(&configuration.validator);
+            let build = Validator::from_settings(
+                metadata,
+                configuration.validator,
+                metrics,
+                agent_metrics,
+                chain_metrics,
+                runtime_metrics,
+                console_server,
+            );
+            tokio::pin!(build);
+            if mode != 2 {
+                let observe_failure = async {
+                    while node.unavailable_responses.load(Ordering::SeqCst) == 0 {
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                };
+                tokio::select! {
+                    _ = &mut build => panic!("startup must await indexer identity recovery"),
+                    observed = tokio::time::timeout(READ_DEADLINE, observe_failure) => {
+                        observed.expect("indexer construction attempts identity read");
+                    },
+                }
+                assert_eq!(node.state_reads.load(Ordering::SeqCst), 0);
+                node.set_fault(Fault::None);
+            }
+            let validator = tokio::time::timeout(READ_DEADLINE, &mut build)
+                .await
+                .expect("validator construction recovers")
+                .expect("validated validator");
+            if mode == 2 {
+                assert_eq!(
+                    node.identity_reads.load(Ordering::SeqCst),
+                    0,
+                    "lightweight construction keeps checkpoint RPCs deferred"
+                );
+            }
+
+            // This is the next RPC constructor called by Validator::run, before
+            // announcement. It must stay pending, then recover in the same process.
+            node.set_fault(Fault::Unavailable);
+            node.unavailable_responses.store(0, Ordering::SeqCst);
+            let before_state_reads = node.state_reads.load(Ordering::SeqCst);
+            let metrics_build = validator.build_metrics_updater();
+            tokio::pin!(metrics_build);
+            let observe_failure = async {
+                while node.unavailable_responses.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            };
+            tokio::select! {
+                _ = &mut metrics_build => panic!("metrics initialization must await identity recovery"),
+                observed = tokio::time::timeout(READ_DEADLINE, observe_failure) => {
+                    observed.expect("metrics construction attempts identity read");
+                },
+            }
+            assert_eq!(
+                node.state_reads.load(Ordering::SeqCst),
+                before_state_reads,
+                "unverified startup cannot reach announcement or checkpoint state"
+            );
+            node.set_fault(Fault::None);
+            let _updater = tokio::time::timeout(READ_DEADLINE, &mut metrics_build)
+                .await
+                .expect("metrics initialization recovers")
+                .expect("validated metrics provider");
+        }
+    }
+
+    #[tokio::test]
     async fn dusk_announcement_factories_retry_initial_observation_errors() {
         use crate::rpc::{build_announcement_client, AnnouncementClientKind};
         for kind in [

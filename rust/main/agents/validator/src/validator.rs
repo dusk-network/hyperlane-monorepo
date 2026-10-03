@@ -48,8 +48,8 @@ use crate::reorg_reporter::{
 };
 use crate::reorg_tombstone;
 use crate::rpc::{
-    build_announcement_client, build_validator_per_url_hooks, dedupe_rpc_urls, state_read_urls,
-    AnnouncementClientKind,
+    build_announcement_client, build_validator_per_url_hooks, build_with_dusk_rpc_retry,
+    dedupe_rpc_urls, state_read_urls, AnnouncementClientKind,
 };
 use crate::server::{self as validator_server, merkle_tree_insertions, ValidatorReadiness};
 use crate::{
@@ -531,32 +531,42 @@ impl BaseAgent for Validator {
         let rpc_sync = if settings.lightweight {
             None
         } else {
-            Some(if let Some(cursor_state) = cursor_state.clone() {
-                settings
-                    .sequenced_contract_sync::<MerkleTreeInsertion, _>(
-                        &settings.origin_chain,
-                        &metrics,
-                        &contract_sync_metrics,
-                        Arc::new(CheckpointingMerkleTreeStore::new(
-                            msg_db.clone(),
-                            cursor_state,
-                        )),
-                        false,
-                        false,
-                    )
-                    .await?
-            } else {
-                settings
-                    .sequenced_contract_sync::<MerkleTreeInsertion, _>(
-                        &settings.origin_chain,
-                        &metrics,
-                        &contract_sync_metrics,
-                        msg_db.clone().into(),
-                        false,
-                        false,
-                    )
-                    .await?
-            })
+            Some(
+                build_with_dusk_rpc_retry(
+                    &origin_chain_conf,
+                    "Merkle tree indexer",
+                    settings.interval,
+                    || async {
+                        if let Some(cursor_state) = cursor_state.clone() {
+                            settings
+                                .sequenced_contract_sync::<MerkleTreeInsertion, _>(
+                                    &settings.origin_chain,
+                                    &metrics,
+                                    &contract_sync_metrics,
+                                    Arc::new(CheckpointingMerkleTreeStore::new(
+                                        msg_db.clone(),
+                                        cursor_state,
+                                    )),
+                                    false,
+                                    false,
+                                )
+                                .await
+                        } else {
+                            settings
+                                .sequenced_contract_sync::<MerkleTreeInsertion, _>(
+                                    &settings.origin_chain,
+                                    &metrics,
+                                    &contract_sync_metrics,
+                                    msg_db.clone().into(),
+                                    false,
+                                    false,
+                                )
+                                .await
+                        }
+                    },
+                )
+                .await?,
+            )
         };
         let sync_source = metrics.new_int_gauge(
             "merkle_tree_hook_sync_source_active",
@@ -662,15 +672,7 @@ impl BaseAgent for Validator {
             ));
         }
 
-        let metrics_updater = match ChainSpecificMetricsUpdater::new(
-            &self.origin_chain_conf,
-            self.core_metrics.clone(),
-            self.agent_metrics.clone(),
-            self.chain_metrics.clone(),
-            Self::AGENT_NAME.to_string(),
-        )
-        .await
-        {
+        let metrics_updater = match self.build_metrics_updater().await {
             Ok(task) => task,
             Err(err) => {
                 tracing::error!(?err, "Failed to build metrics updater");
@@ -754,6 +756,24 @@ impl BaseAgent for Validator {
 }
 
 impl Validator {
+    pub(crate) async fn build_metrics_updater(&self) -> Result<ChainSpecificMetricsUpdater> {
+        build_with_dusk_rpc_retry(
+            &self.origin_chain_conf,
+            "chain metrics provider",
+            self.interval,
+            || {
+                ChainSpecificMetricsUpdater::new(
+                    &self.origin_chain_conf,
+                    self.core_metrics.clone(),
+                    self.agent_metrics.clone(),
+                    self.chain_metrics.clone(),
+                    Self::AGENT_NAME.to_string(),
+                )
+            },
+        )
+        .await
+    }
+
     /// Try to create merkle tree hook contract sync attempts times before giving up.
     async fn try_n_times_to_run_merkle_tree_hook_sync(
         &self,
