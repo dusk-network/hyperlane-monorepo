@@ -1905,6 +1905,7 @@ async fn validate_dusk_provider(
         chain_conf.domain.id(),
         &mailbox_id,
         &validator_announce_id,
+        &chain_conf.addresses.merkle_tree_hook.into(),
     )
     .await?;
     Ok(h_dusk::DuskProvider::new(chain_conf.domain.clone(), rues))

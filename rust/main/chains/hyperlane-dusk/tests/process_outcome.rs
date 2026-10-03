@@ -68,7 +68,7 @@ impl Fixture {
             format!("printf '%s\\n' '  Prepared TX {tx}; reconcile this exact hash before retrying if submission is interrupted' >&2\n")
         };
         std::fs::write(&helper_path,format!(
-            "#!/bin/sh\nIFS= read -r fixture_input\n{prepared}printf '%s\\n' '{output}'\nexit {code}\n")).unwrap();
+            "#!/bin/sh\nIFS= read -r fixture_url\nIFS= read -r fixture_input\n[ -n \"$fixture_url\" ] && [ -n \"$fixture_input\" ] || exit 89\nfor fixture_arg do\n  [ \"$fixture_arg\" != \"$fixture_url\" ] && [ \"$fixture_arg\" != \"$fixture_input\" ] || exit 90\ndone\n{prepared}printf '%s\\n' '{output}'\nexit {code}\n")).unwrap();
         std::fs::set_permissions(&helper_path, std::fs::Permissions::from_mode(0o700)).unwrap();
         // This is only the test process environment; live agents are separate.
         std::env::set_var("DUSK_TX_BIN", &helper_path);

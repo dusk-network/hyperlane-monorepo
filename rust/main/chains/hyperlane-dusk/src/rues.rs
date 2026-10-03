@@ -215,6 +215,7 @@ impl RuesClient {
         expected_domain: u32,
         mailbox_id: &[u8; 32],
         validator_announce_id: &[u8; 32],
+        merkle_tree_hook_id: &[u8; 32],
     ) -> Result<(), HyperlaneDuskError> {
         let observed_chain_id = self.chain_id().await?;
         if observed_chain_id != expected_chain_id {
@@ -240,6 +241,64 @@ impl RuesClient {
                     "Configured Dusk domainId {expected_domain} does not match {label} local_domain {observed_domain}"
                 )));
             }
+        }
+        self.validate_mailbox_binding(validator_announce_id, mailbox_id, "ValidatorAnnounce")
+            .await?;
+
+        // The supported deployments attach the Merkle hook directly, or as a
+        // child of the required static aggregation. A matching local domain
+        // alone cannot identify the deployment whose checkpoints we sign.
+        let required: [u8; 32] = self
+            .contract_query(mailbox_id, "required_hook", &())
+            .await?;
+        let hook_type: u8 = self
+            .contract_query(merkle_tree_hook_id, "hook_type", &())
+            .await?;
+        if hook_type != 3 {
+            return Err(HyperlaneDuskError::Other(
+                "Configured Dusk MerkleTreeHook does not have MerkleTree hook_type 3".into(),
+            ));
+        }
+        if required == *merkle_tree_hook_id {
+            self.validate_mailbox_binding(merkle_tree_hook_id, mailbox_id, "MerkleTreeHook")
+                .await?;
+        } else {
+            let required_type: u8 = self.contract_query(&required, "hook_type", &()).await?;
+            if required_type != 2 {
+                return Err(HyperlaneDuskError::Other(
+                    "Dusk Mailbox required_hook must be the configured MerkleTreeHook or its static aggregation".into(),
+                ));
+            }
+            self.validate_mailbox_binding(&required, mailbox_id, "required aggregation hook")
+                .await?;
+            let hooks: Vec<[u8; 32]> = self.contract_query(&required, "hooks", &()).await?;
+            if hooks
+                .iter()
+                .filter(|hook| *hook == merkle_tree_hook_id)
+                .count()
+                != 1
+            {
+                return Err(HyperlaneDuskError::Other(
+                    "Dusk required aggregation must contain the configured MerkleTreeHook exactly once".into(),
+                ));
+            }
+            self.validate_mailbox_binding(merkle_tree_hook_id, &required, "MerkleTreeHook")
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn validate_mailbox_binding(
+        &self,
+        contract: &[u8; 32],
+        expected_mailbox: &[u8; 32],
+        label: &str,
+    ) -> Result<(), HyperlaneDuskError> {
+        let mailbox: [u8; 32] = self.contract_query(contract, "mailbox", &()).await?;
+        if mailbox != *expected_mailbox {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Configured Dusk {label} mailbox does not match the configured deployment"
+            )));
         }
         Ok(())
     }
@@ -432,7 +491,7 @@ impl RuesClient {
                     event,
                 )
                 .await;
-            if result.is_err() {
+            if matches!(&result, Err(HyperlaneDuskError::FinalizedEventMismatch(_))) {
                 self.invalidate_finalized_event(contract_id, topic, sequence)
                     .await?;
             }
@@ -518,8 +577,10 @@ impl RuesClient {
                 let provenance = match result {
                     Ok(provenance) => provenance,
                     Err(error) => {
-                        self.invalidate_finalized_event(contract_id, topic, sequence)
-                            .await?;
+                        if matches!(&error, HyperlaneDuskError::FinalizedEventMismatch(_)) {
+                            self.invalidate_finalized_event(contract_id, topic, sequence)
+                                .await?;
+                        }
                         return Err(error);
                     }
                 };
@@ -739,26 +800,26 @@ impl RuesClient {
         event: FinalizedContractEvent,
     ) -> Result<FinalizedEventProvenance, HyperlaneDuskError> {
         if event.reverted || event.topic != topic {
-            return Err(HyperlaneDuskError::Other(format!(
+            return Err(HyperlaneDuskError::FinalizedEventMismatch(format!(
                 "Finalized Dusk event {}/{topic} sequence {sequence} is reverted or has the wrong topic",
                 hex::encode(contract_id)
             )));
         }
         if event.block_height != expected_block_height {
-            return Err(HyperlaneDuskError::Other(format!(
+            return Err(HyperlaneDuskError::FinalizedEventMismatch(format!(
                 "Finalized Dusk event {}/{topic} sequence {sequence} has block height {}, contract state says {expected_block_height}",
                 hex::encode(contract_id),
                 event.block_height
             )));
         }
         let data = hex::decode(strip_hex_prefix(&event.data)).map_err(|error| {
-            HyperlaneDuskError::Other(format!(
+            HyperlaneDuskError::FinalizedEventMismatch(format!(
                 "Finalized Dusk event {}/{topic} sequence {sequence} has invalid data: {error}",
                 hex::encode(contract_id)
             ))
         })?;
         if data != expected_data {
-            return Err(HyperlaneDuskError::Other(format!(
+            return Err(HyperlaneDuskError::FinalizedEventMismatch(format!(
                 "Finalized Dusk event {}/{topic} sequence {sequence} does not match contract state",
                 hex::encode(contract_id)
             )));
@@ -786,7 +847,7 @@ impl RuesClient {
                 )
             })?;
         if !checked {
-            return Err(HyperlaneDuskError::Other(format!(
+            return Err(HyperlaneDuskError::FinalizedEventMismatch(format!(
                 "Finalized Dusk event block {}/{} failed checkBlock",
                 event.block_height, event.block_hash
             )));
@@ -1386,11 +1447,12 @@ mod tests {
         }
     }
 
-    fn test_server(responses: Vec<(u16, &'static str)>) -> Url {
+    fn test_server<T: AsRef<[u8]> + Send + 'static>(responses: Vec<(u16, T)>) -> Url {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         thread::spawn(move || {
             for (status, body) in responses {
+                let body = body.as_ref();
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = Vec::new();
                 let mut buffer = [0u8; 4096];
@@ -1421,10 +1483,11 @@ mod tests {
                 };
                 write!(
                     stream,
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 )
                 .unwrap();
+                stream.write_all(body).unwrap();
             }
         });
         Url::parse(&format!("http://{address}")).unwrap()
@@ -2116,10 +2179,177 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transient_block_checks_keep_durable_rows_quarantined_until_revalidation() {
+        let contract = [3u8; 32];
+        let event = FinalizedContractEvent {
+            id: 80,
+            block_height: 90,
+            block_hash: hex::encode([4; 32]),
+            origin: hex::encode([5; 32]),
+            topic: "dispatch".into(),
+            source: hex::encode(contract),
+            data: hex::encode([6]),
+            reverted: false,
+        };
+        for response in [
+            (503, "temporarily unavailable"),
+            (200, "{}"),
+            (200, "not-json"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let client = test_client_with_event_store(
+                test_server(vec![
+                    (200, r#"{"checkBlock":true}"#),
+                    response,
+                    (200, r#"{"checkBlock":true}"#),
+                ]),
+                directory.path(),
+            );
+            client
+                .validate_finalized_event(&contract, "dispatch", 80, 90, &[6], event.clone())
+                .await
+                .unwrap();
+            client
+                .persist_finalized_event(&contract, "dispatch", 80, &event)
+                .unwrap();
+            let scan = FinalizedEventScan {
+                cursor: Some(canonical_event_cursor(79)),
+                last_id: Some(79),
+                before_block: 90,
+            };
+            client
+                .finalized_event_caches
+                .lock()
+                .await
+                .entry(contract)
+                .or_default()
+                .scans
+                .insert("dispatch".into(), scan.clone());
+            assert!(client
+                .finalized_contract_event(&contract, "dispatch", 80, 90, &[6])
+                .await
+                .is_err());
+            assert!(client
+                .load_finalized_event(&contract, "dispatch", 80)
+                .unwrap()
+                .is_some());
+            assert_eq!(
+                client.finalized_event_caches.lock().await[&contract].scans["dispatch"],
+                scan
+            );
+            // This server has only a checkBlock response left: no archive replay.
+            let recovered = client
+                .finalized_contract_event(&contract, "dispatch", 80, 90, &[6])
+                .await
+                .unwrap();
+            assert_eq!(recovered.event_id, 80);
+            assert_eq!(recovered.block_height, 90);
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(
+            test_server(vec![(200, r#"{"checkBlock":false}"#)]),
+            directory.path(),
+        );
+        client
+            .persist_finalized_event(&contract, "dispatch", 80, &event)
+            .unwrap();
+        assert!(matches!(
+            client
+                .finalized_contract_event(&contract, "dispatch", 80, 90, &[6])
+                .await,
+            Err(HyperlaneDuskError::FinalizedEventMismatch(_))
+        ));
+        assert!(client
+            .load_finalized_event(&contract, "dispatch", 80)
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn identity_binds_the_required_hook_topology_and_announce_to_one_mailbox() {
+        let mailbox = [3u8; 32];
+        let announce = [4u8; 32];
+        let merkle = [5u8; 32];
+        let aggregate = [6u8; 32];
+        let foreign = [7u8; 32];
+        let prefix = || {
+            vec![
+                (200, vec![1]),
+                (200, rkyv_serialize(&4242u32).unwrap()),
+                (200, rkyv_serialize(&4242u32).unwrap()),
+                (200, rkyv_serialize(&mailbox).unwrap()),
+            ]
+        };
+        let mut direct = prefix();
+        direct.extend([
+            (200, rkyv_serialize(&merkle).unwrap()),
+            (200, vec![3]),
+            (200, rkyv_serialize(&mailbox).unwrap()),
+        ]);
+        RuesClient::new(test_server(direct))
+            .unwrap()
+            .validate_chain_identity(1, 4242, &mailbox, &announce, &merkle)
+            .await
+            .unwrap();
+        let aggregated = || {
+            let mut responses = prefix();
+            responses.extend([
+                (200, rkyv_serialize(&aggregate).unwrap()),
+                (200, vec![3]),
+                (200, vec![2]),
+                (200, rkyv_serialize(&mailbox).unwrap()),
+                (200, rkyv_serialize(&vec![merkle, foreign]).unwrap()),
+                (200, rkyv_serialize(&aggregate).unwrap()),
+            ]);
+            responses
+        };
+        RuesClient::new(test_server(aggregated()))
+            .unwrap()
+            .validate_chain_identity(1, 4242, &mailbox, &announce, &merkle)
+            .await
+            .unwrap();
+        for (position, bytes, diagnostic) in [
+            (
+                3,
+                rkyv_serialize(&foreign).unwrap(),
+                "ValidatorAnnounce mailbox",
+            ),
+            (5, vec![2], "MerkleTree hook_type"),
+            (6, vec![1], "required_hook"),
+            (
+                7,
+                rkyv_serialize(&foreign).unwrap(),
+                "required aggregation hook mailbox",
+            ),
+            (8, rkyv_serialize(&vec![foreign]).unwrap(), "exactly once"),
+            (
+                8,
+                rkyv_serialize(&vec![merkle, merkle]).unwrap(),
+                "exactly once",
+            ),
+            (
+                9,
+                rkyv_serialize(&mailbox).unwrap(),
+                "MerkleTreeHook mailbox",
+            ),
+        ] {
+            let mut responses = aggregated();
+            responses[position].1 = bytes;
+            responses.truncate(position + 1);
+            let error = RuesClient::new(test_server(responses))
+                .unwrap()
+                .validate_chain_identity(1, 4242, &mailbox, &announce, &merkle)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(diagnostic), "{error}");
+        }
+    }
+
+    #[tokio::test]
     async fn endpoint_chain_id_mismatch_fails_before_contract_queries() {
         let client = RuesClient::new(test_server(vec![(200, "\u{2}")])).unwrap();
         let error = client
-            .validate_chain_identity(1, 4242, &[3u8; 32], &[4u8; 32])
+            .validate_chain_identity(1, 4242, &[3u8; 32], &[4u8; 32], &[5u8; 32])
             .await
             .unwrap_err();
         assert!(error

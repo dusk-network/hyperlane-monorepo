@@ -1617,6 +1617,18 @@ mod tests {
                             (axum::http::StatusCode::OK, vec![7u8])
                         } else if uri.path().ends_with("/local_domain") {
                             (axum::http::StatusCode::OK, 1337u32.to_le_bytes().to_vec())
+                        } else if uri.path().ends_with("/mailbox") {
+                            (
+                                axum::http::StatusCode::OK,
+                                H256::from_low_u64_be(1).as_bytes().to_vec(),
+                            )
+                        } else if uri.path().ends_with("/required_hook") {
+                            (
+                                axum::http::StatusCode::OK,
+                                H256::from_low_u64_be(4).as_bytes().to_vec(),
+                            )
+                        } else if uri.path().ends_with("/hook_type") {
+                            (axum::http::StatusCode::OK, vec![3])
                         } else {
                             (axum::http::StatusCode::NOT_FOUND, Vec::new())
                         }
@@ -1636,6 +1648,7 @@ mod tests {
             "chains": {"test": {
                 "name": "test", "domainid": 1337, "chainid": 7, "protocol": "dusk",
                 "rpcurls": [{"http": first.as_str()}, {"http": second.as_str()}],
+                "rpcconsensustype": "single",
                 "eventcursordir": directory.path().join("events"),
                 "nativetoken": {"decimals": 9, "symbol": "DUSK", "denom": "LUX"},
                 "mailbox": "0x0000000000000000000000000000000000000001",
@@ -1664,14 +1677,14 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(hooks.len(), 2);
-        assert_eq!(first_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(first_calls.load(Ordering::SeqCst), 7);
         assert_eq!(second_calls.load(Ordering::SeqCst), 0);
         for (_, hook) in &hooks {
             // Identity succeeds; this narrow fixture has no checkpoint response.
             assert!(hook.latest_checkpoint(&ReorgPeriod::None).await.is_err());
         }
-        assert_eq!(first_calls.load(Ordering::SeqCst), 7);
-        assert_eq!(second_calls.load(Ordering::SeqCst), 4);
+        assert_eq!(first_calls.load(Ordering::SeqCst), 15);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 8);
         first_server.abort();
         second_server.abort();
     }

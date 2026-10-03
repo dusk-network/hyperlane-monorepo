@@ -21,6 +21,8 @@ use crate::rues::rkyv_serialize;
 use crate::{ConnectionConf, DuskSigner, HyperlaneDuskError};
 
 const DUSK_TX_HELPER_TIMEOUT: Duration = Duration::from_secs(120);
+const DUSK_TX_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+const MAX_RUES_URL_STDIN_BYTES: usize = 8 * 1024;
 const MAX_DUSK_TX_STREAM_BYTES: usize = 1024 * 1024;
 const MAX_DUSK_TX_ARGS_BYTES: usize = 60 * 1024;
 const MAX_PROCESS_PAYLOAD_BYTES: usize = MAX_DUSK_TX_ARGS_BYTES - 1024;
@@ -41,6 +43,11 @@ pub async fn dusk_tx_call(
             "dusk-tx arguments for {fn_name} exceed the {MAX_DUSK_TX_ARGS_BYTES}-byte helper transport limit"
         )));
     }
+    if conn.url.as_str().len() + 1 > MAX_RUES_URL_STDIN_BYTES {
+        return Err(HyperlaneDuskError::Other(
+            "Dusk RUES URL exceeds the helper's 8192-byte stdin line limit".into(),
+        ));
+    }
     let bin = std::env::var("DUSK_TX_BIN").unwrap_or_else(|_| "dusk-tx".into());
     let contract_hex = hex::encode(contract_id);
     let args_hex = hex::encode(args_bytes);
@@ -58,8 +65,7 @@ pub async fn dusk_tx_call(
     command.kill_on_drop(true);
     command.arg("call");
     let mut child = command
-        .arg("--rues-url")
-        .arg(conn.url.as_str())
+        .arg("--rues-url-stdin")
         .arg("--expected-chain-id")
         .arg(conn.chain_id.to_string())
         .arg("--secret-key-stdin")
@@ -84,19 +90,18 @@ pub async fn dusk_tx_call(
             ))
         })?;
 
-    // Provide the secret key via stdin so it is not exposed in the process list.
+    // Keep both the authenticated URL and signing key out of process arguments.
+    // The helper consumes the URL line first, then the key after chain validation.
     if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(secret_key_hex.as_bytes())
+        let input = format!("{}\n{secret_key_hex}\n", conn.url.as_str());
+        tokio::time::timeout(DUSK_TX_HELPER_TIMEOUT, stdin.write_all(input.as_bytes()))
             .await
-            .map_err(|e| {
-                HyperlaneDuskError::Other(format!(
-                    "Failed to write dusk secret key to dusk-tx stdin: {e}"
-                ))
+            .map_err(|_| {
+                HyperlaneDuskError::Other("dusk-tx stdin write exceeded its deadline".into())
+            })?
+            .map_err(|error| {
+                HyperlaneDuskError::Other(format!("Failed to write dusk-tx private stdin: {error}"))
             })?;
-        stdin.write_all(b"\n").await.map_err(|e| {
-            HyperlaneDuskError::Other(format!("Failed to finalize dusk-tx stdin: {e}"))
-        })?;
     }
 
     let output = wait_for_child_output(child, fn_name, DUSK_TX_HELPER_TIMEOUT).await?;
@@ -168,8 +173,8 @@ async fn wait_for_child_output(
         HyperlaneDuskError::Other("dusk-tx stderr pipe was not configured".into())
     })?;
     let (prepared_tx_sender, mut prepared_tx_receiver) = oneshot::channel();
-    let stdout_task = tokio::spawn(read_bounded_stream(stdout, "stdout", None));
-    let stderr_task = tokio::spawn(read_bounded_stream(
+    let mut stdout_task = tokio::spawn(read_bounded_stream(stdout, "stdout", None));
+    let mut stderr_task = tokio::spawn(read_bounded_stream(
         stderr,
         "stderr",
         Some(prepared_tx_sender),
@@ -184,8 +189,7 @@ async fn wait_for_child_output(
         Err(_) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
-            stdout_task.abort();
-            stderr_task.abort();
+            drain_timed_out_readers(&mut stdout_task, &mut stderr_task).await;
             let detail = format!(
                 "dusk-tx call {fn_name} exceeded the {}s helper deadline",
                 timeout.as_secs()
@@ -211,6 +215,24 @@ async fn wait_for_child_output(
         stdout,
         stderr,
     })
+}
+
+type PipeReader = tokio::task::JoinHandle<Result<Vec<u8>, HyperlaneDuskError>>;
+
+async fn drain_timed_out_readers(stdout: &mut PipeReader, stderr: &mut PipeReader) {
+    // Killing the child closes its pipes, but bytes already emitted can still be
+    // buffered. Give the readers time to observe the prepared hash before aborting.
+    // Descendants retaining a pipe cannot extend this deadline indefinitely.
+    if tokio::time::timeout(DUSK_TX_DRAIN_TIMEOUT, async {
+        let _ = (&mut *stderr).await;
+        let _ = (&mut *stdout).await;
+    })
+    .await
+    .is_err()
+    {
+        stdout.abort();
+        stderr.abort();
+    }
 }
 
 async fn read_bounded_stream(
@@ -478,6 +500,23 @@ mod tests {
             prepared_tx_id(format!("Prepared TX {}; reconcile", "z".repeat(64)).as_bytes())
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn timeout_drain_keeps_a_prepared_hash_already_buffered_in_the_pipe() {
+        let tx_id = "ab".repeat(32);
+        let (mut writer, reader) = tokio::io::duplex(256);
+        writer
+            .write_all(format!("Prepared TX {tx_id}; reconcile\n").as_bytes())
+            .await
+            .unwrap();
+        drop(writer);
+        let (sender, mut receiver) = oneshot::channel();
+        // Neither reader has run when drain starts on this single-thread runtime.
+        let mut stdout = tokio::spawn(read_bounded_stream(tokio::io::empty(), "stdout", None));
+        let mut stderr = tokio::spawn(read_bounded_stream(reader, "stderr", Some(sender)));
+        drain_timed_out_readers(&mut stdout, &mut stderr).await;
+        assert_eq!(receiver.try_recv().unwrap(), tx_id);
     }
 
     #[cfg(unix)]

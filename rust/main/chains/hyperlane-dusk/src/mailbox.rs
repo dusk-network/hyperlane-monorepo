@@ -255,6 +255,7 @@ impl DuskMerkleTreeHook {
                         self.inner.domain.id(),
                         &self.inner.mailbox_id,
                         &identity.validator_announce_id,
+                        &self.inner.merkle_tree_hook_id,
                     )
                 })
                 .await?;

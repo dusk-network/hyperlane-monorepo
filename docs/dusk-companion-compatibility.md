@@ -94,10 +94,26 @@ is claimed.
 
 Every Dusk chain requires separate explicit `domainId` and native `chainId`
 values plus an agent-exclusive `eventCursorDir`. Startup validates the endpoint
-chain ID and both Mailbox and ValidatorAnnounce `local_domain` values before a
-provider is returned. Every submission passes the configured native chain ID
+chain ID, both Mailbox and ValidatorAnnounce `local_domain` values, and the
+ValidatorAnnounce's Mailbox binding before a provider is returned. The configured
+Merkle hook must be the Mailbox's required hook or occur exactly once in its
+required static aggregation; hook types and every parent binding are checked.
+Other hook topologies require explicit adapter support. These checks detect
+inconsistent deployment configuration; operators still authenticate deployed
+contract code and RPC providers. Every submission passes the configured native chain ID
 to `dusk-tx`; a mismatch is rejected before signer access or transaction
-construction.
+construction. Agent/helper calls now require a `dusk-tx` build supporting
+`call --rues-url-stdin`: stdin contains the URL line followed by the existing
+secret-key line. Authenticated URLs are never passed in process arguments.
+The original `--rues-url` CLI remains available for explicit public URLs.
+
+Dusk providers do not implement RPC failover. Multi-URL `fallback`, raw `quorum`,
+and raw `majority` configurations are rejected instead of silently selecting the
+first URL; `single` explicitly selects the primary. Validator `majority`/`quorum`
+(and lightweight checkpoint voting) retain all endpoint slots for independent
+checkpoint consensus, but archive indexing and transaction submission use the
+primary endpoint. A failed primary still requires operator recovery. Ordinary
+relayer/scraper configurations must use one URL or explicitly choose `single`.
 
 Dusk signer material is parsed as a BLS scalar, not as a generic address. It
 must decode from hex, base58, or bech32 to exactly 32 bytes and must be a valid
@@ -116,7 +132,9 @@ The archive path uses Rusk 1.7.1's contract-scoped
 Each row supplies its own event ID, height, block hash, transaction origin,
 source, topic, data, and reverted flag. State-derived height/data is matched to
 that row and `checkBlock(..., onlyFinalized: true)` validates its finalized
-block. Whole-block event buffering is not used.
+block. A transient or malformed `checkBlock` response returns an error while
+retaining a durable row for revalidation; only proven state/block mismatches
+invalidate it. Whole-block event buffering is not used.
 
 Endpoint cursors and row IDs remain process-local scan hints, independently
 tracked per topic; they never become durable authority. The exclusive RocksDB

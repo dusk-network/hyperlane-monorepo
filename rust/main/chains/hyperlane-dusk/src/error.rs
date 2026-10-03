@@ -52,6 +52,10 @@ pub enum HyperlaneDuskError {
     /// The configured BLS secret key is invalid.
     #[error("Invalid BLS secret key: {0}")]
     InvalidBlsSecretKey(String),
+    /// An archived event is demonstrably inconsistent with contract state or
+    /// finalized block provenance. Transport failures must not use this variant.
+    #[error("{0}")]
+    FinalizedEventMismatch(String),
     /// Generic error.
     #[error("{0}")]
     Other(String),
