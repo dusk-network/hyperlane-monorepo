@@ -36,7 +36,7 @@ static SHARED_RUES_CLIENTS: OnceLock<StdMutex<SharedRuesClients>> = OnceLock::ne
 #[derive(Clone)]
 pub struct RuesClient {
     client: reqwest::Client,
-    base_url: String,
+    base_url: Url,
     finalized_event_caches: Arc<tokio::sync::Mutex<HashMap<[u8; 32], FinalizedEventCache>>>,
     event_store: Option<Arc<DB>>,
 }
@@ -148,9 +148,12 @@ impl RuesClient {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()?;
-        // Normalize to avoid footguns around missing/extra trailing slashes.
-        let base_url = url.to_string();
-        let base_url = base_url.trim_end_matches('/').to_string();
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(HyperlaneDuskError::Other(
+                "Dusk RUES URL must use HTTP or HTTPS".into(),
+            ));
+        }
+        let base_url = url;
         Ok(Self {
             client,
             base_url,
@@ -166,10 +169,10 @@ impl RuesClient {
         url: Url,
         event_cursor_dir: PathBuf,
     ) -> Result<Self, HyperlaneDuskError> {
-        let key = (
-            url.as_str().trim_end_matches('/').to_owned(),
-            event_cursor_dir.clone(),
-        );
+        let mut canonical_url = url.clone();
+        canonical_url.set_path(url.path().trim_end_matches('/'));
+        canonical_url.set_fragment(None);
+        let key = (canonical_url.to_string(), event_cursor_dir.clone());
         let shared = SHARED_RUES_CLIENTS.get_or_init(|| StdMutex::new(HashMap::new()));
         let mut shared = shared.lock().map_err(|_| {
             HyperlaneDuskError::Other("Shared Dusk RUES client registry is poisoned".into())
@@ -189,6 +192,13 @@ impl RuesClient {
         client.event_store = Some(Arc::new(event_store));
         shared.insert(key, client.clone());
         Ok(client)
+    }
+
+    fn endpoint(&self, path: &str) -> Url {
+        let mut url = self.base_url.clone();
+        url.set_path(&format!("{}{path}", url.path().trim_end_matches('/')));
+        url.set_fragment(None);
+        url
     }
 
     /// Query the native Dusk chain ID from the transfer contract.
@@ -311,11 +321,11 @@ impl RuesClient {
         body: &[u8],
     ) -> Result<Vec<u8>, HyperlaneDuskError> {
         let contract_hex = hex::encode(contract_id);
-        let url = format!("{}/on/contracts:{}/{}", self.base_url, contract_hex, method);
+        let url = self.endpoint(&format!("/on/contracts:{contract_hex}/{method}"));
 
         let response = self
             .client
-            .post(&url)
+            .post(url)
             .headers(self.default_headers())
             .body(body.to_vec())
             .send()
@@ -339,11 +349,11 @@ impl RuesClient {
         contract_id: &[u8; 32],
     ) -> Result<ContractMetadata, HyperlaneDuskError> {
         let contract_hex = hex::encode(contract_id);
-        let url = format!("{}/on/contract:{}/metadata", self.base_url, contract_hex);
+        let url = self.endpoint(&format!("/on/contract:{contract_hex}/metadata"));
 
         let response = self
             .client
-            .post(&url)
+            .post(url)
             .headers(self.default_headers())
             .body(Vec::new())
             .send()
@@ -386,10 +396,10 @@ impl RuesClient {
     /// Propagate a serialized transaction to the network.
     pub async fn propagate_tx(&self, tx_bytes: &[u8]) -> Result<(), HyperlaneDuskError> {
         // Preverify first
-        let preverify_url = format!("{}/on/transactions/preverify", self.base_url);
+        let preverify_url = self.endpoint("/on/transactions/preverify");
         let response = self
             .client
-            .post(&preverify_url)
+            .post(preverify_url)
             .headers(self.default_headers())
             .body(tx_bytes.to_vec())
             .send()
@@ -404,11 +414,11 @@ impl RuesClient {
             });
         }
 
-        let url = format!("{}/on/transactions/propagate", self.base_url);
+        let url = self.endpoint("/on/transactions/propagate");
 
         let response = self
             .client
-            .post(&url)
+            .post(url)
             .headers(self.default_headers())
             .body(tx_bytes.to_vec())
             .send()
@@ -428,11 +438,11 @@ impl RuesClient {
 
     /// Execute a GraphQL query against the node's `/on/graphql/query` endpoint.
     pub async fn graphql_query(&self, query: &str) -> Result<JsonValue, HyperlaneDuskError> {
-        let url = format!("{}/on/graphql/query", self.base_url);
+        let url = self.endpoint("/on/graphql/query");
 
         let response = self
             .client
-            .post(&url)
+            .post(url)
             .headers(self.default_headers())
             .body(query.as_bytes().to_vec())
             .send()
@@ -988,11 +998,11 @@ impl RuesClient {
 
     /// Query a Moonlight account status by bs58-encoded BLS public key.
     pub async fn account_status(&self, bs58_pk: &str) -> Result<AccountStatus, HyperlaneDuskError> {
-        let url = format!("{}/on/account:{}/status", self.base_url, bs58_pk);
+        let url = self.endpoint(&format!("/on/account:{bs58_pk}/status"));
 
         let response = self
             .client
-            .post(&url)
+            .post(url)
             .headers(self.default_headers())
             .body(Vec::new())
             .send()
@@ -1044,11 +1054,11 @@ impl RuesClient {
         &self,
         max_transactions: usize,
     ) -> Result<GasPriceStats, HyperlaneDuskError> {
-        let url = format!("{}/on/blocks/gas-price", self.base_url);
+        let url = self.endpoint("/on/blocks/gas-price");
 
         let response = self
             .client
-            .post(&url)
+            .post(url)
             .headers(self.default_headers())
             .body(max_transactions.to_string())
             .send()
@@ -1419,6 +1429,102 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn request_routes_preserve_path_query_and_ignore_fragment() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        for suffix in [
+            "/rpc",
+            "/rpc/",
+            "/rpc?token=fixture%2Fvalue",
+            "/rpc#label",
+            "/rpc/?token=fixture%2Fvalue#label",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let mut paths = Vec::new();
+                for body in [
+                    vec![7],
+                    br#"{"tx":{"gasSpent":1,"err":null}}"#.to_vec(),
+                    br#"{"contract_owner":"fixture-owner"}"#.to_vec(),
+                    vec![],
+                    vec![],
+                    br#"{"balance":5,"nonce":1,"next_nonce":2}"#.to_vec(),
+                    br#"{"average":1,"max":2,"median":1,"min":0}"#.to_vec(),
+                ] {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                        .unwrap();
+                    let mut reader = BufReader::new(&mut stream);
+                    let mut first = String::new();
+                    reader.read_line(&mut first).unwrap();
+                    paths.push(first.split_whitespace().nth(1).unwrap().to_owned());
+                    let mut length = 0;
+                    loop {
+                        let mut header = String::new();
+                        assert_ne!(reader.read_line(&mut header).unwrap(), 0);
+                        if header == "\r\n" {
+                            break;
+                        }
+                        if let Some(value) =
+                            header.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
+                            length = value.trim().parse::<usize>().unwrap();
+                        }
+                    }
+                    let mut input = vec![0; length];
+                    reader.read_exact(&mut input).unwrap();
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .unwrap();
+                    stream.write_all(&body).unwrap();
+                }
+                paths
+            });
+            let client =
+                RuesClient::new(Url::parse(&format!("http://{address}{suffix}")).unwrap()).unwrap();
+            assert_eq!(client.chain_id().await.unwrap(), 7);
+            assert_eq!(
+                client
+                    .wait_for_tx(&"ab".repeat(32), Duration::from_secs(1))
+                    .await
+                    .unwrap()
+                    .gas_spent,
+                1
+            );
+            assert_eq!(
+                client
+                    .contract_metadata(&[2; 32])
+                    .await
+                    .unwrap()
+                    .contract_owner,
+                "fixture-owner"
+            );
+            client.propagate_tx(&[1]).await.unwrap();
+            assert_eq!(client.account_status("11111").await.unwrap().balance, 5);
+            assert_eq!(client.gas_price_stats(1).await.unwrap().max, 2);
+            let query = if suffix.contains('?') {
+                "?token=fixture%2Fvalue"
+            } else {
+                ""
+            };
+            assert_eq!(worker.join().unwrap(), vec![
+                format!("/rpc/on/contracts:0100000000000000000000000000000000000000000000000000000000000000/chain_id{query}"),
+                format!("/rpc/on/graphql/query{query}"),
+                format!("/rpc/on/contract:{}/metadata{query}", "02".repeat(32)),
+                format!("/rpc/on/transactions/preverify{query}"),
+                format!("/rpc/on/transactions/propagate{query}"),
+                format!("/rpc/on/account:11111/status{query}"),
+                format!("/rpc/on/blocks/gas-price{query}"),
+            ], "base suffix: {suffix}");
+        }
+    }
+
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
