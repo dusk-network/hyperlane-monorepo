@@ -31,6 +31,13 @@ enum Helper {
     OutcomeUnknown,
     IncludedFailure,
     RejectedBeforeSubmission,
+    AbruptExit,
+    Interrupted,
+    MalformedOutput,
+    MissingTransactionId,
+    UnrecognizedError,
+    PreverifyRejected,
+    PreverifyUnavailable,
 }
 struct Fixture {
     url: Url,
@@ -59,16 +66,42 @@ impl Fixture {
                 serde_json::json!({"success":false,"error":"Insufficient balance before transaction preparation"}),
                 1,
             ),
+            Helper::AbruptExit | Helper::Interrupted => (serde_json::Value::Null, 1),
+            Helper::MalformedOutput => (serde_json::Value::Null, 0),
+            Helper::MissingTransactionId => (serde_json::json!({"success":true}), 0),
+            Helper::UnrecognizedError => (
+                serde_json::json!({"success":false,"error":"Observation interrupted"}),
+                1,
+            ),
+            Helper::PreverifyRejected => (
+                serde_json::json!({"success":false,"error":format!(
+                    "Transaction {tx} submission failed: Preverify rejected before propagation (400 Bad Request): invalid transaction; retain tx_id={tx}")}),
+                1,
+            ),
+            Helper::PreverifyUnavailable => (
+                serde_json::json!({"success":false,"error":format!(
+                    "Transaction {tx} submission failed: Preverify failed before propagation: connection closed; retain tx_id={tx}")}),
+                1,
+            ),
         };
         let helper_path = directory.path().join("fixture-helper");
-        let output = serde_json::to_string(&value).unwrap();
+        let output = match helper {
+            Helper::AbruptExit | Helper::Interrupted => String::new(),
+            Helper::MalformedOutput => "{".to_owned(),
+            _ => serde_json::to_string(&value).unwrap(),
+        };
+        let termination = if matches!(helper, Helper::Interrupted) {
+            "kill -TERM \"$$\"".to_owned()
+        } else {
+            format!("exit {code}")
+        };
         let prepared = if matches!(helper, Helper::RejectedBeforeSubmission) {
             String::new()
         } else {
             format!("printf '%s\\n' '  Prepared TX {tx}; reconcile this exact hash before retrying if submission is interrupted' >&2\n")
         };
         std::fs::write(&helper_path,format!(
-            "#!/bin/sh\nIFS= read -r fixture_url\nIFS= read -r fixture_input\n[ -n \"$fixture_url\" ] && [ -n \"$fixture_input\" ] || exit 89\nfor fixture_arg do\n  [ \"$fixture_arg\" != \"$fixture_url\" ] && [ \"$fixture_arg\" != \"$fixture_input\" ] || exit 90\ndone\n{prepared}printf '%s\\n' '{output}'\nexit {code}\n")).unwrap();
+            "#!/bin/sh\nIFS= read -r fixture_url\nIFS= read -r fixture_input\n[ -n \"$fixture_url\" ] && [ -n \"$fixture_input\" ] || exit 89\nfor fixture_arg do\n  [ \"$fixture_arg\" != \"$fixture_url\" ] && [ \"$fixture_arg\" != \"$fixture_input\" ] || exit 90\ndone\n{prepared}printf '%s\\n' '{output}'\n{termination}\n")).unwrap();
         std::fs::set_permissions(&helper_path, std::fs::Permissions::from_mode(0o700)).unwrap();
         // This is only the test process environment; live agents are separate.
         std::env::set_var("DUSK_TX_BIN", &helper_path);
@@ -235,4 +268,51 @@ async fn included_failure_must_preserve_outcome_for_gas_accounting() {
         "an included failure must return its TxOutcome so PendingMessage records gas expenditure",
     ));
     assert_eq!(fixture.queries.load(Ordering::SeqCst), 1);
+}
+
+async fn assert_interrupted_helper_reconciles(helper: Helper) {
+    let _env_guard = HELPER_ENV.lock().await;
+    let fixture = Fixture::start(helper);
+    assert_failed_outcome(process(&fixture).await.unwrap_or_else(|error| {
+        panic!("{helper:?} must reconcile the prepared transaction: {error}")
+    }));
+    assert_eq!(fixture.queries.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn abrupt_helper_exit_reconciles_prepared_transaction() {
+    assert_interrupted_helper_reconciles(Helper::AbruptExit).await;
+}
+
+#[tokio::test]
+async fn signaled_helper_reconciles_prepared_transaction() {
+    assert_interrupted_helper_reconciles(Helper::Interrupted).await;
+}
+
+#[tokio::test]
+async fn malformed_helper_output_reconciles_prepared_transaction() {
+    assert_interrupted_helper_reconciles(Helper::MalformedOutput).await;
+}
+
+#[tokio::test]
+async fn missing_output_transaction_id_reconciles_prepared_transaction() {
+    assert_interrupted_helper_reconciles(Helper::MissingTransactionId).await;
+}
+
+#[tokio::test]
+async fn unrecognized_helper_error_reconciles_prepared_transaction() {
+    assert_interrupted_helper_reconciles(Helper::UnrecognizedError).await;
+}
+
+#[tokio::test]
+async fn complete_preverify_failures_do_not_query_or_charge_a_receipt() {
+    let _env_guard = HELPER_ENV.lock().await;
+    for helper in [Helper::PreverifyRejected, Helper::PreverifyUnavailable] {
+        let fixture = Fixture::start(helper);
+        assert!(process(&fixture)
+            .await
+            .unwrap_err()
+            .contains("before propagation"));
+        assert_eq!(fixture.queries.load(Ordering::SeqCst), 0);
+    }
 }
