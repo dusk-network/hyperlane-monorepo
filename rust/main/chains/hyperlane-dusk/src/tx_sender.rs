@@ -125,6 +125,20 @@ pub async fn dusk_tx_call(
         // Try to parse error from JSON output
         if let Ok(json) = serde_json::from_str::<Value>(&stdout) {
             if let Some(err) = json.get("error").and_then(|e| e.as_str()) {
+                // Diagnostic bodies are opaque. Only the helper's anchored
+                // transaction prefix can report an identity, and it cannot
+                // replace the locally prepared hash captured from stderr.
+                if let Some(prepared) = prepared_tx_id.as_deref() {
+                    if transaction_error_parts(err)
+                        .is_some_and(|(reported, _)| !prepared.eq_ignore_ascii_case(reported))
+                    {
+                        return Err(helper_failure(
+                            Some(prepared),
+                            "dusk-tx error transaction ID disagrees with the prepared transaction"
+                                .into(),
+                        ));
+                    }
+                }
                 if let Some(tx_id) = included_failure_tx_id(err) {
                     return Err(HyperlaneDuskError::TransactionExecutionFailed {
                         tx_id,
@@ -157,15 +171,19 @@ pub async fn dusk_tx_call(
             format!("Failed to parse dusk-tx output as JSON: {e}. Output: {stdout}"),
         )
     })?;
+    let returned_id = json
+        .get("tx_id")
+        .and_then(Value::as_str)
+        .and_then(|tx_id| dusk_tx_id_to_h512(tx_id).ok());
     if json.get("success").and_then(Value::as_bool) != Some(true)
-        || json
-            .get("tx_id")
-            .and_then(Value::as_str)
-            .is_none_or(|tx_id| dusk_tx_id_to_h512(tx_id).is_err())
+        || returned_id.is_none()
+        || prepared_tx_id
+            .as_deref()
+            .is_some_and(|prepared| dusk_tx_id_to_h512(prepared).ok() != returned_id)
     {
         return Err(helper_failure(
             prepared_tx_id.as_deref(),
-            "dusk-tx output is missing a successful result with a valid transaction ID".into(),
+            "dusk-tx output is missing a successful result with the prepared transaction ID".into(),
         ));
     }
 
@@ -391,26 +409,26 @@ pub fn process_args(
     Ok(args)
 }
 
-// The helper's confirmed-failure diagnostic starts with its locally computed
-// hash. Do not accept a hash merely quoted inside a pre-submission RPC error.
-fn included_failure_tx_id(error: &str) -> Option<String> {
-    let (tx_id, _) = error
-        .strip_prefix("Transaction ")?
-        .split_once(" failed: ")?;
+// Only the helper-owned leading fields carry transaction identity. RPC response
+// text is opaque and must not supply a replacement through a quoted tx_id field.
+fn transaction_error_parts(error: &str) -> Option<(&str, &str)> {
+    let (tx_id, detail) = error.strip_prefix("Transaction ")?.split_once(' ')?;
     (tx_id.len() == 64 && tx_id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some((tx_id, detail))
+}
+
+fn included_failure_tx_id(error: &str) -> Option<String> {
+    let (tx_id, detail) = transaction_error_parts(error)?;
+    detail
+        .starts_with("failed: ")
         .then(|| tx_id.to_ascii_lowercase())
 }
 
 fn outcome_unknown_tx_id(error: &str) -> Option<String> {
-    if !error.contains("submission failed: Propagation outcome unknown")
-        && !error.contains("confirmation outcome unknown")
-    {
-        return None;
-    }
-    let tx_id = error.split("tx_id=").nth(1)?.split_whitespace().next()?;
-    let tx_id = tx_id.trim_end_matches(|character: char| !character.is_ascii_hexdigit());
-    (tx_id.len() == 64 && tx_id.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .then(|| tx_id.to_ascii_lowercase())
+    let (tx_id, detail) = transaction_error_parts(error)?;
+    (detail.starts_with("submission failed: Propagation outcome unknown")
+        || detail.starts_with("confirmation outcome unknown"))
+    .then(|| tx_id.to_ascii_lowercase())
 }
 
 /// Build rkyv-serialized args for validator_announce.announce(validator, location, signature).
@@ -454,6 +472,18 @@ mod tests {
             "Transaction {tx_id} submission failed: Propagation rejected; retain tx_id={tx_id}"
         );
         assert_eq!(outcome_unknown_tx_id(&rejected), None);
+    }
+
+    #[test]
+    fn opaque_diagnostics_do_not_change_error_identity_or_classification() {
+        let tx_id = "ab".repeat(32);
+        let other = "cd".repeat(32);
+        let error = format!("Transaction {tx_id} confirmation outcome unknown: diagnostic tx_id={other}; retain tx_id={tx_id}");
+        assert_eq!(outcome_unknown_tx_id(&error), Some(tx_id.clone()));
+        let preverify = format!("Transaction {tx_id} submission failed: Preverify rejected before propagation (400): diagnostic confirmation outcome unknown tx_id={other}");
+        assert_eq!(outcome_unknown_tx_id(&preverify), None);
+        assert!(before_propagation_error(&preverify));
+        assert_eq!(outcome_unknown_tx_id(&format!("Diagnostic: {error}")), None);
     }
 
     #[test]

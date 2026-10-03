@@ -1094,6 +1094,30 @@ impl ChainConf {
         }
     }
 
+    /// Build the strict state reader used before validator self-announcement.
+    /// Dusk relayer aggregation separately permits partial validator results.
+    pub async fn build_validator_self_announce_reader(
+        &self,
+        metrics: &CoreMetrics,
+    ) -> Result<Box<dyn ValidatorAnnounce>> {
+        if let ChainConnectionConf::Dusk(conf) = &self.connection {
+            let provider = Arc::new(build_dusk_provider(self, conf).await?);
+            let rues = provider.rues().clone();
+            let reader = h_dusk::DuskValidatorAnnounce::new(
+                provider,
+                rues,
+                self.addresses.validator_announce,
+                self.domain.clone(),
+                None,
+                conf.clone(),
+            )
+            .with_strict_reads();
+            Ok(Box::new(reader))
+        } else {
+            self.build_validator_announce_reader(metrics).await
+        }
+    }
+
     /// Try to convert the chain settings into a ValidatorAnnounce
     pub async fn build_validator_announce(
         &self,

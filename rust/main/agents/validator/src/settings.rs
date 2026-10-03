@@ -1069,6 +1069,7 @@ mod dusk_rpc_tests {
         WrongAnnounceMailbox,
         WrongMerkleMailbox,
         WrongRequiredHook,
+        AnnounceUnavailable,
     }
 
     struct Node {
@@ -1206,6 +1207,13 @@ mod dusk_rpc_tests {
                     } else if path == "/on/graphql/query" {
                         assert_eq!(body, b"query { lastBlockPair { json } }");
                         (200, br#"{"lastBlockPair":{"json":{"last_block":[100,"tip"],"last_finalized_block":[90,"final"]}}}"#.to_vec())
+                    } else if path.ends_with("/get_announced_storage_locations_for_validator") {
+                        if current == Fault::AnnounceUnavailable as u8 {
+                            (503, b"temporarily unavailable".to_vec())
+                        } else {
+                            // rkyv archived empty Vec<String>: zero offset and length.
+                            (200, vec![0; 8])
+                        }
                     } else if path.ends_with("/count") {
                         (200, 1u32.to_le_bytes().to_vec())
                     } else if path.ends_with("/inserted_block_height") {
@@ -1331,6 +1339,75 @@ mod dusk_rpc_tests {
         .into_iter()
         .map(|(_, hook)| hook)
         .collect()
+    }
+
+    #[test]
+    fn dusk_endpoint_deduplication_uses_request_url_semantics() {
+        use crate::rpc::{dedupe_rpc_urls, state_read_urls};
+        let urls: Vec<Url> = [
+            "https://rpc.example/rpc",
+            "https://rpc.example/rpc/",
+            "https://rpc.example/rpc/#display",
+            "https://other.example/rpc",
+            "https://rpc.example/rpc?token=one/",
+            "https://rpc.example/rpc?token=one",
+            "https://reader:fixture@rpc.example/rpc",
+            "https://rpc.example/encoded%2Fpath",
+        ]
+        .iter()
+        .map(|url| Url::parse(url).unwrap())
+        .collect();
+        let configuration = Configuration::new(&urls);
+        let (source, selected) = state_read_urls(&configuration.chain, urls.clone());
+        assert_eq!(
+            dedupe_rpc_urls(selected, source),
+            [
+                urls[0].clone(),
+                urls[3].clone(),
+                urls[4].clone(),
+                urls[5].clone(),
+                urls[6].clone(),
+                urls[7].clone()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn dusk_self_announce_reader_preserves_observation_errors_and_recovers() {
+        let node = Node::start(Fault::None);
+        let configuration = Configuration::new(&[node.url.clone()]);
+        let metrics = metrics();
+        let strict = configuration
+            .chain
+            .build_validator_self_announce_reader(&metrics)
+            .await
+            .unwrap();
+        let partial = configuration
+            .chain
+            .build_validator_announce_reader(&metrics)
+            .await
+            .unwrap();
+        node.set_fault(Fault::AnnounceUnavailable);
+        let validators = [H256::repeat_byte(7)];
+        assert!(strict
+            .get_announced_storage_locations(&validators)
+            .await
+            .is_err());
+        assert_eq!(
+            partial
+                .get_announced_storage_locations(&validators)
+                .await
+                .unwrap(),
+            vec![Vec::<String>::new()]
+        );
+        node.set_fault(Fault::None);
+        assert_eq!(
+            strict
+                .get_announced_storage_locations(&validators)
+                .await
+                .unwrap(),
+            vec![Vec::<String>::new()]
+        );
     }
 
     #[tokio::test]

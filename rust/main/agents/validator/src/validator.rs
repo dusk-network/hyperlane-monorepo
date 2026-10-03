@@ -1036,7 +1036,7 @@ impl Validator {
         // their locations, which makes them functionally unusable.
         let validator_announce = self
             .origin_chain_conf
-            .build_validator_announce_reader(&self.core.metrics)
+            .build_validator_self_announce_reader(&self.core.metrics)
             .await?;
         // Only a real submission needs a signer, gas oracle, or escalator.
         let mut submission_contract: Option<Box<dyn ValidatorAnnounce>> = None;
@@ -1044,11 +1044,24 @@ impl Validator {
         let mut retry_backoff = AnnouncementRetryBackoff::default();
         loop {
             info!("Checking for validator announcement");
-            if let Some(locations) = validator_announce
+            let observed_locations = match validator_announce
                 .get_announced_storage_locations(&validators)
-                .await?
-                .first()
+                .await
             {
+                Ok(locations) => locations,
+                Err(error)
+                    if matches!(
+                        self.origin_chain_conf.connection,
+                        hyperlane_base::settings::ChainConnectionConf::Dusk(_)
+                    ) =>
+                {
+                    warn!(%error, "Could not observe Dusk announcement; retrying without submitting");
+                    sleep(self.interval).await;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if let Some(locations) = observed_locations.first() {
                 if locations.contains(&announcement_location) {
                     info!(
                         ?locations,

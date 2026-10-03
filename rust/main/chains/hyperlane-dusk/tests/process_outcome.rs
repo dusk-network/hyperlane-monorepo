@@ -38,6 +38,9 @@ enum Helper {
     UnrecognizedError,
     PreverifyRejected,
     PreverifyUnavailable,
+    SuccessDifferentIdentity,
+    ErrorDifferentIdentity,
+    OpaqueDiagnosticIdentity,
 }
 struct Fixture {
     url: Url,
@@ -52,6 +55,21 @@ impl Fixture {
         let tx = hex::encode(TX);
         let (value, code) = match helper {
             Helper::Success => (serde_json::json!({"success":true,"tx_id":tx}), 0),
+            Helper::SuccessDifferentIdentity => (
+                serde_json::json!({"success":true,"tx_id":"22".repeat(32)}),
+                0,
+            ),
+            Helper::ErrorDifferentIdentity => (
+                serde_json::json!({"success":false,"error":format!(
+                    "Transaction {} failed: unrelated observation", "22".repeat(32))}),
+                1,
+            ),
+            Helper::OpaqueDiagnosticIdentity => (
+                serde_json::json!({"success":false,"error":format!(
+                    "Transaction {tx} submission failed: Propagation outcome unknown: diagnostic tx_id={}; retain tx_id={tx}", "22".repeat(32))}),
+                1,
+            ),
+
             Helper::OutcomeUnknown => (
                 serde_json::json!({"success":false,"error":format!(
                 "Transaction {tx} confirmation outcome unknown: temporary query error; retain tx_id={tx} and reconcile this exact hash before retrying")}),
@@ -314,5 +332,16 @@ async fn complete_preverify_failures_do_not_query_or_charge_a_receipt() {
             .unwrap_err()
             .contains("before propagation"));
         assert_eq!(fixture.queries.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn helper_results_cannot_replace_the_prepared_transaction_identity() {
+    for helper in [
+        Helper::SuccessDifferentIdentity,
+        Helper::ErrorDifferentIdentity,
+        Helper::OpaqueDiagnosticIdentity,
+    ] {
+        assert_interrupted_helper_reconciles(helper).await;
     }
 }

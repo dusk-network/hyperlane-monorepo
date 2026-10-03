@@ -46,7 +46,21 @@ pub(crate) fn state_read_urls(chain: &ChainConf, rpc_urls: Vec<Url>) -> (&'stati
             ("walletSolidityUrls", conn.wallet_solidity_urls.clone())
         }
         ChainConnectionConf::Radix(conn) => ("rpcUrls", conn.core.clone()),
-        ChainConnectionConf::Dusk(_) => ("rpcUrls", rpc_urls),
+        ChainConnectionConf::Dusk(_) => {
+            // Match Dusk RUES request construction before the shared deduper:
+            // trailing pathname slashes and fragments do not select a node.
+            // Authentication, query strings and encoded paths remain distinct.
+            let urls = rpc_urls
+                .into_iter()
+                .map(|mut url| {
+                    let path = url.path().trim_end_matches('/').to_owned();
+                    url.set_path(&path);
+                    url.set_fragment(None);
+                    url
+                })
+                .collect();
+            ("rpcUrls", urls)
+        }
         #[cfg(feature = "aleo")]
         ChainConnectionConf::Aleo(conn) => ("rpcUrls", conn.rpcs.clone()),
     }

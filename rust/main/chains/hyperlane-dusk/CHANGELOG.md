@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Prepared transaction IDs remained authoritative when helper diagnostics or results disagreed ([Dusk invariant review]).
+- Equivalent Dusk request URLs counted as one validator checkpoint endpoint ([Dusk invariant review]).
+- Self-announcement required a successful state read before submitting a transaction ([Dusk invariant review]).
+
 - Interrupted helper calls retained their prepared transaction identity for exact-hash receipt reconciliation ([Dusk invariant review]).
 - RUES routes preserved RPC base-path prefixes and query parameters ([Dusk invariant review]).
 - Deployment checks bound ValidatorAnnounce and the required Merkle-hook topology to the configured Mailbox ([Dusk invariant review]).

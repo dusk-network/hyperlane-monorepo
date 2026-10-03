@@ -240,3 +240,11 @@ Fresh independent GPT-5.6 xhigh and Controlecentrum deep/xhigh reviews must
 target these frozen source heads. Any source change after those reviews
 invalidates the affected evidence and requires a new pin and proportionate
 rerun.
+
+### October 2026 review follow-up
+
+The locally prepared transaction ID remains authoritative if helper output disagrees. Receipt reconciliation never selects an ID from an RPC diagnostic body. A complete, matching preverify failure remains a pre-submission failure.
+
+Validator checkpoint and reorg endpoint lists remove known Dusk request aliases before counting votes: trailing pathname slashes and URL fragments do not create another endpoint. Query values and authentication remain significant. Operators still need independently operated providers; URL normalization cannot establish provider independence.
+
+Validator self-announcement uses strict storage-location reads. Transport, schema and validation failures remain unknown observations; the validator waits and reads again without submitting. Relayer aggregation retains per-validator partial results so one unavailable record does not hide healthy validators.
