@@ -555,7 +555,7 @@ impl ChainConf {
                 Ok(Box::new(hook) as Box<dyn MerkleTreeHook>)
             }
             ChainConnectionConf::Dusk(conf) => {
-                let provider = Arc::new(build_dusk_state_provider(self, conf).await?);
+                let provider = Arc::new(build_dusk_state_provider(self, conf)?);
                 let rues = provider.rues().clone();
                 let mailbox = h_dusk::DuskMailbox::new(
                     provider,
@@ -566,7 +566,10 @@ impl ChainConf {
                     None,
                     conf.clone(),
                 );
-                let hook = h_dusk::DuskMerkleTreeHook::new(mailbox);
+                let hook = h_dusk::DuskMerkleTreeHook::new_with_identity_validation(
+                    mailbox,
+                    self.addresses.validator_announce,
+                );
                 Ok(Box::new(hook) as Box<dyn MerkleTreeHook>)
             }
             #[cfg(feature = "aleo")]
@@ -1088,6 +1091,30 @@ impl ChainConf {
             .await
         } else {
             self.build_validator_announce(metrics).await
+        }
+    }
+
+    /// Build the strict state reader used before validator self-announcement.
+    /// Dusk relayer aggregation separately permits partial validator results.
+    pub async fn build_validator_self_announce_reader(
+        &self,
+        metrics: &CoreMetrics,
+    ) -> Result<Box<dyn ValidatorAnnounce>> {
+        if let ChainConnectionConf::Dusk(conf) = &self.connection {
+            let provider = Arc::new(build_dusk_provider(self, conf).await?);
+            let rues = provider.rues().clone();
+            let reader = h_dusk::DuskValidatorAnnounce::new(
+                provider,
+                rues,
+                self.addresses.validator_announce,
+                self.domain.clone(),
+                None,
+                conf.clone(),
+            )
+            .with_strict_reads();
+            Ok(Box::new(reader))
+        } else {
+            self.build_validator_announce_reader(metrics).await
         }
     }
 
@@ -1867,6 +1894,29 @@ fn build_tron_provider(
     )
 }
 
+/// Returns whether startup failed while observing Dusk deployment identity.
+/// Local client, event-store and signer construction errors are not retryable.
+pub fn is_dusk_identity_observation_error(error: &Report) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<DuskIdentityObservationError>())
+}
+
+#[derive(Debug)]
+struct DuskIdentityObservationError(Report);
+
+impl std::fmt::Display for DuskIdentityObservationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Dusk identity observation failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for DuskIdentityObservationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
 async fn build_dusk_provider(
     chain_conf: &ChainConf,
     connection_conf: &h_dusk::ConnectionConf,
@@ -1878,14 +1928,16 @@ async fn build_dusk_provider(
     validate_dusk_provider(chain_conf, connection_conf, rues).await
 }
 
-async fn build_dusk_state_provider(
+fn build_dusk_state_provider(
     chain_conf: &ChainConf,
     connection_conf: &h_dusk::ConnectionConf,
 ) -> Result<h_dusk::DuskProvider> {
     // Checkpoint readers query contract state only. Each quorum endpoint needs
     // its own client, without competing for the indexer's exclusive event DB.
     let rues = Arc::new(h_dusk::RuesClient::new(connection_conf.url.clone())?);
-    validate_dusk_provider(chain_conf, connection_conf, rues).await
+    // The state hook validates identity on its first read, inside the quorum's
+    // deadline. One unavailable endpoint must not veto construction of the pool.
+    Ok(h_dusk::DuskProvider::new(chain_conf.domain.clone(), rues))
 }
 
 async fn validate_dusk_provider(
@@ -1900,7 +1952,9 @@ async fn validate_dusk_provider(
         chain_conf.domain.id(),
         &mailbox_id,
         &validator_announce_id,
+        &chain_conf.addresses.merkle_tree_hook.into(),
     )
-    .await?;
+    .await
+    .map_err(|error| DuskIdentityObservationError(error.into()))?;
     Ok(h_dusk::DuskProvider::new(chain_conf.domain.clone(), rues))
 }

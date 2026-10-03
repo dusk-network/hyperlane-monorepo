@@ -16,7 +16,7 @@ use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 use serde_json::Value as JsonValue;
 use url::Url;
 
-use hyperlane_core::{H256, H512};
+use hyperlane_core::{ReorgPeriod, H256, H512};
 
 use crate::HyperlaneDuskError;
 
@@ -36,7 +36,7 @@ static SHARED_RUES_CLIENTS: OnceLock<StdMutex<SharedRuesClients>> = OnceLock::ne
 #[derive(Clone)]
 pub struct RuesClient {
     client: reqwest::Client,
-    base_url: String,
+    base_url: Url,
     finalized_event_caches: Arc<tokio::sync::Mutex<HashMap<[u8; 32], FinalizedEventCache>>>,
     event_store: Option<Arc<DB>>,
 }
@@ -118,9 +118,9 @@ struct FinalizedEventPage {
 
 #[derive(Debug, Clone, Default)]
 struct FinalizedEventCache {
-    /// Each requested topic scans the contract stream independently. This
-    /// prevents one topic from skipping unrequested peers without retaining an
-    /// unbounded pending-event buffer. All endpoint-owned scan state is
+    /// Each topic retains only a cursor before its last requested block.
+    /// Same-block peers can then be found in any archive order without an
+    /// unbounded pending-event buffer. These endpoint-owned hints are
     /// process-local and rebuilt from genesis after restart.
     scans: HashMap<String, FinalizedEventScan>,
 }
@@ -129,7 +129,8 @@ struct FinalizedEventCache {
 struct FinalizedEventScan {
     cursor: Option<String>,
     last_id: Option<i64>,
-    replayed: usize,
+    /// Every row before this cursor had a height below this bound.
+    before_block: u64,
 }
 
 /// Row-owned provenance for one finalized, state-matched contract event.
@@ -147,9 +148,12 @@ impl RuesClient {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()?;
-        // Normalize to avoid footguns around missing/extra trailing slashes.
-        let base_url = url.to_string();
-        let base_url = base_url.trim_end_matches('/').to_string();
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(HyperlaneDuskError::Other(
+                "Dusk RUES URL must use HTTP or HTTPS".into(),
+            ));
+        }
+        let base_url = url;
         Ok(Self {
             client,
             base_url,
@@ -165,10 +169,10 @@ impl RuesClient {
         url: Url,
         event_cursor_dir: PathBuf,
     ) -> Result<Self, HyperlaneDuskError> {
-        let key = (
-            url.as_str().trim_end_matches('/').to_owned(),
-            event_cursor_dir.clone(),
-        );
+        let mut canonical_url = url.clone();
+        canonical_url.set_path(url.path().trim_end_matches('/'));
+        canonical_url.set_fragment(None);
+        let key = (canonical_url.to_string(), event_cursor_dir.clone());
         let shared = SHARED_RUES_CLIENTS.get_or_init(|| StdMutex::new(HashMap::new()));
         let mut shared = shared.lock().map_err(|_| {
             HyperlaneDuskError::Other("Shared Dusk RUES client registry is poisoned".into())
@@ -188,6 +192,13 @@ impl RuesClient {
         client.event_store = Some(Arc::new(event_store));
         shared.insert(key, client.clone());
         Ok(client)
+    }
+
+    fn endpoint(&self, path: &str) -> Url {
+        let mut url = self.base_url.clone();
+        url.set_path(&format!("{}{path}", url.path().trim_end_matches('/')));
+        url.set_fragment(None);
+        url
     }
 
     /// Query the native Dusk chain ID from the transfer contract.
@@ -214,6 +225,7 @@ impl RuesClient {
         expected_domain: u32,
         mailbox_id: &[u8; 32],
         validator_announce_id: &[u8; 32],
+        merkle_tree_hook_id: &[u8; 32],
     ) -> Result<(), HyperlaneDuskError> {
         let observed_chain_id = self.chain_id().await?;
         if observed_chain_id != expected_chain_id {
@@ -240,6 +252,64 @@ impl RuesClient {
                 )));
             }
         }
+        self.validate_mailbox_binding(validator_announce_id, mailbox_id, "ValidatorAnnounce")
+            .await?;
+
+        // The supported deployments attach the Merkle hook directly, or as a
+        // child of the required static aggregation. A matching local domain
+        // alone cannot identify the deployment whose checkpoints we sign.
+        let required: [u8; 32] = self
+            .contract_query(mailbox_id, "required_hook", &())
+            .await?;
+        let hook_type: u8 = self
+            .contract_query(merkle_tree_hook_id, "hook_type", &())
+            .await?;
+        if hook_type != 3 {
+            return Err(HyperlaneDuskError::Other(
+                "Configured Dusk MerkleTreeHook does not have MerkleTree hook_type 3".into(),
+            ));
+        }
+        if required == *merkle_tree_hook_id {
+            self.validate_mailbox_binding(merkle_tree_hook_id, mailbox_id, "MerkleTreeHook")
+                .await?;
+        } else {
+            let required_type: u8 = self.contract_query(&required, "hook_type", &()).await?;
+            if required_type != 2 {
+                return Err(HyperlaneDuskError::Other(
+                    "Dusk Mailbox required_hook must be the configured MerkleTreeHook or its static aggregation".into(),
+                ));
+            }
+            self.validate_mailbox_binding(&required, mailbox_id, "required aggregation hook")
+                .await?;
+            let hooks: Vec<[u8; 32]> = self.contract_query(&required, "hooks", &()).await?;
+            if hooks
+                .iter()
+                .filter(|hook| *hook == merkle_tree_hook_id)
+                .count()
+                != 1
+            {
+                return Err(HyperlaneDuskError::Other(
+                    "Dusk required aggregation must contain the configured MerkleTreeHook exactly once".into(),
+                ));
+            }
+            self.validate_mailbox_binding(merkle_tree_hook_id, &required, "MerkleTreeHook")
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn validate_mailbox_binding(
+        &self,
+        contract: &[u8; 32],
+        expected_mailbox: &[u8; 32],
+        label: &str,
+    ) -> Result<(), HyperlaneDuskError> {
+        let mailbox: [u8; 32] = self.contract_query(contract, "mailbox", &()).await?;
+        if mailbox != *expected_mailbox {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Configured Dusk {label} mailbox does not match the configured deployment"
+            )));
+        }
         Ok(())
     }
 
@@ -251,11 +321,11 @@ impl RuesClient {
         body: &[u8],
     ) -> Result<Vec<u8>, HyperlaneDuskError> {
         let contract_hex = hex::encode(contract_id);
-        let url = format!("{}/on/contracts:{}/{}", self.base_url, contract_hex, method);
+        let url = self.endpoint(&format!("/on/contracts:{contract_hex}/{method}"));
 
         let response = self
             .client
-            .post(&url)
+            .post(url)
             .headers(self.default_headers())
             .body(body.to_vec())
             .send()
@@ -279,11 +349,11 @@ impl RuesClient {
         contract_id: &[u8; 32],
     ) -> Result<ContractMetadata, HyperlaneDuskError> {
         let contract_hex = hex::encode(contract_id);
-        let url = format!("{}/on/contract:{}/metadata", self.base_url, contract_hex);
+        let url = self.endpoint(&format!("/on/contract:{contract_hex}/metadata"));
 
         let response = self
             .client
-            .post(&url)
+            .post(url)
             .headers(self.default_headers())
             .body(Vec::new())
             .send()
@@ -326,10 +396,10 @@ impl RuesClient {
     /// Propagate a serialized transaction to the network.
     pub async fn propagate_tx(&self, tx_bytes: &[u8]) -> Result<(), HyperlaneDuskError> {
         // Preverify first
-        let preverify_url = format!("{}/on/transactions/preverify", self.base_url);
+        let preverify_url = self.endpoint("/on/transactions/preverify");
         let response = self
             .client
-            .post(&preverify_url)
+            .post(preverify_url)
             .headers(self.default_headers())
             .body(tx_bytes.to_vec())
             .send()
@@ -344,11 +414,11 @@ impl RuesClient {
             });
         }
 
-        let url = format!("{}/on/transactions/propagate", self.base_url);
+        let url = self.endpoint("/on/transactions/propagate");
 
         let response = self
             .client
-            .post(&url)
+            .post(url)
             .headers(self.default_headers())
             .body(tx_bytes.to_vec())
             .send()
@@ -368,11 +438,11 @@ impl RuesClient {
 
     /// Execute a GraphQL query against the node's `/on/graphql/query` endpoint.
     pub async fn graphql_query(&self, query: &str) -> Result<JsonValue, HyperlaneDuskError> {
-        let url = format!("{}/on/graphql/query", self.base_url);
+        let url = self.endpoint("/on/graphql/query");
 
         let response = self
             .client
-            .post(&url)
+            .post(url)
             .headers(self.default_headers())
             .body(query.as_bytes().to_vec())
             .send()
@@ -407,8 +477,11 @@ impl RuesClient {
         Ok(payload.get("data").cloned().unwrap_or(payload))
     }
 
-    /// Return one finalized contract event by its topic-local sequence and
-    /// prove its row-owned provenance against finalized block state.
+    /// Match one contract-state record to its finalized archive event.
+    ///
+    /// Archive IDs order transactions by hash within a block, not by contract
+    /// execution sequence. Only the expected height, topic and complete event
+    /// data identify the requested row; sequence names its durable local key.
     pub(crate) async fn finalized_contract_event(
         &self,
         contract_id: &[u8; 32],
@@ -417,38 +490,46 @@ impl RuesClient {
         expected_block_height: u64,
         expected_data: &[u8],
     ) -> Result<FinalizedEventProvenance, HyperlaneDuskError> {
-        loop {
-            if let Some(event) = self.load_finalized_event(contract_id, topic, sequence)? {
-                let result = self
-                    .validate_finalized_event(
-                        contract_id,
-                        topic,
-                        sequence,
-                        expected_block_height,
-                        expected_data,
-                        event,
-                    )
-                    .await;
-                if result.is_err() {
-                    self.invalidate_finalized_event(contract_id, topic, sequence)
-                        .await?;
-                }
-                return result;
+        if let Some(event) = self.load_finalized_event(contract_id, topic, sequence)? {
+            let result = self
+                .validate_finalized_event(
+                    contract_id,
+                    topic,
+                    sequence,
+                    expected_block_height,
+                    expected_data,
+                    event,
+                )
+                .await;
+            if matches!(&result, Err(HyperlaneDuskError::FinalizedEventMismatch(_))) {
+                self.invalidate_finalized_event(contract_id, topic, sequence)
+                    .await?;
             }
+            return result;
+        }
 
-            let scan = {
-                let mut caches = self.finalized_event_caches.lock().await;
-                let cache = caches.entry(*contract_id).or_default();
-                let scan = cache.scans.entry(topic.to_owned()).or_default();
-                // Exact rows are cached independently, so callers may begin at
-                // any sequence. Rewind a transient scan when asked to move
-                // behind it rather than trusting a remote cursor as authority.
-                if sequence < scan.replayed {
-                    *scan = FinalizedEventScan::default();
-                }
-                scan.clone()
-            };
+        let original_scan = {
+            let mut caches = self.finalized_event_caches.lock().await;
+            caches
+                .entry(*contract_id)
+                .or_default()
+                .scans
+                .entry(topic.to_owned())
+                .or_default()
+                .clone()
+        };
+        // A cursor before a later block says nothing about an earlier request.
+        let mut scan = if expected_block_height < original_scan.before_block {
+            FinalizedEventScan::default()
+        } else {
+            original_scan.clone()
+        };
+        let mut anchor = scan.clone();
+        anchor.before_block = expected_block_height;
+        let mut reached_block = false;
+        let expected_hex = hex::encode(expected_data);
 
+        loop {
             let page = self
                 .finalized_event_page(contract_id, scan.cursor.as_deref())
                 .await?;
@@ -459,57 +540,40 @@ impl RuesClient {
                 &page,
             )?;
             let has_next_page = page.has_next_page;
-
-            // Only one concurrent fetch may advance a contract cursor. If
-            // another task won the race, discard this page and retry from the
-            // now-current cache rather than duplicating rows.
-            let mut caches = self.finalized_event_caches.lock().await;
-            let cache = caches.entry(*contract_id).or_default();
-            let current_scan = cache.scans.get(topic).cloned().unwrap_or_default();
-            if current_scan != scan {
-                continue;
-            }
-            let mut candidate_scan = scan;
-            let mut cached = None;
+            let mut candidate = None;
             for event in page.events {
-                candidate_scan.last_id = Some(event.id);
-                if !event.reverted && event.topic == topic {
-                    let replayed = candidate_scan.replayed;
-                    // Only the caller-requested row becomes a candidate.
-                    // Prefix and page-peer rows remain endpoint assertions and
-                    // never acquire durable authority transitively.
-                    if replayed == sequence {
-                        let mut durable_event = event.clone();
-                        durable_event.id = i64::try_from(sequence).map_err(|_| {
-                            HyperlaneDuskError::Other(
-                                "Dusk finalized-event sequence exceeds i64 provenance range".into(),
-                            )
-                        })?;
-                        cached = Some(durable_event);
-                    }
-                    let next_replayed = replayed.checked_add(1).ok_or_else(|| {
-                        HyperlaneDuskError::Other(
-                            "Dusk finalized-event replay sequence overflow".into(),
-                        )
-                    })?;
-                    candidate_scan.replayed = next_replayed;
+                scan.last_id = Some(event.id);
+                scan.cursor = Some(canonical_event_cursor(event.id));
 
-                    // Keep the transient cursor immediately after the target
-                    // row. Advancing to the end of this page would skip
-                    // uncommitted later rows on the next request.
-                    if cached.is_some() {
-                        break;
+                // Advance only over a prefix entirely below the target height.
+                // Freeze the anchor before its first same-height (or later)
+                // peer, even if the matching row is on a later page. Subsequent
+                // requests for this block must still see earlier archive rows.
+                if !reached_block {
+                    if event.block_height < expected_block_height {
+                        anchor.last_id = scan.last_id;
+                        anchor.cursor = scan.cursor.clone();
+                    } else {
+                        reached_block = true;
                     }
                 }
+                if !event.reverted
+                    && event.topic == topic
+                    && event.block_height == expected_block_height
+                    && strip_hex_prefix(&event.data).eq_ignore_ascii_case(&expected_hex)
+                {
+                    let mut event = event;
+                    event.id = i64::try_from(sequence).map_err(|_| {
+                        HyperlaneDuskError::Other(
+                            "Dusk finalized-event sequence exceeds i64 provenance range".into(),
+                        )
+                    })?;
+                    candidate = Some(event);
+                    break;
+                }
             }
-            // This cursor is locally encoded but still derived from an
-            // endpoint-owned row ID. It is useful only in this process and is
-            // omitted from durable state.
-            candidate_scan.cursor = candidate_scan.last_id.map(canonical_event_cursor);
-            cache.scans.insert(topic.to_owned(), candidate_scan);
 
-            if let Some(event) = cached {
-                drop(caches);
+            if let Some(event) = candidate {
                 let result = self
                     .validate_finalized_event(
                         contract_id,
@@ -523,23 +587,71 @@ impl RuesClient {
                 let provenance = match result {
                     Ok(provenance) => provenance,
                     Err(error) => {
-                        self.invalidate_finalized_event(contract_id, topic, sequence)
-                            .await?;
+                        if matches!(&error, HyperlaneDuskError::FinalizedEventMismatch(_)) {
+                            self.invalidate_finalized_event(contract_id, topic, sequence)
+                                .await?;
+                        }
                         return Err(error);
                     }
                 };
-                // Contract state and checkBlock have authenticated this exact
-                // row. Persist it independently; no prefix or page peer is
-                // promoted by association.
+                // Only this independently state/checkBlock-validated row is
+                // durable. Page peers and cursor hints never gain authority.
                 self.persist_finalized_event(contract_id, topic, sequence, &event)?;
+                self.remember_finalized_event_scan(contract_id, topic, &original_scan, anchor)
+                    .await;
                 return Ok(provenance);
             }
             if !has_next_page {
+                // Archive IDs are endpoint-local hints. A repaired or replaced
+                // endpoint may assign lower IDs; exhaustion must let the next
+                // retry replay from genesis on this same client.
+                self.forget_finalized_event_scan(contract_id, topic, &original_scan)
+                    .await;
                 return Err(HyperlaneDuskError::Other(format!(
-                    "Finalized Dusk event {}/{topic} sequence {sequence} is not archived yet",
+                    "Finalized Dusk event {}/{topic} sequence {sequence} matching contract state is not archived yet",
                     hex::encode(contract_id)
                 )));
             }
+        }
+    }
+
+    /// Save a bounded replay hint without overwriting a concurrent lookup's
+    /// progress or moving an existing hint back for an older-block request.
+    async fn remember_finalized_event_scan(
+        &self,
+        contract_id: &[u8; 32],
+        topic: &str,
+        original: &FinalizedEventScan,
+        anchor: FinalizedEventScan,
+    ) {
+        let mut caches = self.finalized_event_caches.lock().await;
+        let current = caches
+            .entry(*contract_id)
+            .or_default()
+            .scans
+            .entry(topic.to_owned())
+            .or_default();
+        if current == original && anchor.before_block >= current.before_block {
+            *current = anchor;
+        }
+    }
+
+    async fn forget_finalized_event_scan(
+        &self,
+        contract_id: &[u8; 32],
+        topic: &str,
+        original: &FinalizedEventScan,
+    ) {
+        let mut caches = self.finalized_event_caches.lock().await;
+        let current = caches
+            .entry(*contract_id)
+            .or_default()
+            .scans
+            .entry(topic.to_owned())
+            .or_default();
+        // Do not discard progress installed by a concurrent successful lookup.
+        if current == original {
+            *current = FinalizedEventScan::default();
         }
     }
 
@@ -698,26 +810,26 @@ impl RuesClient {
         event: FinalizedContractEvent,
     ) -> Result<FinalizedEventProvenance, HyperlaneDuskError> {
         if event.reverted || event.topic != topic {
-            return Err(HyperlaneDuskError::Other(format!(
+            return Err(HyperlaneDuskError::FinalizedEventMismatch(format!(
                 "Finalized Dusk event {}/{topic} sequence {sequence} is reverted or has the wrong topic",
                 hex::encode(contract_id)
             )));
         }
         if event.block_height != expected_block_height {
-            return Err(HyperlaneDuskError::Other(format!(
+            return Err(HyperlaneDuskError::FinalizedEventMismatch(format!(
                 "Finalized Dusk event {}/{topic} sequence {sequence} has block height {}, contract state says {expected_block_height}",
                 hex::encode(contract_id),
                 event.block_height
             )));
         }
         let data = hex::decode(strip_hex_prefix(&event.data)).map_err(|error| {
-            HyperlaneDuskError::Other(format!(
+            HyperlaneDuskError::FinalizedEventMismatch(format!(
                 "Finalized Dusk event {}/{topic} sequence {sequence} has invalid data: {error}",
                 hex::encode(contract_id)
             ))
         })?;
         if data != expected_data {
-            return Err(HyperlaneDuskError::Other(format!(
+            return Err(HyperlaneDuskError::FinalizedEventMismatch(format!(
                 "Finalized Dusk event {}/{topic} sequence {sequence} does not match contract state",
                 hex::encode(contract_id)
             )));
@@ -745,7 +857,7 @@ impl RuesClient {
                 )
             })?;
         if !checked {
-            return Err(HyperlaneDuskError::Other(format!(
+            return Err(HyperlaneDuskError::FinalizedEventMismatch(format!(
                 "Finalized Dusk event block {}/{} failed checkBlock",
                 event.block_height, event.block_hash
             )));
@@ -764,10 +876,30 @@ impl RuesClient {
 
     /// Return the latest block height finalized by the node's consensus view.
     pub(crate) async fn finalized_block_height(&self) -> Result<u64, HyperlaneDuskError> {
+        self.checkpoint_block_height(&ReorgPeriod::None).await
+    }
+
+    /// Apply the configured block delay while retaining consensus finality as
+    /// an upper bound. Both heights come from one archive snapshot.
+    pub(crate) async fn checkpoint_block_height(
+        &self,
+        reorg_period: &ReorgPeriod,
+    ) -> Result<u64, HyperlaneDuskError> {
+        let delay = match reorg_period {
+            ReorgPeriod::None => 0,
+            ReorgPeriod::Blocks(blocks) => u64::from(blocks.get()),
+            ReorgPeriod::Tag(tag) if tag == "finalized" => 0,
+            ReorgPeriod::Tag(tag) => {
+                return Err(HyperlaneDuskError::Other(format!(
+                    "Dusk supports a numeric reorgPeriod or the finalized tag, got {tag:?}"
+                )));
+            }
+        };
         let data = self
             .graphql_query("query { lastBlockPair { json } }")
             .await?;
-        parse_finalized_block_height(&data)
+        let (latest, finalized) = parse_block_heights(&data)?;
+        Ok(finalized.min(latest.saturating_sub(delay)))
     }
 
     /// Return the finalized height in Hyperlane's shared u32 cursor range.
@@ -866,11 +998,11 @@ impl RuesClient {
 
     /// Query a Moonlight account status by bs58-encoded BLS public key.
     pub async fn account_status(&self, bs58_pk: &str) -> Result<AccountStatus, HyperlaneDuskError> {
-        let url = format!("{}/on/account:{}/status", self.base_url, bs58_pk);
+        let url = self.endpoint(&format!("/on/account:{bs58_pk}/status"));
 
         let response = self
             .client
-            .post(&url)
+            .post(url)
             .headers(self.default_headers())
             .body(Vec::new())
             .send()
@@ -922,11 +1054,11 @@ impl RuesClient {
         &self,
         max_transactions: usize,
     ) -> Result<GasPriceStats, HyperlaneDuskError> {
-        let url = format!("{}/on/blocks/gas-price", self.base_url);
+        let url = self.endpoint("/on/blocks/gas-price");
 
         let response = self
             .client
-            .post(&url)
+            .post(url)
             .headers(self.default_headers())
             .body(max_transactions.to_string())
             .send()
@@ -997,7 +1129,7 @@ fn parse_confirmed_transaction(
     Ok(ConfirmedTransaction { gas_spent, error })
 }
 
-fn parse_finalized_block_height(data: &JsonValue) -> Result<u64, HyperlaneDuskError> {
+fn parse_block_heights(data: &JsonValue) -> Result<(u64, u64), HyperlaneDuskError> {
     let pair = data
         .get("lastBlockPair")
         .and_then(|value| value.get("json"))
@@ -1031,7 +1163,7 @@ fn parse_finalized_block_height(data: &JsonValue) -> Result<u64, HyperlaneDuskEr
             "Rusk finalized height {finalized} exceeds latest height {latest}"
         )));
     }
-    Ok(finalized)
+    Ok((latest, finalized))
 }
 
 fn validate_finalized_event_page(
@@ -1297,6 +1429,102 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn request_routes_preserve_path_query_and_ignore_fragment() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        for suffix in [
+            "/rpc",
+            "/rpc/",
+            "/rpc?token=fixture%2Fvalue",
+            "/rpc#label",
+            "/rpc/?token=fixture%2Fvalue#label",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = std::thread::spawn(move || {
+                let mut paths = Vec::new();
+                for body in [
+                    vec![7],
+                    br#"{"tx":{"gasSpent":1,"err":null}}"#.to_vec(),
+                    br#"{"contract_owner":"fixture-owner"}"#.to_vec(),
+                    vec![],
+                    vec![],
+                    br#"{"balance":5,"nonce":1,"next_nonce":2}"#.to_vec(),
+                    br#"{"average":1,"max":2,"median":1,"min":0}"#.to_vec(),
+                ] {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                        .unwrap();
+                    let mut reader = BufReader::new(&mut stream);
+                    let mut first = String::new();
+                    reader.read_line(&mut first).unwrap();
+                    paths.push(first.split_whitespace().nth(1).unwrap().to_owned());
+                    let mut length = 0;
+                    loop {
+                        let mut header = String::new();
+                        assert_ne!(reader.read_line(&mut header).unwrap(), 0);
+                        if header == "\r\n" {
+                            break;
+                        }
+                        if let Some(value) =
+                            header.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
+                            length = value.trim().parse::<usize>().unwrap();
+                        }
+                    }
+                    let mut input = vec![0; length];
+                    reader.read_exact(&mut input).unwrap();
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .unwrap();
+                    stream.write_all(&body).unwrap();
+                }
+                paths
+            });
+            let client =
+                RuesClient::new(Url::parse(&format!("http://{address}{suffix}")).unwrap()).unwrap();
+            assert_eq!(client.chain_id().await.unwrap(), 7);
+            assert_eq!(
+                client
+                    .wait_for_tx(&"ab".repeat(32), Duration::from_secs(1))
+                    .await
+                    .unwrap()
+                    .gas_spent,
+                1
+            );
+            assert_eq!(
+                client
+                    .contract_metadata(&[2; 32])
+                    .await
+                    .unwrap()
+                    .contract_owner,
+                "fixture-owner"
+            );
+            client.propagate_tx(&[1]).await.unwrap();
+            assert_eq!(client.account_status("11111").await.unwrap().balance, 5);
+            assert_eq!(client.gas_price_stats(1).await.unwrap().max, 2);
+            let query = if suffix.contains('?') {
+                "?token=fixture%2Fvalue"
+            } else {
+                ""
+            };
+            assert_eq!(worker.join().unwrap(), vec![
+                format!("/rpc/on/contracts:0100000000000000000000000000000000000000000000000000000000000000/chain_id{query}"),
+                format!("/rpc/on/graphql/query{query}"),
+                format!("/rpc/on/contract:{}/metadata{query}", "02".repeat(32)),
+                format!("/rpc/on/transactions/preverify{query}"),
+                format!("/rpc/on/transactions/propagate{query}"),
+                format!("/rpc/on/account:11111/status{query}"),
+                format!("/rpc/on/blocks/gas-price{query}"),
+            ], "base suffix: {suffix}");
+        }
+    }
+
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
@@ -1325,11 +1553,12 @@ mod tests {
         }
     }
 
-    fn test_server(responses: Vec<(u16, &'static str)>) -> Url {
+    fn test_server<T: AsRef<[u8]> + Send + 'static>(responses: Vec<(u16, T)>) -> Url {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         thread::spawn(move || {
             for (status, body) in responses {
+                let body = body.as_ref();
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = Vec::new();
                 let mut buffer = [0u8; 4096];
@@ -1360,10 +1589,11 @@ mod tests {
                 };
                 write!(
                     stream,
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 )
                 .unwrap();
+                stream.write_all(body).unwrap();
             }
         });
         Url::parse(&format!("http://{address}")).unwrap()
@@ -1428,7 +1658,7 @@ mod tests {
     #[test]
     fn finalized_height_is_parsed_fail_closed() {
         assert_eq!(
-            parse_finalized_block_height(&serde_json::json!({
+            parse_block_heights(&serde_json::json!({
                 "lastBlockPair": {
                     "json": {
                         "last_block": [46, "latest"],
@@ -1437,9 +1667,9 @@ mod tests {
                 }
             }))
             .unwrap(),
-            45
+            (46, 45)
         );
-        assert!(parse_finalized_block_height(&serde_json::json!({
+        assert!(parse_block_heights(&serde_json::json!({
             "lastBlockPair": {
                 "json": {
                     "last_block": [45, "latest"],
@@ -1448,7 +1678,7 @@ mod tests {
             }
         }))
         .is_err());
-        assert!(parse_finalized_block_height(&serde_json::json!({})).is_err());
+        assert!(parse_block_heights(&serde_json::json!({})).is_err());
     }
 
     #[tokio::test]
@@ -1549,6 +1779,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replayed, provenance);
+    }
+
+    #[tokio::test]
+    async fn reverse_archive_rows_keep_exact_provenance_after_store_reopen() {
+        let contract_id = [7u8; 32];
+        let page = serde_json::json!({
+            "finalizedEvents": { "json": {
+                "events": ([2u8, 1u8].into_iter().enumerate().map(|(id, value)| {
+                    serde_json::json!({
+                        "id": id as i64, "block_height": 7,
+                        "block_hash": hex::encode([8u8; 32]),
+                        "origin": hex::encode([value; 32]),
+                        "topic": "dispatch", "source": hex::encode(contract_id),
+                        "data": hex::encode([value]), "reverted": false
+                    })
+                }).collect::<Vec<_>>()),
+                "startCursor": canonical_event_cursor(0),
+                "endCursor": canonical_event_cursor(1),
+                "hasNextPage": false
+            }}
+        })
+        .to_string();
+        let page: &'static str = Box::leak(page.into_boxed_str());
+        let directory = tempfile::tempdir().unwrap();
+        let store = directory.path().join("event-store");
+        let client = test_client_with_event_store(
+            test_server(vec![
+                (200, page),
+                (200, r#"{"checkBlock":true}"#),
+                (200, page),
+                (200, r#"{"checkBlock":true}"#),
+            ]),
+            &store,
+        );
+        for (sequence, value) in [1u8, 2].into_iter().enumerate() {
+            let row = client
+                .finalized_contract_event(&contract_id, "dispatch", sequence, 7, &[value])
+                .await
+                .unwrap();
+            assert_eq!(row.event_id, sequence as i64);
+            assert_eq!(&row.transaction_id.as_bytes()[32..], &[value; 32]);
+            if sequence == 0 {
+                assert!(client
+                    .load_finalized_event(&contract_id, "dispatch", 1)
+                    .unwrap()
+                    .is_none());
+            }
+        }
+        drop(client);
+        // Reopen the actual store with no archive pages available. Each row
+        // still requires its own finalized-block validation on cache replay.
+        let reopened = test_client_with_event_store(
+            test_server(vec![
+                (200, r#"{"checkBlock":true}"#),
+                (200, r#"{"checkBlock":true}"#),
+            ]),
+            &store,
+        );
+        for (sequence, value) in [(1usize, 2u8), (0, 1)] {
+            let row = reopened
+                .finalized_contract_event(&contract_id, "dispatch", sequence, 7, &[value])
+                .await
+                .unwrap();
+            assert_eq!(row.event_id, sequence as i64);
+            assert_eq!(&row.transaction_id.as_bytes()[32..], &[value; 32]);
+        }
     }
 
     #[tokio::test]
@@ -1989,10 +2285,177 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transient_block_checks_keep_durable_rows_quarantined_until_revalidation() {
+        let contract = [3u8; 32];
+        let event = FinalizedContractEvent {
+            id: 80,
+            block_height: 90,
+            block_hash: hex::encode([4; 32]),
+            origin: hex::encode([5; 32]),
+            topic: "dispatch".into(),
+            source: hex::encode(contract),
+            data: hex::encode([6]),
+            reverted: false,
+        };
+        for response in [
+            (503, "temporarily unavailable"),
+            (200, "{}"),
+            (200, "not-json"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let client = test_client_with_event_store(
+                test_server(vec![
+                    (200, r#"{"checkBlock":true}"#),
+                    response,
+                    (200, r#"{"checkBlock":true}"#),
+                ]),
+                directory.path(),
+            );
+            client
+                .validate_finalized_event(&contract, "dispatch", 80, 90, &[6], event.clone())
+                .await
+                .unwrap();
+            client
+                .persist_finalized_event(&contract, "dispatch", 80, &event)
+                .unwrap();
+            let scan = FinalizedEventScan {
+                cursor: Some(canonical_event_cursor(79)),
+                last_id: Some(79),
+                before_block: 90,
+            };
+            client
+                .finalized_event_caches
+                .lock()
+                .await
+                .entry(contract)
+                .or_default()
+                .scans
+                .insert("dispatch".into(), scan.clone());
+            assert!(client
+                .finalized_contract_event(&contract, "dispatch", 80, 90, &[6])
+                .await
+                .is_err());
+            assert!(client
+                .load_finalized_event(&contract, "dispatch", 80)
+                .unwrap()
+                .is_some());
+            assert_eq!(
+                client.finalized_event_caches.lock().await[&contract].scans["dispatch"],
+                scan
+            );
+            // This server has only a checkBlock response left: no archive replay.
+            let recovered = client
+                .finalized_contract_event(&contract, "dispatch", 80, 90, &[6])
+                .await
+                .unwrap();
+            assert_eq!(recovered.event_id, 80);
+            assert_eq!(recovered.block_height, 90);
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(
+            test_server(vec![(200, r#"{"checkBlock":false}"#)]),
+            directory.path(),
+        );
+        client
+            .persist_finalized_event(&contract, "dispatch", 80, &event)
+            .unwrap();
+        assert!(matches!(
+            client
+                .finalized_contract_event(&contract, "dispatch", 80, 90, &[6])
+                .await,
+            Err(HyperlaneDuskError::FinalizedEventMismatch(_))
+        ));
+        assert!(client
+            .load_finalized_event(&contract, "dispatch", 80)
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn identity_binds_the_required_hook_topology_and_announce_to_one_mailbox() {
+        let mailbox = [3u8; 32];
+        let announce = [4u8; 32];
+        let merkle = [5u8; 32];
+        let aggregate = [6u8; 32];
+        let foreign = [7u8; 32];
+        let prefix = || {
+            vec![
+                (200, vec![1]),
+                (200, rkyv_serialize(&4242u32).unwrap()),
+                (200, rkyv_serialize(&4242u32).unwrap()),
+                (200, rkyv_serialize(&mailbox).unwrap()),
+            ]
+        };
+        let mut direct = prefix();
+        direct.extend([
+            (200, rkyv_serialize(&merkle).unwrap()),
+            (200, vec![3]),
+            (200, rkyv_serialize(&mailbox).unwrap()),
+        ]);
+        RuesClient::new(test_server(direct))
+            .unwrap()
+            .validate_chain_identity(1, 4242, &mailbox, &announce, &merkle)
+            .await
+            .unwrap();
+        let aggregated = || {
+            let mut responses = prefix();
+            responses.extend([
+                (200, rkyv_serialize(&aggregate).unwrap()),
+                (200, vec![3]),
+                (200, vec![2]),
+                (200, rkyv_serialize(&mailbox).unwrap()),
+                (200, rkyv_serialize(&vec![merkle, foreign]).unwrap()),
+                (200, rkyv_serialize(&aggregate).unwrap()),
+            ]);
+            responses
+        };
+        RuesClient::new(test_server(aggregated()))
+            .unwrap()
+            .validate_chain_identity(1, 4242, &mailbox, &announce, &merkle)
+            .await
+            .unwrap();
+        for (position, bytes, diagnostic) in [
+            (
+                3,
+                rkyv_serialize(&foreign).unwrap(),
+                "ValidatorAnnounce mailbox",
+            ),
+            (5, vec![2], "MerkleTree hook_type"),
+            (6, vec![1], "required_hook"),
+            (
+                7,
+                rkyv_serialize(&foreign).unwrap(),
+                "required aggregation hook mailbox",
+            ),
+            (8, rkyv_serialize(&vec![foreign]).unwrap(), "exactly once"),
+            (
+                8,
+                rkyv_serialize(&vec![merkle, merkle]).unwrap(),
+                "exactly once",
+            ),
+            (
+                9,
+                rkyv_serialize(&mailbox).unwrap(),
+                "MerkleTreeHook mailbox",
+            ),
+        ] {
+            let mut responses = aggregated();
+            responses[position].1 = bytes;
+            responses.truncate(position + 1);
+            let error = RuesClient::new(test_server(responses))
+                .unwrap()
+                .validate_chain_identity(1, 4242, &mailbox, &announce, &merkle)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(diagnostic), "{error}");
+        }
+    }
+
+    #[tokio::test]
     async fn endpoint_chain_id_mismatch_fails_before_contract_queries() {
         let client = RuesClient::new(test_server(vec![(200, "\u{2}")])).unwrap();
         let error = client
-            .validate_chain_identity(1, 4242, &[3u8; 32], &[4u8; 32])
+            .validate_chain_identity(1, 4242, &[3u8; 32], &[4u8; 32], &[5u8; 32])
             .await
             .unwrap_err();
         assert!(error

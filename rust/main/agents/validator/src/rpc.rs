@@ -1,15 +1,71 @@
-//! Shared endpoint isolation for checkpoint verification and reorg diagnostics.
+//! RPC clients for checkpoint verification, reorg diagnostics and announcements.
 use futures_util::future::try_join_all;
 use hyperlane_base::{
-    settings::{ChainConf, ChainConnectionConf},
+    settings::{is_dusk_identity_observation_error, ChainConf, ChainConnectionConf},
     CoreMetrics,
 };
-use hyperlane_core::{ChainResult, MerkleTreeHook};
+use hyperlane_core::{ChainResult, MerkleTreeHook, ValidatorAnnounce};
 use hyperlane_ethereum::RpcConnectionConf;
 use hyperlane_metric::prometheus_metric::RpcRole;
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, future::Future, sync::Arc, time::Duration};
 use tracing::warn;
 use url::Url;
+
+/// Distinguishes strict observation from the signer-backed submission client.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AnnouncementClientKind {
+    Reader,
+    Submission,
+}
+
+/// Dusk identity reads happen during construction as well as ordinary queries.
+/// Keep startup waiting for a validated client when those observations fail.
+pub(crate) async fn build_announcement_client(
+    chain: &ChainConf,
+    metrics: &CoreMetrics,
+    kind: AnnouncementClientKind,
+    retry_interval: Duration,
+) -> eyre::Result<Box<dyn ValidatorAnnounce>> {
+    build_with_dusk_rpc_retry(chain, "announcement client", retry_interval, || async {
+        match kind {
+            AnnouncementClientKind::Reader => {
+                chain.build_validator_self_announce_reader(metrics).await
+            }
+            AnnouncementClientKind::Submission => chain.build_validator_announce(metrics).await,
+        }
+    })
+    .await
+}
+
+/// Dusk factories authenticate deployment identity through RPC. Keep every
+/// startup factory waiting for a validated result when that observation fails.
+/// Local construction failures return immediately so configuration can be fixed.
+/// Other protocols retain their existing one-attempt initialization behavior.
+pub(crate) async fn build_with_dusk_rpc_retry<T, F, Fut>(
+    chain: &ChainConf,
+    component: &'static str,
+    retry_interval: Duration,
+    mut build: F,
+) -> eyre::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = eyre::Result<T>>,
+{
+    loop {
+        match build().await {
+            Ok(client) => return Ok(client),
+            Err(error)
+                if matches!(chain.connection, ChainConnectionConf::Dusk(_))
+                    && is_dusk_identity_observation_error(&error) =>
+            {
+                warn!(%error, component, "Could not initialize validated Dusk RPC component; retrying");
+                // Bound retries even when the ordinary polling interval is zero.
+                tokio::time::sleep(retry_interval.max(Duration::from_secs(1))).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 /// Removes exact duplicate URLs (order-preserving). A duplicated endpoint would
 /// otherwise count as two independent votes, undermining the quorum's independence
@@ -46,7 +102,21 @@ pub(crate) fn state_read_urls(chain: &ChainConf, rpc_urls: Vec<Url>) -> (&'stati
             ("walletSolidityUrls", conn.wallet_solidity_urls.clone())
         }
         ChainConnectionConf::Radix(conn) => ("rpcUrls", conn.core.clone()),
-        ChainConnectionConf::Dusk(_) => ("rpcUrls", rpc_urls),
+        ChainConnectionConf::Dusk(_) => {
+            // Match Dusk RUES request construction before the shared deduper:
+            // trailing pathname slashes and fragments do not select a node.
+            // Authentication, query strings and encoded paths remain distinct.
+            let urls = rpc_urls
+                .into_iter()
+                .map(|mut url| {
+                    let path = url.path().trim_end_matches('/').to_owned();
+                    url.set_path(&path);
+                    url.set_fragment(None);
+                    url
+                })
+                .collect();
+            ("rpcUrls", urls)
+        }
         #[cfg(feature = "aleo")]
         ChainConnectionConf::Aleo(conn) => ("rpcUrls", conn.rpcs.clone()),
     }

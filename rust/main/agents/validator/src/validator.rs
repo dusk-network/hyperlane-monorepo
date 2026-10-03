@@ -47,7 +47,10 @@ use crate::reorg_reporter::{
     LatestCheckpointReorgReporter, LatestCheckpointReorgReporterWithStorageWriter, ReorgReporter,
 };
 use crate::reorg_tombstone;
-use crate::rpc::{build_validator_per_url_hooks, dedupe_rpc_urls, state_read_urls};
+use crate::rpc::{
+    build_announcement_client, build_validator_per_url_hooks, build_with_dusk_rpc_retry,
+    dedupe_rpc_urls, state_read_urls, AnnouncementClientKind,
+};
 use crate::server::{self as validator_server, merkle_tree_insertions, ValidatorReadiness};
 use crate::{
     settings::ValidatorSettings,
@@ -528,32 +531,42 @@ impl BaseAgent for Validator {
         let rpc_sync = if settings.lightweight {
             None
         } else {
-            Some(if let Some(cursor_state) = cursor_state.clone() {
-                settings
-                    .sequenced_contract_sync::<MerkleTreeInsertion, _>(
-                        &settings.origin_chain,
-                        &metrics,
-                        &contract_sync_metrics,
-                        Arc::new(CheckpointingMerkleTreeStore::new(
-                            msg_db.clone(),
-                            cursor_state,
-                        )),
-                        false,
-                        false,
-                    )
-                    .await?
-            } else {
-                settings
-                    .sequenced_contract_sync::<MerkleTreeInsertion, _>(
-                        &settings.origin_chain,
-                        &metrics,
-                        &contract_sync_metrics,
-                        msg_db.clone().into(),
-                        false,
-                        false,
-                    )
-                    .await?
-            })
+            Some(
+                build_with_dusk_rpc_retry(
+                    &origin_chain_conf,
+                    "Merkle tree indexer",
+                    settings.interval,
+                    || async {
+                        if let Some(cursor_state) = cursor_state.clone() {
+                            settings
+                                .sequenced_contract_sync::<MerkleTreeInsertion, _>(
+                                    &settings.origin_chain,
+                                    &metrics,
+                                    &contract_sync_metrics,
+                                    Arc::new(CheckpointingMerkleTreeStore::new(
+                                        msg_db.clone(),
+                                        cursor_state,
+                                    )),
+                                    false,
+                                    false,
+                                )
+                                .await
+                        } else {
+                            settings
+                                .sequenced_contract_sync::<MerkleTreeInsertion, _>(
+                                    &settings.origin_chain,
+                                    &metrics,
+                                    &contract_sync_metrics,
+                                    msg_db.clone().into(),
+                                    false,
+                                    false,
+                                )
+                                .await
+                        }
+                    },
+                )
+                .await?,
+            )
         };
         let sync_source = metrics.new_int_gauge(
             "merkle_tree_hook_sync_source_active",
@@ -659,15 +672,7 @@ impl BaseAgent for Validator {
             ));
         }
 
-        let metrics_updater = match ChainSpecificMetricsUpdater::new(
-            &self.origin_chain_conf,
-            self.core_metrics.clone(),
-            self.agent_metrics.clone(),
-            self.chain_metrics.clone(),
-            Self::AGENT_NAME.to_string(),
-        )
-        .await
-        {
+        let metrics_updater = match self.build_metrics_updater().await {
             Ok(task) => task,
             Err(err) => {
                 tracing::error!(?err, "Failed to build metrics updater");
@@ -751,6 +756,24 @@ impl BaseAgent for Validator {
 }
 
 impl Validator {
+    pub(crate) async fn build_metrics_updater(&self) -> Result<ChainSpecificMetricsUpdater> {
+        build_with_dusk_rpc_retry(
+            &self.origin_chain_conf,
+            "chain metrics provider",
+            self.interval,
+            || {
+                ChainSpecificMetricsUpdater::new(
+                    &self.origin_chain_conf,
+                    self.core_metrics.clone(),
+                    self.agent_metrics.clone(),
+                    self.chain_metrics.clone(),
+                    Self::AGENT_NAME.to_string(),
+                )
+            },
+        )
+        .await
+    }
+
     /// Try to create merkle tree hook contract sync attempts times before giving up.
     async fn try_n_times_to_run_merkle_tree_hook_sync(
         &self,
@@ -1034,21 +1057,37 @@ impl Validator {
         // the main validator submit loop. This is to avoid a situation in
         // which the validator is signing checkpoints but has not announced
         // their locations, which makes them functionally unusable.
-        let validator_announce = self
-            .origin_chain_conf
-            .build_validator_announce_reader(&self.core.metrics)
-            .await?;
+        let validator_announce = build_announcement_client(
+            &self.origin_chain_conf,
+            &self.core.metrics,
+            AnnouncementClientKind::Reader,
+            self.interval,
+        )
+        .await?;
         // Only a real submission needs a signer, gas oracle, or escalator.
         let mut submission_contract: Option<Box<dyn ValidatorAnnounce>> = None;
         let validators: [H256; 1] = [address.into()];
         let mut retry_backoff = AnnouncementRetryBackoff::default();
         loop {
             info!("Checking for validator announcement");
-            if let Some(locations) = validator_announce
+            let observed_locations = match validator_announce
                 .get_announced_storage_locations(&validators)
-                .await?
-                .first()
+                .await
             {
+                Ok(locations) => locations,
+                Err(error)
+                    if matches!(
+                        self.origin_chain_conf.connection,
+                        hyperlane_base::settings::ChainConnectionConf::Dusk(_)
+                    ) =>
+                {
+                    warn!(%error, "Could not observe Dusk announcement; retrying without submitting");
+                    sleep(self.interval).await;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if let Some(locations) = observed_locations.first() {
                 if locations.contains(&announcement_location) {
                     info!(
                         ?locations,
@@ -1113,10 +1152,22 @@ impl Validator {
                             info!(eth_validator_address=?announcement.validator, ?chain_signer_string, ?chain_signer_h256, "Attempting self announce");
                             if submission_contract.is_none() {
                                 submission_contract = Some(
-                                    self.origin_chain_conf
-                                        .build_validator_announce(&self.core.metrics)
-                                        .await?,
+                                    build_announcement_client(
+                                        &self.origin_chain_conf,
+                                        &self.core.metrics,
+                                        AnnouncementClientKind::Submission,
+                                        self.interval,
+                                    )
+                                    .await?,
                                 );
+                                if matches!(
+                                    self.origin_chain_conf.connection,
+                                    hyperlane_base::settings::ChainConnectionConf::Dusk(_)
+                                ) {
+                                    // Construction may have waited for RPC recovery.
+                                    // Observe announcement state again before writing.
+                                    continue;
+                                }
                             }
                             let result = submission_contract
                                 .as_ref()
@@ -1617,6 +1668,18 @@ mod tests {
                             (axum::http::StatusCode::OK, vec![7u8])
                         } else if uri.path().ends_with("/local_domain") {
                             (axum::http::StatusCode::OK, 1337u32.to_le_bytes().to_vec())
+                        } else if uri.path().ends_with("/mailbox") {
+                            (
+                                axum::http::StatusCode::OK,
+                                H256::from_low_u64_be(1).as_bytes().to_vec(),
+                            )
+                        } else if uri.path().ends_with("/required_hook") {
+                            (
+                                axum::http::StatusCode::OK,
+                                H256::from_low_u64_be(4).as_bytes().to_vec(),
+                            )
+                        } else if uri.path().ends_with("/hook_type") {
+                            (axum::http::StatusCode::OK, vec![3])
                         } else {
                             (axum::http::StatusCode::NOT_FOUND, Vec::new())
                         }
@@ -1636,6 +1699,7 @@ mod tests {
             "chains": {"test": {
                 "name": "test", "domainid": 1337, "chainid": 7, "protocol": "dusk",
                 "rpcurls": [{"http": first.as_str()}, {"http": second.as_str()}],
+                "rpcconsensustype": "single",
                 "eventcursordir": directory.path().join("events"),
                 "nativetoken": {"decimals": 9, "symbol": "DUSK", "denom": "LUX"},
                 "mailbox": "0x0000000000000000000000000000000000000001",
@@ -1664,8 +1728,14 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(hooks.len(), 2);
-        assert_eq!(first_calls.load(Ordering::SeqCst), 6);
-        assert_eq!(second_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(first_calls.load(Ordering::SeqCst), 7);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 0);
+        for (_, hook) in &hooks {
+            // Identity succeeds; this narrow fixture has no checkpoint response.
+            assert!(hook.latest_checkpoint(&ReorgPeriod::None).await.is_err());
+        }
+        assert_eq!(first_calls.load(Ordering::SeqCst), 15);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 8);
         first_server.abort();
         second_server.abort();
     }

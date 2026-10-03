@@ -161,17 +161,20 @@ impl FromRawConf<RawValidatorSettings> for ValidatorSettings {
         } else {
             configured_consensus
         };
-        // Quorum/majority vote on checkpoint history in the validator, not on raw
-        // JSON responses. Indexing and auxiliary reads use ordinary fallback.
-        // Normalize only the base parser's copy, preserving the configured endpoint metadata.
+        // Quorum/majority vote on checkpoint history, not raw RPC responses.
+        // Dusk has no provider failover: keep its primary indexing/submission
+        // connection explicit while retaining every endpoint in the voting pool.
         let mut base_raw = raw.0.clone();
-        if configured_consensus.is_some() {
-            if let Some(name) = origin_chain_name {
-                if let Some(chain) = base_raw
-                    .get_mut("chains")
-                    .and_then(|chains| chains.get_mut(name.to_ascii_lowercase()))
-                    .and_then(Value::as_object_mut)
-                {
+        if let Some(name) = origin_chain_name {
+            if let Some(chain) = base_raw
+                .get_mut("chains")
+                .and_then(|chains| chains.get_mut(name.to_ascii_lowercase()))
+                .and_then(Value::as_object_mut)
+            {
+                let dusk = chain.get("protocol").and_then(Value::as_str) == Some("dusk");
+                if dusk && checkpoint_consensus.is_some() {
+                    chain.insert("rpcconsensustype".into(), "single".into());
+                } else if configured_consensus.is_some() {
                     chain.insert("rpcconsensustype".into(), "fallback".into());
                 }
             }
@@ -1019,5 +1022,851 @@ mod test {
         ] {
             assert!(!parse_lightweight_flag(&mut raw, &ConfigPath::default()).expect("disabled"));
         }
+    }
+}
+
+#[cfg(test)]
+mod dusk_rpc_tests {
+    //! Dusk checkpoint endpoints retain their voting slots while offline and must
+    //! authenticate chain and contract identities before producing state reads.
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    use hyperlane_base::{settings::ChainConf, CoreMetrics};
+    use hyperlane_core::{
+        config::{ConfigPath, FromRawConf},
+        CheckpointAtBlock, MerkleTreeHook, ReorgPeriod, H256,
+    };
+    use hyperlane_metric::prometheus_metric::RpcRole;
+    use prometheus::Registry;
+    use serde_json::Value;
+    use tempfile::TempDir;
+    use url::Url;
+
+    use crate::checkpoint_consensus::{CheckpointConsensus, CheckpointReader};
+    use crate::reorg_reporter::{LatestCheckpointReorgReporter, ReorgReporter};
+    use crate::rpc::build_validator_per_url_hooks;
+    use crate::settings::{RawValidatorSettings, ValidatorSettings};
+
+    const DOMAIN: u32 = 1337;
+    const CHAIN_ID: u8 = 7;
+    const READ_DEADLINE: Duration = Duration::from_secs(5);
+
+    #[derive(Clone, Copy)]
+    #[repr(u8)]
+    enum Fault {
+        None,
+        Unavailable,
+        WrongChain,
+        WrongMailboxDomain,
+        WrongAnnounceDomain,
+        WrongAnnounceMailbox,
+        WrongMerkleMailbox,
+        WrongRequiredHook,
+        AnnounceUnavailable,
+    }
+
+    struct Node {
+        url: Url,
+        fault: Arc<AtomicU8>,
+        identity_reads: Arc<AtomicUsize>,
+        state_reads: Arc<AtomicUsize>,
+        unavailable_responses: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
+        worker: Option<JoinHandle<()>>,
+    }
+
+    impl Node {
+        fn start(initial: Fault) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture listener");
+            listener
+                .set_nonblocking(true)
+                .expect("make fixture listener nonblocking");
+            let url = Url::parse(&format!(
+                "http://{}",
+                listener.local_addr().expect("get fixture address")
+            ))
+            .expect("parse fixture URL");
+            let fault = Arc::new(AtomicU8::new(initial as u8));
+            let identity_reads = Arc::new(AtomicUsize::new(0));
+            let state_reads = Arc::new(AtomicUsize::new(0));
+            let unavailable_responses = Arc::new(AtomicUsize::new(0));
+            let observed_unavailable = unavailable_responses.clone();
+            let stop = Arc::new(AtomicBool::new(false));
+            let observed_fault = fault.clone();
+            let observed_identity = identity_reads.clone();
+            let observed_state = state_reads.clone();
+            let stopped = stop.clone();
+            let worker = thread::spawn(move || {
+                while !stopped.load(Ordering::SeqCst) {
+                    let (mut stream, _) = match listener.accept() {
+                        Ok(connection) => connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(2));
+                            continue;
+                        }
+                        Err(error) => panic!("fixture accept failed: {error}"),
+                    };
+                    stream
+                        .set_nonblocking(false)
+                        .expect("make request socket blocking");
+                    stream
+                        .set_read_timeout(Some(READ_DEADLINE))
+                        .expect("bound fixture request reads");
+                    let mut reader = BufReader::new(&mut stream);
+                    let mut request = String::new();
+                    if reader.read_line(&mut request).expect("read HTTP request") == 0 {
+                        continue;
+                    }
+                    let path = request
+                        .split_whitespace()
+                        .nth(1)
+                        .expect("HTTP request has a target")
+                        .to_owned();
+                    let mut length = 0;
+                    loop {
+                        let mut header = String::new();
+                        assert_ne!(
+                            reader.read_line(&mut header).expect("read HTTP header"),
+                            0,
+                            "request ended before its headers"
+                        );
+                        if header == "\r\n" {
+                            break;
+                        }
+                        if let Some(value) =
+                            header.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
+                            length = value.trim().parse().expect("parse Content-Length");
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    reader.read_exact(&mut body).expect("read HTTP body");
+                    drop(reader);
+
+                    let chain_query = path.ends_with("/chain_id");
+                    let mailbox_query = path.ends_with(&format!("{:064x}/local_domain", 1));
+                    let announce_query = path.ends_with(&format!("{:064x}/local_domain", 3));
+                    let topology_query = path.ends_with("/mailbox")
+                        || path.ends_with("/required_hook")
+                        || path.ends_with("/hook_type");
+                    if chain_query || mailbox_query || announce_query || topology_query {
+                        observed_identity.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        observed_state.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let current = observed_fault.load(Ordering::SeqCst);
+                    let (status, reply) = if current == Fault::Unavailable as u8 {
+                        (503, b"temporarily unavailable".to_vec())
+                    } else if chain_query {
+                        (
+                            200,
+                            vec![if current == Fault::WrongChain as u8 {
+                                CHAIN_ID + 1
+                            } else {
+                                CHAIN_ID
+                            }],
+                        )
+                    } else if mailbox_query || announce_query {
+                        let mismatched = (mailbox_query
+                            && current == Fault::WrongMailboxDomain as u8)
+                            || (announce_query && current == Fault::WrongAnnounceDomain as u8);
+                        (
+                            200,
+                            (if mismatched { 1338u32 } else { DOMAIN })
+                                .to_le_bytes()
+                                .to_vec(),
+                        )
+                    } else if path.ends_with("/required_hook") {
+                        (
+                            200,
+                            H256::from_low_u64_be(if current == Fault::WrongRequiredHook as u8 {
+                                9
+                            } else {
+                                4
+                            })
+                            .as_bytes()
+                            .to_vec(),
+                        )
+                    } else if path.ends_with("/hook_type") {
+                        (200, vec![3])
+                    } else if path.ends_with("/mailbox") {
+                        let wrong = (path.ends_with(&format!("{:064x}/mailbox", 3))
+                            && current == Fault::WrongAnnounceMailbox as u8)
+                            || (path.ends_with(&format!("{:064x}/mailbox", 4))
+                                && current == Fault::WrongMerkleMailbox as u8);
+                        (
+                            200,
+                            H256::from_low_u64_be(if wrong { 9 } else { 1 })
+                                .as_bytes()
+                                .to_vec(),
+                        )
+                    } else if path == "/on/graphql/query" {
+                        assert_eq!(body, b"query { lastBlockPair { json } }");
+                        (200, br#"{"lastBlockPair":{"json":{"last_block":[100,"tip"],"last_finalized_block":[90,"final"]}}}"#.to_vec())
+                    } else if path.ends_with("/get_announced_storage_locations_for_validator") {
+                        if current == Fault::AnnounceUnavailable as u8 {
+                            (503, b"temporarily unavailable".to_vec())
+                        } else {
+                            // rkyv archived empty Vec<String>: zero offset and length.
+                            (200, vec![0; 8])
+                        }
+                    } else if path.ends_with("/count") {
+                        (200, 1u32.to_le_bytes().to_vec())
+                    } else if path.ends_with("/inserted_block_height") {
+                        (200, 85u64.to_le_bytes().to_vec())
+                    } else if path.ends_with("/root_at") {
+                        (200, vec![9; 32])
+                    } else {
+                        panic!("unexpected fixture path {path}");
+                    };
+                    if status == 503 {
+                        observed_unavailable.fetch_add(1, Ordering::SeqCst);
+                    }
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        reply.len()
+                    )
+                    .expect("write HTTP response headers");
+                    stream.write_all(&reply).expect("write HTTP response body");
+                }
+            });
+            Self {
+                url,
+                fault,
+                identity_reads,
+                state_reads,
+                unavailable_responses,
+                stop,
+                worker: Some(worker),
+            }
+        }
+
+        fn set_fault(&self, fault: Fault) {
+            self.fault.store(fault as u8, Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for Node {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Err(panic) = self.worker.take().expect("fixture owns its worker").join() {
+                if !thread::panicking() {
+                    std::panic::resume_unwind(panic);
+                }
+            }
+        }
+    }
+
+    struct Configuration {
+        chain: ChainConf,
+        validator: ValidatorSettings,
+        _directory: TempDir,
+    }
+
+    impl Configuration {
+        fn new(urls: &[Url]) -> Self {
+            let directory = tempfile::tempdir().expect("create fixture directory");
+            let raw: Value = serde_json::json!({
+                "originchainname": "test",
+                "validator": {"type": "hexKey", "key": format!("0x{}", "11".repeat(32))},
+                "checkpointsyncer": {"type": "localStorage", "path": directory.path().join("checkpoints")},
+                "db": directory.path().join("validator-db"),
+                "chains": {"test": {
+                    "name": "test", "domainid": DOMAIN, "chainid": CHAIN_ID, "protocol": "dusk",
+                    "rpcconsensustype": "majority",
+                    "rpcurls": urls.iter().map(|url| serde_json::json!({"http": url.as_str()})).collect::<Vec<_>>(),
+                    "eventcursordir": directory.path().join("events"),
+                    "nativetoken": {"decimals": 9, "symbol": "DUSK", "denom": "LUX"},
+                    "mailbox": "0x0000000000000000000000000000000000000001",
+                    "interchaingaspaymaster": "0x0000000000000000000000000000000000000002",
+                    "validatorannounce": "0x0000000000000000000000000000000000000003",
+                    "merkletreehook": "0x0000000000000000000000000000000000000004"
+                }}
+            });
+            let validator = ValidatorSettings::from_config_filtered(
+                RawValidatorSettings(raw),
+                &ConfigPath::default(),
+                (),
+                "validator",
+            )
+            .expect("parse validator settings");
+            let chain = validator.base.chains[&validator.origin_chain].clone();
+            assert_eq!(validator.rpcs.len(), urls.len());
+            Self {
+                chain,
+                validator,
+                _directory: directory,
+            }
+        }
+    }
+
+    impl Configuration {
+        async fn build_validator(&self) -> eyre::Result<crate::validator::Validator> {
+            use crate::validator::{Validator, ValidatorMetadata};
+            use hyperlane_base::{
+                metrics::AgentMetrics, BaseAgent, ChainMetrics, MetadataFromSettings,
+                RuntimeMetrics,
+            };
+            let metrics = metrics();
+            let agent_metrics = AgentMetrics::new(&metrics).expect("agent metrics");
+            let chain_metrics = ChainMetrics::new(&metrics).expect("chain metrics");
+            let runtime_metrics =
+                RuntimeMetrics::new(&metrics, Default::default()).expect("runtime metrics");
+            let (_, console_server) = console_subscriber::ConsoleLayer::builder().build();
+            Validator::from_settings(
+                ValidatorMetadata::build_metadata(&self.validator),
+                self.validator.clone(),
+                metrics,
+                agent_metrics,
+                chain_metrics,
+                runtime_metrics,
+                console_server,
+            )
+            .await
+        }
+    }
+
+    fn metrics() -> Arc<CoreMetrics> {
+        Arc::new(
+            CoreMetrics::new("dusk-rpc-fixture", 0, Registry::new())
+                .expect("create fixture metrics"),
+        )
+    }
+
+    fn assert_checkpoint(checkpoint: &CheckpointAtBlock) {
+        assert_eq!(checkpoint.block_height, Some(90));
+        assert_eq!(checkpoint.checkpoint.mailbox_domain, DOMAIN);
+        assert_eq!(
+            checkpoint.checkpoint.merkle_tree_hook_address,
+            H256::from_low_u64_be(4)
+        );
+        assert_eq!(checkpoint.checkpoint.index, 0);
+        assert_eq!(checkpoint.checkpoint.root, H256::from([9; 32]));
+    }
+
+    async fn build_hooks(
+        configuration: &Configuration,
+        urls: &[Url],
+    ) -> Vec<Arc<dyn MerkleTreeHook>> {
+        tokio::time::timeout(
+            READ_DEADLINE,
+            build_validator_per_url_hooks(
+                &configuration.chain,
+                "rpcUrls",
+                RpcRole::Primary,
+                urls,
+                &metrics(),
+            ),
+        )
+        .await
+        .expect("endpoint pool construction finishes")
+        .expect("offline secondary does not veto endpoint pool")
+        .into_iter()
+        .map(|(_, hook)| hook)
+        .collect()
+    }
+
+    #[test]
+    fn dusk_endpoint_deduplication_uses_request_url_semantics() {
+        use crate::rpc::{dedupe_rpc_urls, state_read_urls};
+        let urls: Vec<Url> = [
+            "https://rpc.example/rpc",
+            "https://rpc.example/rpc/",
+            "https://rpc.example/rpc/#display",
+            "https://other.example/rpc",
+            "https://rpc.example/rpc?token=one/",
+            "https://rpc.example/rpc?token=one",
+            "https://reader:fixture@rpc.example/rpc",
+            "https://rpc.example/encoded%2Fpath",
+        ]
+        .iter()
+        .map(|url| Url::parse(url).expect("parse fixture URL"))
+        .collect();
+        let configuration = Configuration::new(&urls);
+        let (source, selected) = state_read_urls(&configuration.chain, urls.clone());
+        assert_eq!(
+            dedupe_rpc_urls(selected, source),
+            [
+                urls[0].clone(),
+                urls[3].clone(),
+                urls[4].clone(),
+                urls[5].clone(),
+                urls[6].clone(),
+                urls[7].clone()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn dusk_validator_startup_recovers_before_announcement() {
+        // Classic RPC indexing, WebSocket with RPC recovery, and lightweight
+        // WebSocket startup all use the real validator construction sequence.
+        for mode in 0..3 {
+            let node = Node::start(Fault::Unavailable);
+            let mut configuration = Configuration::new(&[node.url.clone()]);
+            configuration.validator.interval = Duration::from_millis(10);
+            if mode > 0 {
+                configuration.validator.websocket_url = Some(
+                    "ws://127.0.0.1:1/fixture"
+                        .parse()
+                        .expect("fixture websocket URL"),
+                );
+            }
+            configuration.validator.lightweight = mode == 2;
+            let build = configuration.build_validator();
+            tokio::pin!(build);
+            if mode != 2 {
+                let observe_failure = async {
+                    while node.unavailable_responses.load(Ordering::SeqCst) == 0 {
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                };
+                tokio::select! {
+                    _ = &mut build => panic!("startup must await indexer identity recovery"),
+                    observed = tokio::time::timeout(READ_DEADLINE, observe_failure) => {
+                        observed.expect("indexer construction attempts identity read");
+                    },
+                }
+                assert_eq!(node.state_reads.load(Ordering::SeqCst), 0);
+                node.set_fault(Fault::None);
+            }
+            let validator = tokio::time::timeout(READ_DEADLINE, &mut build)
+                .await
+                .expect("validator construction recovers")
+                .expect("validated validator");
+            if mode == 2 {
+                assert_eq!(
+                    node.identity_reads.load(Ordering::SeqCst),
+                    0,
+                    "lightweight construction keeps checkpoint RPCs deferred"
+                );
+            }
+
+            // This is the next RPC constructor called by Validator::run, before
+            // announcement. It must stay pending, then recover in the same process.
+            node.set_fault(Fault::Unavailable);
+            node.unavailable_responses.store(0, Ordering::SeqCst);
+            let before_state_reads = node.state_reads.load(Ordering::SeqCst);
+            let metrics_build = validator.build_metrics_updater();
+            tokio::pin!(metrics_build);
+            let observe_failure = async {
+                while node.unavailable_responses.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            };
+            tokio::select! {
+                _ = &mut metrics_build => panic!("metrics initialization must await identity recovery"),
+                observed = tokio::time::timeout(READ_DEADLINE, observe_failure) => {
+                    observed.expect("metrics construction attempts identity read");
+                },
+            }
+            assert_eq!(
+                node.state_reads.load(Ordering::SeqCst),
+                before_state_reads,
+                "unverified startup cannot reach announcement or checkpoint state"
+            );
+            node.set_fault(Fault::None);
+            let _updater = tokio::time::timeout(READ_DEADLINE, &mut metrics_build)
+                .await
+                .expect("metrics initialization recovers")
+                .expect("validated metrics provider");
+        }
+    }
+
+    #[tokio::test]
+    async fn dusk_local_initialization_errors_return_without_rpc_retry() {
+        use crate::rpc::{build_announcement_client, AnnouncementClientKind};
+        use hyperlane_base::settings::{
+            is_dusk_identity_observation_error, ChainConnectionConf, DuskSignerKeyConf, SignerConf,
+        };
+
+        let node = Node::start(Fault::Unavailable);
+        let mut configuration = Configuration::new(&[node.url.clone()]);
+        configuration.validator.interval = Duration::from_millis(10);
+        let invalid_directory = configuration._directory.path().join("events-is-a-file");
+        std::fs::write(&invalid_directory, b"fixture").expect("create ordinary path conflict");
+        if let ChainConnectionConf::Dusk(connection) = &mut configuration.chain.connection {
+            connection.event_cursor_dir = invalid_directory;
+        } else {
+            panic!("fixture must select Dusk");
+        }
+        configuration.validator.base.chains.insert(
+            configuration.validator.origin_chain.clone(),
+            configuration.chain.clone(),
+        );
+        let error = tokio::time::timeout(READ_DEADLINE, configuration.build_validator())
+            .await
+            .expect("local indexer error returns instead of retrying forever")
+            .expect_err("an event-store path must be usable");
+        assert!(!is_dusk_identity_observation_error(&error));
+        for kind in [
+            AnnouncementClientKind::Reader,
+            AnnouncementClientKind::Submission,
+        ] {
+            let error = tokio::time::timeout(
+                READ_DEADLINE,
+                build_announcement_client(
+                    &configuration.chain,
+                    &metrics(),
+                    kind,
+                    Duration::from_millis(10),
+                ),
+            )
+            .await
+            .expect("local announcement-client error returns promptly")
+            .expect_err("an event-store path must be usable");
+            assert!(!is_dusk_identity_observation_error(&error));
+        }
+        assert_eq!(node.identity_reads.load(Ordering::SeqCst), 0);
+
+        // Lightweight construction needs no indexer or signer-backed RPC setup.
+        // An invalid chain key must still fail the later metrics/submission factories.
+        let mut configuration = Configuration::new(&[node.url.clone()]);
+        configuration.validator.lightweight = true;
+        configuration.validator.websocket_url = Some(
+            "ws://127.0.0.1:1/fixture"
+                .parse()
+                .expect("fixture websocket URL"),
+        );
+        configuration.chain.signer = Some(SignerConf::DuskKey {
+            key: DuskSignerKeyConf::Inline {
+                key: "0x00".to_owned(),
+            },
+        });
+        configuration.validator.base.chains.insert(
+            configuration.validator.origin_chain.clone(),
+            configuration.chain.clone(),
+        );
+        let validator = configuration
+            .build_validator()
+            .await
+            .expect("deferred lightweight setup");
+        let result = tokio::time::timeout(READ_DEADLINE, validator.build_metrics_updater())
+            .await
+            .expect("invalid local signer cannot enter an RPC retry loop");
+        let error = match result {
+            Ok(_) => panic!("invalid local signer must fail"),
+            Err(error) => error,
+        };
+        assert!(!is_dusk_identity_observation_error(&error));
+        let error = tokio::time::timeout(
+            READ_DEADLINE,
+            build_announcement_client(
+                &configuration.chain,
+                &metrics(),
+                AnnouncementClientKind::Submission,
+                Duration::from_millis(10),
+            ),
+        )
+        .await
+        .expect("submission signer error returns promptly")
+        .expect_err("invalid local signer must fail");
+        assert!(!is_dusk_identity_observation_error(&error));
+        assert_eq!(node.identity_reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn dusk_identity_observation_errors_retain_retry_classification() {
+        use hyperlane_base::settings::is_dusk_identity_observation_error;
+        for fault in [
+            Fault::Unavailable,
+            Fault::WrongChain,
+            Fault::WrongAnnounceMailbox,
+        ] {
+            let node = Node::start(fault);
+            let configuration = Configuration::new(&[node.url.clone()]);
+            let error = configuration
+                .chain
+                .build_provider(&metrics())
+                .await
+                .expect_err("unverified identity cannot produce a provider");
+            assert!(is_dusk_identity_observation_error(&error));
+            assert!(
+                is_dusk_identity_observation_error(&error.wrap_err("factory context")),
+                "retry classification survives caller context"
+            );
+            assert_eq!(node.state_reads.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn dusk_announcement_factories_retry_initial_observation_errors() {
+        use crate::rpc::{build_announcement_client, AnnouncementClientKind};
+        for kind in [
+            AnnouncementClientKind::Reader,
+            AnnouncementClientKind::Submission,
+        ] {
+            let node = Node::start(Fault::Unavailable);
+            let configuration = Configuration::new(&[node.url.clone()]);
+            let metrics = metrics();
+            let build = build_announcement_client(
+                &configuration.chain,
+                &metrics,
+                kind,
+                Duration::from_millis(10),
+            );
+            tokio::pin!(build);
+            let observe_failure = async {
+                while node.unavailable_responses.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            };
+            tokio::select! {
+                result = &mut build => panic!("construction must wait for identity recovery: {result:?}"),
+                observed = tokio::time::timeout(READ_DEADLINE, observe_failure) => {
+                    observed.expect("fixture receives initial identity request");
+                },
+            }
+            assert!(node.unavailable_responses.load(Ordering::SeqCst) >= 1);
+            assert_eq!(
+                node.state_reads.load(Ordering::SeqCst),
+                0,
+                "unverified construction cannot reach announcement reads or writes"
+            );
+            node.set_fault(Fault::None);
+            let client = tokio::time::timeout(READ_DEADLINE, &mut build)
+                .await
+                .expect("factory recovers after the endpoint")
+                .expect("validated client");
+            assert_eq!(
+                client
+                    .get_announced_storage_locations(&[H256::repeat_byte(7)])
+                    .await
+                    .expect("valid Dusk announcement fixture result"),
+                vec![Vec::<String>::new()]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dusk_self_announce_reader_preserves_observation_errors_and_recovers() {
+        let node = Node::start(Fault::None);
+        let configuration = Configuration::new(&[node.url.clone()]);
+        let metrics = metrics();
+        let strict = configuration
+            .chain
+            .build_validator_self_announce_reader(&metrics)
+            .await
+            .expect("valid Dusk announcement fixture result");
+        let partial = configuration
+            .chain
+            .build_validator_announce_reader(&metrics)
+            .await
+            .expect("valid Dusk announcement fixture result");
+        node.set_fault(Fault::AnnounceUnavailable);
+        let validators = [H256::repeat_byte(7)];
+        assert!(strict
+            .get_announced_storage_locations(&validators)
+            .await
+            .is_err());
+        assert_eq!(
+            partial
+                .get_announced_storage_locations(&validators)
+                .await
+                .expect("valid Dusk announcement fixture result"),
+            vec![Vec::<String>::new()]
+        );
+        node.set_fault(Fault::None);
+        assert_eq!(
+            strict
+                .get_announced_storage_locations(&validators)
+                .await
+                .expect("valid Dusk announcement fixture result"),
+            vec![Vec::<String>::new()]
+        );
+    }
+
+    #[tokio::test]
+    async fn dusk_unavailable_secondary_recovers_without_changing_quorum_denominator() {
+        let nodes = [
+            Node::start(Fault::None),
+            Node::start(Fault::Unavailable),
+            Node::start(Fault::None),
+        ];
+        let urls: Vec<_> = nodes.iter().map(|node| node.url.clone()).collect();
+        let configuration = Configuration::new(&urls);
+        let hooks = build_hooks(&configuration, &urls).await;
+        assert_eq!(hooks.len(), 3);
+        for node in &nodes {
+            assert_eq!(node.identity_reads.load(Ordering::SeqCst), 0);
+            assert_eq!(node.state_reads.load(Ordering::SeqCst), 0);
+        }
+        for consensus in [CheckpointConsensus::Majority, CheckpointConsensus::Quorum] {
+            let reader = CheckpointReader::new(consensus, hooks.clone())
+                .expect("configured pool is nonempty");
+            assert_eq!(reader.endpoint_count(), 3);
+            assert_eq!(reader.consensus.required(reader.endpoint_count()), 2);
+            let votes = tokio::time::timeout(READ_DEADLINE, reader.checkpoints(&ReorgPeriod::None))
+                .await
+                .expect("checkpoint reads finish")
+                .expect("two endpoints form a quorum");
+            assert!(votes[1].is_none());
+            assert_eq!(votes.iter().flatten().count(), 2);
+            for checkpoint in votes.iter().flatten() {
+                assert_checkpoint(checkpoint);
+            }
+            nodes[2].set_fault(Fault::Unavailable);
+            assert!(
+                tokio::time::timeout(READ_DEADLINE, reader.checkpoints(&ReorgPeriod::None))
+                    .await
+                    .expect("failed reads finish")
+                    .is_err()
+            );
+            assert_eq!(reader.endpoint_count(), 3);
+            nodes[2].set_fault(Fault::None);
+        }
+        let reader = CheckpointReader::new(CheckpointConsensus::Majority, hooks)
+            .expect("configured pool is nonempty");
+        nodes[1].set_fault(Fault::None);
+        let votes = tokio::time::timeout(READ_DEADLINE, reader.checkpoints(&ReorgPeriod::None))
+            .await
+            .expect("recovered reads finish")
+            .expect("recovered endpoint rejoins quorum");
+        assert_eq!(votes.iter().flatten().count(), 3);
+        for checkpoint in votes.iter().flatten() {
+            assert_checkpoint(checkpoint);
+        }
+        assert_eq!(nodes[0].identity_reads.load(Ordering::SeqCst), 7);
+        assert_eq!(nodes[2].identity_reads.load(Ordering::SeqCst), 7);
+    }
+
+    async fn identity_failure_blocks_every_read_and_can_recover(fault: Fault) {
+        let node = Node::start(fault);
+        let configuration = Configuration::new(std::slice::from_ref(&node.url));
+        let hook = configuration
+            .chain
+            .build_merkle_tree_hook(&metrics())
+            .await
+            .expect("state hook construction is lazy");
+        assert_eq!(node.identity_reads.load(Ordering::SeqCst), 0);
+        assert!(hook.tree(&ReorgPeriod::None).await.is_err());
+        assert!(hook.count(&ReorgPeriod::None).await.is_err());
+        assert!(hook.latest_checkpoint(&ReorgPeriod::None).await.is_err());
+        assert!(hook.latest_checkpoint_at_block(90).await.is_err());
+        assert_eq!(node.state_reads.load(Ordering::SeqCst), 0);
+        node.set_fault(Fault::None);
+        let recovered =
+            tokio::time::timeout(READ_DEADLINE, hook.latest_checkpoint(&ReorgPeriod::None))
+                .await
+                .expect("identity recovery read finishes")
+                .expect("corrected endpoint returns a checkpoint");
+        assert_checkpoint(&recovered);
+        let successful_validation_count = node.identity_reads.load(Ordering::SeqCst);
+        assert_checkpoint(
+            &hook
+                .latest_checkpoint_at_block(90)
+                .await
+                .expect("validated hook returns a checkpoint at height"),
+        );
+        assert_eq!(
+            node.identity_reads.load(Ordering::SeqCst),
+            successful_validation_count
+        );
+    }
+
+    #[tokio::test]
+    async fn dusk_wrong_chain_cannot_return_any_state_read() {
+        identity_failure_blocks_every_read_and_can_recover(Fault::WrongChain).await;
+    }
+
+    #[tokio::test]
+    async fn dusk_wrong_mailbox_domain_cannot_return_any_state_read() {
+        identity_failure_blocks_every_read_and_can_recover(Fault::WrongMailboxDomain).await;
+    }
+
+    #[tokio::test]
+    async fn dusk_wrong_announce_domain_cannot_return_any_state_read() {
+        identity_failure_blocks_every_read_and_can_recover(Fault::WrongAnnounceDomain).await;
+    }
+
+    #[tokio::test]
+    async fn dusk_wrong_announce_mailbox_cannot_return_any_state_read() {
+        identity_failure_blocks_every_read_and_can_recover(Fault::WrongAnnounceMailbox).await;
+    }
+
+    #[tokio::test]
+    async fn dusk_wrong_merkle_mailbox_cannot_return_any_state_read() {
+        identity_failure_blocks_every_read_and_can_recover(Fault::WrongMerkleMailbox).await;
+    }
+
+    #[tokio::test]
+    async fn dusk_wrong_required_hook_cannot_return_any_state_read() {
+        identity_failure_blocks_every_read_and_can_recover(Fault::WrongRequiredHook).await;
+    }
+
+    #[tokio::test]
+    async fn dusk_concurrent_first_reads_share_identity_validation() {
+        let node = Node::start(Fault::None);
+        let configuration = Configuration::new(std::slice::from_ref(&node.url));
+        let hook = configuration
+            .chain
+            .build_merkle_tree_hook(&metrics())
+            .await
+            .expect("state hook construction is lazy");
+        let (count, checkpoint) = tokio::join!(
+            hook.count(&ReorgPeriod::None),
+            hook.latest_checkpoint(&ReorgPeriod::None)
+        );
+        assert_eq!(count.expect("healthy hook returns count"), 1);
+        assert_checkpoint(&checkpoint.expect("healthy hook returns checkpoint"));
+        assert_eq!(node.identity_reads.load(Ordering::SeqCst), 7);
+    }
+
+    #[tokio::test]
+    async fn dusk_reorg_reporter_construction_tolerates_unavailable_secondary() {
+        let nodes = [
+            Node::start(Fault::None),
+            Node::start(Fault::Unavailable),
+            Node::start(Fault::None),
+        ];
+        let urls: Vec<_> = nodes.iter().map(|node| node.url.clone()).collect();
+        let configuration = Configuration::new(&urls);
+        let reporter = tokio::time::timeout(
+            READ_DEADLINE,
+            LatestCheckpointReorgReporter::from_settings(&configuration.validator, &metrics()),
+        )
+        .await
+        .expect("diagnostic construction finishes")
+        .expect("offline secondary does not veto diagnostics");
+        for node in &nodes {
+            assert_eq!(node.identity_reads.load(Ordering::SeqCst), 0);
+        }
+        tokio::time::timeout(
+            READ_DEADLINE,
+            ReorgReporter::report_with_reorg_period(&reporter, &ReorgPeriod::None),
+        )
+        .await
+        .expect("diagnostic reads finish");
+        assert!(nodes[0].state_reads.load(Ordering::SeqCst) > 0);
+        assert_eq!(nodes[1].state_reads.load(Ordering::SeqCst), 0);
+        assert!(nodes[2].state_reads.load(Ordering::SeqCst) > 0);
+    }
+
+    #[tokio::test]
+    async fn dusk_invalid_url_is_still_rejected_during_pool_construction() {
+        let node = Node::start(Fault::None);
+        let configuration = Configuration::new(std::slice::from_ref(&node.url));
+        let urls = [
+            node.url.clone(),
+            Url::parse("file:///tmp/dusk-rpc-invalid").expect("parse unsupported URL fixture"),
+        ];
+        assert!(build_validator_per_url_hooks(
+            &configuration.chain,
+            "rpcUrls",
+            RpcRole::Primary,
+            &urls,
+            &metrics()
+        )
+        .await
+        .is_err());
+        assert_eq!(node.identity_reads.load(Ordering::SeqCst), 0);
     }
 }

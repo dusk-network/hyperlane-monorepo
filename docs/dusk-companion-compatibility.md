@@ -23,7 +23,9 @@ three ABI tests, 26 helper tests, eight E2E driver tests, and operator compilati
 The helper-timeout regression failed against the prior agent implementation
 and passed after retaining the prepared transaction hash.
 
-No fresh live cross-chain E2E or production deployment was performed in October.
+These fork-sync checks did not include a live cross-chain E2E or production
+deployment. Subsequent Mac integration runs are recorded in
+[the Dusk invariant PR](https://github.com/dusk-network/hyperlane-dusk/pull/11).
 The protected manual reproduction still requires its trusted runner and private
 source access. The July live-run receipts below remain historical evidence for
 those exact earlier source sets; they do not certify the October sync.
@@ -94,10 +96,28 @@ is claimed.
 
 Every Dusk chain requires separate explicit `domainId` and native `chainId`
 values plus an agent-exclusive `eventCursorDir`. Startup validates the endpoint
-chain ID and both Mailbox and ValidatorAnnounce `local_domain` values before a
-provider is returned. Every submission passes the configured native chain ID
+chain ID, both Mailbox and ValidatorAnnounce `local_domain` values, and the
+ValidatorAnnounce's Mailbox binding before a provider is returned. The configured
+Merkle hook must be the Mailbox's required hook or occur exactly once in its
+required static aggregation; hook types and every parent binding are checked.
+Other hook topologies require explicit adapter support. These checks detect
+inconsistent deployment configuration; operators still authenticate deployed
+contract code and RPC providers. Every submission passes the configured native chain ID
 to `dusk-tx`; a mismatch is rejected before signer access or transaction
-construction.
+construction. Agent/helper calls now require a `dusk-tx` build supporting
+`call --rues-url-stdin`: stdin contains the URL line followed by the existing
+secret-key line. Authenticated URLs are never passed in process arguments.
+The original `--rues-url` CLI remains available for explicit public URLs.
+RUES routes preserve base-path prefixes and query parameters; URL fragments
+are omitted from HTTP requests.
+
+Dusk providers do not implement RPC failover. Multi-URL `fallback`, raw `quorum`,
+and raw `majority` configurations are rejected instead of silently selecting the
+first URL; `single` explicitly selects the primary. Validator `majority`/`quorum`
+(and lightweight checkpoint voting) retain all endpoint slots for independent
+checkpoint consensus, but archive indexing and transaction submission use the
+primary endpoint. A failed primary still requires operator recovery. Ordinary
+relayer/scraper configurations must use one URL or explicitly choose `single`.
 
 Dusk signer material is parsed as a BLS scalar, not as a generic address. It
 must decode from hex, base58, or bech32 to exactly 32 bytes and must be a valid
@@ -116,7 +136,9 @@ The archive path uses Rusk 1.7.1's contract-scoped
 Each row supplies its own event ID, height, block hash, transaction origin,
 source, topic, data, and reverted flag. State-derived height/data is matched to
 that row and `checkBlock(..., onlyFinalized: true)` validates its finalized
-block. Whole-block event buffering is not used.
+block. A transient or malformed `checkBlock` response returns an error while
+retaining a durable row for revalidation; only proven state/block mismatches
+invalidate it. Whole-block event buffering is not used.
 
 Endpoint cursors and row IDs remain process-local scan hints, independently
 tracked per topic; they never become durable authority. The exclusive RocksDB
@@ -132,7 +154,9 @@ be replayed. The agent therefore performs bounded local payload preparation and
 uses the configured conservative gas ceiling; it does not send a signed
 simulation to a remote endpoint. After propagation starts, non-success is an
 unknown outcome and the exact locally computed transaction hash is retained
-for ledger reconciliation.
+for ledger reconciliation. Prompt exits, signals and incomplete helper output
+also retain an emitted transaction identity. A complete preverify failure
+remains a pre-submission failure and does not trigger a receipt lookup.
 
 On validator root mismatch, the fail-stop reorg flag is written before any
 best-effort RPC diagnostics. Diagnostics have per-endpoint timeouts and retain
@@ -216,3 +240,17 @@ Fresh independent GPT-5.6 xhigh and Controlecentrum deep/xhigh reviews must
 target these frozen source heads. Any source change after those reviews
 invalidates the affected evidence and requires a new pin and proportionate
 rerun.
+
+### October 2026 review follow-up
+
+The locally prepared transaction ID remains authoritative if helper output disagrees. Receipt reconciliation never selects an ID from an RPC diagnostic body. A complete, matching preverify failure remains a pre-submission failure.
+
+Validator checkpoint and reorg endpoint lists remove known Dusk request aliases before counting votes: trailing pathname slashes and URL fragments do not create another endpoint. Query values and authentication remain significant. Operators still need independently operated providers; URL normalization cannot establish provider independence.
+
+Validator self-announcement uses strict storage-location reads. Transport, schema and validation failures remain unknown observations; the validator waits and reads again without submitting. Relayer aggregation retains per-validator partial results so one unavailable record does not hide healthy validators.
+
+Self-announcement also retries failed identity observations while constructing its read and submission clients. These retries wait at least one second, including when the configured ordinary polling interval is zero. A client is used only after the deployment identity checks succeed.
+
+Dusk validator indexer and metrics-provider construction use the same paced identity-read retry policy before announcement. Classic RPC indexing and WebSocket recovery wait for a validated primary endpoint; lightweight construction keeps checkpoint reads deferred. Reorg tombstone and checkpoint-storage validation still precede these RPC factories.
+
+Only errors from RPC deployment-identity observation are retryable during Dusk startup. Local HTTP-client, event-store and signer construction errors propagate immediately; unusable paths or invalid keys cannot leave initialization waiting indefinitely.
