@@ -1,7 +1,7 @@
 //! RPC clients for checkpoint verification, reorg diagnostics and announcements.
 use futures_util::future::try_join_all;
 use hyperlane_base::{
-    settings::{ChainConf, ChainConnectionConf},
+    settings::{is_dusk_identity_observation_error, ChainConf, ChainConnectionConf},
     CoreMetrics,
 };
 use hyperlane_core::{ChainResult, MerkleTreeHook, ValidatorAnnounce};
@@ -39,6 +39,7 @@ pub(crate) async fn build_announcement_client(
 
 /// Dusk factories authenticate deployment identity through RPC. Keep every
 /// startup factory waiting for a validated result when that observation fails.
+/// Local construction failures return immediately so configuration can be fixed.
 /// Other protocols retain their existing one-attempt initialization behavior.
 pub(crate) async fn build_with_dusk_rpc_retry<T, F, Fut>(
     chain: &ChainConf,
@@ -53,7 +54,10 @@ where
     loop {
         match build().await {
             Ok(client) => return Ok(client),
-            Err(error) if matches!(chain.connection, ChainConnectionConf::Dusk(_)) => {
+            Err(error)
+                if matches!(chain.connection, ChainConnectionConf::Dusk(_))
+                    && is_dusk_identity_observation_error(&error) =>
+            {
                 warn!(%error, component, "Could not initialize validated Dusk RPC component; retrying");
                 // Bound retries even when the ordinary polling interval is zero.
                 tokio::time::sleep(retry_interval.max(Duration::from_secs(1))).await;

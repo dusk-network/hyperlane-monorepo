@@ -1308,6 +1308,32 @@ mod dusk_rpc_tests {
         }
     }
 
+    impl Configuration {
+        async fn build_validator(&self) -> eyre::Result<crate::validator::Validator> {
+            use crate::validator::{Validator, ValidatorMetadata};
+            use hyperlane_base::{
+                metrics::AgentMetrics, BaseAgent, ChainMetrics, MetadataFromSettings,
+                RuntimeMetrics,
+            };
+            let metrics = metrics();
+            let agent_metrics = AgentMetrics::new(&metrics).expect("agent metrics");
+            let chain_metrics = ChainMetrics::new(&metrics).expect("chain metrics");
+            let runtime_metrics =
+                RuntimeMetrics::new(&metrics, Default::default()).expect("runtime metrics");
+            let (_, console_server) = console_subscriber::ConsoleLayer::builder().build();
+            Validator::from_settings(
+                ValidatorMetadata::build_metadata(&self.validator),
+                self.validator.clone(),
+                metrics,
+                agent_metrics,
+                chain_metrics,
+                runtime_metrics,
+                console_server,
+            )
+            .await
+        }
+    }
+
     fn metrics() -> Arc<CoreMetrics> {
         Arc::new(
             CoreMetrics::new("dusk-rpc-fixture", 0, Registry::new())
@@ -1381,11 +1407,6 @@ mod dusk_rpc_tests {
 
     #[tokio::test]
     async fn dusk_validator_startup_recovers_before_announcement() {
-        use crate::validator::{Validator, ValidatorMetadata};
-        use hyperlane_base::{
-            metrics::AgentMetrics, BaseAgent, ChainMetrics, MetadataFromSettings, RuntimeMetrics,
-        };
-
         // Classic RPC indexing, WebSocket with RPC recovery, and lightweight
         // WebSocket startup all use the real validator construction sequence.
         for mode in 0..3 {
@@ -1400,22 +1421,7 @@ mod dusk_rpc_tests {
                 );
             }
             configuration.validator.lightweight = mode == 2;
-            let metrics = metrics();
-            let agent_metrics = AgentMetrics::new(&metrics).expect("agent metrics");
-            let chain_metrics = ChainMetrics::new(&metrics).expect("chain metrics");
-            let runtime_metrics =
-                RuntimeMetrics::new(&metrics, Default::default()).expect("runtime metrics");
-            let (_, console_server) = console_subscriber::ConsoleLayer::builder().build();
-            let metadata = ValidatorMetadata::build_metadata(&configuration.validator);
-            let build = Validator::from_settings(
-                metadata,
-                configuration.validator,
-                metrics,
-                agent_metrics,
-                chain_metrics,
-                runtime_metrics,
-                console_server,
-            );
+            let build = configuration.build_validator();
             tokio::pin!(build);
             if mode != 2 {
                 let observe_failure = async {
@@ -1472,6 +1478,122 @@ mod dusk_rpc_tests {
                 .await
                 .expect("metrics initialization recovers")
                 .expect("validated metrics provider");
+        }
+    }
+
+    #[tokio::test]
+    async fn dusk_local_initialization_errors_return_without_rpc_retry() {
+        use crate::rpc::{build_announcement_client, AnnouncementClientKind};
+        use hyperlane_base::settings::{
+            is_dusk_identity_observation_error, ChainConnectionConf, DuskSignerKeyConf, SignerConf,
+        };
+
+        let node = Node::start(Fault::Unavailable);
+        let mut configuration = Configuration::new(&[node.url.clone()]);
+        configuration.validator.interval = Duration::from_millis(10);
+        let invalid_directory = configuration._directory.path().join("events-is-a-file");
+        std::fs::write(&invalid_directory, b"fixture").expect("create ordinary path conflict");
+        if let ChainConnectionConf::Dusk(connection) = &mut configuration.chain.connection {
+            connection.event_cursor_dir = invalid_directory;
+        } else {
+            panic!("fixture must select Dusk");
+        }
+        configuration.validator.base.chains.insert(
+            configuration.validator.origin_chain.clone(),
+            configuration.chain.clone(),
+        );
+        let error = tokio::time::timeout(READ_DEADLINE, configuration.build_validator())
+            .await
+            .expect("local indexer error returns instead of retrying forever")
+            .expect_err("an event-store path must be usable");
+        assert!(!is_dusk_identity_observation_error(&error));
+        for kind in [
+            AnnouncementClientKind::Reader,
+            AnnouncementClientKind::Submission,
+        ] {
+            let error = tokio::time::timeout(
+                READ_DEADLINE,
+                build_announcement_client(
+                    &configuration.chain,
+                    &metrics(),
+                    kind,
+                    Duration::from_millis(10),
+                ),
+            )
+            .await
+            .expect("local announcement-client error returns promptly")
+            .expect_err("an event-store path must be usable");
+            assert!(!is_dusk_identity_observation_error(&error));
+        }
+        assert_eq!(node.identity_reads.load(Ordering::SeqCst), 0);
+
+        // Lightweight construction needs no indexer or signer-backed RPC setup.
+        // An invalid chain key must still fail the later metrics/submission factories.
+        let mut configuration = Configuration::new(&[node.url.clone()]);
+        configuration.validator.lightweight = true;
+        configuration.validator.websocket_url = Some(
+            "ws://127.0.0.1:1/fixture"
+                .parse()
+                .expect("fixture websocket URL"),
+        );
+        configuration.chain.signer = Some(SignerConf::DuskKey {
+            key: DuskSignerKeyConf::Inline {
+                key: "0x00".to_owned(),
+            },
+        });
+        configuration.validator.base.chains.insert(
+            configuration.validator.origin_chain.clone(),
+            configuration.chain.clone(),
+        );
+        let validator = configuration
+            .build_validator()
+            .await
+            .expect("deferred lightweight setup");
+        let result = tokio::time::timeout(READ_DEADLINE, validator.build_metrics_updater())
+            .await
+            .expect("invalid local signer cannot enter an RPC retry loop");
+        let error = match result {
+            Ok(_) => panic!("invalid local signer must fail"),
+            Err(error) => error,
+        };
+        assert!(!is_dusk_identity_observation_error(&error));
+        let error = tokio::time::timeout(
+            READ_DEADLINE,
+            build_announcement_client(
+                &configuration.chain,
+                &metrics(),
+                AnnouncementClientKind::Submission,
+                Duration::from_millis(10),
+            ),
+        )
+        .await
+        .expect("submission signer error returns promptly")
+        .expect_err("invalid local signer must fail");
+        assert!(!is_dusk_identity_observation_error(&error));
+        assert_eq!(node.identity_reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn dusk_identity_observation_errors_retain_retry_classification() {
+        use hyperlane_base::settings::is_dusk_identity_observation_error;
+        for fault in [
+            Fault::Unavailable,
+            Fault::WrongChain,
+            Fault::WrongAnnounceMailbox,
+        ] {
+            let node = Node::start(fault);
+            let configuration = Configuration::new(&[node.url.clone()]);
+            let error = configuration
+                .chain
+                .build_provider(&metrics())
+                .await
+                .expect_err("unverified identity cannot produce a provider");
+            assert!(is_dusk_identity_observation_error(&error));
+            assert!(
+                is_dusk_identity_observation_error(&error.wrap_err("factory context")),
+                "retry classification survives caller context"
+            );
+            assert_eq!(node.state_reads.load(Ordering::SeqCst), 0);
         }
     }
 

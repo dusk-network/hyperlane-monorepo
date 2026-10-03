@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Startup retries were limited to Dusk identity observations; local event-store and signer errors returned promptly ([Dusk invariant review]).
+
 - Validator indexer and metrics-provider startup recovered from unavailable identity reads before announcement ([Dusk invariant review]).
 
 - Announcement-client construction retried failed identity observations before validator startup continued ([Dusk invariant review]).

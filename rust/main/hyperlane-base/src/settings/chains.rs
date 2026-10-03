@@ -1894,6 +1894,29 @@ fn build_tron_provider(
     )
 }
 
+/// Returns whether startup failed while observing Dusk deployment identity.
+/// Local client, event-store and signer construction errors are not retryable.
+pub fn is_dusk_identity_observation_error(error: &Report) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<DuskIdentityObservationError>())
+}
+
+#[derive(Debug)]
+struct DuskIdentityObservationError(Report);
+
+impl std::fmt::Display for DuskIdentityObservationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Dusk identity observation failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for DuskIdentityObservationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
 async fn build_dusk_provider(
     chain_conf: &ChainConf,
     connection_conf: &h_dusk::ConnectionConf,
@@ -1931,6 +1954,7 @@ async fn validate_dusk_provider(
         &validator_announce_id,
         &chain_conf.addresses.merkle_tree_hook.into(),
     )
-    .await?;
+    .await
+    .map_err(|error| DuskIdentityObservationError(error.into()))?;
     Ok(h_dusk::DuskProvider::new(chain_conf.domain.clone(), rues))
 }

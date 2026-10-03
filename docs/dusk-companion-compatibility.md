@@ -252,3 +252,5 @@ Validator self-announcement uses strict storage-location reads. Transport, schem
 Self-announcement also retries failed identity observations while constructing its read and submission clients. These retries wait at least one second, including when the configured ordinary polling interval is zero. A client is used only after the deployment identity checks succeed.
 
 Dusk validator indexer and metrics-provider construction use the same paced identity-read retry policy before announcement. Classic RPC indexing and WebSocket recovery wait for a validated primary endpoint; lightweight construction keeps checkpoint reads deferred. Reorg tombstone and checkpoint-storage validation still precede these RPC factories.
+
+Only errors from RPC deployment-identity observation are retryable during Dusk startup. Local HTTP-client, event-store and signer construction errors propagate immediately; unusable paths or invalid keys cannot leave initialization waiting indefinitely.
