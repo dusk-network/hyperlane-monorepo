@@ -23,7 +23,9 @@ three ABI tests, 26 helper tests, eight E2E driver tests, and operator compilati
 The helper-timeout regression failed against the prior agent implementation
 and passed after retaining the prepared transaction hash.
 
-No fresh live cross-chain E2E or production deployment was performed in October.
+These fork-sync checks did not include a live cross-chain E2E or production
+deployment. Subsequent Mac integration runs are recorded in
+[the Dusk invariant PR](https://github.com/dusk-network/hyperlane-dusk/pull/11).
 The protected manual reproduction still requires its trusted runner and private
 source access. The July live-run receipts below remain historical evidence for
 those exact earlier source sets; they do not certify the October sync.
@@ -106,6 +108,8 @@ construction. Agent/helper calls now require a `dusk-tx` build supporting
 `call --rues-url-stdin`: stdin contains the URL line followed by the existing
 secret-key line. Authenticated URLs are never passed in process arguments.
 The original `--rues-url` CLI remains available for explicit public URLs.
+RUES routes preserve base-path prefixes and query parameters; URL fragments
+are omitted from HTTP requests.
 
 Dusk providers do not implement RPC failover. Multi-URL `fallback`, raw `quorum`,
 and raw `majority` configurations are rejected instead of silently selecting the
@@ -150,7 +154,9 @@ be replayed. The agent therefore performs bounded local payload preparation and
 uses the configured conservative gas ceiling; it does not send a signed
 simulation to a remote endpoint. After propagation starts, non-success is an
 unknown outcome and the exact locally computed transaction hash is retained
-for ledger reconciliation.
+for ledger reconciliation. Prompt exits, signals and incomplete helper output
+also retain an emitted transaction identity. A complete preverify failure
+remains a pre-submission failure and does not trigger a receipt lookup.
 
 On validator root mismatch, the fail-stop reorg flag is written before any
 best-effort RPC diagnostics. Diagnostics have per-endpoint timeouts and retain
