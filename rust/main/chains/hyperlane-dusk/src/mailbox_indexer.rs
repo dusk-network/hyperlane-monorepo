@@ -8,9 +8,9 @@ use hyperlane_core::{
     ChainResult, HyperlaneMessage, Indexed, Indexer, LogMeta, SequenceAwareIndexer, H256, H512,
     U256,
 };
-use hyperlane_dusk_types::events;
+use hyperlane_dusk_types::{events, message};
 
-use crate::rues::rkyv_serialize;
+use crate::rues::{rkyv_deserialize, rkyv_serialize};
 use crate::tx_sender::{dusk_tx_id_to_h512, h512_to_dusk_tx_id};
 use crate::RuesClient;
 
@@ -24,15 +24,21 @@ pub struct DuskMailboxIndexer {
     rues: Arc<RuesClient>,
     mailbox_id: [u8; 32],
     mailbox_address: H256,
+    local_domain: u32,
 }
 
 impl DuskMailboxIndexer {
-    /// Create a new indexer.
-    pub fn new(rues: Arc<RuesClient>, mailbox_id: H256) -> Self {
+    /// Create a dispatch indexer for the Mailbox of `local_domain`.
+    ///
+    /// Only messages whose origin is `local_domain` are indexed. Agents pass
+    /// the configured domain, which startup checks against the Mailbox's own
+    /// `local_domain`.
+    pub fn new(rues: Arc<RuesClient>, mailbox_id: H256, local_domain: u32) -> Self {
         Self {
             rues,
             mailbox_id: mailbox_id.into(),
             mailbox_address: mailbox_id,
+            local_domain,
         }
     }
 
@@ -109,42 +115,30 @@ impl Indexer<HyperlaneMessage> for DuskMailboxIndexer {
                 .contract_query(&self.mailbox_id, "dispatched_block_height", &(nonce,))
                 .await?;
             ensure_cursor_height(block_number)?;
-            // Query the encoded dispatched message at this nonce.
-            let encoded: Vec<u8> = self
+            // The Mailbox stores only the message ID. The message itself is in
+            // the finalized Dispatch event that hashes to it.
+            let message_id: [u8; 32] = self
                 .rues
-                .contract_query(&self.mailbox_id, "dispatched_message", &(nonce,))
+                .contract_query(&self.mailbox_id, "dispatched_id", &(nonce,))
                 .await?;
-
-            // Decode the Dusk-format message.
-            let dusk_msg = hyperlane_dusk_types::message::decode(&encoded).ok_or_else(|| {
-                crate::HyperlaneDuskError::Other(format!(
-                    "Failed to decode dispatched message at nonce {nonce}"
-                ))
-            })?;
-            if dusk_msg.nonce != nonce {
-                return Err(crate::HyperlaneDuskError::Other(format!(
-                    "Dispatched message nonce {} does not match queried sequence {nonce}",
-                    dusk_msg.nonce
-                ))
-                .into());
-            }
-
-            let expected_event = rkyv_serialize(&events::Dispatch {
-                sender: dusk_msg.sender,
-                destination: dusk_msg.destination,
-                recipient: dusk_msg.recipient,
-                message: encoded.clone(),
-            })?;
-            let provenance = self
+            let local_domain = self.local_domain;
+            let dispatch = self
                 .rues
-                .finalized_contract_event(
+                .finalized_contract_event_matching(
                     &self.mailbox_id,
                     events::Dispatch::TOPIC,
                     nonce as usize,
                     block_number,
-                    &expected_event,
+                    |data| decode_dispatch(data, nonce, &message_id, local_domain).is_some(),
                 )
                 .await?;
+            let provenance = dispatch.provenance;
+            let dusk_msg = decode_dispatch(&dispatch.data, nonce, &message_id, local_domain)
+                .ok_or_else(|| {
+                    crate::HyperlaneDuskError::Other(format!(
+                        "Matched Dusk Dispatch event for nonce {nonce} no longer decodes"
+                    ))
+                })?;
 
             // Convert to hyperlane-core HyperlaneMessage.
             let core_msg = HyperlaneMessage {
@@ -412,6 +406,41 @@ fn ensure_cursor_height(block_height: u64) -> ChainResult<()> {
     Ok(())
 }
 
+/// Decode a `Dispatch` event as the message the Mailbox stored at `nonce`.
+///
+/// Returns the message only when the event is exactly the one the Mailbox
+/// emits for it: the message hashes to the stored `message_id`, carries this
+/// nonce and the Mailbox's origin domain, the event's routing fields repeat
+/// the message's, and the event bytes are the canonical encoding of that
+/// event. Any other event data is not this dispatch.
+fn decode_dispatch(
+    event_data: &[u8],
+    nonce: u32,
+    message_id: &[u8; 32],
+    local_domain: u32,
+) -> Option<message::HyperlaneMessage> {
+    let event: events::Dispatch = rkyv_deserialize(event_data).ok()?;
+    if message::id(&event.message) != *message_id {
+        return None;
+    }
+    let decoded = message::decode(&event.message)?;
+    if decoded.nonce != nonce
+        || decoded.origin != local_domain
+        || decoded.sender != event.sender
+        || decoded.destination != event.destination
+        || decoded.recipient != event.recipient
+    {
+        return None;
+    }
+    // The ID pins the message and the fields pin the rest of the event.
+    // Requiring the canonical bytes keeps this as strict as comparing against
+    // the event rebuilt from contract state.
+    if rkyv_serialize(&event).ok()? != event_data {
+        return None;
+    }
+    Some(decoded)
+}
+
 #[async_trait]
 impl SequenceAwareIndexer<H256> for DuskDeliveryIndexer {
     async fn latest_sequence_count_and_tip(&self) -> ChainResult<(Option<u32>, u32)> {
@@ -421,5 +450,77 @@ impl SequenceAwareIndexer<H256> for DuskDeliveryIndexer {
             .await?;
         let (finalized_count, finalized_tip) = self.finalized_process_count(count).await?;
         Ok((Some(finalized_count), finalized_tip))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ORIGIN: u32 = 4242;
+
+    fn stored(nonce: u32, body: &[u8]) -> Vec<u8> {
+        message::encode(3, nonce, ORIGIN, [7; 32], 42, [8; 32], body)
+    }
+
+    fn event(message: Vec<u8>) -> events::Dispatch {
+        events::Dispatch {
+            sender: [7; 32],
+            destination: 42,
+            recipient: [8; 32],
+            message,
+        }
+    }
+
+    fn bytes(event: &events::Dispatch) -> Vec<u8> {
+        rkyv_serialize(event).unwrap()
+    }
+
+    #[test]
+    fn dispatch_event_decodes_only_as_the_stored_message() {
+        let message = stored(5, &[1]);
+        let id = message::id(&message);
+        let decoded = decode_dispatch(&bytes(&event(message.clone())), 5, &id, ORIGIN).unwrap();
+        assert_eq!(decoded.encode(), message);
+
+        // Same nonce, origin and routing with another body: only the ID differs.
+        assert!(decode_dispatch(&bytes(&event(stored(5, &[2]))), 5, &id, ORIGIN).is_none());
+        // A message whose own ID is stored, but for another nonce or origin.
+        let other_nonce = stored(6, &[1]);
+        let other_origin = message::encode(3, 5, ORIGIN + 1, [7; 32], 42, [8; 32], &[1]);
+        for foreign in [other_nonce, other_origin] {
+            let foreign_id = message::id(&foreign);
+            assert!(decode_dispatch(&bytes(&event(foreign)), 5, &foreign_id, ORIGIN).is_none());
+        }
+        // The event's routing fields must repeat the message's.
+        for tampered in [
+            events::Dispatch {
+                sender: [9; 32],
+                ..event(message.clone())
+            },
+            events::Dispatch {
+                destination: 43,
+                ..event(message.clone())
+            },
+            events::Dispatch {
+                recipient: [9; 32],
+                ..event(message.clone())
+            },
+        ] {
+            assert!(decode_dispatch(&bytes(&tampered), 5, &id, ORIGIN).is_none());
+        }
+    }
+
+    #[test]
+    fn dispatch_event_bytes_must_be_canonical() {
+        let message = stored(5, &[1]);
+        let id = message::id(&message);
+        // rkyv reads the root from the end of the buffer, so leading bytes
+        // still decode to the same event.
+        let mut padded = vec![0u8; 16];
+        padded.extend_from_slice(&bytes(&event(message)));
+        assert!(rkyv_deserialize::<events::Dispatch>(&padded).is_ok());
+        assert!(decode_dispatch(&padded, 5, &id, ORIGIN).is_none());
+        assert!(decode_dispatch(b"not a dispatch event", 5, &id, ORIGIN).is_none());
     }
 }

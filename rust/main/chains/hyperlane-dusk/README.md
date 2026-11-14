@@ -19,12 +19,19 @@ how to run the local bridge.
   node must be built with the `archive` feature.
 - **Indexing** uses finalized contract events only. Each event is matched to
   its block and transaction, and stored in the agent's `eventCursorDir`, which
-  every agent process needs its own copy of.
+  every agent process needs its own copy of. The Mailbox stores only the ID of
+  each dispatched message (`dispatched_id`); the message itself comes from the
+  finalized `Dispatch` event whose message hashes to that ID.
 - **Writes** are Moonlight transactions built and signed by the `dusk-tx`
   helper from the companion repository. The agent runs it as a subprocess
   (`DUSK_TX_BIN`, or `dusk-tx` on `PATH`) and passes the RPC URL and signing
   key on stdin. Before retrying an uncertain submission, the agent reconciles
   it against the transaction hash it prepared.
+- **Delivery simulation.** Dusk charges a failed transaction its whole gas
+  limit. Before submitting `process`, the relayer runs it as an unsigned
+  contract query, which Rusk executes in a throwaway session. If the query
+  fails, nothing is submitted and the message is retried later. The query
+  reports no gas use, so `gasLimit` stays the transaction ceiling.
 - **Identity checks.** On startup the agent checks that the node's chain ID
   and the configured contracts agree with each other: the Mailbox domain, and
   the ValidatorAnnounce and Merkle hook bindings to that Mailbox. Startup waits
@@ -35,6 +42,7 @@ how to run the local bridge.
 ## Supported
 
 - `index.mode: sequence` only.
+- A Mailbox that stores dispatched message IDs (`state_version` 4 or later).
 - Security modules: `MessageIdMultisig`, plus the companion repository's
   test-only null ISM. Routing, Aggregation and CCIP-read ISMs return an
   explicit unsupported error.

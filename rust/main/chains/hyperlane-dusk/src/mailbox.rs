@@ -65,6 +65,36 @@ impl DuskMailbox {
         )
     }
 
+    /// Run `process` as an unsigned contract query before paying for it.
+    ///
+    /// Dusk charges a failed transaction its whole gas limit, so a delivery
+    /// that would revert must not be submitted. Rusk runs contract queries in
+    /// a throwaway session on the current tip: writes are discarded and
+    /// nothing is signed, so an endpoint gets no transaction it could replay.
+    /// A contract panic comes back as an HTTP error.
+    ///
+    /// This filters out deliveries that fail; it cannot prove one will
+    /// succeed. A query runs with the node's block gas limit rather than the
+    /// transaction's, and a recipient can tell a query from a transaction.
+    async fn simulate_process(&self, message: &HyperlaneMessage, args: &[u8]) -> ChainResult<()> {
+        if let Err(error) = self
+            .rues
+            .contract_query_raw(&self.mailbox_id, "process", args)
+            .await
+        {
+            warn!(
+                message_id = ?message.id(),
+                %error,
+                "Dusk process simulation failed; not submitting the message"
+            );
+            return Err(ChainCommunicationError::SimulationFailed(format!(
+                "Dusk Mailbox process query failed for message {:?}: {error}",
+                message.id()
+            )));
+        }
+        Ok(())
+    }
+
     async fn merkle_tree_count(&self) -> ChainResult<u32> {
         Ok(self
             .rues
@@ -334,12 +364,6 @@ impl Mailbox for DuskMailbox {
             .ok_or(HyperlaneDuskError::SignerUnavailable)?;
 
         let encoded = Self::encode_message(message);
-        info!(
-            message_id = ?message.id(),
-            nonce = message.nonce,
-            "Processing message on Dusk via dusk-tx"
-        );
-
         let args = crate::tx_sender::process_args(metadata, &encoded)?;
 
         let gas_limit = tx_gas_limit
@@ -352,6 +376,17 @@ impl Mailbox for DuskMailbox {
                 Ok(limit.low_u64())
             })
             .transpose()?;
+
+        // The relayer simulates through process_estimate_costs before calling
+        // this. Simulate again here, at the only call that spends gas, so no
+        // caller submits a delivery that would revert.
+        self.simulate_process(message, &args).await?;
+
+        info!(
+            message_id = ?message.id(),
+            nonce = message.nonce,
+            "Processing message on Dusk via dusk-tx"
+        );
 
         let call_result = crate::tx_sender::dusk_tx_call(
             &self.conn,
@@ -411,12 +446,14 @@ impl Mailbox for DuskMailbox {
         message: &HyperlaneMessage,
         metadata: &Metadata,
     ) -> ChainResult<TxCostEstimate> {
-        // Current Rusk simulation accepts an ordinary signed transaction that
-        // a remote endpoint can replay through propagation. Until consensus
-        // has a non-propagatable simulation envelope, validate the payload
-        // locally and return the configured conservative ceiling.
+        // Rusk's transaction simulation takes a signed transaction that a
+        // remote endpoint could replay through propagation, so simulate with
+        // an unsigned query of `process` instead. A failure here is a failed
+        // estimate: the relayer retries later without submitting. The query
+        // measures no gas, so the configured gas limit remains the ceiling.
         let encoded = Self::encode_message(message);
-        crate::tx_sender::process_args(metadata, &encoded)?;
+        let args = crate::tx_sender::process_args(metadata, &encoded)?;
+        self.simulate_process(message, &args).await?;
         Ok(TxCostEstimate {
             gas_limit: U256::from(self.conn.gas_limit),
             gas_price: FixedPointNumber::from(self.conn.gas_price),

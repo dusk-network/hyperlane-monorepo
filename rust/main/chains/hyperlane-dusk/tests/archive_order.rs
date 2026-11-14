@@ -23,6 +23,7 @@ use url::Url;
 
 const CONTRACT: [u8; 32] = [2; 32];
 const HEIGHT: u64 = 85;
+const ORIGIN: u32 = 4242;
 
 #[derive(Clone, Copy, Debug)]
 enum Kind {
@@ -43,14 +44,7 @@ impl Kind {
     }
     fn event(self, index: usize) -> Vec<u8> {
         match self {
-            Self::Dispatch => rkyv::to_bytes::<_, 256>(&events::Dispatch {
-                sender: [7; 32],
-                destination: 42,
-                recipient: [8; 32],
-                message: encoded(index),
-            })
-            .unwrap()
-            .to_vec(),
+            Self::Dispatch => dispatch_event(encoded(index)),
             Self::Process => rkyv::to_bytes::<_, 256>(&events::ProcessId {
                 message_id: id(index),
             })
@@ -77,7 +71,28 @@ fn id(index: usize) -> [u8; 32] {
     [3 + index as u8; 32]
 }
 fn encoded(index: usize) -> Vec<u8> {
-    message::encode(3, index as u32, 4242, [7; 32], 42, [8; 32], &[index as u8])
+    message_with_body(index as u32, &[index as u8])
+}
+fn message_with_body(nonce: u32, body: &[u8]) -> Vec<u8> {
+    message::encode(3, nonce, ORIGIN, [7; 32], 42, [8; 32], body)
+}
+fn dispatch_event(message: Vec<u8>) -> Vec<u8> {
+    rkyv::to_bytes::<_, 256>(&events::Dispatch {
+        sender: [7; 32],
+        destination: 42,
+        recipient: [8; 32],
+        message,
+    })
+    .unwrap()
+    .to_vec()
+}
+fn dispatch_row(id: i64, origin: [u8; 32], message: Vec<u8>) -> Value {
+    json!({
+        "id": id, "block_height": HEIGHT, "block_hash": hex::encode([9; 32]),
+        "origin": hex::encode(origin), "topic": events::Dispatch::TOPIC,
+        "source": hex::encode(CONTRACT), "data": hex::encode(dispatch_event(message)),
+        "reverted": false,
+    })
 }
 fn payment(index: usize) -> GasPaymentRecord {
     GasPaymentRecord {
@@ -117,6 +132,7 @@ struct Fixture {
     worker: Option<JoinHandle<()>>,
     archive_requests: Arc<Mutex<Vec<i64>>>,
     archive_rows: Arc<Mutex<Vec<Value>>>,
+    dispatched_ids: Arc<Mutex<Vec<[u8; 32]>>>,
 }
 impl Fixture {
     fn start(kind: Kind, reversed: bool, prefix_rows: usize) -> Self {
@@ -156,6 +172,12 @@ impl Fixture {
         }
         let archive_rows = Arc::new(Mutex::new(rows));
         let worker_rows = archive_rows.clone();
+        let dispatched_ids = Arc::new(Mutex::new(
+            (0..2)
+                .map(|index| message::id(&encoded(index)))
+                .collect::<Vec<_>>(),
+        ));
+        let worker_ids = dispatched_ids.clone();
         let worker = thread::spawn(move || {
             while !worker_stop.load(Ordering::SeqCst) {
                 let (mut stream, _) = match listener.accept() {
@@ -235,9 +257,7 @@ impl Fixture {
                         "dispatched_block_height"
                         | "processed_block_height_at_index"
                         | "inserted_block_height" => HEIGHT.to_le_bytes().to_vec(),
-                        "dispatched_message" => rkyv::to_bytes::<_, 256>(&encoded(index()))
-                            .unwrap()
-                            .to_vec(),
+                        "dispatched_id" => worker_ids.lock().unwrap()[index()].to_vec(),
                         "processed_at_index" | "message_id_at" => id(index()).to_vec(),
                         "gas_payment_at" => rkyv::to_bytes::<_, 256>(&payment(index()))
                             .unwrap()
@@ -270,6 +290,7 @@ impl Fixture {
             worker: Some(worker),
             archive_requests,
             archive_rows,
+            dispatched_ids,
         }
     }
     fn client(&self) -> Arc<RuesClient> {
@@ -313,7 +334,7 @@ async fn read(
         }};
     }
     match kind {
-        Kind::Dispatch => read_indexer!(DuskMailboxIndexer::new(rues, address)),
+        Kind::Dispatch => read_indexer!(DuskMailboxIndexer::new(rues, address, ORIGIN)),
         Kind::Process => read_indexer!(DuskDeliveryIndexer::new(rues, address)),
         Kind::Merkle => read_indexer!(DuskMerkleTreeHookIndexer::new(rues, address)),
         Kind::Igp => read_indexer!(DuskInterchainGasPaymasterIndexer::new(rues, address)),
@@ -516,4 +537,68 @@ async fn a_successful_lookup_hint_is_discarded_when_archive_ids_are_rebuilt() {
             vec![-1, 15, 31, 39, -1]
         );
     }
+}
+
+#[tokio::test]
+async fn dispatch_event_with_another_message_id_is_not_accepted() {
+    let fixture = Fixture::start(Kind::Dispatch, false, 0);
+    // Right block, nonce, origin and routing; only the body, and so the
+    // message ID, differs from what the Mailbox stored.
+    *fixture.archive_rows.lock().unwrap() = vec![dispatch_row(
+        0,
+        tx_hash(0, false),
+        message_with_body(0, &[0xff]),
+    )];
+    let rues = fixture.client();
+    let error = read(Kind::Dispatch, rues.clone(), 0..=0, None)
+        .await
+        .unwrap_err();
+    assert!(error.contains("not archived yet"), "{error}");
+
+    // Nothing was kept: the stored message indexes once the archive has it.
+    *fixture.archive_rows.lock().unwrap() = vec![dispatch_row(0, tx_hash(0, false), encoded(0))];
+    let logs = read(Kind::Dispatch, rues, 0..=0, None).await.unwrap();
+    assert_eq!(logs[0].transaction_id, h512(tx_hash(0, false)));
+}
+
+#[tokio::test]
+async fn same_block_dispatch_is_picked_by_its_stored_id() {
+    let fixture = Fixture::start(Kind::Dispatch, false, 0);
+    // A same-nonce decoy comes first in archive order.
+    *fixture.archive_rows.lock().unwrap() = vec![
+        dispatch_row(0, [0xaa; 32], message_with_body(0, &[0xff])),
+        dispatch_row(1, [0xbb; 32], encoded(0)),
+    ];
+    let indexer = DuskMailboxIndexer::new(fixture.client(), H256::from(CONTRACT), ORIGIN);
+    let logs = indexer.fetch_logs_in_range(0..=0).await.unwrap();
+    assert_eq!(logs.len(), 1);
+    let (message, meta) = &logs[0];
+    assert_eq!(message.inner().body, vec![0]);
+    assert_eq!(message.inner().nonce, 0);
+    assert_eq!(message.inner().origin, ORIGIN);
+    assert_eq!(meta.transaction_id, h512([0xbb; 32]));
+}
+
+#[tokio::test]
+async fn persisted_dispatch_that_no_longer_matches_the_stored_id_is_invalidated() {
+    let fixture = Fixture::start(Kind::Dispatch, false, 0);
+    let rues = fixture.client();
+    let logs = read(Kind::Dispatch, rues.clone(), 0..=0, None)
+        .await
+        .unwrap();
+    assert_eq!(logs[0].transaction_id, h512(tx_hash(0, false)));
+
+    // A repaired endpoint stores another message at nonce 0, so the persisted
+    // row no longer hashes to the stored ID.
+    let repaired = message_with_body(0, &[0xee]);
+    fixture.dispatched_ids.lock().unwrap()[0] = message::id(&repaired);
+    *fixture.archive_rows.lock().unwrap() = vec![dispatch_row(0, [0xcc; 32], repaired)];
+    let error = read(Kind::Dispatch, rues.clone(), 0..=0, None)
+        .await
+        .unwrap_err();
+    assert!(error.contains("does not match contract state"), "{error}");
+
+    // The mismatch dropped the row, so the retry rebuilds it from the archive.
+    let logs = read(Kind::Dispatch, rues, 0..=0, None).await.unwrap();
+    assert_eq!(logs[0].transaction_id, h512([0xcc; 32]));
 }

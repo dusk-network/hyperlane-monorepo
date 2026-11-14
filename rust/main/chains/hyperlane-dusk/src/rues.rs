@@ -142,6 +142,14 @@ pub(crate) struct FinalizedEventProvenance {
     pub event_id: i64,
 }
 
+/// One finalized, state-matched contract event: its provenance and the event
+/// data that matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FinalizedEventMatch {
+    pub provenance: FinalizedEventProvenance,
+    pub data: Vec<u8>,
+}
+
 impl RuesClient {
     /// Create a new RUES client.
     pub fn new(url: Url) -> Result<Self, HyperlaneDuskError> {
@@ -490,6 +498,37 @@ impl RuesClient {
         expected_block_height: u64,
         expected_data: &[u8],
     ) -> Result<FinalizedEventProvenance, HyperlaneDuskError> {
+        self.finalized_contract_event_matching(
+            contract_id,
+            topic,
+            sequence,
+            expected_block_height,
+            |data| data == expected_data,
+        )
+        .await
+        .map(|matched| matched.provenance)
+    }
+
+    /// Match one contract-state record to the finalized archive event whose
+    /// data satisfies `is_match`, and return that data with its provenance.
+    ///
+    /// For records whose contract state commits to the event data only
+    /// indirectly, for example by hash. `is_match` must accept only the data
+    /// that contract state implies for this sequence: the first finalized row
+    /// at the expected height and topic that it accepts becomes the record.
+    /// A persisted row must pass `is_match` again before it is served, and is
+    /// dropped when it no longer does.
+    pub(crate) async fn finalized_contract_event_matching<F>(
+        &self,
+        contract_id: &[u8; 32],
+        topic: &str,
+        sequence: usize,
+        expected_block_height: u64,
+        is_match: F,
+    ) -> Result<FinalizedEventMatch, HyperlaneDuskError>
+    where
+        F: Fn(&[u8]) -> bool + Send + Sync,
+    {
         if let Some(event) = self.load_finalized_event(contract_id, topic, sequence)? {
             let result = self
                 .validate_finalized_event(
@@ -497,7 +536,7 @@ impl RuesClient {
                     topic,
                     sequence,
                     expected_block_height,
-                    expected_data,
+                    &is_match,
                     event,
                 )
                 .await;
@@ -527,7 +566,6 @@ impl RuesClient {
         let mut anchor = scan.clone();
         anchor.before_block = expected_block_height;
         let mut reached_block = false;
-        let expected_hex = hex::encode(expected_data);
 
         loop {
             let page = self
@@ -560,7 +598,8 @@ impl RuesClient {
                 if !event.reverted
                     && event.topic == topic
                     && event.block_height == expected_block_height
-                    && strip_hex_prefix(&event.data).eq_ignore_ascii_case(&expected_hex)
+                    && hex::decode(strip_hex_prefix(&event.data))
+                        .is_ok_and(|data| is_match(data.as_slice()))
                 {
                     let mut event = event;
                     event.id = i64::try_from(sequence).map_err(|_| {
@@ -580,12 +619,12 @@ impl RuesClient {
                         topic,
                         sequence,
                         expected_block_height,
-                        expected_data,
+                        &is_match,
                         event.clone(),
                     )
                     .await;
-                let provenance = match result {
-                    Ok(provenance) => provenance,
+                let matched = match result {
+                    Ok(matched) => matched,
                     Err(error) => {
                         if matches!(&error, HyperlaneDuskError::FinalizedEventMismatch(_)) {
                             self.invalidate_finalized_event(contract_id, topic, sequence)
@@ -599,7 +638,7 @@ impl RuesClient {
                 self.persist_finalized_event(contract_id, topic, sequence, &event)?;
                 self.remember_finalized_event_scan(contract_id, topic, &original_scan, anchor)
                     .await;
-                return Ok(provenance);
+                return Ok(matched);
             }
             if !has_next_page {
                 // Archive IDs are endpoint-local hints. A repaired or replaced
@@ -800,15 +839,18 @@ impl RuesClient {
         })
     }
 
-    async fn validate_finalized_event(
+    async fn validate_finalized_event<F>(
         &self,
         contract_id: &[u8; 32],
         topic: &str,
         sequence: usize,
         expected_block_height: u64,
-        expected_data: &[u8],
+        is_match: &F,
         event: FinalizedContractEvent,
-    ) -> Result<FinalizedEventProvenance, HyperlaneDuskError> {
+    ) -> Result<FinalizedEventMatch, HyperlaneDuskError>
+    where
+        F: Fn(&[u8]) -> bool + Sync,
+    {
         if event.reverted || event.topic != topic {
             return Err(HyperlaneDuskError::FinalizedEventMismatch(format!(
                 "Finalized Dusk event {}/{topic} sequence {sequence} is reverted or has the wrong topic",
@@ -828,7 +870,7 @@ impl RuesClient {
                 hex::encode(contract_id)
             ))
         })?;
-        if data != expected_data {
+        if !is_match(data.as_slice()) {
             return Err(HyperlaneDuskError::FinalizedEventMismatch(format!(
                 "Finalized Dusk event {}/{topic} sequence {sequence} does not match contract state",
                 hex::encode(contract_id)
@@ -866,11 +908,14 @@ impl RuesClient {
         let origin = parse_h256_hex(&event.origin, "finalized event origin")?;
         let mut transaction_id = [0u8; 64];
         transaction_id[32..].copy_from_slice(origin.as_bytes());
-        Ok(FinalizedEventProvenance {
-            block_height: event.block_height,
-            block_hash,
-            transaction_id: H512::from(transaction_id),
-            event_id: event.id,
+        Ok(FinalizedEventMatch {
+            provenance: FinalizedEventProvenance {
+                block_height: event.block_height,
+                block_hash,
+                transaction_id: H512::from(transaction_id),
+                event_id: event.id,
+            },
+            data,
         })
     }
 
@@ -2312,7 +2357,14 @@ mod tests {
                 directory.path(),
             );
             client
-                .validate_finalized_event(&contract, "dispatch", 80, 90, &[6], event.clone())
+                .validate_finalized_event(
+                    &contract,
+                    "dispatch",
+                    80,
+                    90,
+                    &|data: &[u8]| data == [6],
+                    event.clone(),
+                )
                 .await
                 .unwrap();
             client
@@ -2369,6 +2421,90 @@ mod tests {
             .load_finalized_event(&contract, "dispatch", 80)
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn predicate_rows_return_their_data_and_are_dropped_once_they_stop_matching() {
+        let contract_id = [47u8; 32];
+        let row = |id: i64, origin: u8, data: &[u8]| {
+            serde_json::json!({
+                "id": id, "block_height": 7, "block_hash": hex::encode([8u8; 32]),
+                "origin": hex::encode([origin; 32]), "topic": "dispatch",
+                "source": hex::encode(contract_id), "data": hex::encode(data),
+                "reverted": false
+            })
+        };
+        let page = serde_json::json!({
+            "finalizedEvents": { "json": {
+                "events": [row(1, 1, &[1, 0]), row(2, 2, &[2, 0])],
+                "startCursor": canonical_event_cursor(1),
+                "endCursor": canonical_event_cursor(2),
+                "hasNextPage": false
+            }}
+        })
+        .to_string();
+        let page: &'static str = Box::leak(page.into_boxed_str());
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(
+            test_server(vec![
+                (200, page),
+                (200, r#"{"checkBlock":true}"#),
+                (200, r#"{"checkBlock":true}"#),
+                (200, page),
+                (200, r#"{"checkBlock":true}"#),
+            ]),
+            directory.path(),
+        );
+        let tagged = |tag: u8| move |data: &[u8]| data.first() == Some(&tag);
+
+        // The first row the predicate accepts becomes the record, data included.
+        let first = client
+            .finalized_contract_event_matching(&contract_id, "dispatch", 0, 7, tagged(2))
+            .await
+            .unwrap();
+        assert_eq!(first.data, vec![2, 0]);
+        assert_eq!(
+            &first.provenance.transaction_id.as_bytes()[32..],
+            &[2u8; 32]
+        );
+        assert_eq!(first.provenance.event_id, 0);
+
+        // The persisted row is served again only after passing the predicate
+        // and a fresh checkBlock; the server has no archive page for it.
+        let replayed = client
+            .finalized_contract_event_matching(&contract_id, "dispatch", 0, 7, tagged(2))
+            .await
+            .unwrap();
+        assert_eq!(replayed, first);
+
+        // Contract state now implies other data. The persisted row is dropped
+        // without being served, together with the topic's scan hint.
+        let error = client
+            .finalized_contract_event_matching(&contract_id, "dispatch", 0, 7, tagged(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            HyperlaneDuskError::FinalizedEventMismatch(_)
+        ));
+        assert!(client
+            .load_finalized_event(&contract_id, "dispatch", 0)
+            .unwrap()
+            .is_none());
+        assert!(!client.finalized_event_caches.lock().await[&contract_id]
+            .scans
+            .contains_key("dispatch"));
+
+        // The retry rebuilds the record from the archive.
+        let rebuilt = client
+            .finalized_contract_event_matching(&contract_id, "dispatch", 0, 7, tagged(1))
+            .await
+            .unwrap();
+        assert_eq!(rebuilt.data, vec![1, 0]);
+        assert_eq!(
+            &rebuilt.provenance.transaction_id.as_bytes()[32..],
+            &[1u8; 32]
+        );
     }
 
     #[tokio::test]

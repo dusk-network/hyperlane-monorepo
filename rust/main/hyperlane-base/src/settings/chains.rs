@@ -712,9 +712,12 @@ impl ChainConf {
                 Ok(Box::new(indexer) as Box<dyn SequenceAwareIndexer<HyperlaneMessage>>)
             }
             ChainConnectionConf::Dusk(conf) => {
+                // The provider build checks this domain against the Mailbox's
+                // local_domain, so dispatches can be bound to it.
                 let provider = Arc::new(build_dusk_provider(self, conf).await?);
                 let rues = provider.rues().clone();
-                let indexer = h_dusk::DuskMailboxIndexer::new(rues, self.addresses.mailbox);
+                let indexer =
+                    h_dusk::DuskMailboxIndexer::new(rues, self.addresses.mailbox, self.domain.id());
                 Ok(Box::new(indexer) as Box<dyn SequenceAwareIndexer<HyperlaneMessage>>)
             }
             #[cfg(feature = "aleo")]

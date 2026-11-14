@@ -2,7 +2,13 @@
 
 ## Unreleased
 
+### Changed
+
+- Dispatch indexing read each message from its finalized `Dispatch` event, matched by the message ID the Mailbox stores (`dispatched_id`), because Mailbox state version 4 no longer stores dispatched messages.
+
 ### Fixed
+
+- The relayer ran `process` as an unsigned contract query before submitting it and retried later when the query failed, instead of paying the full gas limit for a delivery that reverts.
 
 - Startup retries were limited to Dusk identity observations; local event-store and signer errors returned promptly ([Dusk invariant review]).
 
