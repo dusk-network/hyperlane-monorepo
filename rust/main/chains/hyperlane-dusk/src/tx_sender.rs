@@ -21,6 +21,8 @@ use crate::rues::rkyv_serialize;
 use crate::{ConnectionConf, DuskSigner, HyperlaneDuskError};
 
 const DUSK_TX_HELPER_TIMEOUT: Duration = Duration::from_secs(120);
+const DUSK_TX_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+const MAX_RUES_URL_STDIN_BYTES: usize = 8 * 1024;
 const MAX_DUSK_TX_STREAM_BYTES: usize = 1024 * 1024;
 const MAX_DUSK_TX_ARGS_BYTES: usize = 60 * 1024;
 const MAX_PROCESS_PAYLOAD_BYTES: usize = MAX_DUSK_TX_ARGS_BYTES - 1024;
@@ -41,6 +43,11 @@ pub async fn dusk_tx_call(
             "dusk-tx arguments for {fn_name} exceed the {MAX_DUSK_TX_ARGS_BYTES}-byte helper transport limit"
         )));
     }
+    if conn.url.as_str().len() + 1 > MAX_RUES_URL_STDIN_BYTES {
+        return Err(HyperlaneDuskError::Other(
+            "Dusk RUES URL exceeds the helper's 8192-byte stdin line limit".into(),
+        ));
+    }
     let bin = std::env::var("DUSK_TX_BIN").unwrap_or_else(|_| "dusk-tx".into());
     let contract_hex = hex::encode(contract_id);
     let args_hex = hex::encode(args_bytes);
@@ -58,8 +65,7 @@ pub async fn dusk_tx_call(
     command.kill_on_drop(true);
     command.arg("call");
     let mut child = command
-        .arg("--rues-url")
-        .arg(conn.url.as_str())
+        .arg("--rues-url-stdin")
         .arg("--expected-chain-id")
         .arg(conn.chain_id.to_string())
         .arg("--secret-key-stdin")
@@ -84,22 +90,22 @@ pub async fn dusk_tx_call(
             ))
         })?;
 
-    // Provide the secret key via stdin so it is not exposed in the process list.
+    // Keep both the authenticated URL and signing key out of process arguments.
+    // The helper consumes the URL line first, then the key after chain validation.
     if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(secret_key_hex.as_bytes())
+        let input = format!("{}\n{secret_key_hex}\n", conn.url.as_str());
+        tokio::time::timeout(DUSK_TX_HELPER_TIMEOUT, stdin.write_all(input.as_bytes()))
             .await
-            .map_err(|e| {
-                HyperlaneDuskError::Other(format!(
-                    "Failed to write dusk secret key to dusk-tx stdin: {e}"
-                ))
+            .map_err(|_| {
+                HyperlaneDuskError::Other("dusk-tx stdin write exceeded its deadline".into())
+            })?
+            .map_err(|error| {
+                HyperlaneDuskError::Other(format!("Failed to write dusk-tx private stdin: {error}"))
             })?;
-        stdin.write_all(b"\n").await.map_err(|e| {
-            HyperlaneDuskError::Other(format!("Failed to finalize dusk-tx stdin: {e}"))
-        })?;
     }
 
-    let output = wait_for_child_output(child, fn_name, DUSK_TX_HELPER_TIMEOUT).await?;
+    let (output, prepared_tx_id) =
+        wait_for_child_output(child, fn_name, DUSK_TX_HELPER_TIMEOUT).await?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -119,27 +125,67 @@ pub async fn dusk_tx_call(
         // Try to parse error from JSON output
         if let Ok(json) = serde_json::from_str::<Value>(&stdout) {
             if let Some(err) = json.get("error").and_then(|e| e.as_str()) {
+                // Diagnostic bodies are opaque. Only the helper's anchored
+                // transaction prefix can report an identity, and it cannot
+                // replace the locally prepared hash captured from stderr.
+                if let Some(prepared) = prepared_tx_id.as_deref() {
+                    if transaction_error_parts(err)
+                        .is_some_and(|(reported, _)| !prepared.eq_ignore_ascii_case(reported))
+                    {
+                        return Err(helper_failure(
+                            Some(prepared),
+                            "dusk-tx error transaction ID disagrees with the prepared transaction"
+                                .into(),
+                        ));
+                    }
+                }
+                if let Some(tx_id) = included_failure_tx_id(err) {
+                    return Err(HyperlaneDuskError::TransactionExecutionFailed {
+                        tx_id,
+                        detail: err.to_owned(),
+                    });
+                }
                 if let Some(tx_id) = outcome_unknown_tx_id(err) {
                     return Err(HyperlaneDuskError::SubmissionOutcomeUnknown {
                         tx_id,
                         detail: err.to_owned(),
                     });
                 }
-                return Err(HyperlaneDuskError::Other(format!(
-                    "dusk-tx call {fn_name} failed: {err}"
-                )));
+                let detail = format!("dusk-tx call {fn_name} failed: {err}");
+                // A complete preverify diagnostic proves propagation never ran.
+                if before_propagation_error(err) {
+                    return Err(HyperlaneDuskError::Other(detail));
+                }
+                return Err(helper_failure(prepared_tx_id.as_deref(), detail));
             }
         }
-        return Err(HyperlaneDuskError::Other(format!(
-            "dusk-tx call {fn_name} failed (exit code {code}): {stderr}"
-        )));
+        return Err(helper_failure(
+            prepared_tx_id.as_deref(),
+            format!("dusk-tx call {fn_name} failed (exit code {code}): {stderr}"),
+        ));
     }
 
     let json: Value = serde_json::from_str(&stdout).map_err(|e| {
-        HyperlaneDuskError::Other(format!(
-            "Failed to parse dusk-tx output as JSON: {e}. Output: {stdout}"
-        ))
+        helper_failure(
+            prepared_tx_id.as_deref(),
+            format!("Failed to parse dusk-tx output as JSON: {e}. Output: {stdout}"),
+        )
     })?;
+    let returned_id = json
+        .get("tx_id")
+        .and_then(Value::as_str)
+        .and_then(|tx_id| dusk_tx_id_to_h512(tx_id).ok());
+    if json.get("success").and_then(Value::as_bool) != Some(true)
+        || returned_id.is_none()
+        || prepared_tx_id
+            .as_deref()
+            .is_some_and(|prepared| dusk_tx_id_to_h512(prepared).ok() != returned_id)
+    {
+        return Err(helper_failure(
+            prepared_tx_id.as_deref(),
+            "dusk-tx output is missing a successful result with the prepared transaction ID".into(),
+        ));
+    }
 
     info!(
         fn_name = %fn_name,
@@ -154,7 +200,7 @@ async fn wait_for_child_output(
     mut child: tokio::process::Child,
     fn_name: &str,
     timeout: Duration,
-) -> Result<std::process::Output, HyperlaneDuskError> {
+) -> Result<(std::process::Output, Option<String>), HyperlaneDuskError> {
     let stdout = child.stdout.take().ok_or_else(|| {
         HyperlaneDuskError::Other("dusk-tx stdout pipe was not configured".into())
     })?;
@@ -162,49 +208,109 @@ async fn wait_for_child_output(
         HyperlaneDuskError::Other("dusk-tx stderr pipe was not configured".into())
     })?;
     let (prepared_tx_sender, mut prepared_tx_receiver) = oneshot::channel();
-    let stdout_task = tokio::spawn(read_bounded_stream(stdout, "stdout", None));
-    let stderr_task = tokio::spawn(read_bounded_stream(
+    let mut stdout_task = tokio::spawn(read_bounded_stream(stdout, "stdout", None));
+    let mut stderr_task = tokio::spawn(read_bounded_stream(
         stderr,
         "stderr",
         Some(prepared_tx_sender),
     ));
 
-    let status = match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(result) => result.map_err(|error| {
-            HyperlaneDuskError::Other(format!(
-                "Failed to wait on dusk-tx child process for {fn_name}: {error}"
-            ))
-        })?,
-        Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            stdout_task.abort();
-            stderr_task.abort();
-            let detail = format!(
+    let status = tokio::time::timeout(timeout, child.wait())
+        .await
+        .map_err(|_| {
+            format!(
                 "dusk-tx call {fn_name} exceeded the {}s helper deadline",
                 timeout.as_secs()
-            );
-            // The helper emits its locally computed hash before propagation.
-            // Once observed, killing the helper cannot establish whether the
-            // transaction landed. Let the caller reconcile that exact hash.
-            return Err(match prepared_tx_receiver.try_recv() {
-                Ok(tx_id) => HyperlaneDuskError::SubmissionOutcomeUnknown { tx_id, detail },
-                Err(_) => HyperlaneDuskError::Other(detail),
-            });
+            )
+        })
+        .and_then(|result| {
+            result.map_err(|error| {
+                format!("Failed to wait on dusk-tx child process for {fn_name}: {error}")
+            })
+        });
+    let status = match status {
+        Ok(status) => status,
+        Err(detail) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            drain_timed_out_readers(&mut stdout_task, &mut stderr_task).await;
+            return Err(helper_failure(
+                prepared_tx_receiver.try_recv().ok().as_deref(),
+                detail,
+            ));
         }
     };
 
-    let stdout = stdout_task.await.map_err(|error| {
-        HyperlaneDuskError::Other(format!("Failed to join dusk-tx stdout reader: {error}"))
-    })??;
-    let stderr = stderr_task.await.map_err(|error| {
-        HyperlaneDuskError::Other(format!("Failed to join dusk-tx stderr reader: {error}"))
-    })??;
-    Ok(std::process::Output {
-        status,
-        stdout,
-        stderr,
+    // Observe both readers before classifying a failed read or parsing output.
+    // A normal or signaled exit can interrupt the helper after propagation just
+    // as a timeout can; the prepared hash remains authoritative in every case.
+    let (stdout, stderr) = tokio::join!(stdout_task, stderr_task);
+    let prepared_tx_id = prepared_tx_receiver.try_recv().ok();
+    let stdout = stdout
+        .map_err(|error| {
+            helper_failure(
+                prepared_tx_id.as_deref(),
+                format!("Failed to join dusk-tx stdout reader: {error}"),
+            )
+        })?
+        .map_err(|error| helper_failure(prepared_tx_id.as_deref(), error.to_string()))?;
+    let stderr = stderr
+        .map_err(|error| {
+            helper_failure(
+                prepared_tx_id.as_deref(),
+                format!("Failed to join dusk-tx stderr reader: {error}"),
+            )
+        })?
+        .map_err(|error| helper_failure(prepared_tx_id.as_deref(), error.to_string()))?;
+    Ok((
+        std::process::Output {
+            status,
+            stdout,
+            stderr,
+        },
+        prepared_tx_id,
+    ))
+}
+
+fn helper_failure(prepared_tx_id: Option<&str>, detail: String) -> HyperlaneDuskError {
+    match prepared_tx_id {
+        Some(tx_id) => HyperlaneDuskError::SubmissionOutcomeUnknown {
+            tx_id: tx_id.to_owned(),
+            detail,
+        },
+        None => HyperlaneDuskError::Other(detail),
+    }
+}
+
+fn before_propagation_error(error: &str) -> bool {
+    let Some((tx_id, detail)) = error
+        .strip_prefix("Transaction ")
+        .and_then(|error| error.split_once(" submission failed: "))
+    else {
+        return false;
+    };
+    tx_id.len() == 64
+        && tx_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && (detail.starts_with("Preverify failed before propagation: ")
+            || detail.starts_with("Preverify rejected before propagation ("))
+}
+
+type PipeReader = tokio::task::JoinHandle<Result<Vec<u8>, HyperlaneDuskError>>;
+
+async fn drain_timed_out_readers(stdout: &mut PipeReader, stderr: &mut PipeReader) {
+    // Killing the child closes its pipes, but bytes already emitted can still be
+    // buffered. Give the readers time to observe the prepared hash before aborting.
+    // Descendants retaining a pipe cannot extend this deadline indefinitely.
+    if tokio::time::timeout(DUSK_TX_DRAIN_TIMEOUT, async {
+        let _ = (&mut *stderr).await;
+        let _ = (&mut *stdout).await;
     })
+    .await
+    .is_err()
+    {
+        stdout.abort();
+        stderr.abort();
+    }
 }
 
 async fn read_bounded_stream(
@@ -303,16 +409,26 @@ pub fn process_args(
     Ok(args)
 }
 
-fn outcome_unknown_tx_id(error: &str) -> Option<String> {
-    if !error.contains("submission failed: Propagation outcome unknown")
-        && !error.contains("confirmation outcome unknown")
-    {
-        return None;
-    }
-    let tx_id = error.split("tx_id=").nth(1)?.split_whitespace().next()?;
-    let tx_id = tx_id.trim_end_matches(|character: char| !character.is_ascii_hexdigit());
+// Only the helper-owned leading fields carry transaction identity. RPC response
+// text is opaque and must not supply a replacement through a quoted tx_id field.
+fn transaction_error_parts(error: &str) -> Option<(&str, &str)> {
+    let (tx_id, detail) = error.strip_prefix("Transaction ")?.split_once(' ')?;
     (tx_id.len() == 64 && tx_id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some((tx_id, detail))
+}
+
+fn included_failure_tx_id(error: &str) -> Option<String> {
+    let (tx_id, detail) = transaction_error_parts(error)?;
+    detail
+        .starts_with("failed: ")
         .then(|| tx_id.to_ascii_lowercase())
+}
+
+fn outcome_unknown_tx_id(error: &str) -> Option<String> {
+    let (tx_id, detail) = transaction_error_parts(error)?;
+    (detail.starts_with("submission failed: Propagation outcome unknown")
+        || detail.starts_with("confirmation outcome unknown"))
+    .then(|| tx_id.to_ascii_lowercase())
 }
 
 /// Build rkyv-serialized args for validator_announce.announce(validator, location, signature).
@@ -356,6 +472,35 @@ mod tests {
             "Transaction {tx_id} submission failed: Propagation rejected; retain tx_id={tx_id}"
         );
         assert_eq!(outcome_unknown_tx_id(&rejected), None);
+    }
+
+    #[test]
+    fn opaque_diagnostics_do_not_change_error_identity_or_classification() {
+        let tx_id = "ab".repeat(32);
+        let other = "cd".repeat(32);
+        let error = format!("Transaction {tx_id} confirmation outcome unknown: diagnostic tx_id={other}; retain tx_id={tx_id}");
+        assert_eq!(outcome_unknown_tx_id(&error), Some(tx_id.clone()));
+        let preverify = format!("Transaction {tx_id} submission failed: Preverify rejected before propagation (400): diagnostic confirmation outcome unknown tx_id={other}");
+        assert_eq!(outcome_unknown_tx_id(&preverify), None);
+        assert!(before_propagation_error(&preverify));
+        assert_eq!(outcome_unknown_tx_id(&format!("Diagnostic: {error}")), None);
+    }
+
+    #[test]
+    fn only_included_failures_yield_an_execution_failure_hash() {
+        let tx_id = "AB".repeat(32);
+        assert_eq!(
+            included_failure_tx_id(&format!("Transaction {tx_id} failed: recipient rejected")),
+            Some(tx_id.to_ascii_lowercase())
+        );
+        for error in [
+            format!("Transaction {tx_id} submission failed: preverify rejected"),
+            format!("Preverify rejected: Transaction {tx_id} failed: quoted node error"),
+            "Transaction short failed: recipient rejected".into(),
+            format!("Transaction {} failed: recipient rejected", "zz".repeat(32)),
+        ] {
+            assert_eq!(included_failure_tx_id(&error), None);
+        }
     }
 
     #[test]
@@ -445,6 +590,23 @@ mod tests {
             prepared_tx_id(format!("Prepared TX {}; reconcile", "z".repeat(64)).as_bytes())
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn timeout_drain_keeps_a_prepared_hash_already_buffered_in_the_pipe() {
+        let tx_id = "ab".repeat(32);
+        let (mut writer, reader) = tokio::io::duplex(256);
+        writer
+            .write_all(format!("Prepared TX {tx_id}; reconcile\n").as_bytes())
+            .await
+            .unwrap();
+        drop(writer);
+        let (sender, mut receiver) = oneshot::channel();
+        // Neither reader has run when drain starts on this single-thread runtime.
+        let mut stdout = tokio::spawn(read_bounded_stream(tokio::io::empty(), "stdout", None));
+        let mut stderr = tokio::spawn(read_bounded_stream(reader, "stderr", Some(sender)));
+        drain_timed_out_readers(&mut stdout, &mut stderr).await;
+        assert_eq!(receiver.try_recv().unwrap(), tx_id);
     }
 
     #[cfg(unix)]

@@ -960,9 +960,21 @@ pub fn build_dusk_connection_conf(
     rpcs: &[Url],
     chain: &ValueParser,
     err: &mut ConfigParsingError,
+    default_rpc_consensus_type: &str,
     operation_batch: OpSubmissionConfig,
 ) -> Option<ChainConnectionConf> {
-    let url = rpcs.first()?.clone();
+    let consensus = chain
+        .chain(err)
+        .get_opt_key("rpcConsensusType")
+        .parse_string()
+        .unwrap_or(default_rpc_consensus_type);
+    let url = match dusk_primary_rpc(rpcs, consensus) {
+        Ok(url) => url,
+        Err(message) => {
+            err.push((&chain.cwp).add("rpcconsensustype"), eyre!(message));
+            return None;
+        }
+    };
     let native_token = parse_native_token(chain, err, 9);
 
     let raw_chain_id = chain.chain(err).get_key("chainId").parse_u64().end()?;
@@ -1011,6 +1023,18 @@ pub fn build_dusk_connection_conf(
     }))
 }
 
+fn dusk_primary_rpc(rpcs: &[Url], consensus: &str) -> Result<Url, &'static str> {
+    if !matches!(consensus, "single" | "fallback" | "quorum" | "majority") {
+        return Err("Unknown Dusk rpcConsensusType; use single for one primary endpoint");
+    }
+    if rpcs.len() > 1 && consensus != "single" {
+        return Err("Dusk provider RPC fallback/quorum is not implemented; configure one rpcUrl or explicitly select rpcConsensusType=single. Validator majority/quorum applies separately to checkpoint voting; indexing and submission use the primary endpoint");
+    }
+    rpcs.first()
+        .cloned()
+        .ok_or("Dusk requires at least one RPC URL")
+}
+
 fn parse_dusk_chain_id(value: u64) -> Result<u8, String> {
     u8::try_from(value)
         .map_err(|_| format!("Dusk chainId must fit in one byte (0..=255), got {value}"))
@@ -1048,9 +1072,13 @@ pub fn build_connection_conf(
         HyperlaneDomainProtocol::Tron => {
             build_tron_connection_conf(rpcs, chain, err, operation_batch)
         }
-        HyperlaneDomainProtocol::Dusk => {
-            build_dusk_connection_conf(rpcs, chain, err, operation_batch)
-        }
+        HyperlaneDomainProtocol::Dusk => build_dusk_connection_conf(
+            rpcs,
+            chain,
+            err,
+            default_rpc_consensus_type,
+            operation_batch,
+        ),
         #[cfg(feature = "aleo")]
         HyperlaneDomainProtocol::Aleo => {
             build_aleo_connection_conf(rpcs, chain, err, operation_batch)
@@ -1257,7 +1285,25 @@ mod tests {
 
 #[cfg(test)]
 mod dusk_tests {
-    use super::parse_dusk_chain_id;
+    use super::{dusk_primary_rpc, parse_dusk_chain_id};
+    use url::Url;
+
+    #[test]
+    fn dusk_rpc_selection_rejects_unsupported_fallback_instead_of_dropping_urls() {
+        let urls = [
+            Url::parse("http://primary.example").unwrap(),
+            Url::parse("http://secondary.example").unwrap(),
+        ];
+        for mode in ["fallback", "quorum", "majority"] {
+            assert!(dusk_primary_rpc(&urls, mode)
+                .unwrap_err()
+                .contains("not implemented"));
+            assert_eq!(dusk_primary_rpc(&urls[..1], mode).unwrap(), urls[0]);
+        }
+        assert_eq!(dusk_primary_rpc(&urls, "single").unwrap(), urls[0]);
+        assert!(dusk_primary_rpc(&urls, "unknown").is_err());
+        assert!(dusk_primary_rpc(&[], "single").is_err());
+    }
 
     #[test]
     fn dusk_chain_id_rejects_truncation() {

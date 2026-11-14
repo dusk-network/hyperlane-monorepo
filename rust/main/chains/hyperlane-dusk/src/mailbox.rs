@@ -106,8 +106,8 @@ impl DuskMailbox {
             .await
     }
 
-    async fn finalized_merkle_view(&self) -> ChainResult<(u32, u64)> {
-        let finalized_height = self.rues.finalized_block_height().await?;
+    async fn finalized_merkle_view(&self, reorg_period: &ReorgPeriod) -> ChainResult<(u32, u64)> {
+        let finalized_height = self.rues.checkpoint_block_height(reorg_period).await?;
         let count = self.merkle_tree_count().await?;
         let finalized_count = self.merkle_count_at_height(count, finalized_height).await?;
         Ok((finalized_count, finalized_height))
@@ -121,8 +121,11 @@ impl DuskMailbox {
         Ok(H256::from_slice(&root))
     }
 
-    async fn finalized_tree(&self) -> ChainResult<IncrementalMerkleAtBlock> {
-        let (count, finalized_height) = self.finalized_merkle_view().await?;
+    async fn finalized_tree(
+        &self,
+        reorg_period: &ReorgPeriod,
+    ) -> ChainResult<IncrementalMerkleAtBlock> {
+        let (count, finalized_height) = self.finalized_merkle_view(reorg_period).await?;
         let mut tree = IncrementalMerkle::default();
         let mut start = 0u32;
         while start < count {
@@ -211,12 +214,53 @@ impl HyperlaneContract for DuskMailbox {
 #[derive(Debug, Clone)]
 pub struct DuskMerkleTreeHook {
     inner: DuskMailbox,
+    identity: Option<Arc<HookIdentity>>,
+}
+
+#[derive(Debug)]
+struct HookIdentity {
+    validator_announce_id: [u8; 32],
+    validated: tokio::sync::OnceCell<()>,
 }
 
 impl DuskMerkleTreeHook {
     /// Create a hook adapter over the same Dusk connection and topology.
     pub fn new(inner: DuskMailbox) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            identity: None,
+        }
+    }
+
+    /// Defer endpoint identity queries until the first state read. An offline
+    /// quorum endpoint retains its voting slot and can recover on a later read.
+    /// No state read succeeds until chain, mailbox and announce identities match.
+    pub fn new_with_identity_validation(inner: DuskMailbox, validator_announce_id: H256) -> Self {
+        Self {
+            inner,
+            identity: Some(Arc::new(HookIdentity {
+                validator_announce_id: validator_announce_id.into(),
+                validated: tokio::sync::OnceCell::new(),
+            })),
+        }
+    }
+
+    async fn ensure_identity(&self) -> ChainResult<()> {
+        if let Some(identity) = &self.identity {
+            identity
+                .validated
+                .get_or_try_init(|| {
+                    self.inner.rues.validate_chain_identity(
+                        self.inner.conn.chain_id,
+                        self.inner.domain.id(),
+                        &self.inner.mailbox_id,
+                        &identity.validator_announce_id,
+                        &self.inner.merkle_tree_hook_id,
+                    )
+                })
+                .await?;
+        }
+        Ok(())
     }
 }
 
@@ -248,8 +292,8 @@ impl Mailbox for DuskMailbox {
         H256::from_slice(&hash)
     }
 
-    async fn count(&self, _reorg_period: &ReorgPeriod) -> ChainResult<u32> {
-        Ok(self.finalized_merkle_view().await?.0)
+    async fn count(&self, reorg_period: &ReorgPeriod) -> ChainResult<u32> {
+        Ok(self.finalized_merkle_view(reorg_period).await?.0)
     }
 
     async fn delivered(&self, id: H256) -> ChainResult<bool> {
@@ -329,8 +373,9 @@ impl Mailbox for DuskMailbox {
                     ))
                 })?
                 .to_owned(),
-            Err(HyperlaneDuskError::SubmissionOutcomeUnknown { tx_id, detail }) => {
-                warn!(%tx_id, %detail, "Reconciling outcome-unknown Dusk submission by exact hash");
+            Err(HyperlaneDuskError::SubmissionOutcomeUnknown { tx_id, detail })
+            | Err(HyperlaneDuskError::TransactionExecutionFailed { tx_id, detail }) => {
+                warn!(%tx_id, %detail, "Reconciling Dusk submission receipt by exact hash");
                 tx_id
             }
             Err(error) => return Err(error.into()),
@@ -396,26 +441,34 @@ impl Mailbox for DuskMailbox {
 
 #[async_trait]
 impl MerkleTreeHook for DuskMerkleTreeHook {
-    async fn tree(&self, _reorg_period: &ReorgPeriod) -> ChainResult<IncrementalMerkleAtBlock> {
+    async fn tree(&self, reorg_period: &ReorgPeriod) -> ChainResult<IncrementalMerkleAtBlock> {
         // Rusk does not expose historical contract-state queries. Reconstruct
         // the one-time validator start tree from hook-owned insertion history,
         // capped at consensus finality, and verify it against the stored root.
-        self.inner.finalized_tree().await
+        self.ensure_identity().await?;
+        self.inner.finalized_tree(reorg_period).await
     }
 
-    async fn count(&self, _reorg_period: &ReorgPeriod) -> ChainResult<u32> {
-        Ok(self.inner.finalized_merkle_view().await?.0)
+    async fn count(&self, reorg_period: &ReorgPeriod) -> ChainResult<u32> {
+        self.ensure_identity().await?;
+        Ok(self.inner.finalized_merkle_view(reorg_period).await?.0)
     }
 
     async fn latest_checkpoint(
         &self,
-        _reorg_period: &ReorgPeriod,
+        reorg_period: &ReorgPeriod,
     ) -> ChainResult<CheckpointAtBlock> {
-        let finalized_height = self.inner.rues.finalized_block_height().await?;
+        self.ensure_identity().await?;
+        let finalized_height = self
+            .inner
+            .rues
+            .checkpoint_block_height(reorg_period)
+            .await?;
         self.inner.checkpoint_at_height(finalized_height).await
     }
 
     async fn latest_checkpoint_at_block(&self, height: u64) -> ChainResult<CheckpointAtBlock> {
+        self.ensure_identity().await?;
         self.inner.checkpoint_at_height(height).await
     }
 }
