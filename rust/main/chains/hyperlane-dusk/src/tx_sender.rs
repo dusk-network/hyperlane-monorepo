@@ -187,9 +187,14 @@ pub async fn dusk_tx_call(
         ));
     }
 
+    let tx_id = json
+        .get("tx_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     info!(
         fn_name = %fn_name,
         contract = %contract_hex,
+        tx_id = %tx_id,
         "dusk-tx call succeeded"
     );
 
