@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use base64::engine::{general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
+use reqwest::StatusCode;
 use rkyv::ser::serializers::AllocSerializer;
 use rkyv::ser::Serializer;
 use rkyv::validation::validators::DefaultValidator;
@@ -23,6 +24,8 @@ use crate::HyperlaneDuskError;
 const MAX_RUES_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const FINALIZED_EVENT_PAGE_SIZE: usize = 16;
 const MAX_EVENT_TOPIC_BYTES: usize = 256;
+/// Most bytes of a response body that go into an error or a log line.
+const MAX_ERROR_BODY_BYTES: usize = 1024;
 const TX_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 type SharedRuesClients = HashMap<(String, PathBuf), RuesClient>;
@@ -342,10 +345,7 @@ impl RuesClient {
         let status = response.status();
         let response_body = read_bounded_body(response, "contract query").await?;
         if !status.is_success() {
-            return Err(HyperlaneDuskError::RuesResponse {
-                status: status.as_u16(),
-                body: String::from_utf8_lossy(&response_body).into_owned(),
-            });
+            return Err(rues_response_error(status, &response_body));
         }
 
         Ok(response_body)
@@ -370,16 +370,13 @@ impl RuesClient {
         let status = response.status();
         let response_body = read_bounded_body(response, "contract metadata query").await?;
         if !status.is_success() {
-            return Err(HyperlaneDuskError::RuesResponse {
-                status: status.as_u16(),
-                body: String::from_utf8_lossy(&response_body).into_owned(),
-            });
+            return Err(rues_response_error(status, &response_body));
         }
 
-        let body = String::from_utf8_lossy(&response_body);
-        serde_json::from_str::<ContractMetadata>(&body).map_err(|error| {
+        serde_json::from_slice::<ContractMetadata>(&response_body).map_err(|error| {
             HyperlaneDuskError::Other(format!(
-                "Failed to parse contract metadata JSON: {error}. Body: {body}"
+                "Failed to parse contract metadata JSON: {error}. Body: {}",
+                bounded_body(&response_body)
             ))
         })
     }
@@ -416,10 +413,7 @@ impl RuesClient {
         let status = response.status();
         if !status.is_success() {
             let body = read_bounded_body(response, "transaction preverification").await?;
-            return Err(HyperlaneDuskError::RuesResponse {
-                status: status.as_u16(),
-                body: String::from_utf8_lossy(&body).into_owned(),
-            });
+            return Err(rues_response_error(status, &body));
         }
 
         let url = self.endpoint("/on/transactions/propagate");
@@ -435,10 +429,7 @@ impl RuesClient {
         let status = response.status();
         if !status.is_success() {
             let body = read_bounded_body(response, "transaction propagation").await?;
-            return Err(HyperlaneDuskError::RuesResponse {
-                status: status.as_u16(),
-                body: String::from_utf8_lossy(&body).into_owned(),
-            });
+            return Err(rues_response_error(status, &body));
         }
 
         Ok(())
@@ -459,23 +450,23 @@ impl RuesClient {
         let status = response.status();
         let body = read_bounded_body(response, "GraphQL query").await?;
         if !status.is_success() {
-            return Err(HyperlaneDuskError::RuesResponse {
-                status: status.as_u16(),
-                body: String::from_utf8_lossy(&body).into_owned(),
-            });
+            return Err(rues_response_error(status, &body));
         }
 
         let payload = serde_json::from_slice::<JsonValue>(&body).map_err(|e| {
             HyperlaneDuskError::Other(format!(
                 "Failed to parse GraphQL JSON response: {e}. Body: {}",
-                String::from_utf8_lossy(&body)
+                bounded_body(&body)
             ))
         })?;
 
-        if payload.get("errors").is_some_and(graphql_errors_present) {
+        if let Some(errors) = payload
+            .get("errors")
+            .filter(|errors| graphql_errors_present(errors))
+        {
             return Err(HyperlaneDuskError::Other(format!(
                 "GraphQL query returned errors: {}",
-                payload["errors"]
+                bounded_json(errors)
             )));
         }
 
@@ -829,7 +820,8 @@ impl RuesClient {
             .and_then(|events| events.get("json"))
             .ok_or_else(|| {
                 HyperlaneDuskError::Other(format!(
-                    "Rusk archive response is missing finalizedEvents.json: {data}"
+                    "Rusk archive response is missing finalizedEvents.json: {}",
+                    bounded_json(&data)
                 ))
             })?;
         serde_json::from_value(page.clone()).map_err(|error| {
@@ -973,7 +965,8 @@ impl RuesClient {
             .and_then(JsonValue::as_u64)
             .ok_or_else(|| {
                 HyperlaneDuskError::Other(format!(
-                    "Ledger transaction {tx_id} is missing numeric blockHeight: {transaction}"
+                    "Ledger transaction {tx_id} is missing numeric blockHeight: {}",
+                    bounded_json(transaction)
                 ))
             })?;
         Ok(Some(height))
@@ -1056,16 +1049,13 @@ impl RuesClient {
         let status = response.status();
         let body = read_bounded_body(response, "account status query").await?;
         if !status.is_success() {
-            return Err(HyperlaneDuskError::RuesResponse {
-                status: status.as_u16(),
-                body: String::from_utf8_lossy(&body).into_owned(),
-            });
+            return Err(rues_response_error(status, &body));
         }
 
         serde_json::from_slice::<AccountStatus>(&body).map_err(|e| {
             HyperlaneDuskError::Other(format!(
                 "Failed to parse account status JSON: {e}. Body: {}",
-                String::from_utf8_lossy(&body)
+                bounded_body(&body)
             ))
         })
     }
@@ -1112,16 +1102,13 @@ impl RuesClient {
         let status = response.status();
         let body = read_bounded_body(response, "gas price query").await?;
         if !status.is_success() {
-            return Err(HyperlaneDuskError::RuesResponse {
-                status: status.as_u16(),
-                body: String::from_utf8_lossy(&body).into_owned(),
-            });
+            return Err(rues_response_error(status, &body));
         }
 
         serde_json::from_slice::<GasPriceStats>(&body).map_err(|e| {
             HyperlaneDuskError::Other(format!(
                 "Failed to parse gas price stats JSON: {e}. Body: {}",
-                String::from_utf8_lossy(&body)
+                bounded_body(&body)
             ))
         })
     }
@@ -1139,7 +1126,8 @@ impl RuesClient {
 fn validate_transaction_id(tx_id: &str) -> Result<(), HyperlaneDuskError> {
     if tx_id.len() != 64 || !tx_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(HyperlaneDuskError::Other(format!(
-            "Invalid Dusk transaction ID '{tx_id}'"
+            "Invalid Dusk transaction ID '{}'",
+            bounded_text(tx_id)
         )));
     }
     Ok(())
@@ -1154,7 +1142,8 @@ fn parse_confirmed_transaction(
         .and_then(JsonValue::as_u64)
         .ok_or_else(|| {
             HyperlaneDuskError::Other(format!(
-                "Ledger transaction {tx_id} is missing numeric gasSpent: {transaction}"
+                "Ledger transaction {tx_id} is missing numeric gasSpent: {}",
+                bounded_json(transaction)
             ))
         })?;
     let error = match transaction.get("err") {
@@ -1162,12 +1151,14 @@ fn parse_confirmed_transaction(
         Some(JsonValue::String(error)) => Some(error.clone()),
         None => {
             return Err(HyperlaneDuskError::Other(format!(
-                "Ledger transaction {tx_id} is missing err status: {transaction}"
+                "Ledger transaction {tx_id} is missing err status: {}",
+                bounded_json(transaction)
             )))
         }
         Some(other) => {
             return Err(HyperlaneDuskError::Other(format!(
-                "Ledger transaction {tx_id} has invalid err field: {other}"
+                "Ledger transaction {tx_id} has invalid err field: {}",
+                bounded_json(other)
             )))
         }
     };
@@ -1180,7 +1171,8 @@ fn parse_block_heights(data: &JsonValue) -> Result<(u64, u64), HyperlaneDuskErro
         .and_then(|value| value.get("json"))
         .ok_or_else(|| {
             HyperlaneDuskError::Other(format!(
-                "Rusk archive response is missing lastBlockPair.json: {data}"
+                "Rusk archive response is missing lastBlockPair.json: {}",
+                bounded_json(data)
             ))
         })?;
     let latest = pair
@@ -1190,7 +1182,8 @@ fn parse_block_heights(data: &JsonValue) -> Result<(u64, u64), HyperlaneDuskErro
         .and_then(JsonValue::as_u64)
         .ok_or_else(|| {
             HyperlaneDuskError::Other(format!(
-                "Rusk archive response is missing numeric last_block height: {pair}"
+                "Rusk archive response is missing numeric last_block height: {}",
+                bounded_json(pair)
             ))
         })?;
     let finalized = pair
@@ -1200,7 +1193,8 @@ fn parse_block_heights(data: &JsonValue) -> Result<(u64, u64), HyperlaneDuskErro
         .and_then(JsonValue::as_u64)
         .ok_or_else(|| {
             HyperlaneDuskError::Other(format!(
-                "Rusk archive response is missing numeric last_finalized_block height: {pair}"
+                "Rusk archive response is missing numeric last_finalized_block height: {}",
+                bounded_json(pair)
             ))
         })?;
     if finalized > latest {
@@ -1286,7 +1280,7 @@ fn validate_finalized_event_page(
         if !strip_hex_prefix(&event.source).eq_ignore_ascii_case(&source) {
             return Err(HyperlaneDuskError::Other(format!(
                 "Rusk finalizedEvents returned source {} while querying {source}",
-                event.source
+                bounded_text(&event.source)
             )));
         }
         last_id = Some(event.id);
@@ -1371,6 +1365,43 @@ fn finalized_event_row_key(
     Ok(key)
 }
 
+fn rues_response_error(status: StatusCode, body: &[u8]) -> HyperlaneDuskError {
+    HyperlaneDuskError::RuesResponse {
+        status: status.as_u16(),
+        body: bounded_body(body),
+    }
+}
+
+/// At most `MAX_ERROR_BODY_BYTES` of a response body, for an error or a log
+/// line. Bodies can be megabytes, and an endpoint chooses their content.
+pub(crate) fn bounded_body(body: &[u8]) -> String {
+    let shown = &body[..body.len().min(MAX_ERROR_BODY_BYTES)];
+    truncated_text(&String::from_utf8_lossy(shown), body.len())
+}
+
+/// At most `MAX_ERROR_BODY_BYTES` of endpoint-supplied text.
+pub(crate) fn bounded_text(text: &str) -> String {
+    truncated_text(text, text.len())
+}
+
+/// At most `MAX_ERROR_BODY_BYTES` of an endpoint-supplied JSON value.
+pub(crate) fn bounded_json(value: &JsonValue) -> String {
+    bounded_text(&value.to_string())
+}
+
+/// Cut `text` to `MAX_ERROR_BODY_BYTES` on a character boundary, and say how
+/// long the original was when anything was cut.
+fn truncated_text(text: &str, original_len: usize) -> String {
+    let mut end = text.len().min(MAX_ERROR_BODY_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == text.len() && original_len <= MAX_ERROR_BODY_BYTES {
+        return text.to_owned();
+    }
+    format!("{}... [truncated, {original_len} bytes]", &text[..end])
+}
+
 fn transaction_query(tx_id: &str) -> String {
     format!(r#"query {{ tx(hash: "{tx_id}") {{ gasSpent err }} }}"#)
 }
@@ -1399,7 +1430,10 @@ fn tx_confirmation_timeout_error(
 
 fn parse_h256_hex(value: &str, field: &str) -> Result<H256, HyperlaneDuskError> {
     let bytes = hex::decode(strip_hex_prefix(value)).map_err(|error| {
-        HyperlaneDuskError::Other(format!("Invalid {field} hex '{value}': {error}"))
+        HyperlaneDuskError::Other(format!(
+            "Invalid {field} hex '{}': {error}",
+            bounded_text(value)
+        ))
     })?;
     if bytes.len() != 32 {
         return Err(HyperlaneDuskError::Other(format!(
@@ -2505,6 +2539,52 @@ mod tests {
             &rebuilt.provenance.transaction_id.as_bytes()[32..],
             &[1u8; 32]
         );
+    }
+
+    #[tokio::test]
+    async fn error_bodies_are_cut_before_they_reach_errors() {
+        let body = "x".repeat(64 * 1024);
+        let client = RuesClient::new(test_server(vec![
+            (503, body.clone()),
+            (200, body.clone()),
+            (200, format!(r#"{{"errors":[{{"message":"{body}"}}]}}"#)),
+        ]))
+        .unwrap();
+        let errors = [
+            client
+                .contract_query_raw(&[1; 32], "nonce", &[])
+                .await
+                .unwrap_err(),
+            client.graphql_query("query { ping }").await.unwrap_err(),
+            client.graphql_query("query { ping }").await.unwrap_err(),
+        ];
+        for error in errors {
+            let error = error.to_string();
+            assert!(
+                error.len() < 2 * MAX_ERROR_BODY_BYTES,
+                "{} bytes",
+                error.len()
+            );
+            assert!(error.contains("[truncated, "), "{error}");
+        }
+    }
+
+    #[test]
+    fn bounded_text_cuts_on_a_character_boundary() {
+        assert_eq!(bounded_text("short"), "short");
+        let text = "\u{20ac}".repeat(MAX_ERROR_BODY_BYTES);
+        let bounded = bounded_text(&text);
+        assert!(bounded.starts_with(&"\u{20ac}".repeat(MAX_ERROR_BODY_BYTES / 3)));
+        assert!(bounded.ends_with(&format!("... [truncated, {} bytes]", text.len())));
+        // Bytes that are not UTF-8 decode to wider replacement characters;
+        // the result is still bounded.
+        let bounded = bounded_body(&vec![0xff; 4 * MAX_ERROR_BODY_BYTES]);
+        assert!(
+            bounded.len() <= MAX_ERROR_BODY_BYTES + 32,
+            "{}",
+            bounded.len()
+        );
+        assert!(bounded.ends_with(&format!("[truncated, {} bytes]", 4 * MAX_ERROR_BODY_BYTES)));
     }
 
     #[tokio::test]

@@ -8,6 +8,9 @@
 
 ### Fixed
 
+- The `process` simulation passed only on the encoding of the `()` that `process` returns. Any other success reply, such as a proxy's error page sent with status 200, failed the simulation instead of letting the transaction burn its gas limit.
+- Response bodies were cut to 1 KiB before they went into errors or logs, instead of being copied in whole, up to 4 MiB.
+
 - The relayer ran `process` as an unsigned contract query before submitting it and retried later when the query failed, instead of paying the full gas limit for a delivery that reverts.
 
 - Startup retries were limited to Dusk identity observations; local event-store and signer errors returned promptly ([Dusk invariant review]).

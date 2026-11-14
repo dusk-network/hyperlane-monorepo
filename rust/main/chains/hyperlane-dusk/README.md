@@ -16,7 +16,8 @@ how to run the local bridge.
 - **Reads** go to Rusk contract queries (`POST /on/contracts:<id>/<method>`)
   with rkyv-encoded arguments, and to Rusk's GraphQL endpoint for blocks,
   transactions and finalized events. Events come from the archive, so the
-  node must be built with the `archive` feature.
+  node must be built with the `archive` feature. Response bodies are cut to
+  1 KiB before they appear in errors or logs.
 - **Indexing** uses finalized contract events only. Each event is matched to
   its block and transaction, and stored in the agent's `eventCursorDir`, which
   every agent process needs its own copy of. The Mailbox stores only the ID of
@@ -30,8 +31,9 @@ how to run the local bridge.
 - **Delivery simulation.** Dusk charges a failed transaction its whole gas
   limit. Before submitting `process`, the relayer runs it as an unsigned
   contract query, which Rusk executes in a throwaway session. If the query
-  fails, nothing is submitted and the message is retried later. The query
-  reports no gas use, so `gasLimit` stays the transaction ceiling.
+  fails, or replies with anything other than the encoding of the `()` that
+  `process` returns, nothing is submitted and the message is retried later.
+  The query reports no gas use, so `gasLimit` stays the transaction ceiling.
 - **Identity checks.** On startup the agent checks that the node's chain ID
   and the configured contracts agree with each other: the Mailbox domain, and
   the ValidatorAnnounce and Merkle hook bindings to that Mailbox. Startup waits

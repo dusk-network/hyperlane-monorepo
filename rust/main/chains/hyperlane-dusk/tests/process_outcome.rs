@@ -29,10 +29,21 @@ const MAILBOX: [u8; 32] = [0x02; 32];
 /// How the endpoint answers the unsigned `process` query.
 #[derive(Clone, Copy, Debug)]
 enum Simulation {
+    /// Rusk's answer when `process` returns: the encoding of `()`, which is
+    /// empty.
     Passes,
     /// Rusk's answer to a contract panic in a query.
     Panics,
+    /// A proxy in front of the node answers with its own page and status 200.
+    ProxyPage,
+    /// A success reply that is not the encoding of `()`.
+    UnexpectedValue,
+    /// An error reply with a body far larger than any diagnostic needs.
+    HugeError,
 }
+
+/// Size of the `HugeError` body.
+const HUGE_ERROR_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug)]
 enum Helper {
@@ -189,6 +200,14 @@ impl Fixture {
                             "500 Internal Server Error",
                             br#"{"error":"Internal server error"}"#.to_vec(),
                         ),
+                        Simulation::ProxyPage => (
+                            "200 OK",
+                            b"<html><body>502 Bad Gateway</body></html>".to_vec(),
+                        ),
+                        Simulation::UnexpectedValue => ("200 OK", vec![0]),
+                        Simulation::HugeError => {
+                            ("500 Internal Server Error", vec![b'x'; HUGE_ERROR_BYTES])
+                        }
                     }
                 } else {
                     assert_eq!(path, "/on/graphql/query");
@@ -470,6 +489,63 @@ async fn passing_simulation_estimates_the_configured_ceiling() {
         }
     );
     assert_eq!(fixture.simulations(), 1);
+    assert!(!fixture.helper_invoked());
+}
+
+#[tokio::test]
+async fn a_success_reply_other_than_unit_fails_the_simulation() {
+    let _env_guard = HELPER_ENV.lock().await;
+    for simulation in [Simulation::ProxyPage, Simulation::UnexpectedValue] {
+        let fixture = Fixture::start_with_simulation(Helper::Success, simulation);
+        let estimate = fixture
+            .mailbox()
+            .process_estimate_costs(&message(), &Metadata::new(vec![]))
+            .await
+            .unwrap_err();
+        let process = fixture
+            .mailbox()
+            .process(
+                &message(),
+                &Metadata::new(vec![]),
+                Some(U256::from(FULL_GAS)),
+            )
+            .await
+            .unwrap_err();
+        for error in [estimate, process] {
+            assert!(
+                matches!(error, ChainCommunicationError::SimulationFailed(_)),
+                "{simulation:?}: {error}"
+            );
+            assert!(
+                error.to_string().contains("instead of the encoding of ()"),
+                "{simulation:?}: {error}"
+            );
+        }
+        assert_eq!(fixture.simulations(), 2);
+        assert!(!fixture.helper_invoked(), "{simulation:?}");
+        assert_eq!(fixture.queries.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn a_huge_simulation_error_body_is_cut_before_it_reaches_the_error() {
+    let _env_guard = HELPER_ENV.lock().await;
+    let fixture = Fixture::start_with_simulation(Helper::Success, Simulation::HugeError);
+    let error = fixture
+        .mailbox()
+        .process_estimate_costs(&message(), &Metadata::new(vec![]))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, ChainCommunicationError::SimulationFailed(_)),
+        "{error}"
+    );
+    let error = error.to_string();
+    assert!(error.len() < 2048, "{} bytes", error.len());
+    assert!(
+        error.contains(&format!("[truncated, {HUGE_ERROR_BYTES} bytes]")),
+        "{error}"
+    );
     assert!(!fixture.helper_invoked());
 }
 

@@ -12,7 +12,7 @@ use hyperlane_core::{
     Metadata, QueueOperation, ReorgPeriod, TxCostEstimate, TxOutcome, H256, U256,
 };
 
-use crate::rues::rkyv_serialize;
+use crate::rues::{bounded_body, bounded_json, bounded_text, rkyv_serialize};
 use crate::{ConnectionConf, DuskProvider, DuskSigner, HyperlaneDuskError, RuesClient};
 
 const TX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(120);
@@ -76,23 +76,35 @@ impl DuskMailbox {
     /// This filters out deliveries that fail; it cannot prove one will
     /// succeed. A query runs with the node's block gas limit rather than the
     /// transaction's, and a recipient can tell a query from a transaction.
+    ///
+    /// `process` returns `()`, so a successful query replies with exactly its
+    /// encoding. Any other success reply, such as a proxy's error page sent
+    /// with status 200, did not come from running `process` and fails the
+    /// simulation.
     async fn simulate_process(&self, message: &HyperlaneMessage, args: &[u8]) -> ChainResult<()> {
-        if let Err(error) = self
+        let unit = rkyv_serialize(&())?;
+        let failure = match self
             .rues
             .contract_query_raw(&self.mailbox_id, "process", args)
             .await
         {
-            warn!(
-                message_id = ?message.id(),
-                %error,
-                "Dusk process simulation failed; not submitting the message"
-            );
-            return Err(ChainCommunicationError::SimulationFailed(format!(
-                "Dusk Mailbox process query failed for message {:?}: {error}",
-                message.id()
-            )));
-        }
-        Ok(())
+            Ok(reply) if reply == unit => return Ok(()),
+            Ok(reply) => format!(
+                "replied with {} bytes instead of the encoding of (): {}",
+                reply.len(),
+                bounded_body(&reply)
+            ),
+            Err(error) => error.to_string(),
+        };
+        warn!(
+            message_id = ?message.id(),
+            error = %failure,
+            "Dusk process simulation failed; not submitting the message"
+        );
+        Err(ChainCommunicationError::SimulationFailed(format!(
+            "Dusk Mailbox process query failed for message {:?}: {failure}",
+            message.id()
+        )))
     }
 
     async fn merkle_tree_count(&self) -> ChainResult<u32> {
@@ -404,7 +416,8 @@ impl Mailbox for DuskMailbox {
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| {
                     HyperlaneDuskError::Other(format!(
-                        "dusk-tx response is missing string tx_id: {response}"
+                        "dusk-tx response is missing string tx_id: {}",
+                        bounded_json(&response)
                     ))
                 })?
                 .to_owned(),
@@ -422,6 +435,7 @@ impl Mailbox for DuskMailbox {
             .await?;
         let executed = confirmed.error.is_none();
         if let Some(error) = &confirmed.error {
+            let error = bounded_text(error);
             warn!(tx_id, %error, "Dusk mailbox transaction execution failed");
         }
 

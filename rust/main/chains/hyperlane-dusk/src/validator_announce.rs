@@ -177,7 +177,8 @@ impl ValidatorAnnounce for DuskValidatorAnnounce {
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| {
                     HyperlaneDuskError::Other(format!(
-                        "dusk-tx response is missing string tx_id: {response}"
+                        "dusk-tx response is missing string tx_id: {}",
+                        crate::rues::bounded_json(&response)
                     ))
                 })?
                 .to_owned(),
@@ -195,6 +196,7 @@ impl ValidatorAnnounce for DuskValidatorAnnounce {
             .await?;
         let executed = confirmed.error.is_none();
         if let Some(error) = &confirmed.error {
+            let error = crate::rues::bounded_text(error);
             warn!(tx_id, %error, "Dusk validator announcement execution failed");
         }
 
