@@ -1,23 +1,27 @@
 import { Mailbox, Mailbox__factory } from '@hyperlane-xyz/core';
-import { addressToBytes32 } from '@hyperlane-xyz/utils';
+import { addressToBytes32, assert } from '@hyperlane-xyz/utils';
 import { expect } from 'chai';
 import sinon from 'sinon';
 
 import { TestChainName, test3 } from '../consts/testChains.js';
+import { DerivedHookConfig, HookType } from '../hook/types.js';
 import { EvmIsmModule } from '../ism/EvmIsmModule.js';
-import { IsmConfig, IsmType } from '../ism/types.js';
+import { DerivedIsmConfig, IsmConfig, IsmType } from '../ism/types.js';
 import { MultiProvider } from '../providers/MultiProvider.js';
 import { RemoteRouters } from '../router/types.js';
 import { contractDouble } from '../test/contractDouble.js';
 import { randomAddress } from '../test/testUtils.js';
 import { TokenType } from '../token/config.js';
+import { EvmWarpModule } from '../token/EvmWarpModule.js';
 import { HypERC20Deployer } from '../token/deploy.js';
 import { WarpRouteDeployConfigMailboxRequired } from '../token/types.js';
 import { collectHybridIsmNodes } from '../utils/ism.js';
+import { WormholeConsistencyType } from '../wormhole/consistency.js';
 
 import {
   assertDelayedFlowRouteCoverage,
   assertDelayedFlowRoutePreconditions,
+  enrollCrossChainRouters,
   executeWarpDeploy,
   executeWarpRouteExtensionDeploy,
 } from './warp.js';
@@ -489,4 +493,218 @@ describe('delayed flow route preconditions', () => {
       );
     });
   });
+});
+
+describe('ALRB router enrollment', () => {
+  it('preserves the legitimate router and gas configuration for the ALRB domain', async () => {
+    const multiProvider = MultiProvider.createTestMultiProvider();
+    const owner = randomAddress();
+    const mailbox = randomAddress();
+    const trustedRouter = randomAddress();
+    const config: WarpRouteDeployConfigMailboxRequired = {
+      test1: {
+        type: TokenType.atomicLocalRebalancing,
+        owner,
+        mailbox,
+        sourceRouter: randomAddress(),
+      },
+      test2: {
+        type: TokenType.synthetic,
+        owner,
+        mailbox,
+        name: 'Test',
+        symbol: 'TST',
+        decimals: 18,
+        remoteRouters: { test1: { address: trustedRouter } },
+        destinationGas: { test1: '123456' },
+      },
+    };
+    const sandbox = sinon.createSandbox();
+    try {
+      sandbox.stub(EvmWarpModule.prototype, 'read').resolves({
+        type: TokenType.synthetic,
+        owner,
+        mailbox,
+        name: 'Test',
+        symbol: 'TST',
+        decimals: 18,
+        tokenFee: undefined,
+        hook: randomAddress(),
+        interchainSecurityModule: randomAddress(),
+      });
+      const update = sandbox
+        .stub(EvmWarpModule.prototype, 'updateSplit')
+        .resolves({ txs: [], feeTxs: [], ownershipTxs: [] });
+      await enrollCrossChainRouters(
+        {
+          multiProvider,
+          altVmSigners: {},
+          registryAddresses: { test2: {} },
+          warpDeployConfig: config,
+        },
+        { test1: randomAddress(), test2: randomAddress() },
+      );
+      expect(update.callCount).to.equal(1);
+      const domain = multiProvider.getDomainId('test1').toString();
+      expect(update.firstCall.args[0].remoteRouters).to.deep.equal({
+        [domain]: { address: addressToBytes32(trustedRouter) },
+      });
+      expect(update.firstCall.args[0].destinationGas).to.deep.equal({
+        [domain]: '123456',
+      });
+    } finally {
+      sandbox.restore();
+    }
+  });
+});
+
+describe('final owner pass with a Wormhole mesh next to a flow-control hybrid', () => {
+  interface Case {
+    name: string;
+    hybridHook: (address: string, owner: string) => DerivedHookConfig;
+    hybridIsm: (address: string, owner: string) => DerivedIsmConfig;
+  }
+
+  const cases: Case[] = [
+    {
+      name: 'NetFlowRateLimitedHookIsm',
+      hybridHook: (address, owner) => ({
+        type: HookType.NET_FLOW_RATE_LIMITED,
+        address,
+        owner,
+        thresholdBps: 5000,
+        duration: 86400n,
+      }),
+      hybridIsm: (address, owner) => ({
+        type: IsmType.NET_FLOW_RATE_LIMITED,
+        address,
+        owner,
+        thresholdBps: 5000,
+        duration: 86400n,
+      }),
+    },
+    {
+      name: 'DelayedFlowRouterHookIsm',
+      hybridHook: (address, owner) => ({
+        type: HookType.DELAYED_FLOW_ROUTER,
+        address,
+        owner,
+        thresholdBps: 10000,
+        maxDelay: 60,
+        duration: 86400n,
+      }),
+      hybridIsm: (address, owner) => ({
+        type: IsmType.DELAYED_FLOW_ROUTER,
+        address,
+        owner,
+        thresholdBps: 10000,
+        maxDelay: 60,
+        duration: 86400n,
+      }),
+    },
+  ];
+
+  for (const c of cases) {
+    it(`transfers the ${c.name} and keeps the Wormhole router by address`, async () => {
+      const multiProvider = MultiProvider.createTestMultiProvider();
+      const deployer = randomAddress();
+      const targetOwner = randomAddress();
+      const meshOwner = randomAddress();
+      const mailbox = randomAddress();
+      const hybridAddress = randomAddress();
+      const wormholeAddress = randomAddress();
+      const config: WarpRouteDeployConfigMailboxRequired = {
+        test1: {
+          type: TokenType.synthetic,
+          owner: targetOwner,
+          mailbox,
+          name: 'Test',
+          symbol: 'TST',
+          decimals: 18,
+        },
+      };
+      const wormholeHook: DerivedHookConfig = {
+        type: HookType.WORMHOLE,
+        address: wormholeAddress,
+      };
+      const relayerIsm: DerivedIsmConfig = {
+        type: IsmType.TRUSTED_RELAYER,
+        address: randomAddress(),
+        relayer: deployer,
+      };
+      const wormholeIsm: DerivedIsmConfig = {
+        type: IsmType.WORMHOLE,
+        address: wormholeAddress,
+        owner: meshOwner,
+        core: randomAddress(),
+        wormholeChainId: 4001,
+        consistencyLevel: { type: WormholeConsistencyType.Finalized },
+        urls: ['https://vaa.example/v1'],
+      };
+      const sandbox = sinon.createSandbox();
+      try {
+        sandbox.stub(EvmWarpModule.prototype, 'read').resolves({
+          type: TokenType.synthetic,
+          owner: deployer,
+          mailbox,
+          name: 'Test',
+          symbol: 'TST',
+          decimals: 18,
+          tokenFee: undefined,
+          hook: {
+            type: HookType.AGGREGATION,
+            address: randomAddress(),
+            hooks: [c.hybridHook(hybridAddress, deployer), wormholeHook],
+          },
+          interchainSecurityModule: {
+            type: IsmType.AGGREGATION,
+            address: randomAddress(),
+            threshold: 3,
+            modules: [
+              relayerIsm,
+              c.hybridIsm(hybridAddress, deployer),
+              wormholeIsm,
+            ],
+          },
+        });
+        const update = sandbox
+          .stub(EvmWarpModule.prototype, 'updateSplit')
+          .resolves({ txs: [], feeTxs: [], ownershipTxs: [] });
+
+        await enrollCrossChainRouters(
+          {
+            multiProvider,
+            altVmSigners: {},
+            registryAddresses: { test1: {} },
+            warpDeployConfig: config,
+          },
+          { test1: randomAddress() },
+        );
+
+        expect(update.callCount).to.equal(1);
+        const [expected] = update.firstCall.args;
+        const { hook, interchainSecurityModule } = expected;
+        assert(
+          typeof hook === 'object' && hook.type === HookType.AGGREGATION,
+          'Expected an aggregation hook',
+        );
+        assert(
+          typeof interchainSecurityModule === 'object' &&
+            interchainSecurityModule.type === IsmType.AGGREGATION,
+          'Expected an aggregation ISM',
+        );
+        expect(hook.hooks).to.deep.equal([
+          c.hybridHook(hybridAddress, targetOwner),
+          wormholeAddress,
+        ]);
+        expect(interchainSecurityModule.modules).to.deep.equal([
+          relayerIsm,
+          c.hybridIsm(hybridAddress, targetOwner),
+          wormholeAddress,
+        ]);
+      } finally {
+        sandbox.restore();
+      }
+    });
+  }
 });

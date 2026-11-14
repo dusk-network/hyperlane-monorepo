@@ -1,33 +1,43 @@
-//! Store EVM logs once, at the head; expose them to legacy readers after confirmation.
+//! Core event-indexing pipeline for every configured chain: ingest near head, publish after confirmation.
 mod enrichment;
+mod pipeline;
 mod runtime;
 mod source;
 mod store;
+mod websocket;
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    sync::{atomic::AtomicU64, Arc},
+    time::Duration,
+};
 
-use ethers::types::{BlockNumber, H160};
 use eyre::{ensure, Result};
-use futures::{stream, StreamExt, TryStreamExt};
 use hyperlane_base::{
     settings::{ChainConf, ChainConnectionConf},
     ChainMetrics, ContractSyncMetrics, CoreMetrics,
 };
-use hyperlane_core::{ContractLocator, ReorgPeriod};
-use tokio::task::JoinHandle;
+use hyperlane_core::{ContractLocator, HyperlaneDomainProtocol, ReorgPeriod};
+use redact::Secret;
+use tokio::{
+    sync::{mpsc, watch, Mutex, Notify},
+    task::JoinHandle,
+};
+use url::Url;
 
 use crate::store::HyperlaneDbStore;
-use source::{Contracts, Header, Source, SourceBuilder};
-use store::{State, Store};
+use pipeline::tag_selector;
+use source::{
+    BlockSelector, Contracts, EvmContracts, GenericSource, Header, Source, SourceBuilder,
+};
+use store::Store;
 
-/// Prevent accidental fallback to legacy writers while provisional state exists.
-pub async fn ensure_legacy_mode(legacy: &HyperlaneDbStore) -> Result<()> {
-    let store = Store {
-        db: legacy.db.clone_connection(),
-        domain: legacy.domain.id(),
-    };
-    ensure!(store.state().await?.is_none(), "Cannot use legacy indexers with retained near-head state; drain and clear scraper_head before switching protocols");
-    Ok(())
+const CRITICAL_FAILURE_GRACE: Duration = Duration::from_secs(60);
+
+fn minimum_auto_anchor(protocol: HyperlaneDomainProtocol) -> u64 {
+    match protocol {
+        HyperlaneDomainProtocol::Cosmos | HyperlaneDomainProtocol::CosmosNative => 1,
+        _ => 0,
+    }
 }
 
 /// Keep auxiliary writers out of the provisional suffix, including after a halt.
@@ -43,353 +53,172 @@ pub async fn confirmed_height(db: &crate::db::ScraperDb, domain: u32) -> Result<
     Ok(u32::try_from(state.confirmed)?)
 }
 
-/// Replace the four EVM log indexers with one range ingestion worker.
+/// Start indexing and receipt enrichment; return a wake-up for committed dispatch confirmations.
 pub async fn spawn(
     conf: &ChainConf,
-    legacy: HyperlaneDbStore,
+    websocket_url: Option<Secret<Url>>,
+    enrichment_store: HyperlaneDbStore,
     metrics: Arc<CoreMetrics>,
     chain_metrics: ChainMetrics,
     sync_metrics: Arc<ContractSyncMetrics>,
     receipt_age: prometheus::GaugeVec,
-) -> Result<JoinHandle<()>> {
-    let ChainConnectionConf::Ethereum(connection) = &conf.connection else {
-        eyre::bail!("nearHead requires an EVM chain");
-    };
+) -> Result<(JoinHandle<()>, Arc<Notify>)> {
     let contracts = Contracts {
-        mailbox: H160::from(conf.addresses.mailbox),
-        hook: H160::from(conf.addresses.merkle_tree_hook),
-        paymaster: H160::from(conf.addresses.interchain_gas_paymaster),
+        mailbox: conf.addresses.mailbox,
+        hook: conf.addresses.merkle_tree_hook,
+        paymaster: conf.addresses.interchain_gas_paymaster,
     };
-    let source = conf
-        .build_ethereum(
-            connection,
-            &ContractLocator {
-                domain: &conf.domain,
-                address: conf.addresses.mailbox,
-            },
-            &metrics,
-            SourceBuilder {
-                contracts: contracts.clone(),
-                domain: conf.domain.id(),
-            },
-        )
-        .await?;
+    let evm_contracts = EvmContracts {
+        mailbox: conf.addresses.mailbox.into(),
+        hook: conf.addresses.merkle_tree_hook.into(),
+        paymaster: conf.addresses.interchain_gas_paymaster.into(),
+    };
+    let filter = evm_contracts.event_filter();
+    let source: Box<dyn Source> =
+        if let ChainConnectionConf::Ethereum(connection) = &conf.connection {
+            conf.build_ethereum(
+                connection,
+                &ContractLocator {
+                    domain: &conf.domain,
+                    address: conf.addresses.mailbox,
+                },
+                &metrics,
+                SourceBuilder {
+                    contracts: evm_contracts,
+                    domain: conf.domain.id(),
+                },
+            )
+            .await?
+        } else {
+            GenericSource::build(conf, &metrics, contracts.clone()).await?
+        };
     let store = Store {
-        db: legacy.db.clone_connection(),
+        db: enrichment_store.db.clone_connection(),
         domain: conf.domain.id(),
     };
-    let anchor_height = store.anchor_height(u32::try_from(conf.index.from)?).await?;
-    let anchor = source.header(anchor_height.into()).await?;
+    let initialized = store.state().await?.is_some();
+    let protocol = conf.connection.protocol();
+    let anchor = if initialized {
+        None
+    } else if protocol == HyperlaneDomainProtocol::Radix {
+        Some(source.empty_anchor().await?.ok_or_else(|| {
+            eyre::eyre!("Radix near-head indexing requires an explicit scraper_head cutover when event history exists")
+        })?)
+    } else if !source.indexes_by_sequence() {
+        let index_from = if conf.index.from < 0 {
+            let tip = source.header(BlockSelector::Latest).await?.height;
+            resolve_index_from(conf.index.from, tip)?
+        } else {
+            resolve_index_from(conf.index.from, 0)?
+        };
+        let anchor_height = store
+            .anchor_height(index_from)
+            .await?
+            .max(minimum_auto_anchor(protocol));
+        Some(source.header(BlockSelector::Height(anchor_height)).await?)
+    } else {
+        Some(source.empty_anchor().await?.ok_or_else(|| {
+            eyre::eyre!("Sequence near-head indexing requires an explicit scraper_head cutover when event history exists")
+        })?)
+    };
     let period = conf.reorg_period.clone();
     ensure!(conf.index.chunk_size > 0, "index.chunk must be positive");
     let chunk_size = u64::from(conf.index.chunk_size);
-    // Match the legacy range cursor's near-tip refresh cadence.
-    let poll_interval = conf
-        .index
-        .configured_interval
-        .unwrap_or(Duration::from_secs(30));
-    prepare(source.as_ref(), &store, &anchor, &contracts, &period).await?;
+    let poll_interval = conf.index.idle_sleep_duration;
+    prepare(
+        source.as_ref(),
+        &store,
+        anchor.as_ref(),
+        &contracts,
+        &period,
+    )
+    .await?;
+    let (head_tx, head_rx) = mpsc::channel(256);
+    let (polled_head_tx, polled_head_rx) = watch::channel(0);
+    let dispatch_wakeup = Arc::new(Notify::new());
     let worker = runtime::Worker {
         source,
         store,
-        domain: legacy.domain.clone(),
+        domain: enrichment_store.domain.clone(),
         period,
         chunk_size,
         poll_interval,
+        wakeup: Notify::new(),
+        dispatch_wakeup: dispatch_wakeup.clone(),
+        receipt_wakeup: watch::channel(()).0,
+        wanted: AtomicU64::new(0),
+        heads: Mutex::new(head_rx),
+        polled_head: polled_head_tx,
+        critical_failure_grace: CRITICAL_FAILURE_GRACE,
         chain_metrics,
         sync_metrics,
     };
-    Ok(tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         tokio::join!(
             worker.run(),
-            enrichment::run(&legacy, poll_interval, &receipt_age)
+            websocket::run(
+                websocket_url,
+                filter,
+                &worker.wakeup,
+                &worker.wanted,
+                &head_tx,
+                polled_head_rx,
+                worker.domain.id(),
+            ),
+            enrichment::run(
+                &enrichment_store,
+                poll_interval,
+                &receipt_age,
+                worker.receipt_wakeup.subscribe()
+            )
         );
-    }))
+    });
+    Ok((task, dispatch_wakeup))
 }
 
-async fn prepare(
+async fn prepare<'a>(
     source: &dyn Source,
     store: &Store,
-    anchor: &Header,
+    anchor: impl Into<Option<&'a Header>>,
     contracts: &Contracts,
     period: &ReorgPeriod,
 ) -> Result<()> {
+    let anchor = anchor.into();
     // Fail before persisting a first-time cutover if required RPC methods fail.
     if let ReorgPeriod::Tag(tag) = period {
         ensure!(
             matches!(tag.as_str(), "safe" | "finalized" | "latest"),
             "Unsupported reorgPeriod tag"
         );
-        source
-            .header(tag.parse().map_err(eyre::Report::msg)?)
-            .await?;
+        source.header(tag_selector(tag)?).await?;
     }
     // Capability checks must not require an RPC that is caught up to our saved
     // indexed height. The observation loop waits for lagging providers and
     // checks retained ancestry before publishing anything.
-    let hash = match store.state().await? {
+    match store.state().await? {
         Some(_) => {
             store.validate_checkpoints().await?;
-            source.header(BlockNumber::Latest).await?.hash
+            store.validate_contracts(contracts).await?;
         }
-        None => anchor.hash,
-    };
-    source.counts(hash).await?;
-    store.initialize(anchor, contracts).await?;
+        None => {
+            anchor.ok_or_else(|| eyre::eyre!("Missing first-start anchor"))?;
+        }
+    }
+    let current = source.header(BlockSelector::Latest).await?;
+    source.counts(current.hash).await?;
+    if let Some(anchor) = anchor {
+        store.initialize(anchor, contracts).await?;
+    }
     Ok(())
 }
 
-async fn observe(source: &dyn Source, store: &Store) -> Result<State> {
-    let state = store
-        .state()
-        .await?
-        .ok_or_else(|| eyre::eyre!("Missing head state"))?;
-    ensure!(
-        !state.halted,
-        "Reorg crossed published history; operator repair required"
-    );
-    let head = source.header(BlockNumber::Latest).await?;
-    if head.height < state.indexed {
-        // A lagging RPC can report an older head without disproving our stored
-        // chain. Pause until it catches up; only a hash mismatch proves a reorg.
-        store.pause(false).await?;
-        eyre::bail!("RPC head is behind indexed history; waiting for a current observation");
-    }
-    let mut height = store.checkpoint(state.indexed.min(head.height)).await?;
-    let ancestor = loop {
-        let header = if height == head.height {
-            head.clone()
-        } else {
-            source.header(height.into()).await?
-        };
-        if store.hash(height).await? == Some(header.hash) {
-            break header;
-        }
-        store.pause(height == state.confirmed).await?;
-        ensure!(
-            height > state.confirmed,
-            "Reorg crossed published history; operator repair required"
-        );
-        height = store
-            .checkpoint(
-                height
-                    .checked_sub(1)
-                    .ok_or_else(|| eyre::eyre!("Missing common ancestor"))?,
-            )
-            .await?;
-    };
-    if ancestor.hash != head.hash {
-        verify(source, &head).await?;
-    }
-    store.observe(&state, &ancestor, &head).await?;
-    store
-        .state()
-        .await?
-        .ok_or_else(|| eyre::eyre!("Missing observed state"))
+fn resolve_index_from(index_from: i64, tip: u64) -> Result<u64> {
+    Ok(u64::try_from(
+        i128::from(tip)
+            .saturating_add(i128::from(index_from))
+            .max(0),
+    )?)
 }
-
-#[cfg(test)]
-async fn ingest(
-    source: &dyn Source,
-    store: &Store,
-    state: &State,
-    chunk_size: u64,
-) -> Result<bool> {
-    ingest_cached(source, store, state, chunk_size, &mut None).await
-}
-
-async fn ingest_cached(
-    source: &dyn Source,
-    store: &Store,
-    state: &State,
-    chunk_size: u64,
-    count_cache: &mut Option<(ethers::types::H256, [u32; 2])>,
-) -> Result<bool> {
-    ensure!(chunk_size > 0, "Empty indexing range");
-    if state.indexed == state.head {
-        return Ok(false);
-    }
-    let end = state.head.min(state.indexed.saturating_add(chunk_size));
-    let boundary = source.header(end.into()).await?;
-    let mut by_block = BTreeMap::<u64, Vec<source::Event>>::new();
-    let cached = count_cache.filter(|(hash, _)| *hash == state.hash);
-    let start_counts = async {
-        match cached {
-            Some((_, counts)) => Ok(counts),
-            None => source.counts(state.hash).await,
-        }
-    };
-    let (events, start_counts, end_counts) = tokio::try_join!(
-        source.events(state.indexed.saturating_add(1), end),
-        start_counts,
-        source.counts(boundary.hash),
-    )?;
-    validate_sequences(&events, start_counts, end_counts)?;
-    for event in events {
-        ensure!(
-            event.block_number > state.indexed && event.block_number <= end,
-            "Event outside requested range"
-        );
-        by_block.entry(event.block_number).or_default().push(event);
-    }
-    // Empty ranges still advance, using only their end header as a checkpoint.
-    by_block.entry(end).or_default();
-    let blocks: Vec<_> = stream::iter(by_block)
-        .map(|(height, events)| {
-            let boundary = &boundary;
-            async move {
-                let header = if height == end {
-                    boundary.clone()
-                } else {
-                    source.header(height.into()).await?
-                };
-                ensure!(
-                    events.iter().all(|event| event.block_hash == header.hash),
-                    "Range contains logs from another fork"
-                );
-                Ok::<_, eyre::Report>((header, events))
-            }
-        })
-        .buffered(8)
-        .try_collect()
-        .await?;
-    ensure!(
-        source.header(state.indexed.into()).await?.hash == state.hash,
-        "Indexed boundary changed during range fetch"
-    );
-    verify(source, &boundary).await?;
-    store.append(state, &blocks).await?;
-    *count_cache = Some((boundary.hash, end_counts));
-    Ok(end < state.head)
-}
-
-fn validate_sequences(events: &[source::Event], mut next: [u32; 2], end: [u32; 2]) -> Result<()> {
-    for event in events {
-        let (stream, index) = match &event.data {
-            source::EventData::Dispatch(message) => (0, message.nonce),
-            source::EventData::Insertion { index, .. } => (1, *index),
-            _ => continue,
-        };
-        ensure!(index == next[stream], "Missing or unordered event sequence");
-        next[stream] = index
-            .checked_add(1)
-            .ok_or_else(|| eyre::eyre!("Event sequence overflow"))?;
-    }
-    ensure!(next == end, "Incomplete event range");
-    Ok(())
-}
-
-async fn verify(source: &dyn Source, header: &Header) -> Result<()> {
-    ensure!(
-        source.header(header.height.into()).await?.hash == header.hash,
-        "Chain changed during RPC reads"
-    );
-    Ok(())
-}
-
-/// Shortest lease on a head observation that confirmation will accept.
-const MIN_CONFIRMATION_LEASE: Duration = Duration::from_secs(60);
-
-/// Confirmation needs a recent healthy observation: pauses clear `healthy`, so a
-/// lagging or reorging RPC stops publication. It does not need
-/// a fresh one: confirmation rechecks ancestry against the RPC before
-/// committing, and an older head only lowers the depth/tag boundary. The lease
-/// therefore spans one poll plus database latency rather than equalling it.
-fn confirmation_lease(poll_interval: Duration) -> Duration {
-    poll_interval.saturating_mul(2).max(MIN_CONFIRMATION_LEASE)
-}
-
-#[cfg(test)]
-async fn confirm(source: &dyn Source, store: &Store, period: &ReorgPeriod) -> Result<[u64; 4]> {
-    Ok(
-        confirm_leased(source, store, period, MIN_CONFIRMATION_LEASE)
-            .await?
-            .counts,
-    )
-}
-
-struct Confirmation {
-    counts: [u64; 4],
-    page_limited: bool,
-}
-
-async fn confirm_leased(
-    source: &dyn Source,
-    store: &Store,
-    period: &ReorgPeriod,
-    lease: Duration,
-) -> Result<Confirmation> {
-    let state = store
-        .state()
-        .await?
-        .ok_or_else(|| eyre::eyre!("Missing head state"))?;
-    ensure!(!state.halted, "Confirmed history requires operator repair");
-    if state.indexed == state.confirmed {
-        return Ok(Confirmation {
-            counts: [0; 4],
-            page_limited: false,
-        });
-    }
-    let tagged = match period {
-        ReorgPeriod::Tag(tag) if tag != "latest" => Some(
-            source
-                .header(tag.parse().map_err(eyre::Report::msg)?)
-                .await?,
-        ),
-        _ => None,
-    };
-    let through = match period {
-        ReorgPeriod::Blocks(depth) => state.head.saturating_sub(u64::from(depth.get())),
-        _ => tagged
-            .as_ref()
-            .map(|header| header.height)
-            .unwrap_or(state.head),
-    };
-    // A tag read after the head observation can be newer than it. Everything up
-    // to the observed head is then final; confirm only that observed history.
-    let through = through.min(state.head);
-    if through <= state.confirmed {
-        return Ok(Confirmation {
-            counts: [0; 4],
-            page_limited: false,
-        });
-    }
-    let target = through.min(state.indexed);
-    let through = store.confirmation_boundary(state.confirmed, target).await?;
-    if through <= state.confirmed {
-        return Ok(Confirmation {
-            counts: [0; 4],
-            page_limited: false,
-        });
-    }
-    let boundary = match tagged {
-        Some(header) if header.height == through => header,
-        _ => source.header(through.into()).await?,
-    };
-    if let Some(hash) = store.hash(through).await? {
-        ensure!(
-            hash == boundary.hash,
-            "Confirmation boundary is on another fork"
-        );
-    }
-    // A sparse boundary must be checked against the indexed range's canonical tip.
-    let indexed_hash = if through == state.indexed {
-        boundary.hash
-    } else {
-        source.header(state.indexed.into()).await?.hash
-    };
-    ensure!(
-        indexed_hash == state.hash,
-        "Indexed fork changed before confirmation"
-    );
-    Ok(Confirmation {
-        counts: store.confirm(&state, &boundary, lease).await?,
-        page_limited: through < target,
-    })
-}
-
-#[cfg(test)]
-use enrichment::enrich_with_timeout;
 
 #[cfg(test)]
 mod tests;

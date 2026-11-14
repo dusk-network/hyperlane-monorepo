@@ -19,6 +19,7 @@ use hyperlane_core::{
 };
 use hyperlane_metric::prometheus_metric::ChainInfo;
 use hyperlane_operation_verifier::ApplicationOperationVerifier;
+use redact::Secret;
 
 #[cfg(feature = "aleo")]
 use hyperlane_aleo::{self as h_aleo, AleoProvider};
@@ -60,11 +61,11 @@ pub trait TryFromWithMetrics<T>: Sized {
 /// AdaptsChain trait implementation.
 #[allow(dead_code)]
 #[derive(Clone, Debug, Default)]
-pub struct RawChainConf(Value);
+pub struct RawChainConf(Secret<Value>);
 
 impl From<Value> for RawChainConf {
     fn from(value: Value) -> Self {
-        Self(value)
+        Self(value.into())
     }
 }
 
@@ -76,6 +77,8 @@ pub struct ChainConf {
     pub domain: HyperlaneDomain,
     /// Signer configuration for this chain
     pub signer: Option<SignerConf>,
+    /// EVM signer used for authenticated CCS reads on Sealevel.
+    pub ccs_signer: Option<SignerConf>,
     /// Identity keypair used as the relayer's on-chain identity (e.g. for TrustedRelayer ISMs).
     /// Only valid for Sealevel chains — an error is returned if set on other protocols.
     /// Falls back to `signer` if not set.
@@ -252,7 +255,7 @@ pub struct IndexSettings {
     /// The indexing mode.
     pub mode: IndexMode,
     /// How long a cursor sleeps when it's caught up and has nothing new to
-    /// index. Defaults to 5s, overridable via `index.interval` (seconds) in
+    /// index. Defaults to 5s, overridable via `index.interval` (fractional seconds) in
     /// the chain config.
     pub idle_sleep_duration: Duration,
     /// The raw `index.interval` as explicitly configured, if any. `None` means the chain didn't
@@ -404,6 +407,11 @@ impl ChainConf {
             ));
         }
 
+        if let ChainConnectionConf::Sealevel(conf) = &self.connection {
+            if let Some(reveal) = &conf.ur_reveal {
+                h_sealevel::validate_ccs_url(&reveal.ccs_url).context("Invalid urReveal.ccsUrl")?;
+            }
+        }
         Ok(())
     }
 
@@ -416,8 +424,33 @@ impl ChainConf {
 
         match &self.connection {
             ChainConnectionConf::Ethereum(conf) => {
-                self.build_ethereum(conf, &locator, metrics, h_eth::MailboxBuilder {})
-                    .await
+                let protected_estimator = if let Some(config) = &conf.mev_submission {
+                    let mut protected_conf = conf.clone();
+                    protected_conf.rpc_connection = h_eth::RpcConnectionConf::HttpFallback {
+                        urls: config.rpc_urls.clone(),
+                    };
+                    protected_conf.mev_submission = None;
+                    Some(
+                        self.build_ethereum(
+                            &protected_conf,
+                            &locator,
+                            metrics,
+                            h_eth::MailboxEstimateBuilder {},
+                        )
+                        .await?,
+                    )
+                } else {
+                    None
+                };
+                self.build_ethereum(
+                    conf,
+                    &locator,
+                    metrics,
+                    h_eth::MailboxBuilder {
+                        protected_estimator,
+                    },
+                )
+                .await
             }
             ChainConnectionConf::Sealevel(conf) => {
                 let keypair = self.sealevel_signer().await.context(ctx)?;
@@ -428,6 +461,24 @@ impl ChainConf {
                 let tx_submitter =
                     build_sealevel_tx_submitter(&provider, self, conf, &locator, metrics);
 
+                let ccs_signer: Option<Arc<dyn hyperlane_core::HyperlaneSigner>> =
+                    if conf.ur_reveal.is_some() && keypair.is_some() {
+                        match &self.ccs_signer {
+                            Some(config) => match config.build::<h_eth::Signers>().await {
+                                Ok(signer) => Some(Arc::new(signer)),
+                                Err(error) => {
+                                    warn!(chain = %self.domain.name(), %error, "CCS signer unavailable; automated UR reveals disabled");
+                                    None
+                                }
+                            },
+                            None => {
+                                warn!(chain = %self.domain.name(), "No ccsSigner configured; automated UR reveals disabled");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
                 h_sealevel::SealevelMailbox::new(
                     provider,
                     tx_submitter,
@@ -436,7 +487,7 @@ impl ChainConf {
                     keypair.map(h_sealevel::SealevelKeypair::new),
                     identity_keypair.map(h_sealevel::SealevelKeypair::new),
                 )
-                .map(|m| Box::new(m) as Box<dyn Mailbox>)
+                .map(|m| Box::new(m.with_ccs_signer(ccs_signer)) as Box<dyn Mailbox>)
                 .map_err(Into::into)
             }
             ChainConnectionConf::Cosmos(conf) => {
@@ -897,8 +948,13 @@ impl ChainConf {
                 ));
                 Ok(indexer as Box<dyn SequenceAwareIndexer<InterchainGasPayment>>)
             }
-            ChainConnectionConf::Starknet(_) => {
-                let indexer = Box::new(h_starknet::StarknetInterchainGasPaymasterIndexer {});
+            ChainConnectionConf::Starknet(conf) => {
+                let provider = build_starknet_provider(self, conf, metrics, &locator)?;
+                let indexer = Box::new(h_starknet::StarknetInterchainGasPaymasterIndexer::new(
+                    provider,
+                    locator.address,
+                    &self.reorg_period,
+                )?);
                 Ok(indexer as Box<dyn SequenceAwareIndexer<InterchainGasPayment>>)
             }
             ChainConnectionConf::CosmosNative(conf) => {
@@ -1758,8 +1814,9 @@ fn build_sealevel_provider(
     let client_metrics = metrics.client_metrics();
 
     let chain = middleware_metrics.chain.clone();
-    let urls = conf.urls.clone();
+    let urls = conf.urls.expose_secret().clone();
     let rpc_client = SealevelFallbackRpcClient::from_urls(
+        "rpcUrls",
         chain,
         urls,
         client_metrics,

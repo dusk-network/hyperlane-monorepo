@@ -1,7 +1,7 @@
 #![allow(clippy::blocks_in_conditions)] // TODO: `rustc` 1.80.1 clippy issue
 #![allow(clippy::unnecessary_get_then_check)] // TODO: `rustc` 1.80.1 clippy issue
 
-use std::{fmt::Debug, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
 use async_trait::async_trait;
 use eyre::Result;
@@ -34,8 +34,40 @@ pub struct MessageMetadataBuilder {
     pub base: Arc<dyn BuildsBaseMetadata>,
     pub app_context: Option<String>,
     pub root_ism: H256,
+    /// Position in the message-specific ISM tree, including addresses to separate routed replacements.
+    pub node_id: String,
     pub max_ism_depth: u32,
     pub max_ism_count: u32,
+    /// Availability probes defer fresh reorg checks to the normal build before delivery.
+    pub(crate) signature_polling: bool,
+    /// Fast-window probes skip validators whose latest index is below the leaf.
+    pub(crate) narrow_signature_probe: bool,
+    /// Offchain reads from a signature probe, reused by the delivery build that
+    /// follows it. Scoped to one `build_for_delivery` call.
+    pub(crate) offchain_reads: Option<Arc<OffchainReadMemo>>,
+}
+
+/// CCIP-read results keyed by tree position and ISM. Offchain responses are
+/// verified onchain at delivery, and this lives only for one probe plus the
+/// delivery build right after it, so reuse cannot serve stale data.
+#[derive(Debug, Default)]
+pub(crate) struct OffchainReadMemo(std::sync::Mutex<HashMap<(String, H256), Metadata>>);
+
+impl OffchainReadMemo {
+    pub(crate) fn get(&self, node_id: &str, ism: H256) -> Option<Metadata> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(node_id.to_owned(), ism))
+            .cloned()
+    }
+
+    pub(crate) fn insert(&self, node_id: &str, ism: H256, metadata: Metadata) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((node_id.to_owned(), ism), metadata);
+    }
 }
 
 /// This is the entry point for recursively building ISM metadata.
@@ -68,6 +100,32 @@ impl MetadataBuilder for MessageMetadataBuilder {
 }
 
 impl MessageMetadataBuilder {
+    /// Missing-signature probes use pooled clients. Only a normal checked build
+    /// can produce delivery metadata, including any aggregation fallbacks.
+    pub(crate) async fn build_for_delivery(
+        &self,
+        ism: H256,
+        message: &HyperlaneMessage,
+        polling: bool,
+        narrow_probe: bool,
+    ) -> Result<Metadata, MetadataBuildError> {
+        let mut builder = self.clone();
+        builder.signature_polling = polling;
+        builder.narrow_signature_probe = polling && narrow_probe;
+        if polling {
+            // The delivery build repeats the whole tree to run fresh reorg checks;
+            // offchain reads from the probe don't depend on them, so reuse those.
+            builder.offchain_reads = Some(Arc::default());
+        }
+        let metadata = builder.build(ism, message, Default::default()).await?;
+        if !polling {
+            return Ok(metadata);
+        }
+        builder.signature_polling = false;
+        builder.narrow_signature_probe = false;
+        builder.build(ism, message, Default::default()).await
+    }
+
     pub async fn new(
         base: Arc<dyn BuildsBaseMetadata>,
         ism_address: H256,
@@ -81,9 +139,28 @@ impl MessageMetadataBuilder {
             base,
             app_context,
             root_ism: ism_address,
+            node_id: format!("{ism_address:#x}"),
             max_ism_depth: ISM_MAX_DEPTH,
             max_ism_count: ISM_MAX_COUNT,
+            signature_polling: false,
+            narrow_signature_probe: false,
+            offchain_reads: None,
         })
+    }
+
+    pub fn child(&self, index: usize, address: H256) -> Self {
+        let mut child = self.clone();
+        child.node_id = format!("{}/{index}:{address:#x}", self.node_id);
+        child
+    }
+
+    pub fn report_activity(
+        &self,
+        message: &HyperlaneMessage,
+        activity: crate::message_activity::Activity,
+    ) {
+        self.base
+            .report_node_activity(message, &self.node_id, activity);
     }
 
     pub fn base_builder(&self) -> &Arc<dyn BuildsBaseMetadata> {
@@ -157,6 +234,8 @@ pub async fn build_message_metadata(
     params: MessageMetadataBuildParams,
     maybe_ism_and_module_type: Option<(Box<dyn InterchainSecurityModule>, ModuleType)>,
 ) -> Result<IsmWithMetadataAndType, MetadataBuildError> {
+    let reporter = message_builder.base_builder().activity_reporter().cloned();
+    let node_id = message_builder.node_id.clone();
     let result = build_message_metadata_inner(
         message_builder,
         ism_address,
@@ -165,6 +244,19 @@ pub async fn build_message_metadata(
         maybe_ism_and_module_type,
     )
     .await;
+    if let Some(reporter) = reporter {
+        reporter.report_node(
+            message,
+            &node_id,
+            crate::message_activity::Activity::Metadata {
+                ism: ism_address,
+                error: result
+                    .as_ref()
+                    .err()
+                    .map(crate::message_activity::metadata_error),
+            },
+        );
+    }
     match &result {
         Err(err @ MetadataBuildError::AwaitingValidatorSignatures) => {
             tracing::debug!(
@@ -198,6 +290,13 @@ async fn build_message_metadata_inner(
         Some((ism, module_type)) => (ism, module_type),
         None => ism_and_module_type(message_builder.clone(), ism_address).await?,
     };
+    message_builder.report_activity(
+        message,
+        crate::message_activity::Activity::MetadataModule {
+            ism: ism_address,
+            module_type,
+        },
+    );
     // check if max depth is reached
     if params.ism_depth >= message_builder.max_ism_depth {
         tracing::error!(

@@ -26,7 +26,11 @@ import {
   getNestedJsonRpcError,
   isCallExceptionWithTransientRpcError,
 } from './jsonRpcError.js';
-import { IProviderMethods, ProviderMethod } from './ProviderMethods.js';
+import {
+  IProviderMethods,
+  ProviderMethod,
+  ReadRpcMethods,
+} from './ProviderMethods.js';
 import { getMultiAddressLogs, isMultiAddressFilter } from './logFilters.js';
 import {
   ChainMetadataWithRpcConnectionInfo,
@@ -124,12 +128,12 @@ function errorChainHasMessage(error: unknown, message: string): boolean {
   return false;
 }
 
+function isEmptyProviderResponse(error: unknown): boolean {
+  return errorChainHasMessage(error, 'Invalid response from provider');
+}
+
 function getMostDiagnosticUnhandledError(errors: Error[]): Error {
-  return (
-    errors.find((error) =>
-      errorChainHasMessage(error, 'Invalid response from provider'),
-    ) ?? errors[0]
-  );
+  return errors.find(isEmptyProviderResponse) ?? errors[0];
 }
 
 export class BlockchainError extends Error {
@@ -298,6 +302,14 @@ export class HyperlaneSmartProvider
     // the provided RPC urls are correct and returns static data here instead of
     // querying each sub-provider for network info
     return this.network;
+  }
+
+  /** Sends raw read requests, retaining RPC fallback and custom connections. */
+  async sendReadRpc(method: string, params: unknown[]): Promise<unknown> {
+    if (!ReadRpcMethods.has(method)) {
+      throw new Error(`Unsupported read RPC method: ${method}`);
+    }
+    return this.perform(ProviderMethod.ReadRpc, { method, params });
   }
 
   async perform(method: string, params: { [name: string]: any }): Promise<any> {
@@ -519,6 +531,7 @@ export class HyperlaneSmartProvider
         `All providers failed on chain ${
           this.network.name
         } for method ${method} and params ${JSON.stringify(params, null, 2)}`,
+        method,
       );
       throw new CombinedError();
     }
@@ -538,6 +551,7 @@ export class HyperlaneSmartProvider
         const CombinedError = this.getCombinedProviderError(
           [result, ...providerResultErrors],
           `All providers timed out on chain ${this.network.name} for method ${method}`,
+          method,
         );
         throw new CombinedError();
       }
@@ -551,6 +565,7 @@ export class HyperlaneSmartProvider
           `All providers failed on chain ${
             this.network.name
           } for method ${method} and params ${JSON.stringify(params, null, 2)}`,
+          method,
         );
         throw new CombinedError();
       }
@@ -624,6 +639,7 @@ export class HyperlaneSmartProvider
   protected getCombinedProviderError(
     errors: any[],
     fallbackMsg: string,
+    method: string,
   ): new () => Error {
     this.logger.debug(fallbackMsg);
     if (errors.length === 0) {
@@ -721,9 +737,7 @@ export class HyperlaneSmartProvider
               // timeout branch below.
               cause:
                 errors.find(
-                  (e) =>
-                    e instanceof Error &&
-                    errorChainHasMessage(e, 'Invalid response from provider'),
+                  (e) => e instanceof Error && isEmptyProviderResponse(e),
                 ) ?? rpcServerError,
             },
           );
@@ -735,24 +749,27 @@ export class HyperlaneSmartProvider
           super(fallbackMsg, {
             cause:
               errors.find(
-                (e) =>
-                  e instanceof Error &&
-                  errorChainHasMessage(e, 'Invalid response from provider'),
+                (e) => e instanceof Error && isEmptyProviderResponse(e),
               ) ?? timedOutError,
           });
         }
       };
     } else {
-      this.logger.warn(
-        {
-          errors: errors.map((e) => ({
-            code: e?.code,
-            message: e?.message,
-            name: e?.name,
-          })),
-        },
-        'Unhandled error case in combined provider error handler',
-      );
+      if (
+        method !== ProviderMethod.Call ||
+        !errors.every(isEmptyProviderResponse)
+      ) {
+        this.logger.warn(
+          {
+            errors: errors.map((e) => ({
+              code: e?.code,
+              message: e?.message,
+              name: e?.name,
+            })),
+          },
+          'Unhandled error case in combined provider error handler',
+        );
+      }
       return class extends Error {
         constructor() {
           super(fallbackMsg, {

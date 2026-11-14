@@ -104,7 +104,9 @@ export const EXCHANGE_RATE_MARGIN_PCT = 50;
 // Gets the StorageGasOracleConfigWithTypicalCost for each remote chain for a particular local chain.
 // Accommodates small non-integer gas prices by scaling up the gas price
 // and scaling down the exchange rate by the same factor.
-function getLocalStorageGasOracleConfigOverride(
+// An optional fee token replaces only the local price/decimals; remotes retain
+// their native token prices, and the same margin/minimum USD cost still applies.
+export function getLocalStorageGasOracleConfigOverride(
   local: ChainName,
   remotes: ChainName[],
   tokenPrices: ChainMap<string>,
@@ -112,20 +114,26 @@ function getLocalStorageGasOracleConfigOverride(
   getOverhead: (local: ChainName, remote: ChainName) => number,
   applyMinUsdCost: boolean,
   onPrecisionFallback?: (ctx: { local: ChainName; remote: ChainName }) => void,
+  feeToken?: ChainGasOracleParams['nativeToken'],
 ): ChainMap<ProtocolAgnositicGasOracleConfigWithTypicalCost> {
   const localProtocolType = getChain(local).protocol;
   const localExchangeRateScale =
     getProtocolExchangeRateScale(localProtocolType);
-  const localNativeTokenDecimals = mustGetChainNativeToken(local).decimals;
+  const localNativeTokenDecimals =
+    feeToken?.decimals ?? mustGetChainNativeToken(local).decimals;
+  const localTokenUsdPrice = parseFloat(feeToken?.price ?? tokenPrices[local]);
 
   // Construct the gas oracle params for each remote chain
   const gasOracleParams = [local, ...remotes].reduce((agg, remote) => {
     agg[remote] = {
       gasPrice: gasPrices[remote],
-      nativeToken: {
-        price: tokenPrices[remote],
-        decimals: mustGetChainNativeToken(remote).decimals,
-      },
+      nativeToken:
+        remote === local && feeToken
+          ? feeToken
+          : {
+              price: tokenPrices[remote],
+              decimals: mustGetChainNativeToken(remote).decimals,
+            },
     };
     return agg;
   }, {} as ChainMap<ChainGasOracleParams>);
@@ -143,7 +151,6 @@ function getLocalStorageGasOracleConfigOverride(
       remoteProtocolType,
       getOverhead,
     );
-    const localTokenUsdPrice = parseFloat(tokenPrices[local]);
     const typicalIgpQuoteUsd = getUsdQuote(
       localTokenUsdPrice,
       localExchangeRateScale,
@@ -165,6 +172,30 @@ function getLocalStorageGasOracleConfigOverride(
     remote: ChainName,
     gasOracleConfig: ProtocolAgnositicGasOracleConfig,
   ): Parameters<typeof BigNumberJs>[0] => {
+    if (feeToken && isEVMLike(localProtocolType)) {
+      const { gasPrice, nativeToken } = gasOracleParams[remote];
+      // The SDK has already rounded/rebalanced the exchange rate. Recover the
+      // unrounded gasPrice * exchangeRate product from the snapshots, then
+      // compensate in gasPrice before checking the USD floor. This preserves
+      // the margin even for scaled rates >= 1 (e.g. 3.5352 rounded to 3).
+      const unroundedGasCost = new BigNumberJs(gasPrice.amount)
+        .times(new BigNumberJs(10).pow(gasPrice.decimals))
+        .times(nativeToken.price)
+        .times(100 + EXCHANGE_RATE_MARGIN_PCT)
+        .div(100)
+        .div(feeToken.price)
+        .times(
+          new BigNumberJs(10).pow(feeToken.decimals - nativeToken.decimals),
+        )
+        .times(localExchangeRateScale.toString());
+      gasOracleConfig = {
+        ...gasOracleConfig,
+        gasPrice: unroundedGasCost
+          .div(gasOracleConfig.tokenExchangeRate)
+          .integerValue(BigNumberJs.ROUND_CEIL)
+          .toFixed(0),
+      };
+    }
     if (!applyMinUsdCost) {
       return gasOracleConfig.gasPrice;
     }
@@ -175,7 +206,6 @@ function getLocalStorageGasOracleConfigOverride(
       getChain(remote).protocol,
       getOverhead,
     );
-    const localTokenUsdPrice = parseFloat(tokenPrices[local]);
     const typicalIgpQuoteUsd = getUsdQuote(
       localTokenUsdPrice,
       localExchangeRateScale,
@@ -294,18 +324,14 @@ function getMinUsdCost(local: ChainName, remote: ChainName): number {
     // mitosis
     mitosis: 0.1,
 
-    // For all SVM chains, min cost is 0.50 USD to cover rent needs
-    // For Ethereum L2s, we need to account for the L1 DA costs that
-    // aren't accounted for directly in the gas price.
-    blast: 0.5,
-    taiko: 0.5,
-
     // Tron uses an energy model, not gas. Delivery costs 80-110K energy
     // ≈ 9-12 TRX ≈ $2.60-$3.50. Standard EVM gas math underestimates Tron costs.
     tron: 4.0,
 
-    // skunkchain special
-    solanamainnet: 0.35,
+    // Solana receipt rent (939,800 lamports), fees and RPC allocation.
+    // ATA creation is funded separately by the route ATA payer. At 900k CU,
+    // the 1.15 lamport/CU snapshot plus 50% margin is below this floor.
+    solanamainnet: 0.25,
     // Ethereum floor ($0.12 -> $0.20). *->ethereum quotes are pinned to this floor; L1 gas rose to ~0.3 gwei (Sep 2026) and $0.12 ran 11 EVM lanes ~30% below break-even.
     ethereum: 0.2,
     arbitrum: 0.09,
@@ -323,9 +349,9 @@ function getMinUsdCost(local: ChainName, remote: ChainName): number {
     eclipsemainnet: 0.22,
   };
 
-  // Skip per-remote overrides on katana routes so the reduced floor isn't
-  // clobbered when sending from katana to a chain with a higher override.
-  if (katanaRoute) {
+  // Retain the Katana exception for other destinations. Solana has an explicit
+  // receipt-rent allowance shared by every origin, including MoonPay's Katana leg.
+  if (katanaRoute && remote !== 'solanamainnet') {
     return minUsdCost;
   }
 
@@ -365,6 +391,9 @@ function getUsdQuote(
 
 // cosmwasm warp route somewhat arbitrarily chosen
 const FOREIGN_DEFAULT_OVERHEAD = 600_000;
+// Tempo adds transaction and new-storage charges. Base->Tempo measured 614,493
+// overhead gas versus the standard 166,887; allow 500k extra with margin.
+const TEMPO_ADDITIONAL_GAS_OVERHEAD = 500_000;
 
 // Overhead for interchain messaging
 export function getOverhead(local: ChainName, remote: ChainName): number {
@@ -396,8 +425,8 @@ export function getOverheadWithOverrides(
 ): number {
   let overhead = getOverhead(local, remote);
 
-  if (remote === 'megaeth') {
-    overhead *= 10;
+  if (remote === 'tempo') {
+    overhead += TEMPO_ADDITIONAL_GAS_OVERHEAD;
   }
 
   // Somnia gas usage is higher than the EVM and tends to give high
@@ -408,10 +437,7 @@ export function getOverheadWithOverrides(
 
   // ZkSync gas usage is different from the EVM and tends to give high
   // estimates. We double the overhead to help account for this.
-  if (
-    getChain(remote).technicalStack === ChainTechnicalStack.ZkSync ||
-    remote === 'adichain'
-  ) {
+  if (getChain(remote).technicalStack === ChainTechnicalStack.ZkSync) {
     overhead *= 2;
   }
 

@@ -92,6 +92,7 @@ import {
   PausableIsmConfig,
   RoutingIsmConfig,
   RoutingIsmDelta,
+  RoutingMessageIdMultisigIsmConfig,
   WeightedMultisigIsmConfig,
 } from './types.js';
 import { isIsmCompatible, routingModuleDelta } from './utils.js';
@@ -158,36 +159,41 @@ const domainRoutingSetGasBuffer = (destination: ChainName) => {
 };
 
 /**
- * Recursively rejects a Composite ISM (Sealevel-only) anywhere in an EVM ISM
- * config tree, including nested under AGGREGATION/ROUTING/AMOUNT_ROUTING —
- * called once up front so an invalid nested config is caught before any
- * sibling module in the tree is deployed on-chain.
+ * Recursively rejects Sealevel-only ISMs (Composite, RoutingMessageIdMultisig)
+ * anywhere in an EVM ISM config tree, including nested under
+ * AGGREGATION/ROUTING/AMOUNT_ROUTING — called once up front so an invalid
+ * nested config is caught before any sibling module in the tree is deployed
+ * on-chain.
  */
-export function assertNoNestedCompositeIsm(
+export function assertNoSealevelOnlyIsm(
   config: IsmConfig,
-): asserts config is Exclude<IsmConfig, CompositeIsmConfig> {
+): asserts config is Exclude<
+  IsmConfig,
+  CompositeIsmConfig | RoutingMessageIdMultisigIsmConfig
+> {
   if (typeof config === 'string') {
     return;
   }
 
   assert(
-    config.type !== IsmType.COMPOSITE,
-    `Cannot deploy compositeIsm via the EVM ISM factory — it is Sealevel-only.`,
+    config.type !== IsmType.COMPOSITE &&
+      config.type !== IsmType.ROUTING_MESSAGE_ID_MULTISIG,
+    `Cannot deploy ${config.type} via the EVM ISM factory — it is Sealevel-only.`,
   );
 
   switch (config.type) {
     case IsmType.AGGREGATION:
     case IsmType.STORAGE_AGGREGATION:
-      config.modules.forEach(assertNoNestedCompositeIsm);
+      config.modules.forEach(assertNoSealevelOnlyIsm);
       break;
     case IsmType.ROUTING:
     case IsmType.FALLBACK_ROUTING:
     case IsmType.INCREMENTAL_ROUTING:
-      Object.values(config.domains).forEach(assertNoNestedCompositeIsm);
+      Object.values(config.domains).forEach(assertNoSealevelOnlyIsm);
       break;
     case IsmType.AMOUNT_ROUTING:
-      assertNoNestedCompositeIsm(config.lowerIsm);
-      assertNoNestedCompositeIsm(config.upperIsm);
+      assertNoSealevelOnlyIsm(config.lowerIsm);
+      assertNoSealevelOnlyIsm(config.upperIsm);
       break;
     default:
       break;
@@ -334,10 +340,10 @@ export class HyperlaneIsmFactory extends HyperlaneApp<ProxyFactoryFactories> {
 
     BaseIsmConfigSchema.parse(config);
 
-    // Reject a nested Composite ISM (Sealevel-only) before deploying any
+    // Reject a nested Sealevel-only ISM before deploying any
     // sibling module in the tree — a leaf-only check would let earlier
     // siblings in e.g. an AGGREGATION deploy before this is caught.
-    assertNoNestedCompositeIsm(config);
+    assertNoSealevelOnlyIsm(config);
 
     if (typeof config === 'string') {
       // @ts-ignore
@@ -515,7 +521,11 @@ export class HyperlaneIsmFactory extends HyperlaneApp<ProxyFactoryFactories> {
           if (!eqAddress(signerAddress, config.owner)) {
             const overrides =
               this.multiProvider.getTransactionOverrides(destination);
-            const tx = await contract.transferOwnership(
+            const netFlowIsm = NetFlowRateLimitedHookIsm__factory.connect(
+              contract.address,
+              this.multiProvider.getSigner(destination),
+            );
+            const tx = await netFlowIsm.transferOwnership(
               config.owner,
               overrides,
             );
@@ -995,6 +1005,17 @@ export class HyperlaneIsmFactory extends HyperlaneApp<ProxyFactoryFactories> {
         isms[origin] = ism.address;
       }
       const submoduleAddresses = Object.values(isms);
+      const signerAddress = await signer.getAddress();
+      const batchSize = domainRoutingInitializationSize(destination);
+      const initialBatchSize = Math.min(batchSize, safeConfigDomains.length);
+      const initialDomains = safeConfigDomains.slice(0, initialBatchSize);
+      const initialAddresses = submoduleAddresses.slice(0, initialBatchSize);
+      // Set the final owner atomically when no further enrollments are needed.
+      // RPCs may still serve pre-deployment state when estimating a follow-up call.
+      const initialOwner =
+        initialBatchSize === safeConfigDomains.length
+          ? config.owner
+          : signerAddress;
       let receipt: ethers.providers.TransactionReceipt;
       if (config.type === IsmType.FALLBACK_ROUTING) {
         // deploying new fallback routing ISM
@@ -1004,15 +1025,10 @@ export class HyperlaneIsmFactory extends HyperlaneApp<ProxyFactoryFactories> {
           );
         }
         logger.debug('Deploying fallback routing ISM ...');
-        const batchSize = domainRoutingInitializationSize(destination);
-        const signerAddress = await signer.getAddress();
-        const initialBatchSize = Math.min(batchSize, safeConfigDomains.length);
-        const initialDomains = safeConfigDomains.slice(0, initialBatchSize);
-        const initialAddresses = submoduleAddresses.slice(0, initialBatchSize);
         routingIsm = await this.multiProvider.handleDeploy(
           destination,
           new AtomicInitDefaultFallbackRoutingIsm__factory(),
-          [mailbox, signerAddress, initialDomains, initialAddresses],
+          [mailbox, initialOwner, initialDomains, initialAddresses],
           await getZKSyncArtifactByContractName(
             'AtomicInitDefaultFallbackRoutingIsm',
           ),
@@ -1026,7 +1042,7 @@ export class HyperlaneIsmFactory extends HyperlaneApp<ProxyFactoryFactories> {
           destination,
           logger,
         });
-        if (!eqAddress(signerAddress, config.owner)) {
+        if (!eqAddress(initialOwner, config.owner)) {
           const transferTxEstimatedGas =
             await routingIsm.estimateGas.transferOwnership(
               config.owner,
@@ -1068,17 +1084,8 @@ export class HyperlaneIsmFactory extends HyperlaneApp<ProxyFactoryFactories> {
           return routingIsm;
         }
 
-        // estimate gas
-        const signerAddress = await signer.getAddress();
-        const batchSize = domainRoutingInitializationSize(destination);
-
-        // Deploy initial batch of domains
-        const initialBatchSize = Math.min(batchSize, safeConfigDomains.length);
-        const initialDomains = safeConfigDomains.slice(0, initialBatchSize);
-        const initialAddresses = submoduleAddresses.slice(0, initialBatchSize);
-
         const estimatedGas = await domainRoutingIsmFactory.estimateGas.deploy(
-          signerAddress,
+          initialOwner,
           initialDomains,
           initialAddresses,
           overrides,
@@ -1088,7 +1095,7 @@ export class HyperlaneIsmFactory extends HyperlaneApp<ProxyFactoryFactories> {
         );
         // add gas buffer
         const tx = await domainRoutingIsmFactory.deploy(
-          signerAddress,
+          initialOwner,
           initialDomains,
           initialAddresses,
           {
@@ -1137,9 +1144,9 @@ export class HyperlaneIsmFactory extends HyperlaneApp<ProxyFactoryFactories> {
           logger,
         });
 
-        // Transfer ownership after all enrollments are complete, unless the
-        // signer is already the target owner (common for self-owned deploys).
-        if (!eqAddress(signerAddress, config.owner)) {
+        // Multi-batch deployments retain the signer as owner until all
+        // enrollments are complete.
+        if (!eqAddress(initialOwner, config.owner)) {
           const transferTxEstimatedGas =
             await routingIsm.estimateGas.transferOwnership(
               config.owner,

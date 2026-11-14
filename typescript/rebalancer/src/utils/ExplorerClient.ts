@@ -6,6 +6,10 @@ import {
   ProtocolType,
 } from '@hyperlane-xyz/utils';
 
+const HEX_PREFIX_REGEX = /^0x/i;
+
+export const DEFAULT_INFLIGHT_USER_TRANSFER_LIMIT = 100;
+
 export type InflightRebalanceQueryParams = {
   bridges: string[];
   routersByDomain: Record<number, string>; // Domain ID → router address (derive routers and domains from this)
@@ -71,9 +75,9 @@ export class ExplorerClient implements IExplorerClient {
       domain !== undefined ? this.getProtocol(domain) : undefined;
     if (protocol && !isEVMLike(protocol)) {
       const hex = addressToByteHexString(addr, protocol);
-      return hex.replace(/^0x/i, '\\x').toLowerCase();
+      return hex.replace(HEX_PREFIX_REGEX, '\\x').toLowerCase();
     }
-    return addr.replace(/^0x/i, '\\x').toLowerCase();
+    return addr.replace(HEX_PREFIX_REGEX, '\\x').toLowerCase();
   }
 
   /**
@@ -230,7 +234,11 @@ export class ExplorerClient implements IExplorerClient {
     params: UserTransferQueryParams,
     logger: Logger,
   ): Promise<ExplorerMessage[]> {
-    const { routersByDomain, excludeTxSenders, limit = 100 } = params;
+    const {
+      routersByDomain,
+      excludeTxSenders,
+      limit = DEFAULT_INFLIGHT_USER_TRANSFER_LIMIT,
+    } = params;
 
     // Derive routers and domains from routersByDomain
     const routerEntries = Object.entries(routersByDomain);

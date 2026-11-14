@@ -44,15 +44,13 @@ let coreCache: ChainMap<CoreConfig> | undefined;
 // These deployed core hook trees predate the current deployer path. Keep this
 // list explicit so registry availability changes cannot silently opt another
 // chain into in-place recovery.
-const legacyCoreHookRecoveryChains: ChainName[] = [
+export const legacyCoreHookRecoveryChains: ChainName[] = [
   'coti',
   'electroneum',
   'krown',
   'metis',
   'pulsechain',
-  'sei',
   'sonic',
-  'taiko',
   'viction',
 ];
 
@@ -144,7 +142,7 @@ export function getCore(): ChainMap<CoreConfig> {
     const pausableIsm: PausableIsmConfig = {
       type: IsmType.PAUSABLE,
       paused: false,
-      owner: PAUSER, // dedicated Turnkey pauser (pause solo, unpause gated)
+      owner: PAUSER,
     };
 
     // No static aggregation ISM support on zkSync
@@ -165,7 +163,7 @@ export function getCore(): ChainMap<CoreConfig> {
     const pausableHook: PausableHookConfig = {
       type: HookType.PAUSABLE,
       paused: false,
-      owner: PAUSER, // dedicated Turnkey pauser (pause solo, unpause gated)
+      owner: PAUSER,
     };
 
     // No static aggregation hook support on zkSync

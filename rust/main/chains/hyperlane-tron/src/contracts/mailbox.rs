@@ -11,10 +11,10 @@ use hyperlane_core::Metadata;
 use tracing::instrument;
 
 use hyperlane_core::{
-    rpc_clients::call_and_retry_indefinitely, ChainResult, ContractLocator, Decode, HyperlaneChain,
-    HyperlaneContract, HyperlaneDomain, HyperlaneMessage, HyperlaneProvider, Indexed, Indexer,
-    LogMeta, Mailbox, RawHyperlaneMessage, ReorgPeriod, SequenceAwareIndexer, TxCostEstimate,
-    TxOutcome, H256, H512, U256,
+    rpc_clients::call_and_retry_indefinitely, ChainCommunicationError, ChainResult,
+    ContractLocator, Decode, HyperlaneChain, HyperlaneContract, HyperlaneDomain, HyperlaneMessage,
+    HyperlaneProvider, Indexed, Indexer, LogMeta, Mailbox, RawHyperlaneMessage, ReorgPeriod,
+    SequenceAwareIndexer, TxCostEstimate, TxOutcome, H256, H512, U256,
 };
 
 use crate::interfaces::i_mailbox::IMailbox as TronMailboxInternal;
@@ -100,8 +100,12 @@ impl Indexer<HyperlaneMessage> for TronMailboxIndexer {
 #[async_trait]
 impl SequenceAwareIndexer<HyperlaneMessage> for TronMailboxIndexer {
     async fn latest_sequence_count_and_tip(&self) -> ChainResult<(Option<u32>, u32)> {
+        // walletsolidity serves the latest solidified state and does not support
+        // historical calls. Read the count before the tip so it never includes
+        // events above the reported tip; reading the tip first let a newly
+        // solidified event make a complete range look incomplete.
+        let sequence = self.contract.nonce().call().await?;
         let tip = Indexer::<HyperlaneMessage>::get_finalized_block_number(self).await?;
-        let sequence = self.contract.nonce().block(u64::from(tip)).call().await?;
         Ok((Some(sequence), tip))
     }
 }
@@ -239,12 +243,12 @@ impl Mailbox for TronMailbox {
         message: &HyperlaneMessage,
         metadata: &Metadata,
     ) -> ChainResult<TxCostEstimate> {
-        let gas_limit = self
-            .contract_call(message, metadata, None)?
-            .estimate_gas()
-            .await?;
-
-        let gas_price: U256 = self.provider.get_gas_price().await?.into();
+        let call = self.contract_call(message, metadata, None)?;
+        let (gas_limit, gas_price) = tokio::try_join!(
+            async { Ok::<_, ChainCommunicationError>(call.estimate_gas().await?) },
+            async { Ok::<_, ChainCommunicationError>(self.provider.get_gas_price().await?) },
+        )?;
+        let gas_price: U256 = gas_price.into();
 
         Ok(TxCostEstimate {
             gas_limit: gas_limit.into(),

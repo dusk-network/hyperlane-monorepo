@@ -50,6 +50,8 @@ pub struct CoreMetrics {
     merkle_tree_ingest_message_ids_count: IntCounterVec,
 
     submitter_queue_length: IntGaugeVec,
+    pending_message_active: IntGaugeVec,
+    pending_message_oldest_timestamp_seconds: IntGaugeVec,
 
     operations_processed_count: IntCounterVec,
     messages_processed_count: IntCounterVec,
@@ -71,6 +73,7 @@ pub struct CoreMetrics {
 
     // ism building metrics
     ism_build_count: IntCounterVec,
+    validator_latest_index_refresh_skipped: IntCounterVec,
 
     /// Chain initialization metrics
     chain_init_latency: IntGaugeVec,
@@ -218,6 +221,26 @@ impl CoreMetrics {
             registry
         )?;
 
+        let pending_message_active = register_int_gauge_vec_with_registry!(
+            opts!(
+                namespaced!("pending_message_active"),
+                "Messages currently pending delivery in this relayer process",
+                const_labels_ref
+            ),
+            &["app_context", "origin", "remote"],
+            registry
+        )?;
+
+        let pending_message_oldest_timestamp_seconds = register_int_gauge_vec_with_registry!(
+            opts!(
+                namespaced!("pending_message_oldest_timestamp_seconds"),
+                "Unix timestamp when the oldest active message was first observed by this relayer process",
+                const_labels_ref
+            ),
+            &["app_context", "origin", "remote"],
+            registry
+        )?;
+
         let latest_checkpoint = register_int_gauge_vec_with_registry!(
             opts!(
                 namespaced!("latest_checkpoint"),
@@ -358,6 +381,16 @@ impl CoreMetrics {
             registry
         )?;
 
+        let validator_latest_index_refresh_skipped = register_int_counter_vec_with_registry!(
+            opts!(
+                namespaced!("validator_latest_index_refresh_skipped"),
+                "Validator latest-index telemetry refreshes that did not complete",
+                const_labels_ref
+            ),
+            &["origin", "reason"],
+            registry
+        )?;
+
         let chain_init_latency = register_int_gauge_vec_with_registry!(
             opts!(
                 namespaced!("chain_init_latency"),
@@ -386,6 +419,8 @@ impl CoreMetrics {
             merkle_tree_ingest_message_ids_count,
 
             submitter_queue_length,
+            pending_message_active,
+            pending_message_oldest_timestamp_seconds,
 
             operations_processed_count,
             messages_processed_count,
@@ -405,6 +440,7 @@ impl CoreMetrics {
             metadata_wait_oldest_timestamp_seconds,
 
             ism_build_count,
+            validator_latest_index_refresh_skipped,
 
             chain_init_latency,
 
@@ -642,6 +678,21 @@ impl CoreMetrics {
         self.submitter_queue_length.clone()
     }
 
+    /// Number of messages currently pending delivery.
+    ///
+    /// Labels: `app_context`, `origin`, `remote`.
+    pub fn pending_message_active(&self) -> IntGaugeVec {
+        self.pending_message_active.clone()
+    }
+
+    /// Unix timestamp when the oldest active message was first observed by
+    /// this relayer process. Zero means no messages are active.
+    ///
+    /// Labels: `app_context`, `origin`, `remote`.
+    pub fn pending_message_oldest_timestamp_seconds(&self) -> IntGaugeVec {
+        self.pending_message_oldest_timestamp_seconds.clone()
+    }
+
     /// The number of operations successfully submitted by this process during
     /// its lifetime.
     ///
@@ -774,6 +825,16 @@ impl CoreMetrics {
     /// - `status`: success or failure
     pub fn ism_build_count(&self) -> IntCounterVec {
         self.ism_build_count.clone()
+    }
+
+    /// Validator latest-index telemetry refreshes that were skipped or did not
+    /// complete, so `observed_validator_latest_index` may be stale.
+    ///
+    /// Labels:
+    /// - `origin`: Chain whose validators were being refreshed.
+    /// - `reason`: `capacity`, `timeout` or `error`.
+    pub fn validator_latest_index_refresh_skipped(&self) -> IntCounterVec {
+        self.validator_latest_index_refresh_skipped.clone()
     }
 
     /// The latency of chain initialization in milliseconds.

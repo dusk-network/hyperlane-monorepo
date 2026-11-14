@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
-use ethers::types::{BlockNumber, H160, H256};
+use ethers::types::{H160, H256};
 use eyre::{ensure, Result};
 use hyperlane_base::CoreMetrics;
 use hyperlane_core::KnownHyperlaneDomain;
@@ -15,29 +15,53 @@ use testcontainers_modules::postgres::Postgres;
 
 use super::*;
 use crate::near_head::{
-    source::{Contracts, Event, EventData, Header},
+    source::{BlockSelector, Contracts, Event, EventBatch, EventData, Header},
     store::State,
 };
 
 struct Chain {
+    forbid_calls: AtomicBool,
     head: AtomicU64,
     tag: AtomicU64,
     fail_tag: AtomicBool,
     fail_events: AtomicBool,
     wrong_tag: AtomicBool,
     observations: AtomicUsize,
+    event_reads: AtomicUsize,
+    count_reads: AtomicUsize,
+    fork_from: AtomicU64,
+    fresh_headers: AtomicUsize,
+    sequence: AtomicBool,
+    counts: AtomicBool,
+    count_values: Mutex<[u32; 2]>,
+    pruned_below: AtomicU64,
+    indexing_tip: AtomicU64,
+    fail_tip_counts: AtomicBool,
+    tip_counts: Mutex<Option<[(Option<u32>, u32); 4]>>,
     events: Mutex<Vec<Event>>,
 }
 
 impl Chain {
     fn new(head: u64, fail_tag: bool) -> Self {
         Self {
+            forbid_calls: AtomicBool::new(false),
             head: AtomicU64::new(head),
             tag: AtomicU64::new(0),
             fail_tag: AtomicBool::new(fail_tag),
             fail_events: AtomicBool::new(false),
             wrong_tag: AtomicBool::new(false),
             observations: AtomicUsize::new(0),
+            event_reads: AtomicUsize::new(0),
+            count_reads: AtomicUsize::new(0),
+            fork_from: AtomicU64::new(u64::MAX),
+            fresh_headers: AtomicUsize::new(0),
+            sequence: AtomicBool::new(false),
+            counts: AtomicBool::new(true),
+            count_values: Mutex::new([0; 2]),
+            pruned_below: AtomicU64::new(0),
+            indexing_tip: AtomicU64::new(u64::MAX),
+            fail_tip_counts: AtomicBool::new(false),
+            tip_counts: Mutex::new(None),
             events: Mutex::new(Vec::new()),
         }
     }
@@ -45,25 +69,30 @@ impl Chain {
 
 #[async_trait]
 impl Source for Arc<Chain> {
-    async fn header(&self, block: BlockNumber) -> Result<Header> {
-        let tagged = matches!(&block, BlockNumber::Safe | BlockNumber::Finalized);
+    async fn header(&self, block: BlockSelector) -> Result<Header> {
+        assert!(
+            !self.forbid_calls.load(Ordering::SeqCst),
+            "Header wake-up made a source call"
+        );
+        let tagged = matches!(&block, BlockSelector::Safe | BlockSelector::Finalized);
         let height = match block {
-            BlockNumber::Number(height) => height.as_u64(),
-            BlockNumber::Safe | BlockNumber::Finalized => {
+            BlockSelector::Height(height) => height,
+            BlockSelector::Safe | BlockSelector::Finalized => {
                 ensure!(!self.fail_tag.load(Ordering::SeqCst), "Tag unavailable");
                 self.tag.load(Ordering::SeqCst)
             }
-            BlockNumber::Latest => {
+            BlockSelector::Latest => {
                 self.observations.fetch_add(1, Ordering::SeqCst);
                 self.head.load(Ordering::SeqCst)
             }
-            _ => eyre::bail!("Unexpected block selector"),
         };
         ensure!(height <= self.head.load(Ordering::SeqCst), "Unknown height");
         Ok(Header {
             height,
             timestamp: 1,
-            hash: if tagged && self.wrong_tag.load(Ordering::SeqCst) {
+            hash: if (tagged && self.wrong_tag.load(Ordering::SeqCst))
+                || height >= self.fork_from.load(Ordering::SeqCst)
+            {
                 H256::repeat_byte(99)
             } else {
                 H256::from_low_u64_be(height.saturating_add(1))
@@ -73,6 +102,11 @@ impl Source for Arc<Chain> {
     }
 
     async fn events(&self, start: u64, end: u64) -> Result<Vec<Event>> {
+        assert!(
+            !self.forbid_calls.load(Ordering::SeqCst),
+            "Header wake-up made a source call"
+        );
+        self.event_reads.fetch_add(1, Ordering::SeqCst);
         ensure!(!self.fail_events.load(Ordering::SeqCst), "Logs unavailable");
         Ok(self
             .events
@@ -84,8 +118,79 @@ impl Source for Arc<Chain> {
             .collect())
     }
 
-    async fn counts(&self, _: H256) -> Result<[u32; 2]> {
-        Ok([0; 2])
+    async fn fresh_header(&self, block: BlockSelector) -> Result<Header> {
+        assert!(
+            !self.forbid_calls.load(Ordering::SeqCst),
+            "Header wake-up made a source call"
+        );
+        self.fresh_headers.fetch_add(1, Ordering::SeqCst);
+        self.header(block).await
+    }
+
+    async fn events_after(&self, start: u64, end: u64, _sequences: [u32; 4]) -> Result<EventBatch> {
+        assert!(
+            !self.forbid_calls.load(Ordering::SeqCst),
+            "Header wake-up made a source call"
+        );
+        let sequence = self.sequence.load(Ordering::SeqCst);
+        let events = self.events(if sequence { 0 } else { start }, end).await?;
+        if !sequence {
+            return Ok(EventBatch {
+                events,
+                through: end,
+            });
+        }
+        Ok(EventBatch {
+            events,
+            through: end,
+        })
+    }
+
+    async fn counts(&self, hash: H256) -> Result<Option<[u32; 2]>> {
+        assert!(
+            !self.forbid_calls.load(Ordering::SeqCst),
+            "Header wake-up made a source call"
+        );
+        self.count_reads.fetch_add(1, Ordering::SeqCst);
+        // Header hashes encode height + 1.
+        let height = hash.to_low_u64_be().saturating_sub(1);
+        ensure!(
+            height >= self.pruned_below.load(Ordering::SeqCst),
+            "Historical state pruned"
+        );
+        Ok(self
+            .counts
+            .load(Ordering::SeqCst)
+            .then(|| *self.count_values.lock().unwrap()))
+    }
+
+    fn has_historical_counts(&self) -> bool {
+        !self.sequence.load(Ordering::SeqCst)
+    }
+
+    fn indexes_by_sequence(&self) -> bool {
+        self.sequence.load(Ordering::SeqCst)
+    }
+
+    async fn indexing_tip(&self) -> Result<Option<u64>> {
+        assert!(
+            !self.forbid_calls.load(Ordering::SeqCst),
+            "Header wake-up made a source call"
+        );
+        let tip = self.indexing_tip.load(Ordering::SeqCst);
+        Ok((tip != u64::MAX).then_some(tip))
+    }
+
+    async fn tip_sequence_counts(&self) -> Result<Option<[(Option<u32>, u32); 4]>> {
+        assert!(
+            !self.forbid_calls.load(Ordering::SeqCst),
+            "Header wake-up made a source call"
+        );
+        ensure!(
+            !self.fail_tip_counts.load(Ordering::SeqCst),
+            "Tip counts unavailable"
+        );
+        Ok(*self.tip_counts.lock().unwrap())
     }
 }
 
@@ -93,16 +198,35 @@ fn gas_event(height: u64, index: u64) -> Event {
     Event {
         block_number: height,
         block_hash: H256::from_low_u64_be(height.saturating_add(1)),
-        tx_hash: H256::from_low_u64_be(index.saturating_add(10_000)),
+        tx_hash: Some(H256::from_low_u64_be(index.saturating_add(10_000)).into()),
         tx_index: index,
         log_index: index,
-        address: H160::repeat_byte(3),
+        address: H160::repeat_byte(3).into(),
+        sequence: None,
         data: EventData::Gas {
-            message_id: H256::from_low_u64_be(index),
+            message_id: H256::from_low_u64_be(index).into(),
             destination: 2,
             gas: "1".into(),
             payment: "1".into(),
         },
+    }
+}
+
+fn dispatch_event(height: u64, nonce: u32) -> Event {
+    Event {
+        block_number: height,
+        block_hash: H256::from_low_u64_be(height.saturating_add(1)),
+        tx_hash: Some(H256::from_low_u64_be(u64::from(nonce).saturating_add(10_000)).into()),
+        tx_index: u64::from(nonce),
+        log_index: u64::from(nonce),
+        address: H160::repeat_byte(1).into(),
+        sequence: Some(nonce),
+        data: EventData::Dispatch(hyperlane_core::HyperlaneMessage {
+            nonce,
+            origin: 1,
+            destination: 2,
+            ..Default::default()
+        }),
     }
 }
 
@@ -113,9 +237,9 @@ async fn worker(db: DatabaseConnection, source: Arc<Chain>) -> Result<Arc<Worker
         .initialize(
             &source.header(0u64.into()).await?,
             &Contracts {
-                mailbox: H160::repeat_byte(1),
-                hook: H160::repeat_byte(2),
-                paymaster: H160::repeat_byte(3),
+                mailbox: H160::repeat_byte(1).into(),
+                hook: H160::repeat_byte(2).into(),
+                paymaster: H160::repeat_byte(3).into(),
             },
         )
         .await?;
@@ -127,9 +251,31 @@ async fn worker(db: DatabaseConnection, source: Arc<Chain>) -> Result<Arc<Worker
         period: ReorgPeriod::Tag("finalized".into()),
         chunk_size: 20_000,
         poll_interval: Duration::from_millis(20),
+        wakeup: Notify::new(),
+        dispatch_wakeup: Arc::new(Notify::new()),
+        receipt_wakeup: watch::channel(()).0,
+        wanted: AtomicU64::new(0),
+        heads: tokio::sync::Mutex::new(mpsc::channel(256).1),
+        polled_head: watch::channel(0).0,
+        critical_failure_grace: Duration::from_millis(60),
         chain_metrics: ChainMetrics::new(&metrics)?,
         sync_metrics: Arc::new(ContractSyncMetrics::new(&metrics)),
     }))
+}
+
+#[tokio::test]
+async fn transient_failures_do_not_set_critical_error() {
+    let mut failures = FailureStreak::default();
+    let grace = Duration::from_millis(40);
+
+    assert!(!failures.record(true, grace));
+    sleep(Duration::from_millis(20)).await;
+    assert!(!failures.record(true, grace));
+    assert!(!failures.record(false, grace));
+    sleep(Duration::from_millis(40)).await;
+    assert!(!failures.record(true, grace));
+    sleep(grace).await;
+    assert!(failures.record(true, grace));
 }
 
 fn critical(worker: &Worker) -> i64 {
@@ -156,7 +302,7 @@ async fn newly_ingested_events_publish_immediately_and_full_pages_keep_draining(
             .chain((999..1500).map(|index| gas_event(2, index))),
     );
     let worker = worker(db, chain).await?;
-    let mut cache = None;
+    let mut cache = CountCache::default();
 
     assert!(worker.cycle(&mut cache).await?.more);
     let first = worker.store.state().await?.unwrap();
@@ -181,7 +327,7 @@ async fn ingestion_errors_do_not_block_existing_publication() -> Result<()> {
             .chain((999..1500).map(|index| gas_event(2, index))),
     );
     let worker = worker(db, chain.clone()).await?;
-    let mut cache = None;
+    let mut cache = CountCache::default();
     worker.cycle(&mut cache).await?;
     assert_eq!(worker.store.state().await?.unwrap().confirmed, 0);
 
@@ -213,7 +359,7 @@ async fn backlog_drains_without_polls_while_ingestion_fails_then_recovers() -> R
             .chain((999..1500).map(|index| gas_event(2, index))),
     );
     let worker = worker(db, chain.clone()).await?;
-    worker.cycle(&mut None).await?;
+    worker.cycle(&mut CountCache::default()).await?;
     assert_eq!(worker.store.state().await?.unwrap().confirmed, 0);
 
     // A poll interval far beyond the test timeout: draining both pages proves
@@ -273,7 +419,7 @@ async fn finality_tag_on_another_fork_releases_nothing() -> Result<()> {
     chain.tag.store(1, Ordering::SeqCst);
     chain.events.lock().unwrap().push(gas_event(1, 0));
     let worker = worker(db, chain.clone()).await?;
-    let mut cache = None;
+    let mut cache = CountCache::default();
     worker.cycle(&mut cache).await?;
     assert_eq!(worker.store.state().await?.unwrap().confirmed, 1);
 
@@ -408,28 +554,728 @@ async fn restart_waits_for_an_rpc_behind_saved_progress() -> Result<()> {
     .await?;
     let chain = Arc::new(Chain::new(5, false));
     let worker = worker(db, chain.clone()).await?;
-    let state = crate::near_head::observe(&chain, &worker.store).await?;
-    crate::near_head::ingest(&chain, &worker.store, &state, 20_000).await?;
+    let state = crate::near_head::pipeline::observe(&chain, &worker.store).await?;
+    crate::near_head::tests::ingest(&chain, &worker.store, &state, 20_000).await?;
     assert_eq!(worker.store.state().await?.unwrap().indexed, 5);
 
     chain.head.store(3, Ordering::SeqCst);
-    let anchor = chain.header(0u64.into()).await?;
     super::super::prepare(
         worker.source.as_ref(),
         &worker.store,
-        &anchor,
+        None,
         &Contracts {
-            mailbox: H160::repeat_byte(1),
-            hook: H160::repeat_byte(2),
-            paymaster: H160::repeat_byte(3),
+            mailbox: H160::repeat_byte(1).into(),
+            hook: H160::repeat_byte(2).into(),
+            paymaster: H160::repeat_byte(3).into(),
         },
         &worker.period,
     )
     .await?;
-    assert!(crate::near_head::observe(&chain, &worker.store)
+    assert!(crate::near_head::pipeline::observe(&chain, &worker.store)
         .await
         .is_err());
     chain.head.store(5, Ordering::SeqCst);
-    crate::near_head::observe(&chain, &worker.store).await?;
+    crate::near_head::pipeline::observe(&chain, &worker.store).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn block_mode_ingestion_stops_at_the_common_stream_tip() -> Result<()> {
+    let postgres = Postgres::default().with_tag("16-alpine").start().await?;
+    let db = Database::connect(format!(
+        "postgresql://postgres:postgres@127.0.0.1:{}/postgres",
+        postgres.get_host_port_ipv4(5432).await?
+    ))
+    .await?;
+    let chain = Arc::new(Chain::new(5, false));
+    chain.indexing_tip.store(3, Ordering::SeqCst);
+    let worker = worker(db, chain.clone()).await?;
+    let state = crate::near_head::pipeline::observe(&chain, &worker.store).await?;
+    assert!(crate::near_head::tests::ingest(&chain, &worker.store, &state, 20_000).await?);
+    let state = worker.store.state().await?.expect("initialized state");
+    assert_eq!((state.indexed, state.head), (3, 5));
+    chain.fresh_headers.store(0, Ordering::SeqCst);
+    crate::near_head::tests::confirm(&chain, &worker.store, &ReorgPeriod::from_blocks(3)).await?;
+    assert_eq!(chain.fresh_headers.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn block_mode_replays_provisional_history_after_a_sequence_gap() -> Result<()> {
+    let postgres = Postgres::default().with_tag("16-alpine").start().await?;
+    let db = Database::connect(format!(
+        "postgresql://postgres:postgres@127.0.0.1:{}/postgres",
+        postgres.get_host_port_ipv4(5432).await?
+    ))
+    .await?;
+    let chain = Arc::new(Chain::new(3, false));
+    chain.counts.store(false, Ordering::SeqCst);
+    chain.events.lock().unwrap().push(dispatch_event(2, 0));
+    let worker = worker(db, chain.clone()).await?;
+    let mut cache = CountCache::default();
+    worker.cycle(&mut cache).await?;
+    assert_eq!(worker.store.state().await?.unwrap().indexed, 3);
+
+    chain
+        .events
+        .lock()
+        .unwrap()
+        .extend([dispatch_event(3, 1), dispatch_event(4, 2)]);
+    chain.head.store(4, Ordering::SeqCst);
+    assert!(worker.cycle(&mut cache).await.is_err());
+    assert_eq!(worker.store.state().await?.unwrap().indexed, 0);
+    worker.cycle(&mut cache).await?;
+    assert_eq!(worker.store.state().await?.unwrap().indexed, 4);
+    Ok(())
+}
+
+#[tokio::test]
+async fn block_mode_retries_a_sequence_gap_after_the_confirmed_frontier() -> Result<()> {
+    let postgres = Postgres::default().with_tag("16-alpine").start().await?;
+    let db = Database::connect(format!(
+        "postgresql://postgres:postgres@127.0.0.1:{}/postgres",
+        postgres.get_host_port_ipv4(5432).await?
+    ))
+    .await?;
+    let chain = Arc::new(Chain::new(3, false));
+    chain.counts.store(false, Ordering::SeqCst);
+    chain.events.lock().unwrap().push(dispatch_event(3, 1));
+    let worker = worker(db, chain.clone()).await?;
+    let mut cache = CountCache::default();
+
+    assert!(worker.cycle(&mut cache).await.is_err());
+    let rejected = worker.store.state().await?.unwrap();
+    assert_eq!((rejected.indexed, rejected.confirmed), (0, 0));
+    assert!(!rejected.halted);
+
+    chain.events.lock().unwrap().insert(0, dispatch_event(2, 0));
+    worker.cycle(&mut cache).await?;
+    assert_eq!(worker.store.state().await?.unwrap().indexed, 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn block_mode_keeps_retrying_a_gap_at_the_confirmed_frontier() -> Result<()> {
+    let postgres = Postgres::default().with_tag("16-alpine").start().await?;
+    let db = Database::connect(format!(
+        "postgresql://postgres:postgres@127.0.0.1:{}/postgres",
+        postgres.get_host_port_ipv4(5432).await?
+    ))
+    .await?;
+    let chain = Arc::new(Chain::new(3, false));
+    chain.counts.store(false, Ordering::SeqCst);
+    chain.events.lock().unwrap().push(dispatch_event(3, 1));
+    let worker = worker(db, chain.clone()).await?;
+    let mut cache = CountCache::default();
+
+    assert!(worker.cycle(&mut cache).await.is_err());
+    assert!(!worker.store.state().await?.unwrap().halted);
+    assert!(worker.cycle(&mut cache).await.is_err());
+    let retried = worker.store.state().await?.unwrap();
+    assert_eq!((retried.indexed, retried.confirmed), (0, 0));
+    assert!(!retried.halted);
+
+    chain.events.lock().unwrap().insert(0, dispatch_event(2, 0));
+    worker.cycle(&mut cache).await?;
+    assert_eq!(worker.store.state().await?.unwrap().indexed, 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn block_mode_does_not_publish_an_unproven_chunk_after_ingestion_fails() -> Result<()> {
+    let postgres = Postgres::default().with_tag("16-alpine").start().await?;
+    let db = Database::connect(format!(
+        "postgresql://postgres:postgres@127.0.0.1:{}/postgres",
+        postgres.get_host_port_ipv4(5432).await?
+    ))
+    .await?;
+    let chain = Arc::new(Chain::new(20, false));
+    chain.counts.store(false, Ordering::SeqCst);
+    chain.tag.store(10, Ordering::SeqCst);
+    *chain.tip_counts.lock().unwrap() = Some([(Some(1), 20), (None, 20), (None, 20), (None, 20)]);
+    let worker = worker(db, chain.clone()).await?;
+    let worker = Worker {
+        chunk_size: 10,
+        ..Arc::into_inner(worker).expect("sole worker handle")
+    };
+    let mut cache = CountCache::default();
+
+    assert!(worker.cycle(&mut cache).await?.more);
+    let partial = worker.store.state().await?.unwrap();
+    assert_eq!((partial.indexed, partial.confirmed), (10, 0));
+
+    chain.fail_events.store(true, Ordering::SeqCst);
+    assert!(worker.cycle(&mut cache).await.is_err());
+    let failed = worker.store.state().await?.unwrap();
+    assert_eq!((failed.indexed, failed.confirmed), (10, 0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn tip_count_errors_leave_provisional_history_unpublished() -> Result<()> {
+    let postgres = Postgres::default().with_tag("16-alpine").start().await?;
+    let db = Database::connect(format!(
+        "postgresql://postgres:postgres@127.0.0.1:{}/postgres",
+        postgres.get_host_port_ipv4(5432).await?
+    ))
+    .await?;
+    let chain = Arc::new(Chain::new(20, false));
+    chain.counts.store(false, Ordering::SeqCst);
+    *chain.tip_counts.lock().unwrap() = Some([(Some(0), 10), (None, 10), (None, 10), (None, 10)]);
+    let worker = worker(db, chain.clone()).await?;
+    let worker = Worker {
+        chunk_size: 10,
+        ..Arc::into_inner(worker).expect("sole worker handle")
+    };
+    let mut cache = CountCache::default();
+
+    assert!(worker.cycle(&mut cache).await?.more);
+    let provisional = worker.store.state().await?.unwrap();
+    assert_eq!((provisional.indexed, provisional.confirmed), (10, 0));
+
+    chain.fail_tip_counts.store(true, Ordering::SeqCst);
+    chain.tag.store(10, Ordering::SeqCst);
+    assert!(worker.cycle(&mut cache).await.is_err());
+    let unchanged = worker.store.state().await?.unwrap();
+    assert_eq!((unchanged.indexed, unchanged.confirmed), (10, 0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn block_mode_does_not_publish_until_tip_counts_are_complete() -> Result<()> {
+    let postgres = Postgres::default().with_tag("16-alpine").start().await?;
+    let db = Database::connect(format!(
+        "postgresql://postgres:postgres@127.0.0.1:{}/postgres",
+        postgres.get_host_port_ipv4(5432).await?
+    ))
+    .await?;
+    let chain = Arc::new(Chain::new(20, false));
+    chain.counts.store(false, Ordering::SeqCst);
+    chain.tag.store(20, Ordering::SeqCst);
+    *chain.tip_counts.lock().unwrap() = Some([(Some(0), 11), (None, 11), (None, 11), (None, 11)]);
+    let worker = worker(db, chain.clone()).await?;
+    let worker = Worker {
+        chunk_size: 10,
+        ..Arc::into_inner(worker).expect("sole worker handle")
+    };
+    let mut cache = CountCache::default();
+
+    assert!(worker.cycle(&mut cache).await?.more);
+    let partial = worker.store.state().await?.unwrap();
+    assert_eq!((partial.indexed, partial.confirmed), (10, 10));
+
+    *chain.tip_counts.lock().unwrap() = Some([(Some(1), 21), (None, 21), (None, 21), (None, 21)]);
+    assert!(!worker.cycle(&mut cache).await?.more);
+    let newer_tip = worker.store.state().await?.unwrap();
+    assert_eq!((newer_tip.indexed, newer_tip.confirmed), (20, 10));
+
+    *chain.tip_counts.lock().unwrap() = Some([(Some(1), 20), (None, 20), (None, 20), (None, 20)]);
+    assert!(worker.cycle(&mut cache).await.is_err());
+    let rejected = worker.store.state().await?.unwrap();
+    assert_eq!((rejected.indexed, rejected.confirmed), (10, 10));
+    assert!(!rejected.halted);
+
+    chain.events.lock().unwrap().push(dispatch_event(15, 0));
+    assert!(!worker.cycle(&mut cache).await?.more);
+    let recovered = worker.store.state().await?.unwrap();
+    assert_eq!((recovered.indexed, recovered.confirmed), (20, 20));
+    assert!(!recovered.halted);
+
+    *chain.tip_counts.lock().unwrap() = Some([(Some(0), 10), (None, 10), (None, 10), (None, 10)]);
+    assert!(!worker.cycle(&mut cache).await?.more);
+    assert_eq!(worker.store.state().await?.unwrap().confirmed, 20);
+    Ok(())
+}
+
+/// Without historical counts, a range's tail cannot be checked: an RPC that drops
+/// the last logs of a range would otherwise be confirmed and lost for good.
+#[tokio::test]
+async fn ranges_without_historical_counts_stay_provisional_until_proven() -> Result<()> {
+    let postgres = Postgres::default().with_tag("16-alpine").start().await?;
+    let db = Database::connect(format!(
+        "postgresql://postgres:postgres@127.0.0.1:{}/postgres",
+        postgres.get_host_port_ipv4(5432).await?
+    ))
+    .await?;
+    let chain = Arc::new(Chain::new(2, false));
+    chain.tag.store(2, Ordering::SeqCst);
+    chain.counts.store(false, Ordering::SeqCst);
+    chain
+        .events
+        .lock()
+        .unwrap()
+        .extend([gas_event(1, 0), gas_event(2, 1)]);
+    let worker = worker(db, chain.clone()).await?;
+    let mut cache = CountCache::default();
+
+    worker.cycle(&mut cache).await?;
+    let state = worker.store.state().await?.unwrap();
+    assert_eq!((state.indexed, state.confirmed), (2, 0));
+
+    // A later range whose end counts are available proves everything before it.
+    chain.counts.store(true, Ordering::SeqCst);
+    chain.head.store(3, Ordering::SeqCst);
+    chain.tag.store(3, Ordering::SeqCst);
+    worker.cycle(&mut cache).await?;
+    let state = worker.store.state().await?.unwrap();
+    assert_eq!((state.indexed, state.confirmed), (3, 3));
+    Ok(())
+}
+
+/// A restart forgets earlier proofs, so a provisional suffix left by unproven
+/// ranges is held until the next proven range.
+#[tokio::test]
+async fn restart_holds_an_unproven_provisional_suffix() -> Result<()> {
+    let postgres = Postgres::default().with_tag("16-alpine").start().await?;
+    let db = Database::connect(format!(
+        "postgresql://postgres:postgres@127.0.0.1:{}/postgres",
+        postgres.get_host_port_ipv4(5432).await?
+    ))
+    .await?;
+    let chain = Arc::new(Chain::new(2, false));
+    chain.counts.store(false, Ordering::SeqCst);
+    let worker = worker(db, chain.clone()).await?;
+    worker.cycle(&mut CountCache::default()).await?;
+    assert_eq!(worker.store.state().await?.unwrap().indexed, 2);
+
+    chain.tag.store(2, Ordering::SeqCst);
+    let mut restarted = CountCache::default();
+    worker.cycle(&mut restarted).await?;
+    assert_eq!(worker.store.state().await?.unwrap().confirmed, 0);
+
+    chain.counts.store(true, Ordering::SeqCst);
+    chain.head.store(3, Ordering::SeqCst);
+    chain.tag.store(3, Ordering::SeqCst);
+    worker.cycle(&mut restarted).await?;
+    assert_eq!(worker.store.state().await?.unwrap().confirmed, 3);
+    Ok(())
+}
+
+/// Confirmation prunes checkpoints below the frontier, so a provider whose tip
+/// lags behind confirmed history must not look one up.
+#[tokio::test]
+async fn tip_counts_below_the_confirmed_frontier_do_not_fail_the_cycle() -> Result<()> {
+    let postgres = Postgres::default().with_tag("16-alpine").start().await?;
+    let db = Database::connect(format!(
+        "postgresql://postgres:postgres@127.0.0.1:{}/postgres",
+        postgres.get_host_port_ipv4(5432).await?
+    ))
+    .await?;
+    let chain = Arc::new(Chain::new(20, false));
+    chain.counts.store(false, Ordering::SeqCst);
+    chain.tag.store(20, Ordering::SeqCst);
+    chain.events.lock().unwrap().push(dispatch_event(15, 0));
+    *chain.tip_counts.lock().unwrap() = Some([(Some(1), 20), (None, 20), (None, 20), (None, 20)]);
+    let worker = worker(db, chain.clone()).await?;
+    let mut cache = CountCache::default();
+    worker.cycle(&mut cache).await?;
+    let confirmed = worker.store.state().await?.unwrap();
+    assert_eq!((confirmed.indexed, confirmed.confirmed), (20, 20));
+
+    *chain.tip_counts.lock().unwrap() = Some([(Some(1), 16), (None, 16), (None, 16), (None, 16)]);
+    worker.cycle(&mut cache).await?;
+    assert_eq!(worker.store.state().await?.unwrap().confirmed, 20);
+    Ok(())
+}
+
+/// A dispatch dropped from an unproven range is only exposed by a later range's
+/// end counts. The provisional suffix must be replayed, not retried forever.
+#[tokio::test]
+async fn incomplete_range_replays_an_unproven_suffix() -> Result<()> {
+    let postgres = Postgres::default().with_tag("16-alpine").start().await?;
+    let db = Database::connect(format!(
+        "postgresql://postgres:postgres@127.0.0.1:{}/postgres",
+        postgres.get_host_port_ipv4(5432).await?
+    ))
+    .await?;
+    let chain = Arc::new(Chain::new(2, false));
+    chain.tag.store(2, Ordering::SeqCst);
+    chain.counts.store(false, Ordering::SeqCst);
+    let worker = worker(db, chain.clone()).await?;
+    let mut cache = CountCache::default();
+    // The provider omits the dispatch at height 1 and cannot serve counts.
+    worker.cycle(&mut cache).await?;
+    let state = worker.store.state().await?.unwrap();
+    assert_eq!((state.indexed, state.confirmed), (2, 0));
+
+    chain.events.lock().unwrap().push(dispatch_event(1, 0));
+    *chain.count_values.lock().unwrap() = [1, 0];
+    chain.counts.store(true, Ordering::SeqCst);
+    // The indexed boundary's state is pruned, so only the next range's end
+    // counts can expose the gap.
+    chain.pruned_below.store(3, Ordering::SeqCst);
+    chain.head.store(3, Ordering::SeqCst);
+    chain.tag.store(3, Ordering::SeqCst);
+    let error = worker.cycle(&mut cache).await.unwrap_err();
+    assert!(error.to_string().contains("Incomplete event range"));
+    assert_eq!(worker.store.state().await?.unwrap().indexed, 0);
+
+    worker.cycle(&mut cache).await?;
+    let state = worker.store.state().await?.unwrap();
+    assert_eq!((state.indexed, state.confirmed), (3, 3));
+    assert_eq!(worker.store.sequence_counts().await?[0], 1);
+    Ok(())
+}
+
+/// Rewinding an incomplete suffix also deletes its previously proven prefix.
+/// An incomplete replay must not inherit that deleted prefix's count proof.
+#[tokio::test]
+async fn indexed_boundary_rewind_invalidates_the_deleted_prefix_proof() -> Result<()> {
+    let postgres = Postgres::default().with_tag("16-alpine").start().await?;
+    let db = Database::connect(format!(
+        "postgresql://postgres:postgres@127.0.0.1:{}/postgres",
+        postgres.get_host_port_ipv4(5432).await?
+    ))
+    .await?;
+    let chain = Arc::new(Chain::new(20, false));
+    chain
+        .events
+        .lock()
+        .expect("events")
+        .push(dispatch_event(5, 0));
+    *chain.count_values.lock().expect("counts") = [1, 0];
+    let worker = worker(db, chain.clone()).await?;
+    let worker = Worker {
+        chunk_size: 10,
+        ..Arc::into_inner(worker).expect("sole worker handle")
+    };
+    let mut cache = CountCache::default();
+
+    // Prove 0->10 but keep it provisional while finality remains at zero.
+    assert!(worker.cycle(&mut cache).await?.more);
+    assert_eq!(cache.proven_through, Some(10));
+    let proven = worker.store.state().await?.expect("state");
+    assert_eq!((proven.indexed, proven.confirmed), (10, 0));
+    assert_eq!(worker.store.sequence_counts().await?[0], 1);
+
+    // Append an unproven 10->20 range whose final dispatch was omitted.
+    chain.counts.store(false, Ordering::SeqCst);
+    worker.cycle(&mut cache).await?;
+    let suffix = worker.store.state().await?.expect("state");
+    assert_eq!((suffix.indexed, suffix.confirmed), (20, 0));
+    assert_eq!(cache.proven_through, Some(10));
+
+    // Counts at 20 expose the gap. Replaying 0->10 now drops its dispatch,
+    // and pruned counts cannot prove that replacement range complete.
+    chain.counts.store(true, Ordering::SeqCst);
+    chain.pruned_below.store(20, Ordering::SeqCst);
+    *chain.count_values.lock().expect("counts") = [2, 0];
+    chain.events.lock().expect("events").clear();
+    chain.tag.store(10, Ordering::SeqCst);
+    assert!(worker.cycle(&mut cache).await?.more);
+    let replayed = worker.store.state().await?.expect("state");
+    assert_eq!((replayed.indexed, replayed.confirmed), (10, 0));
+    assert_eq!(worker.store.sequence_counts().await?[0], 0);
+    assert_eq!(cache.proven_through, Some(0));
+    assert!(!replayed.halted);
+    Ok(())
+}
+
+/// Sources without hash-pinned historical counts (e.g. Sealevel sequence mode)
+/// keep publishing; only sources that can prove a range wait for that proof.
+#[tokio::test]
+async fn sources_without_historical_counts_are_not_proof_gated() -> Result<()> {
+    let postgres = Postgres::default().with_tag("16-alpine").start().await?;
+    let db = Database::connect(format!(
+        "postgresql://postgres:postgres@127.0.0.1:{}/postgres",
+        postgres.get_host_port_ipv4(5432).await?
+    ))
+    .await?;
+    let chain = Arc::new(Chain::new(2, false));
+    chain.tag.store(2, Ordering::SeqCst);
+    chain.sequence.store(true, Ordering::SeqCst);
+    chain.counts.store(false, Ordering::SeqCst);
+    let worker = worker(db, chain).await?;
+    worker.cycle(&mut CountCache::default()).await?;
+    let state = worker.store.state().await?.unwrap();
+    assert_eq!((state.indexed, state.confirmed), (2, 2));
+    Ok(())
+}
+
+/// Re-proving at the indexed boundary also repairs a stationary chain: no new
+/// block is needed to replay a provably incomplete suffix.
+#[tokio::test]
+async fn reproof_replays_an_incomplete_suffix_without_a_new_block() -> Result<()> {
+    let postgres = Postgres::default().with_tag("16-alpine").start().await?;
+    let db = Database::connect(format!(
+        "postgresql://postgres:postgres@127.0.0.1:{}/postgres",
+        postgres.get_host_port_ipv4(5432).await?
+    ))
+    .await?;
+    let chain = Arc::new(Chain::new(2, false));
+    chain.tag.store(2, Ordering::SeqCst);
+    chain.counts.store(false, Ordering::SeqCst);
+    let worker = worker(db, chain.clone()).await?;
+    let mut cache = CountCache::default();
+    worker.cycle(&mut cache).await?;
+    assert_eq!(worker.store.state().await?.unwrap().confirmed, 0);
+
+    chain.events.lock().unwrap().push(dispatch_event(1, 0));
+    *chain.count_values.lock().unwrap() = [1, 0];
+    chain.counts.store(true, Ordering::SeqCst);
+    worker.cycle(&mut cache).await?;
+    let state = worker.store.state().await?.unwrap();
+    assert_eq!((state.indexed, state.confirmed), (2, 2));
+    assert_eq!(worker.store.sequence_counts().await?[0], 1);
+    Ok(())
+}
+
+fn streamed_header(height: u64) -> Header {
+    Header {
+        height,
+        timestamp: 1,
+        hash: H256::from_low_u64_be(height.saturating_add(1)),
+        parent: H256::from_low_u64_be(height),
+    }
+}
+
+async fn header_worker(
+    chain: Arc<Chain>,
+    depth: u32,
+) -> Result<(testcontainers::ContainerAsync<Postgres>, Worker)> {
+    let postgres = Postgres::default().with_tag("16-alpine").start().await?;
+    let db = Database::connect(format!(
+        "postgresql://postgres:postgres@127.0.0.1:{}/postgres",
+        postgres.get_host_port_ipv4(5432).await?
+    ))
+    .await?;
+    let worker = Worker {
+        period: ReorgPeriod::from_blocks(depth),
+        ..Arc::into_inner(worker(db, chain).await?).expect("sole worker")
+    };
+    Ok((postgres, worker))
+}
+
+#[tokio::test]
+async fn streamed_headers_preserve_proofs_ancestry_health_and_http_bounds() -> Result<()> {
+    let chain = Arc::new(Chain::new(1, false));
+    chain.events.lock().expect("events").push(gas_event(1, 0));
+    chain.counts.store(false, Ordering::SeqCst);
+    let (_postgres, worker) = header_worker(chain.clone(), 2).await?;
+    let mut cache = CountCache::default();
+    assert!(worker.cycle(&mut cache).await?.ingestion_failed);
+    let mut recent = VecDeque::new();
+    for height in 2..=3 {
+        remember_header(&mut recent, streamed_header(height));
+    }
+    chain.forbid_calls.store(true, Ordering::SeqCst);
+    worker.header_cycle(&recent, &cache).await?;
+    assert_eq!(worker.store.state().await?.expect("state").confirmed, 0);
+    // HTTP remains at 1; proving its indexed boundary must retain the WS ancestry.
+    chain.forbid_calls.store(false, Ordering::SeqCst);
+    chain.counts.store(true, Ordering::SeqCst);
+    worker.cycle(&mut cache).await?;
+    chain.forbid_calls.store(true, Ordering::SeqCst);
+    worker.header_cycle(&recent, &cache).await?;
+    worker.header_cycle(&recent, &cache).await?; // Duplicate cannot republish.
+    assert_eq!(worker.store.state().await?.expect("state").confirmed, 1);
+    for height in 4..=66 {
+        remember_header(&mut recent, streamed_header(height));
+    }
+    worker.header_cycle(&recent, &cache).await?;
+    assert_eq!(worker.store.state().await?.expect("state").head, 3); // HTTP+64 cap.
+    let mut fork = streamed_header(4);
+    fork.parent = H256::repeat_byte(99);
+    remember_header(&mut recent, fork);
+    worker.header_cycle(&recent, &cache).await?;
+    assert_eq!(worker.store.state().await?.expect("state").head, 3);
+    for height in 2..=4 {
+        remember_header(&mut recent, streamed_header(height));
+    }
+    worker.store.pause(false).await?;
+    assert!(worker.header_cycle(&recent, &cache).await.is_err());
+    for height in 5..=300 {
+        remember_header(&mut recent, streamed_header(height));
+    }
+    assert_eq!(recent.len(), RECENT_HEADERS);
+    assert!(linked_tip(&recent, &worker.store.state().await?.expect("state")).is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn streamed_headers_refresh_tagged_finality_without_reindexing() -> Result<()> {
+    for tag in ["safe", "finalized"] {
+        let chain = Arc::new(Chain::new(2, false));
+        chain
+            .events
+            .lock()
+            .expect("events")
+            .extend([dispatch_event(1, 0), gas_event(2, 0)]);
+        *chain.count_values.lock().expect("counts") = [1, 0];
+        let (_postgres, worker) = header_worker(chain.clone(), 0).await?;
+        let worker = Worker {
+            period: ReorgPeriod::Tag(tag.into()),
+            ..worker
+        };
+        let mut cache = CountCache::default();
+        worker.cycle(&mut cache).await?;
+        assert_eq!(worker.store.state().await?.expect("state").confirmed, 0);
+        let reads = chain.event_reads.load(Ordering::SeqCst);
+        let mut recent = VecDeque::new();
+        remember_header(&mut recent, streamed_header(3));
+        chain.head.store(3, Ordering::SeqCst);
+
+        // A new head alone cannot confirm anything while the tag stays behind.
+        worker.header_cycle(&recent, &cache).await?;
+        assert_eq!(worker.store.state().await?.expect("state").confirmed, 0);
+        chain.tag.store(1, Ordering::SeqCst);
+        worker.header_cycle(&recent, &cache).await?;
+        assert_eq!(worker.store.state().await?.expect("state").confirmed, 1);
+        assert!(worker.dispatch_wakeup.notified().now_or_never().is_some());
+        worker.header_cycle(&recent, &cache).await?;
+        assert!(worker.dispatch_wakeup.notified().now_or_never().is_none());
+
+        chain.fail_tag.store(true, Ordering::SeqCst);
+        assert!(worker.header_cycle(&recent, &cache).await.is_err());
+        assert_eq!(worker.store.state().await?.expect("state").confirmed, 1);
+        chain.fail_tag.store(false, Ordering::SeqCst);
+        chain.tag.store(3, Ordering::SeqCst);
+        worker.header_cycle(&recent, &cache).await?;
+        // Tagged finality cannot publish beyond complete indexed history.
+        assert_eq!(worker.store.state().await?.expect("state").confirmed, 2);
+        assert_eq!(chain.event_reads.load(Ordering::SeqCst), reads);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn indexing_wakes_all_receipt_pages_before_confirmation() -> Result<()> {
+    let chain = Arc::new(Chain::new(1, false));
+    chain.events.lock().expect("events").extend([
+        dispatch_event(1, 0),
+        gas_event(1, 10),
+        Event {
+            address: H160::repeat_byte(1).into(),
+            data: EventData::Delivery(H256::repeat_byte(4).into()),
+            ..gas_event(1, 20)
+        },
+    ]);
+    *chain.count_values.lock().expect("counts") = [1, 0];
+    let (_postgres, worker) = header_worker(chain.clone(), 2).await?;
+    let mut wakeup = worker.receipt_wakeup.subscribe();
+    let mut cache = CountCache::default();
+    worker.cycle(&mut cache).await?;
+    assert_eq!(worker.store.state().await?.expect("state").confirmed, 0);
+    assert!(wakeup.has_changed()?);
+    wakeup.borrow_and_update();
+    assert!(worker.dispatch_wakeup.notified().now_or_never().is_none());
+
+    let mut recent = VecDeque::new();
+    for height in 2..=3 {
+        remember_header(&mut recent, streamed_header(height));
+    }
+    worker.header_cycle(&recent, &cache).await?;
+    assert_eq!(worker.store.state().await?.expect("state").confirmed, 1);
+    assert!(!wakeup.has_changed()?);
+    assert!(worker.dispatch_wakeup.notified().now_or_never().is_some());
+    worker.header_cycle(&recent, &cache).await?;
+    assert!(worker.dispatch_wakeup.notified().now_or_never().is_none());
+
+    chain
+        .events
+        .lock()
+        .expect("events")
+        .push(dispatch_event(4, 1));
+    *chain.count_values.lock().expect("counts") = [2, 0];
+    chain.head.store(6, Ordering::SeqCst);
+    worker.cycle(&mut cache).await?;
+    assert_eq!(worker.store.state().await?.expect("state").confirmed, 4);
+    assert!(wakeup.has_changed()?);
+    assert!(worker.dispatch_wakeup.notified().now_or_never().is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn coalesced_headers_drain_sparse_confirmation_pages_without_rpcs() -> Result<()> {
+    let chain = Arc::new(Chain::new(100, false));
+    chain.events.lock().expect("events").extend(
+        (0..1001)
+            .map(|index| gas_event(1, index))
+            .chain([gas_event(2, 1001)]),
+    );
+    let (_postgres, worker) = header_worker(chain.clone(), 100).await?;
+    let mut cache = CountCache::default();
+    worker.cycle(&mut cache).await?;
+    let mut wakeup = worker.receipt_wakeup.subscribe();
+    wakeup.borrow_and_update();
+    chain.forbid_calls.store(true, Ordering::SeqCst);
+    let mut recent = VecDeque::new();
+    for height in [101, 102] {
+        remember_header(&mut recent, streamed_header(height));
+    }
+    assert!(worker.header_cycle(&recent, &cache).await?.more);
+    assert_eq!(worker.store.state().await?.expect("state").confirmed, 1);
+    assert!(!worker.header_cycle(&recent, &cache).await?.more);
+    assert_eq!(worker.store.state().await?.expect("state").confirmed, 2);
+    assert!(worker.dispatch_wakeup.notified().now_or_never().is_none());
+    assert!(!wakeup.has_changed()?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_cycles_retries_a_log_ahead_of_http_then_stops_at_indexed_height() -> Result<()> {
+    let chain = Arc::new(Chain::new(1, false));
+    let (_postgres, worker) = header_worker(chain.clone(), 2).await?;
+    let worker = Arc::new(Worker {
+        poll_interval: Duration::from_secs(5),
+        ..worker
+    });
+    let started = Instant::now();
+    let task = tokio::spawn({
+        let worker = worker.clone();
+        async move { worker.run_cycles().await }
+    });
+    wait_for(&worker, |state| state.indexed == 1).await?;
+    let initial = chain.observations.load(Ordering::SeqCst);
+    worker.wanted.store(2, Ordering::Relaxed);
+    for _ in 0..10 {
+        worker.wakeup.notify_one();
+    }
+    sleep(Duration::from_millis(200)).await;
+    assert_eq!(chain.observations.load(Ordering::SeqCst), initial);
+    // First wake still observes the lagging HTTP head. A second retry must run
+    // without a new log or the five-second scheduled poll.
+    wait_for(&worker, |_| {
+        chain.observations.load(Ordering::SeqCst) > initial
+    })
+    .await?;
+    assert_eq!(worker.wanted.load(Ordering::Relaxed), 2);
+    chain.head.store(2, Ordering::SeqCst);
+    wait_for(&worker, |state| {
+        state.indexed == 2 && worker.wanted.load(Ordering::Relaxed) == 0
+    })
+    .await?;
+    let caught_up = chain.observations.load(Ordering::SeqCst);
+    sleep(MIN_WAKE_INTERVAL + Duration::from_millis(100)).await;
+    assert_eq!(chain.observations.load(Ordering::SeqCst), caught_up);
+    wait_for(&worker, |_| {
+        chain.observations.load(Ordering::SeqCst) > caught_up
+    })
+    .await?;
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "wake cycles postponed the five-second poll"
+    );
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    Ok(())
+}
+
+#[tokio::test]
+async fn only_appended_events_wake_receipts_including_unsequenced_gas() -> Result<()> {
+    let chain = Arc::new(Chain::new(1, false));
+    let (_postgres, worker) = header_worker(chain.clone(), 5).await?;
+    let mut wakeup = worker.receipt_wakeup.subscribe();
+    let mut cache = CountCache::default();
+    worker.cycle(&mut cache).await?;
+    assert!(!wakeup.has_changed()?);
+    chain.events.lock().expect("events").push(gas_event(2, 0));
+    chain.head.store(2, Ordering::SeqCst);
+    worker.cycle(&mut cache).await?;
+    assert!(wakeup.has_changed()?);
+    wakeup.borrow_and_update();
+    chain.head.store(3, Ordering::SeqCst);
+    worker.cycle(&mut cache).await?;
+    assert!(!wakeup.has_changed()?);
     Ok(())
 }

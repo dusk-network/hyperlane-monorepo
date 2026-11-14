@@ -40,7 +40,6 @@ import {
   isEVMLike,
   rootLogger,
 } from '@hyperlane-xyz/utils';
-import { readJson } from '@hyperlane-xyz/utils/fs';
 import { BigNumber, ethers } from 'ethers';
 
 import { Contexts } from '../../config/contexts.js';
@@ -55,6 +54,7 @@ import {
 } from '../../config/environments/mainnet3/owners.js';
 import { getEnvAddresses } from '../../config/registry.js';
 import { chainsToSkip, legacyIgpChains } from '../../src/config/chain.js';
+import { writeVerificationInputs } from '../../src/deployment/verification-inputs.js';
 import { determineGovernanceType, Owner } from '../../src/governance.js';
 import { GovernanceType } from '../../src/governanceTypes.js';
 import { GOVERNOR_MAX_BATCH_SIZE } from '../../src/govern/constants.js';
@@ -65,7 +65,6 @@ import { getTimelockLogBlockRange } from '../../src/utils/timelock.js';
 import { writeAndFormatJsonAtPath } from '../../src/utils/utils.js';
 import {
   getArgs,
-  getModuleDirectory,
   Modules,
   withChains,
   withContext,
@@ -73,6 +72,9 @@ import {
   withPropose,
 } from '../agent-utils.js';
 import { getEnvironmentConfig } from '../core-utils.js';
+
+const FACTORY_SUFFIX_REGEX = /__factory$/;
+const TIMESTAMP_PUNCTUATION_REGEX = /[:.]/g;
 
 const ETHEREUM_CHAIN: ChainName = 'ethereum';
 const OUTPUT_ROOT = 'igp-upgrade-output';
@@ -197,7 +199,10 @@ class DryRunDeployMultiProvider extends MultiProvider {
       from: this.deployerAddress,
       nonce,
     });
-    const contractName = factory.constructor.name.replace(/__factory$/, '');
+    const contractName = factory.constructor.name.replace(
+      FACTORY_SUFFIX_REGEX,
+      '',
+    );
     this.simulatedDeployments.push({
       chain,
       contractName,
@@ -248,53 +253,6 @@ export async function determineUpgradeGovernanceRoute(
   }
 
   return determineGovernanceType(chain, ownerAddress);
-}
-
-export function mergeVerificationInputs(
-  existingInputs: ChainMap<ContractVerificationInput[]>,
-  newInputs: ChainMap<ContractVerificationInput[]>,
-): ChainMap<ContractVerificationInput[]> {
-  const mergedInputs: ChainMap<ContractVerificationInput[]> =
-    deepCopy(existingInputs);
-  for (const [chain, inputs] of Object.entries(newInputs)) {
-    const chainInputs = (mergedInputs[chain] ??= []);
-    for (const input of inputs) {
-      if (
-        chainInputs.some(
-          (existing) =>
-            existing.name === input.name &&
-            eqAddress(existing.address, input.address) &&
-            existing.constructorArguments === input.constructorArguments &&
-            existing.isProxy === input.isProxy,
-        )
-      ) {
-        continue;
-      }
-      chainInputs.push(input);
-    }
-  }
-  return mergedInputs;
-}
-
-async function writeVerificationInputs(
-  environment: 'mainnet3',
-  newInputs: ChainMap<ContractVerificationInput[]>,
-) {
-  if (Object.keys(newInputs).length === 0) return;
-
-  const verificationPath = join(
-    getModuleDirectory(environment, Modules.INTERCHAIN_GAS_PAYMASTER),
-    'verification.json',
-  );
-  const existingInputs =
-    readJson<ChainMap<ContractVerificationInput[]>>(verificationPath);
-  await writeAndFormatJsonAtPath(
-    verificationPath,
-    mergeVerificationInputs(existingInputs, newInputs),
-  );
-  rootLogger.info(
-    `Wrote deployment verification inputs to ${verificationPath}`,
-  );
 }
 
 export function isMissingPackageVersionError(error: unknown): boolean {
@@ -1644,7 +1602,11 @@ async function main() {
   );
 
   if (propose) {
-    await writeVerificationInputs(environment, verificationInputs);
+    await writeVerificationInputs(
+      environment,
+      Modules.INTERCHAIN_GAS_PAYMASTER,
+      verificationInputs,
+    );
   }
 
   await flushIcaCallGroups({
@@ -1660,7 +1622,7 @@ async function main() {
   const groups = splitSafeCallGroups([...safeGroups.values()]);
   const runDir = join(
     OUTPUT_ROOT,
-    new Date().toISOString().replace(/[:.]/g, '-'),
+    new Date().toISOString().replace(TIMESTAMP_PUNCTUATION_REGEX, '-'),
   );
   const rawFallbackGroupKeys = await writeSafeBatchFiles({
     groups,

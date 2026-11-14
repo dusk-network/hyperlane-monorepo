@@ -8,7 +8,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use derive_new::new;
 use eyre::Result;
 use parking_lot::Mutex;
 use prometheus::IntGauge;
@@ -18,33 +17,47 @@ use tracing::{debug, error, info, info_span, instrument, trace, warn, Instrument
 
 use hyperlane_base::{
     cache::{FunctionCallCache, LocalCache, MeteredCache, OptionalCache},
-    db::{HyperlaneDb, HyperlaneRocksDB, PendingMessageRetryState},
+    db::{HyperlaneDb, HyperlaneRocksDB, PendingMessageRetryState, SignatureRetryState},
 };
 use hyperlane_core::{
     gas_used_by_operation, BatchItem, ChainCommunicationError, ChainResult, ConfirmReason,
     FixedPointNumber, HyperlaneChain, HyperlaneDomain, HyperlaneMessage, Mailbox,
     MessageSubmissionData, Metadata, PendingOperation, PendingOperationResult,
-    PendingOperationStatus, ReprepareReason, TryBatchAs, TxCostEstimate, TxOutcome, H256, U256,
+    PendingOperationStatus, ReprepareReason, SubmissionStage, TryBatchAs, TxCostEstimate,
+    TxOutcome, H256, U256,
 };
 use hyperlane_metric::rpc_operation::{with_rpc_operation, RpcOperation};
 use hyperlane_operation_verifier::ApplicationOperationVerifier;
 
 use crate::{
+    message_activity::{Activity, Outcome, Stage},
     metrics::message_submission::{
         MessageSubmissionMetrics, MetadataBuildMetric, MetadataWaitObservation,
     },
-    msg::metadata::{MessageMetadataBuildParams, MetadataBuildError},
+    msg::metadata::MetadataBuildError,
 };
 
 use super::{
     gas_payment::{GasPaymentEnforcer, GasPolicyStatus},
-    metadata::{BuildsBaseMetadata, MessageMetadataBuilder, MetadataBuilder},
+    metadata::{BuildsBaseMetadata, MessageMetadataBuilder},
+    runtime_denylist::{is_hash_not_stored, OriginSenderCheck},
 };
 
 /// a default of 66 is picked, so messages are retried for 2 weeks (period confirmed by @nambrot) before being skipped.
 /// See this PR for why 66 retries means 2 weeks:
 /// https://github.com/hyperlane-xyz/hyperlane-monorepo/pull/5468
 pub const DEFAULT_MAX_MESSAGE_RETRIES: u32 = 66;
+/// Failed origin tx signer lookups before relaying without that check.
+/// Backoff doubles from `ORIGIN_LOOKUP_BACKOFF` (30+60+120+240s): about 8
+/// minutes of failed lookups before giving up.
+const ORIGIN_LOOKUP_MAX_FAILURES: u32 = 5;
+const ORIGIN_LOOKUP_BACKOFF: Duration = Duration::from_secs(30);
+/// How long a given-up message relays without lookups before trying again.
+const ORIGIN_LOOKUP_GIVE_UP_COOLDOWN: Duration = Duration::from_secs(300);
+/// One wait for a dispatch tx hash that isn't stored yet. It's normally
+/// written right after the message; when it never is (Cosmos block-level
+/// events, old DB backlog) there's nothing to check, so don't wait longer.
+const ORIGIN_HASH_WAIT: Duration = Duration::from_secs(30);
 pub const CONFIRM_DELAY: Duration = if cfg!(any(test, feature = "test-utils")) {
     // Wait 5 seconds after submitting the message before confirming in test mode
     Duration::from_secs(5)
@@ -59,8 +72,8 @@ pub const INVALIDATE_CACHE_METADATA_LOG: &str = "Invalidating cached metadata";
 pub const ISM_MAX_DEPTH: u32 = 13;
 pub const ISM_MAX_COUNT: u32 = 100;
 
-const VALIDATOR_SIGNATURE_FAST_RETRY_INTERVAL: Duration = Duration::from_secs(2);
-const VALIDATOR_SIGNATURE_FAST_RETRY_MAX: u32 = 3;
+const SIGNATURE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const SIGNATURE_POLL_WINDOW: Duration = Duration::from_secs(10);
 
 /// Revert string emitted by the ICA router when the originating commit has not
 /// yet been confirmed on-chain. There is no typed error variant for this today —
@@ -105,6 +118,8 @@ pub struct MessageContext {
     pub metrics: MessageSubmissionMetrics,
     /// Application operation verifier
     pub application_operation_verifier: Arc<dyn ApplicationOperationVerifier>,
+    /// Checks the origin tx sender against runtime denylist `address` rules.
+    pub origin_sender_check: Option<Arc<OriginSenderCheck>>,
 }
 
 /// Keeps an indexed message from being loaded again while its operation is alive.
@@ -112,6 +127,9 @@ pub(super) struct LoadedMessageGuard {
     message_id: H256,
     loaded_messages: Arc<Mutex<HashSet<H256>>>,
     db: HyperlaneRocksDB,
+    /// Hands the nonce back to the loader on release, when set.
+    reconsider: Option<(u32, Arc<Mutex<Vec<u32>>>)>,
+    reconsider_on_release: bool,
 }
 
 impl LoadedMessageGuard {
@@ -127,7 +145,24 @@ impl LoadedMessageGuard {
             message_id,
             loaded_messages,
             db,
+            reconsider: None,
+            reconsider_on_release: false,
         })
+    }
+
+    /// Where to hand back `nonce` if the message is released for the loader
+    /// to look at again.
+    pub(super) fn with_reconsideration(
+        mut self,
+        nonce: u32,
+        released: Arc<Mutex<Vec<u32>>>,
+    ) -> Self {
+        self.reconsider = Some((nonce, released));
+        self
+    }
+
+    pub(super) fn reconsider_on_release(&mut self) {
+        self.reconsider_on_release = true;
     }
 
     fn mark_terminal(&self) -> hyperlane_base::db::DbResult<()> {
@@ -138,39 +173,45 @@ impl LoadedMessageGuard {
 impl Drop for LoadedMessageGuard {
     fn drop(&mut self) {
         self.loaded_messages.lock().remove(&self.message_id);
+        if self.reconsider_on_release {
+            if let Some((nonce, released)) = &self.reconsider {
+                released.lock().push(*nonce);
+            }
+        }
     }
 }
 
 /// A message that is pending processing and submission.
-#[derive(new, Serialize)]
+#[derive(Serialize)]
 pub struct PendingMessage {
     pub message: HyperlaneMessage,
     #[serde(skip_serializing)]
     ctx: Arc<MessageContext>,
     status: PendingOperationStatus,
     app_context: Option<String>,
+    /// First observation in this process, retained across confirmation retries.
+    #[serde(skip_serializing)]
+    first_seen: SystemTime,
+    #[serde(skip_serializing)]
+    first_seen_reported: bool,
+    #[serde(skip_serializing)]
+    submission_stage: Mutex<Option<SubmissionStage>>,
+    #[serde(skip_serializing)]
+    pending_tracked: bool,
     #[serde(skip_serializing)]
     max_retries: u32,
-    #[new(default)]
     submitted: bool,
-    #[new(default)]
     #[serde(skip_serializing)]
     pub(crate) submission_data: Option<Box<MessageSubmissionData>>,
-    #[new(default)]
     num_retries: u32,
-    #[new(value = "Instant::now()")]
     #[serde(skip_serializing)]
     last_attempted_at: Instant,
-    #[new(default)]
     #[serde(skip_serializing)]
     next_attempt_after: Option<Instant>,
-    #[new(default)]
     #[serde(skip_serializing)]
     submission_outcome: Option<TxOutcome>,
-    #[new(default)]
     #[serde(skip_serializing)]
     metadata: Option<Metadata>,
-    #[new(default)]
     #[serde(skip_serializing)]
     metric: Option<Arc<IntGauge>>,
     /// When true, drop the message immediately once `num_retries > max_retries`
@@ -184,24 +225,122 @@ pub struct PendingMessage {
     /// relevant. If a message were recovered through the DB path before the indexer
     /// catches up, it would rehydrate with `fail_fast=false` and follow the normal
     /// long-backoff arm — acceptable degradation, not a correctness issue.
-    #[new(default)]
     #[serde(skip_serializing)]
     fail_fast: bool,
     /// Number of consecutive times this message has been returned to the queue
     /// due to an "ICA: Invalid Reveal" simulation failure. Tracked separately
     /// from `num_retries` so these transient waits don't consume the fail-fast
     /// retry budget.
-    #[new(default)]
     #[serde(skip_serializing)]
     ica_reveal_attempts: u32,
-    #[new(default)]
     #[serde(skip_serializing)]
     loaded_message_guard: Option<LoadedMessageGuard>,
+    /// Consecutive failed origin tx signer lookups. Tracked apart from
+    /// `num_retries` so an RPC outage can't use up the retry budget.
+    #[serde(skip_serializing)]
+    origin_lookup_failures: u32,
+    /// Whether this message has already waited for its dispatch tx hash.
+    #[serde(skip_serializing)]
+    origin_hash_waited: bool,
+    /// After a give-up, skip lookups until then rather than query a failing
+    /// RPC on every prepare.
+    #[serde(skip_serializing)]
+    origin_lookup_skip_until: Option<Instant>,
+    #[serde(skip_serializing)]
+    signature_retry: Option<SignatureRetryState>,
 }
 
 impl PendingMessage {
+    fn report_first_seen(&mut self) {
+        if self.first_seen_reported {
+            return;
+        }
+        let at_millis = self
+            .first_seen
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or_default();
+        self.ctx
+            .metadata_builder
+            .report_activity(&self.message, Activity::FirstSeen { at_millis });
+        self.first_seen_reported = true;
+    }
+
+    fn report_progress(&self, stage: Stage, outcome: Outcome) {
+        self.ctx
+            .metadata_builder
+            .report_activity(&self.message, Activity::Progress { stage, outcome });
+    }
+
+    fn report_chain_failure(&self, stage: Stage, error: &ChainCommunicationError) {
+        self.ctx.metadata_builder.report_activity(
+            &self.message,
+            Activity::ChainFailure {
+                stage,
+                reason: crate::message_activity::chain_error(error),
+            },
+        );
+    }
+
+    pub fn new(
+        message: HyperlaneMessage,
+        ctx: Arc<MessageContext>,
+        status: PendingOperationStatus,
+        app_context: Option<String>,
+        max_retries: u32,
+    ) -> Self {
+        let first_seen = SystemTime::now();
+        let pending_tracked = !matches!(status, PendingOperationStatus::Confirm(_));
+        if pending_tracked {
+            ctx.metrics
+                .record_pending_message(message.id(), app_context.as_deref(), first_seen);
+        }
+        Self {
+            message,
+            ctx,
+            status,
+            app_context,
+            first_seen,
+            first_seen_reported: false,
+            submission_stage: Mutex::new(None),
+            pending_tracked,
+            max_retries,
+            submitted: false,
+            submission_data: None,
+            num_retries: 0,
+            last_attempted_at: Instant::now(),
+            next_attempt_after: None,
+            submission_outcome: None,
+            metadata: None,
+            metric: None,
+            fail_fast: false,
+            ica_reveal_attempts: 0,
+            loaded_message_guard: None,
+            origin_lookup_failures: 0,
+            origin_hash_waited: false,
+            origin_lookup_skip_until: None,
+            signature_retry: None,
+        }
+    }
+
     pub(super) fn set_loaded_message_guard(&mut self, guard: LoadedMessageGuard) {
         self.loaded_message_guard = Some(guard);
+    }
+
+    fn set_pending_tracking(&mut self, tracked: bool) {
+        if self.pending_tracked == tracked {
+            return;
+        }
+        if tracked {
+            self.ctx.metrics.record_pending_message(
+                self.message.id(),
+                self.app_context.as_deref(),
+                self.first_seen,
+            );
+        } else {
+            self.ctx.metrics.finish_pending_message(self.message.id());
+        }
+        self.pending_tracked = tracked;
     }
 
     pub(super) fn terminal_drop(&mut self) -> PendingOperationResult {
@@ -211,12 +350,16 @@ impl PendingMessage {
                     .on_reprepare(Some(err), ReprepareReason::ErrorPersistingTerminalMessage);
             }
         }
+        self.ctx
+            .metadata_builder
+            .report_activity(&self.message, Activity::Dropped);
         PendingOperationResult::Drop
     }
 }
 
 impl Drop for PendingMessage {
     fn drop(&mut self) {
+        self.set_pending_tracking(false);
         self.ctx.metrics.finish_metadata_wait(
             self.message.id(),
             self.app_context.as_deref(),
@@ -274,6 +417,18 @@ impl TryBatchAs<HyperlaneMessage> for PendingMessage {
 #[async_trait]
 #[typetag::serialize]
 impl PendingOperation for PendingMessage {
+    fn on_runtime_denylist_drop(&mut self) {
+        self.ctx.metadata_builder.report_activity(
+            &self.message,
+            Activity::Filtered {
+                reason: crate::message_activity::FilterReason::RuntimeDenylisted,
+            },
+        );
+        if let Some(guard) = self.loaded_message_guard.as_mut() {
+            guard.reconsider_on_release();
+        }
+    }
+
     fn id(&self) -> H256 {
         self.message.id()
     }
@@ -283,6 +438,9 @@ impl PendingOperation for PendingMessage {
     }
 
     fn set_status(&mut self, status: PendingOperationStatus) {
+        // Exclude normal finality waits. Confirmation errors explicitly resume
+        // tracking without changing the queue status.
+        self.set_pending_tracking(!matches!(status, PendingOperationStatus::Confirm(_)));
         // Manual status commits atomically with the cleared retry deadline.
         if status != PendingOperationStatus::Retry(ReprepareReason::Manual) {
             if let Err(e) = self
@@ -292,6 +450,14 @@ impl PendingOperation for PendingMessage {
             {
                 warn!(message_id = ?self.message.id(), err = %e, status = %status, "Persisting `status` failed for message");
             }
+        }
+        if self.status != status {
+            self.ctx.metadata_builder.report_activity(
+                &self.message,
+                Activity::Status {
+                    status: status.clone(),
+                },
+            );
         }
         self.status = status;
     }
@@ -341,6 +507,8 @@ impl PendingOperation for PendingMessage {
             return PendingOperationResult::NotReady;
         }
 
+        self.report_first_seen();
+        self.report_progress(Stage::Prepare, Outcome::Started);
         // If the message has already been processed, e.g. due to another relayer having
         // already processed, then mark it as already-processed, and move on to
         // the next tick.
@@ -372,6 +540,9 @@ impl PendingOperation for PendingMessage {
                 Err(reprepare_reason) => return reprepare_reason,
             };
         if !is_contract {
+            self.ctx
+                .metadata_builder
+                .report_activity(&self.message, Activity::RecipientNotContract);
             info!(
                 recipient=?self.message.recipient,
                 "Dropping message because recipient is not a contract"
@@ -387,6 +558,92 @@ impl PendingOperation for PendingMessage {
         {
             info!("Message does not meet the gas payment requirement preflight check");
             return op_result;
+        }
+
+        // After the gas preflight, so unpaid messages don't cost origin RPC
+        // lookups that could push real deposits into giving up.
+        if let Some(check) = self.ctx.origin_sender_check.clone() {
+            let message_id = self.message.id();
+            let lookup_paused = self
+                .origin_lookup_skip_until
+                .is_some_and(|until| Instant::now() < until);
+            // While paused after a give-up, skip only the RPC: a signer that
+            // is already cached still applies.
+            let denial = if lookup_paused {
+                Ok(check.cached_deny_reason(&self.message).await)
+            } else {
+                check
+                    .deny_reason(self.ctx.origin_db.as_ref(), &self.message)
+                    .await
+            };
+            match denial {
+                Ok(Some(reason)) => {
+                    warn!(?message_id, %reason, "Dropping message: origin tx signer matches runtime denylist");
+                    self.ctx
+                        .metadata_builder
+                        .report_activity(&self.message, Activity::OriginSenderDenied);
+                    check.record_drop(self.ctx.destination_mailbox.domain().name());
+                    // Not terminal: the loader reloads it if the rule is removed.
+                    self.on_runtime_denylist_drop();
+                    return PendingOperationResult::Drop;
+                }
+                Ok(None) if lookup_paused => {}
+                Ok(None) => {
+                    self.origin_lookup_failures = 0;
+                    self.origin_lookup_skip_until = None;
+                }
+                // Relay API ops keep their drop-after-budget behaviour.
+                Err(err) if self.fail_fast => {
+                    return self
+                        .on_reprepare(Some(err), ReprepareReason::ErrorFetchingOriginTxSender);
+                }
+                Err(err) if is_hash_not_stored(&err) => {
+                    if !self.origin_hash_waited {
+                        self.origin_hash_waited = true;
+                        debug!(?message_id, "Dispatch tx hash not stored yet; waiting before the origin sender check");
+                        return self.delay_reprepare(
+                            ORIGIN_HASH_WAIT,
+                            ReprepareReason::ErrorFetchingOriginTxSender,
+                        );
+                    }
+                    // Nothing to check against. Not cached: a later prepare
+                    // reads the DB again, so a late hash still gets checked.
+                    debug!(
+                        ?message_id,
+                        "No dispatch tx hash stored; relaying without the origin sender check"
+                    );
+                }
+                Err(err) => {
+                    self.origin_lookup_failures = self.origin_lookup_failures.saturating_add(1);
+                    if self.origin_lookup_failures < ORIGIN_LOOKUP_MAX_FAILURES {
+                        // Fail closed while an address rule exists: wait for
+                        // the RPC rather than relay a possibly denied message.
+                        warn!(
+                            ?message_id,
+                            error = ?err,
+                            attempt = self.origin_lookup_failures,
+                            "Origin tx signer lookup failed; retrying"
+                        );
+                        let delay = ORIGIN_LOOKUP_BACKOFF
+                            .saturating_mul(1 << self.origin_lookup_failures.saturating_sub(1));
+                        return self
+                            .delay_reprepare(delay, ReprepareReason::ErrorFetchingOriginTxSender);
+                    }
+                    // Persistent failures are usually permanent (pruned or
+                    // unparsable tx), so stop blocking the message. Nothing
+                    // is cached; after a cooldown the next prepare looks up
+                    // again, so a recovered RPC or a new rule still applies.
+                    warn!(
+                        ?message_id,
+                        error = ?err,
+                        attempts = self.origin_lookup_failures,
+                        "Origin tx signer lookup keeps failing; relaying without the origin sender check"
+                    );
+                    self.origin_lookup_skip_until =
+                        Instant::now().checked_add(ORIGIN_LOOKUP_GIVE_UP_COOLDOWN);
+                    check.record_give_up();
+                }
+            }
         }
 
         // If metadata is already built, check gas estimation works.
@@ -413,9 +670,12 @@ impl PendingOperation for PendingMessage {
                         if is_ica_invalid_reveal(&e)
                             && self.ica_reveal_attempts < REVEAL_POLL_TOTAL_MAX =>
                     {
+                        self.report_progress(Stage::Simulate, Outcome::Failed);
                         return self.requeue_ica_reveal();
                     }
-                    Err(_) => {
+                    Err(e) => {
+                        self.report_chain_failure(Stage::Simulate, &e);
+                        self.report_progress(Stage::Simulate, Outcome::Failed);
                         self.clear_metadata();
                         None
                     }
@@ -468,6 +728,8 @@ impl PendingOperation for PendingMessage {
                         cost
                     }
                     Err(e) => {
+                        self.report_chain_failure(Stage::Simulate, &e);
+                        self.report_progress(Stage::Simulate, Outcome::Failed);
                         if is_ica_invalid_reveal(&e)
                             && self.ica_reveal_attempts < REVEAL_POLL_TOTAL_MAX
                         {
@@ -560,6 +822,8 @@ impl PendingOperation for PendingMessage {
             )
             .await
             {
+                self.report_chain_failure(Stage::Simulate, &e);
+                self.report_progress(Stage::Simulate, Outcome::Failed);
                 warn!(
                     message_id = ?self.message.id(),
                     error = %e,
@@ -574,6 +838,8 @@ impl PendingOperation for PendingMessage {
             }
         }
 
+        self.on_submission_stage(SubmissionStage::Submitting);
+        self.report_progress(Stage::Submit, Outcome::Started);
         // We use the estimated gas limit from the prior call to
         // `process_estimate_costs` to avoid a second gas estimation.
         let tx_outcome = with_rpc_operation(
@@ -592,6 +858,7 @@ impl PendingOperation for PendingMessage {
                 PendingOperationResult::Confirm(ConfirmReason::SubmittedBySelf)
             }
             Err(e) => {
+                self.report_chain_failure(Stage::Submit, &e);
                 error!(error=?e, "Error when processing message");
                 self.clear_metadata();
                 return self.on_reprepare::<String>(None, ReprepareReason::ErrorSubmitting);
@@ -600,6 +867,13 @@ impl PendingOperation for PendingMessage {
     }
 
     fn set_submission_outcome(&mut self, outcome: TxOutcome) {
+        self.ctx.metadata_builder.report_activity(
+            &self.message,
+            Activity::TransactionOutcome {
+                transaction_id: outcome.transaction_id,
+                executed: outcome.executed,
+            },
+        );
         self.submission_outcome = Some(outcome);
     }
 
@@ -620,14 +894,14 @@ impl PendingOperation for PendingMessage {
         {
             Ok(is_delivered) => is_delivered,
             Err(err) => {
-                return self.on_reconfirm(Some(err), "Error confirming message delivery");
+                self.report_chain_failure(Stage::Confirm, &err);
+                return self.on_reconfirm(Some(err), ConfirmReason::ErrorConfirmingDelivery);
             }
         };
 
         if is_delivered {
             if let Err(err) = self.record_message_process_success() {
-                return self
-                    .on_reconfirm(Some(err), "Error when recording message process success");
+                return self.on_reconfirm(Some(err), ConfirmReason::ErrorRecordingProcessSuccess);
             }
             self.ctx.destination_mailbox.on_delivered(&self.message);
             info!(
@@ -725,6 +999,17 @@ impl PendingOperation for PendingMessage {
             .on_submitted_success(&self.message);
     }
 
+    fn on_submission_stage(&self, stage: SubmissionStage) {
+        let mut current = self.submission_stage.lock();
+        if current.as_ref() == Some(&stage) {
+            return;
+        }
+        self.ctx
+            .metadata_builder
+            .report_activity(&self.message, Activity::Submission { stage });
+        *current = Some(stage);
+    }
+
     fn get_metric(&self) -> Option<Arc<IntGauge>> {
         self.metric.clone()
     }
@@ -741,7 +1026,15 @@ impl PendingOperation for PendingMessage {
             .as_ref()
             .expect("Pending message must be prepared before we can create payload for it");
         let metadata = &submission_data.metadata;
-        let payload = mailbox.process_calldata(message, metadata).await?;
+
+        let payload = mailbox
+            .process_calldata(message, metadata)
+            .await
+            .inspect_err(|error| {
+                self.report_chain_failure(Stage::BuildPayload, error);
+                self.report_progress(Stage::BuildPayload, Outcome::Failed);
+            })?;
+
         Ok(payload)
     }
 
@@ -801,6 +1094,8 @@ impl PendingMessage {
             }
         }
         if Self::should_skip(num_retries, max_retries) && !manual_retry {
+            // Loading an already-exhausted message is not a new retry-limit
+            // transition. Repeated admission scans must not replay diagnostics.
             return None;
         }
         let reprepare_reason = match &message_status {
@@ -826,9 +1121,16 @@ impl PendingMessage {
                 message_status = PendingOperationStatus::Retry(reason);
             }
         }
+        // Recovered messages enter the prepare queue, even if their last
+        // persisted status was Confirm. Count them throughout the restored
+        // backoff until preparation observes delivery again.
+        if matches!(message_status, PendingOperationStatus::Confirm(_)) {
+            message_status = PendingOperationStatus::FirstPrepareAttempt;
+        }
         let mut pending_message = Self::new(message, ctx, message_status, app_context, max_retries);
         pending_message.num_retries = num_retries;
         pending_message.next_attempt_after = next_attempt_after;
+        pending_message.signature_retry = retry_state.and_then(|state| state.signature_retry);
         Some(pending_message)
     }
 
@@ -1152,6 +1454,7 @@ impl PendingMessage {
         delay: Duration,
         reason: ReprepareReason,
     ) -> PendingOperationResult {
+        *self.submission_stage.lock() = None;
         self.submitted = false;
         self.last_attempted_at = Instant::now();
         self.next_attempt_after = self.last_attempted_at.checked_add(delay);
@@ -1164,6 +1467,7 @@ impl PendingMessage {
         err: Option<E>,
         reason: ReprepareReason,
     ) -> PendingOperationResult {
+        *self.submission_stage.lock() = None;
         self.inc_attempts(Some(&reason));
         self.submitted = false;
         if let Some(e) = err {
@@ -1176,6 +1480,7 @@ impl PendingMessage {
 
     fn on_metadata_wait(&mut self, observation: MetadataWaitObservation) -> PendingOperationResult {
         let reason = ReprepareReason::AwaitingValidatorSignatures;
+        *self.submission_stage.lock() = None;
         self.inc_attempts(Some(&reason));
         self.submitted = false;
         if observation.first_observation {
@@ -1206,6 +1511,13 @@ impl PendingMessage {
         // hit the fixed early-backoff arms (1 => 5s, 2 => 10s, ...) rather than dropping.
         // Normal relayer messages do NOT set fail_fast and continue to the long-backoff arm.
         if self.fail_fast && self.num_retries >= self.max_retries {
+            self.ctx.metadata_builder.report_activity(
+                &self.message,
+                Activity::RetryLimitReached {
+                    retries: self.num_retries,
+                    limit: self.max_retries,
+                },
+            );
             warn!(
                 message_id = ?self.message.id(),
                 num_retries = self.num_retries,
@@ -1217,7 +1529,18 @@ impl PendingMessage {
         PendingOperationResult::Reprepare(reason)
     }
 
-    fn on_reconfirm<E: Debug>(&mut self, err: Option<E>, reason: &str) -> PendingOperationResult {
+    fn on_reconfirm<E: Debug>(
+        &mut self,
+        err: Option<E>,
+        reason: ConfirmReason,
+    ) -> PendingOperationResult {
+        self.ctx.metadata_builder.report_activity(
+            &self.message,
+            Activity::ConfirmationError {
+                reason: reason.clone(),
+            },
+        );
+        self.set_pending_tracking(true);
         self.inc_attempts(None);
         if let Some(e) = err {
             warn!(error = ?e, id = ?self.id(), "Reconfirming message: {}", reason);
@@ -1246,6 +1569,9 @@ impl PendingMessage {
             );
         }
         self.ctx.origin_db.store_message_processed(&self.message)?;
+        self.ctx
+            .metadata_builder
+            .report_activity(&self.message, Activity::Delivered);
         self.ctx.metrics.update_nonce(&self.message);
         self.ctx.metrics.messages_processed.inc();
         Ok(())
@@ -1266,22 +1592,68 @@ impl PendingMessage {
             warn!(message_id = ?self.message.id(), err = %e, "Persisting manual retry reset failed for message");
             return false;
         }
-        self.status = status;
+        self.set_status(status);
         self.num_retries = 0;
+        self.signature_retry = None;
         self.next_attempt_after = None;
         self.last_attempted_at = Instant::now();
         true
     }
 
+    /// Whether accelerated signature polling is still within its fast window.
+    fn in_signature_poll_window(&self, now: SystemTime) -> bool {
+        self.signature_retry.as_ref().is_some_and(|state| {
+            state.backoff_retries == 0
+                && now
+                    .duration_since(state.started_at)
+                    .is_ok_and(|elapsed| elapsed < SIGNATURE_POLL_WINDOW)
+        })
+    }
+
+    /// Returns an accelerated polling delay, or `None` to consume a normal retry.
+    fn signature_retry_delay(&mut self, now: SystemTime) -> Option<Duration> {
+        let state = self.signature_retry.get_or_insert(SignatureRetryState {
+            started_at: now,
+            backoff_retries: 0,
+        });
+        // Clock rollback ends the fast window rather than extending it.
+        let elapsed = now
+            .duration_since(state.started_at)
+            .unwrap_or(SIGNATURE_POLL_WINDOW);
+        if state.backoff_retries == 0 && elapsed < SIGNATURE_POLL_WINDOW {
+            return Some(
+                SIGNATURE_POLL_INTERVAL.min(SIGNATURE_POLL_WINDOW.saturating_sub(elapsed)),
+            );
+        }
+        state.backoff_retries = state.backoff_retries.saturating_add(1);
+        if state.backoff_retries <= 3 {
+            return Some(Duration::from_secs(u64::from(state.backoff_retries)));
+        }
+        None
+    }
+
     fn inc_attempts(&mut self, reason: Option<&ReprepareReason>) {
-        self.num_retries = self.num_retries.saturating_add(1);
         self.last_attempted_at = Instant::now();
-        let delay = PendingMessage::calculate_msg_backoff(
-            self.num_retries,
-            self.max_retries,
-            Some(self.message.id()),
-            reason,
-        );
+        let signature_delay = if !self.fail_fast
+            && self.num_retries < self.max_retries
+            && matches!(reason, Some(ReprepareReason::AwaitingValidatorSignatures))
+        {
+            self.signature_retry_delay(SystemTime::now())
+        } else {
+            self.signature_retry = None;
+            None
+        };
+        // Only accelerated polls bypass the normal budget. Relay API messages
+        // must still consume an attempt so their fail-fast limit is respected.
+        let delay = signature_delay.or_else(|| {
+            self.num_retries = self.num_retries.saturating_add(1);
+            Self::calculate_msg_backoff(
+                self.num_retries,
+                self.max_retries,
+                Some(self.message.id()),
+                None,
+            )
+        });
         self.next_attempt_after = delay.and_then(|dur| self.last_attempted_at.checked_add(dur));
         self.persist_retry_state(delay, reason.cloned());
     }
@@ -1312,13 +1684,22 @@ impl PendingMessage {
                 .try_into()
                 .ok()
         });
+        self.ctx.metadata_builder.report_activity(
+            &self.message,
+            Activity::Retry {
+                reason: reason.clone(),
+                retry_count: self.num_retries,
+                next_attempt_at_millis,
+            },
+        );
         let retry_delay_millis = delay.and_then(|delay| delay.as_millis().try_into().ok());
-        let state = PendingMessageRetryState::new(
+        let mut state = PendingMessageRetryState::new(
             self.num_retries,
             next_attempt_at_millis,
             retry_delay_millis,
             reason,
         );
+        state.signature_retry = self.signature_retry.clone();
         if let Err(e) = self
             .ctx
             .origin_db
@@ -1337,26 +1718,12 @@ impl PendingMessage {
         message_id: Option<H256>,
         reason: Option<&ReprepareReason>,
     ) -> Option<Duration> {
-        // Signatures are simply not yet available (validator hasn't signed past the reorg
-        // period yet). Use a short 2s fast-path so the relayer can pick them up promptly
-        // without repeatedly rebuilding aggregation metadata for up to 20 seconds. Note:
-        // num_retries is the total persisted retry counter across all reasons, not a
-        // per-reason count.
-        //
-        // After the fast-path budget is spent, restart the normal gentle ramp (5s→10s→30s…)
-        // from the beginning rather than landing mid-table at the 3-min arm.
-        if matches!(reason, Some(ReprepareReason::AwaitingValidatorSignatures)) {
-            if (1..=VALIDATOR_SIGNATURE_FAST_RETRY_MAX).contains(&num_retries) {
-                return Some(VALIDATOR_SIGNATURE_FAST_RETRY_INTERVAL);
-            }
-            // Offset retries so the first retry after the fast path resumes the normal ramp.
-            // Pass reason=None to avoid recursing into this branch again.
-            return Self::calculate_msg_backoff(
-                num_retries.saturating_sub(VALIDATOR_SIGNATURE_FAST_RETRY_MAX),
-                max_retries,
-                message_id,
-                None,
-            );
+        // Without a stored deadline, start signature checking promptly. The
+        // elapsed-time window and subsequent backoff are handled by signature_retry_delay.
+        if (1..max_retries).contains(&num_retries)
+            && matches!(reason, Some(ReprepareReason::AwaitingValidatorSignatures))
+        {
+            return Some(SIGNATURE_POLL_INTERVAL);
         }
         Some(Duration::from_secs(match num_retries {
             i if i < 1 => return None,
@@ -1439,17 +1806,23 @@ impl PendingMessage {
             }
         };
 
-        let params = MessageMetadataBuildParams::default();
-
+        let polling = matches!(
+            self.status,
+            PendingOperationStatus::Retry(ReprepareReason::AwaitingValidatorSignatures)
+        );
+        // Probes only skip validators behind the leaf during the fast window, so
+        // a lagging latest index can delay delivery by at most that window.
+        let narrow_probe = self.in_signature_poll_window(SystemTime::now());
         let build_metadata_start = Instant::now();
         let metadata_res = message_metadata_builder
-            .build(ism_address, &self.message, params)
+            .build_for_delivery(ism_address, &self.message, polling, narrow_probe)
             .await;
 
         tracing::debug!(?self.message, ?metadata_res, "Metadata build result");
 
         let metadata_res = match metadata_res {
             Ok(metadata) => {
+                self.signature_retry = None;
                 if let Some(wait_duration) = self.ctx.metrics.finish_metadata_wait(
                     self.message.id(),
                     self.app_context.as_deref(),
@@ -1559,7 +1932,7 @@ mod test {
 
     use crate::test_utils::dummy_data::{dummy_message_context, dummy_metadata_builder};
 
-    use super::{PendingMessage, DEFAULT_MAX_MESSAGE_RETRIES, VALIDATOR_SIGNATURE_FAST_RETRY_MAX};
+    use super::{PendingMessage, DEFAULT_MAX_MESSAGE_RETRIES};
 
     fn unix_millis(time: SystemTime) -> u64 {
         time.duration_since(UNIX_EPOCH)
@@ -2028,6 +2401,14 @@ mod test {
         mailbox: hyperlane_test::mocks::MockMailboxContract,
         max_gas: Option<U256>,
     ) -> (tempfile::TempDir, PendingMessage) {
+        pending_with_sender_check(mailbox, max_gas, None)
+    }
+
+    fn pending_with_sender_check(
+        mailbox: hyperlane_test::mocks::MockMailboxContract,
+        max_gas: Option<U256>,
+        origin_sender_check: Option<Arc<crate::msg::runtime_denylist::OriginSenderCheck>>,
+    ) -> (tempfile::TempDir, PendingMessage) {
         use crate::{
             msg::gas_payment::GasPaymentEnforcer,
             settings::{GasPaymentEnforcementConf, GasPaymentEnforcementPolicy},
@@ -2051,6 +2432,7 @@ mod test {
         let mut context = dummy_message_context(Arc::new(base), &db, cache);
         context.destination_mailbox = Arc::new(mailbox);
         context.transaction_gas_limit = max_gas;
+        context.origin_sender_check = origin_sender_check;
         context.origin_gas_payment_enforcer =
             Arc::new(tokio::sync::RwLock::new(GasPaymentEnforcer::new(
                 [GasPaymentEnforcementConf {
@@ -2122,6 +2504,214 @@ mod test {
             }
             assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         }
+    }
+
+    struct OriginCheckSetup {
+        _dir: tempfile::TempDir,
+        pending: PendingMessage,
+        provider: Arc<crate::msg::runtime_denylist::tests::origin_sender::SenderProvider>,
+        denylist: Arc<crate::msg::runtime_denylist::RuntimeDenylist>,
+    }
+
+    impl OriginCheckSetup {
+        fn lookups(&self) -> usize {
+            self.provider
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// A recipient that is a contract (cached) and a `None` gas policy, so
+    /// prepare reaches the origin sender check. `estimate_calls` covers
+    /// prepares that get past the check.
+    async fn pending_with_origin_check(
+        sender: Option<H256>,
+        blocked: H256,
+        delivered_calls: usize,
+        estimate_calls: usize,
+        store_hash: bool,
+    ) -> OriginCheckSetup {
+        use crate::msg::runtime_denylist::{
+            tests::origin_sender::{SenderProvider, SignerIndexer},
+            OriginSenderCheck, RuntimeDenylist,
+        };
+
+        let mut mailbox = contract_test_mailbox();
+        mailbox.expect__provider().times(0);
+        mailbox
+            .expect__delivered()
+            .times(delivered_calls)
+            .returning(|_| Ok(false));
+        mailbox
+            .expect_process_estimate_costs()
+            .times(estimate_calls)
+            .returning(|_, _| {
+                Ok(TxCostEstimate {
+                    gas_limit: U256::from(100),
+                    gas_price: FixedPointNumber::zero(),
+                    l2_gas_limit: None,
+                })
+            });
+        let provider = Arc::new(SenderProvider::new(sender));
+        let denylist = Arc::new(RuntimeDenylist::from_rules_for_test(serde_json::json!([
+            { "reason": "exploit", "addedBy": "test", "address": format!("{blocked:?}") }
+        ])));
+        let check = Arc::new(OriginSenderCheck::new(
+            denylist.clone(),
+            provider.clone(),
+            Arc::new(SignerIndexer::unsupported()),
+        ));
+        let (dir, mut pending) = pending_with_sender_check(mailbox, None, Some(check));
+        if store_hash {
+            pending
+                .ctx
+                .origin_db
+                .store_dispatched_tx_hash_by_message_id(&pending.message.id(), &H512::random())
+                .expect("store tx hash");
+        }
+        pending
+            .store_to_cache("arbitrum", "is_contract", &pending.message.recipient, &true)
+            .await;
+        pending.metadata = Some(Metadata::new(vec![7; 8]));
+        OriginCheckSetup {
+            _dir: dir,
+            pending,
+            provider,
+            denylist,
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_drops_message_with_denied_origin_tx_signer() {
+        let blocked = H256::random();
+        let mut s = pending_with_origin_check(Some(blocked), blocked, 1, 0, true).await;
+        assert!(matches!(
+            s.pending.prepare().await,
+            PendingOperationResult::Drop
+        ));
+    }
+
+    #[tokio::test]
+    async fn prepare_skips_origin_lookup_for_messages_dropped_by_preflight() {
+        // Pins the order: the lookup runs after the contract and gas checks,
+        // so messages they reject cost no origin RPCs.
+        let blocked = H256::random();
+        let mut s = pending_with_origin_check(Some(blocked), blocked, 1, 0, true).await;
+        s.pending
+            .store_to_cache(
+                "arbitrum",
+                "is_contract",
+                &s.pending.message.recipient,
+                &false,
+            )
+            .await;
+        assert!(matches!(
+            s.pending.prepare().await,
+            PendingOperationResult::Drop
+        ));
+        assert_eq!(s.lookups(), 0);
+    }
+
+    #[tokio::test]
+    async fn prepare_waits_once_for_a_missing_dispatch_hash() {
+        let mut s = pending_with_origin_check(None, H256::random(), 2, 1, false).await;
+        assert!(matches!(
+            s.pending.prepare().await,
+            PendingOperationResult::Reprepare(ReprepareReason::ErrorFetchingOriginTxSender)
+        ));
+        assert!(s.pending.next_attempt_after.is_some());
+        s.pending.next_attempt_after = None;
+        // Still no hash: nothing to check, so relay rather than wait again.
+        assert!(matches!(
+            s.pending.prepare().await,
+            PendingOperationResult::Success
+        ));
+        assert_eq!(s.pending.num_retries, 0);
+        assert_eq!(s.lookups(), 0);
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn prepare_retries_failed_origin_lookups_then_gives_up_with_cooldown() {
+        let max = super::ORIGIN_LOOKUP_MAX_FAILURES;
+        // `None` makes every lookup a transport error.
+        let mut s =
+            pending_with_origin_check(None, H256::random(), max as usize + 2, 3, true).await;
+
+        for attempt in 1..max {
+            assert!(matches!(
+                s.pending.prepare().await,
+                PendingOperationResult::Reprepare(ReprepareReason::ErrorFetchingOriginTxSender)
+            ));
+            // Fail closed with backoff, without spending the retry budget.
+            assert_eq!(s.pending.num_retries, 0);
+            assert!(s.pending.next_attempt_after.is_some(), "attempt {attempt}");
+            s.pending.next_attempt_after = None;
+        }
+
+        // The last failure gives up and prepare carries on past the check.
+        assert!(matches!(
+            s.pending.prepare().await,
+            PendingOperationResult::Success
+        ));
+        assert!(logs_contain("relaying without the origin sender check"));
+        assert_eq!(s.lookups(), max as usize);
+
+        // During the cooldown, prepares don't hit the failing RPC.
+        s.pending.submitted = false;
+        assert!(matches!(
+            s.pending.prepare().await,
+            PendingOperationResult::Success
+        ));
+        assert_eq!(s.lookups(), max as usize);
+
+        // After it, nothing was cached: the lookup runs again (and, still
+        // failing, gives up again straight away).
+        s.pending.origin_lookup_skip_until = Some(Instant::now());
+        s.pending.submitted = false;
+        assert!(matches!(
+            s.pending.prepare().await,
+            PendingOperationResult::Success
+        ));
+        assert_eq!(s.lookups(), max as usize + 1);
+    }
+
+    #[tokio::test]
+    async fn prepare_still_checks_cached_signers_during_the_give_up_pause() {
+        let blocked = H256::random();
+        let mut s = pending_with_origin_check(None, blocked, 1, 0, true).await;
+        s.pending.origin_lookup_skip_until = Instant::now().checked_add(Duration::from_secs(60));
+        s.denylist
+            .cache_origin_signers_for_test(s.pending.message.id(), vec![blocked])
+            .await;
+        assert!(matches!(
+            s.pending.prepare().await,
+            PendingOperationResult::Drop
+        ));
+        assert_eq!(s.lookups(), 0, "no RPC during the pause");
+    }
+
+    #[tokio::test]
+    async fn prepare_drops_fail_fast_ops_without_a_hash_after_their_budget() {
+        let mut s = pending_with_origin_check(None, H256::random(), 1, 0, false).await;
+        s.pending.fail_fast = true;
+        s.pending.max_retries = 1;
+        assert!(matches!(
+            s.pending.prepare().await,
+            PendingOperationResult::Drop
+        ));
+    }
+
+    #[tokio::test]
+    async fn prepare_origin_lookup_error_drops_fail_fast_ops_after_their_budget() {
+        let mut s = pending_with_origin_check(None, H256::random(), 1, 0, true).await;
+        s.pending.fail_fast = true;
+        s.pending.max_retries = 1;
+        assert!(matches!(
+            s.pending.prepare().await,
+            PendingOperationResult::Drop
+        ));
+        assert_eq!(s.pending.num_retries, 1);
     }
 
     #[tokio::test]
@@ -2377,6 +2967,213 @@ mod test {
     }
 
     #[tokio::test]
+    async fn pending_metric_follows_queue_status() {
+        use PendingOperationStatus::{Confirm, ReadyToSubmit, Retry};
+
+        let (_dir, mut pending) = pending_with_mailbox(contract_test_mailbox(), None);
+        pending.set_pending_tracking(false);
+        pending.first_seen = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        pending.set_pending_tracking(true);
+        let metrics = &pending.ctx.metrics;
+        let labels = [
+            "Unknown",
+            metrics.origin.as_str(),
+            metrics.destination.as_str(),
+        ];
+        let active = metrics.pending_message_active.with_label_values(&labels);
+        let oldest = metrics
+            .pending_message_oldest_timestamp_seconds
+            .with_label_values(&labels);
+        assert_eq!(active.get(), 1);
+        assert_eq!(oldest.get(), 1_700_000_000);
+
+        for reason in [
+            ConfirmReason::SubmittedBySelf,
+            ConfirmReason::AlreadySubmitted,
+        ] {
+            pending.set_status(Confirm(reason.clone()));
+            pending.set_status(Confirm(reason));
+            assert_eq!(active.get(), 0);
+            assert_eq!(oldest.get(), 0);
+
+            for status in [
+                Retry(ReprepareReason::RevertedOrReorged),
+                Retry(ReprepareReason::ErrorSubmitting),
+                ReadyToSubmit,
+            ] {
+                pending.set_status(status);
+                assert_eq!(active.get(), 1);
+                assert_eq!(oldest.get(), 1_700_000_000);
+            }
+        }
+
+        pending.set_status(Confirm(ConfirmReason::SubmittedBySelf));
+        assert!(pending.reset_attempts());
+        assert_eq!(active.get(), 1);
+        assert_eq!(oldest.get(), 1_700_000_000);
+        drop(pending);
+        assert_eq!(active.get(), 0);
+        assert_eq!(oldest.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn confirmation_errors_resume_pending_metrics_through_backoff() {
+        for db_failure in [false, true] {
+            let mut mailbox = contract_test_mailbox();
+            mailbox.expect__delivered().returning(move |_| {
+                if db_failure {
+                    Ok(true)
+                } else {
+                    Err(ChainCommunicationError::from_other_str("RPC unavailable"))
+                }
+            });
+            let (_dir, mut pending) = pending_with_mailbox(mailbox, None);
+            pending.first_seen = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+            let status = PendingOperationStatus::Confirm(ConfirmReason::SubmittedBySelf);
+            pending.set_status(status.clone());
+            if db_failure {
+                let mut db = MockDb::new();
+                db.expect_store_processed_by_nonce()
+                    .returning(|_, _| Err(DbError::Other("DB unavailable".to_owned())));
+                db.expect_store_pending_message_retry_state_by_message_id()
+                    .returning(|_, _| Ok(()));
+                Arc::get_mut(&mut pending.ctx)
+                    .expect("unique test context")
+                    .origin_db = Arc::new(db);
+            }
+            let metrics = &pending.ctx.metrics;
+            let labels = [
+                "Unknown",
+                metrics.origin.as_str(),
+                metrics.destination.as_str(),
+            ];
+            let active = metrics.pending_message_active.with_label_values(&labels);
+            let oldest = metrics
+                .pending_message_oldest_timestamp_seconds
+                .with_label_values(&labels);
+            assert_eq!(active.get(), 0);
+
+            for retries in 1..=2 {
+                // Expire the prior backoff without sleeping.
+                pending.next_attempt_after = None;
+                assert!(matches!(
+                    pending.confirm().await,
+                    PendingOperationResult::NotReady
+                ));
+                assert_eq!(pending.status(), status);
+                assert_eq!(pending.get_retries(), retries);
+                assert!(pending.next_attempt_after().unwrap() > Instant::now());
+                assert_eq!(active.get(), 1);
+                assert_eq!(oldest.get(), 1_700_000_000);
+                // Waiting out that backoff must keep both gauges active.
+                assert!(matches!(
+                    pending.confirm().await,
+                    PendingOperationResult::NotReady
+                ));
+                assert_eq!(pending.get_retries(), retries);
+                assert_eq!(active.get(), 1);
+            }
+            drop(pending);
+            assert_eq!(active.get(), 0);
+            assert_eq!(oldest.get(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn restored_confirm_messages_are_pending_during_prepare_backoff() {
+        for reconfirm_error in [false, true] {
+            let mut mailbox = contract_test_mailbox();
+            mailbox.expect__delivered().returning(|_| Ok(true));
+            let (_dir, mut pending) = pending_with_mailbox(mailbox, None);
+            pending.set_status(PendingOperationStatus::Confirm(
+                ConfirmReason::SubmittedBySelf,
+            ));
+            pending.set_next_attempt_after(Duration::from_secs(60));
+            if reconfirm_error {
+                pending.on_reconfirm::<String>(None, ConfirmReason::ErrorConfirmingDelivery);
+            }
+            let message = pending.message.clone();
+            let ctx = pending.ctx.clone();
+            drop(pending);
+            let metrics = &ctx.metrics;
+            let labels = [
+                "Unknown",
+                metrics.origin.as_str(),
+                metrics.destination.as_str(),
+            ];
+            let active = metrics.pending_message_active.with_label_values(&labels);
+            let oldest = metrics
+                .pending_message_oldest_timestamp_seconds
+                .with_label_values(&labels);
+            let mut restored = PendingMessage::maybe_from_persisted_retries(
+                message,
+                ctx,
+                None,
+                DEFAULT_MAX_MESSAGE_RETRIES,
+            )
+            .expect("restore confirming message");
+            assert_eq!(
+                restored.status(),
+                PendingOperationStatus::FirstPrepareAttempt
+            );
+            assert!(restored.next_attempt_after().unwrap() > Instant::now());
+            // receive_task re-pushes with the restored status before preparation.
+            restored.set_status(restored.status());
+            assert!(matches!(
+                restored.prepare().await,
+                PendingOperationResult::NotReady
+            ));
+            assert_eq!(active.get(), 1);
+            assert!(oldest.get() > 0);
+
+            restored.next_attempt_after = None;
+            let result = restored.prepare().await;
+            assert!(matches!(
+                result,
+                PendingOperationResult::Confirm(ConfirmReason::AlreadySubmitted)
+            ));
+            restored.set_status(PendingOperationStatus::Confirm(
+                ConfirmReason::AlreadySubmitted,
+            ));
+            assert_eq!(active.get(), 0);
+            assert_eq!(oldest.get(), 0);
+            drop(restored);
+            assert_eq!(active.get(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_metric_preserves_other_message_references() {
+        let (_dir, pending) = pending_with_mailbox(contract_test_mailbox(), None);
+        let mut duplicate = PendingMessage::new(
+            pending.message.clone(),
+            pending.ctx.clone(),
+            PendingOperationStatus::Confirm(ConfirmReason::AlreadySubmitted),
+            pending.app_context.clone(),
+            DEFAULT_MAX_MESSAGE_RETRIES,
+        );
+        let metrics = &pending.ctx.metrics;
+        let active = metrics.pending_message_active.with_label_values(&[
+            "Unknown",
+            &metrics.origin,
+            &metrics.destination,
+        ]);
+        assert_eq!(active.get(), 1);
+
+        duplicate.set_status(PendingOperationStatus::ReadyToSubmit);
+        duplicate.set_status(PendingOperationStatus::Confirm(
+            ConfirmReason::SubmittedBySelf,
+        ));
+        duplicate.set_status(PendingOperationStatus::Confirm(
+            ConfirmReason::AlreadySubmitted,
+        ));
+        drop(duplicate);
+        assert_eq!(active.get(), 1);
+        drop(pending);
+        assert_eq!(active.get(), 0);
+    }
+
+    #[tokio::test]
     #[should_panic(expected = "Pending message must be prepared before it can be submitted")]
     async fn classic_submit_requires_prepared_state_before_dry_run() {
         let (_dir, mut pending) = pending_with_mailbox(contract_test_mailbox(), None);
@@ -2489,52 +3286,251 @@ mod test {
     }
 
     #[test]
-    fn test_awaiting_validator_signatures_backoff() {
-        let reason = ReprepareReason::AwaitingValidatorSignatures;
-
-        // Fast path: the bounded initial retries always return 2s.
-        for i in 1..=VALIDATOR_SIGNATURE_FAST_RETRY_MAX {
+    fn missing_signature_deadlines_restart_with_a_prompt_probe() {
+        for retries in [1, 20, DEFAULT_MAX_MESSAGE_RETRIES - 1] {
             assert_eq!(
                 PendingMessage::calculate_msg_backoff(
-                    i,
+                    retries,
                     DEFAULT_MAX_MESSAGE_RETRIES,
                     None,
-                    Some(&reason)
+                    Some(&ReprepareReason::AwaitingValidatorSignatures),
                 ),
-                Some(Duration::from_secs(2)),
-                "retry {i} should be 2s"
+                Some(Duration::from_millis(500))
             );
         }
+        assert_eq!(
+            PendingMessage::calculate_msg_backoff(
+                0,
+                DEFAULT_MAX_MESSAGE_RETRIES,
+                None,
+                Some(&ReprepareReason::AwaitingValidatorSignatures),
+            ),
+            None,
+            "the first request has no delay"
+        );
+    }
 
-        // After the fast path, resume the gentle ramp from its first step.
-        let first_normal_retry = VALIDATOR_SIGNATURE_FAST_RETRY_MAX.saturating_add(1);
+    #[test]
+    fn signature_retry_window_uses_elapsed_time_not_attempt_count() {
+        let (_dir, mut pending) = pending_with_mailbox(contract_test_mailbox(), None);
+        pending.num_retries = 50; // Other failures must not consume the signature fast window.
+        let start = UNIX_EPOCH + Duration::from_secs(1_000);
+        for millis in [0, 500, 1_000, 4_000, 9_500] {
+            assert_eq!(
+                pending.signature_retry_delay(start + Duration::from_millis(millis)),
+                Some(Duration::from_millis(500))
+            );
+        }
         assert_eq!(
-            PendingMessage::calculate_msg_backoff(
-                first_normal_retry,
-                DEFAULT_MAX_MESSAGE_RETRIES,
-                None,
-                Some(&reason)
-            ),
-            Some(Duration::from_secs(5)),
-            "first retry after the fast path should resume the normal ramp at 5s"
+            pending.signature_retry_delay(start + Duration::from_millis(9_900)),
+            Some(Duration::from_millis(100))
+        );
+        for seconds in [1, 2, 3] {
+            assert_eq!(
+                pending.signature_retry_delay(start + Duration::from_secs(10)),
+                Some(Duration::from_secs(seconds))
+            );
+        }
+        assert_eq!(
+            pending.signature_retry_delay(start + Duration::from_secs(10)),
+            None
+        );
+        // A backwards clock jump cannot return an already-backed-off message to fast polling.
+        assert_eq!(
+            pending.signature_retry_delay(start - Duration::from_secs(1)),
+            None
+        );
+        let (_skew_dir, mut skewed) = pending_with_mailbox(contract_test_mailbox(), None);
+        assert_eq!(
+            skewed.signature_retry_delay(start),
+            Some(Duration::from_millis(500))
         );
         assert_eq!(
-            PendingMessage::calculate_msg_backoff(
-                first_normal_retry.saturating_add(1),
-                DEFAULT_MAX_MESSAGE_RETRIES,
-                None,
-                Some(&reason)
-            ),
-            Some(Duration::from_secs(10)),
+            skewed.signature_retry_delay(start - Duration::from_secs(1)),
+            Some(Duration::from_secs(1))
         );
         assert_eq!(
-            PendingMessage::calculate_msg_backoff(
-                first_normal_retry.saturating_add(2),
-                DEFAULT_MAX_MESSAGE_RETRIES,
-                None,
-                Some(&reason)
-            ),
-            Some(Duration::from_secs(30)),
+            skewed.signature_retry_delay(start + Duration::from_secs(1)),
+            Some(Duration::from_secs(2))
+        );
+    }
+
+    #[test]
+    fn signature_polls_preserve_existing_retry_budget() {
+        let (_dir, mut pending) = pending_with_mailbox(contract_test_mailbox(), None);
+        pending.num_retries = DEFAULT_MAX_MESSAGE_RETRIES - 1;
+        // Even more polls than the entire normal budget must not exhaust it.
+        for _ in 0..DEFAULT_MAX_MESSAGE_RETRIES {
+            pending.signature_retry = Some(SignatureRetryState {
+                started_at: SystemTime::now(),
+                backoff_retries: 0,
+            });
+            let observation = pending
+                .ctx
+                .metrics
+                .record_metadata_wait(pending.message.id(), None);
+            assert!(matches!(
+                pending.on_metadata_wait(observation),
+                PendingOperationResult::Reprepare(ReprepareReason::AwaitingValidatorSignatures)
+            ));
+            assert_eq!(pending.num_retries, DEFAULT_MAX_MESSAGE_RETRIES - 1);
+        }
+        pending.inc_attempts(Some(&ReprepareReason::ErrorBuildingMetadata));
+        assert_eq!(pending.num_retries, DEFAULT_MAX_MESSAGE_RETRIES);
+        assert!(pending.signature_retry.is_none());
+    }
+
+    #[test]
+    fn signature_retry_schedule_preserves_normal_retry_lifetime() {
+        let (_dir, mut pending) = pending_with_mailbox(contract_test_mailbox(), None);
+        let reason = ReprepareReason::AwaitingValidatorSignatures;
+        let day = Duration::from_secs(24 * 60 * 60);
+        let mut total = Duration::ZERO;
+        // Simulate the fast window without sleeping or depending on test runtime.
+        for _ in 0..20 {
+            pending.signature_retry = Some(SignatureRetryState {
+                started_at: SystemTime::now(),
+                backoff_retries: 0,
+            });
+            pending.inc_attempts(Some(&reason));
+            let delay = pending
+                .next_attempt_after
+                .expect("signature poll must have a deadline")
+                .duration_since(pending.last_attempted_at);
+            assert_eq!(delay, Duration::from_millis(500));
+            assert_eq!(pending.num_retries, 0);
+            total += delay;
+        }
+        pending.signature_retry = Some(SignatureRetryState {
+            started_at: SystemTime::now() - Duration::from_secs(10),
+            backoff_retries: 0,
+        });
+        for seconds in [1, 2, 3] {
+            pending.inc_attempts(Some(&reason));
+            let delay = pending
+                .next_attempt_after
+                .expect("signature ramp must have a deadline")
+                .duration_since(pending.last_attempted_at);
+            assert_eq!(delay, Duration::from_secs(seconds));
+            assert_eq!(pending.num_retries, 0);
+            total += delay;
+        }
+        for retry in 1..=DEFAULT_MAX_MESSAGE_RETRIES {
+            pending.inc_attempts(Some(&reason));
+            assert_eq!(pending.num_retries, retry);
+            let delay = pending
+                .next_attempt_after
+                .expect("normal retry must have a deadline")
+                .duration_since(pending.last_attempted_at);
+            if retry == DEFAULT_MAX_MESSAGE_RETRIES {
+                assert_eq!(delay, day * 70);
+            } else {
+                total += delay;
+            }
+        }
+        // Same jitter tolerance as the ordinary retry lifetime test.
+        assert!(total > day * 9);
+        assert!(total < day * 19);
+    }
+
+    #[test]
+    fn signature_waits_respect_fail_fast_retry_limit() {
+        for max_retries in [1, 3] {
+            let (_dir, pending) = pending_with_mailbox(contract_test_mailbox(), None);
+            let mut pending = pending.with_fail_fast();
+            pending.max_retries = max_retries;
+            for retry in 1..=max_retries {
+                let observation = pending
+                    .ctx
+                    .metrics
+                    .record_metadata_wait(pending.message.id(), None);
+                let result = pending.on_metadata_wait(observation);
+                assert_eq!(pending.num_retries, retry);
+                assert!(pending.signature_retry.is_none());
+                if retry == max_retries {
+                    assert!(matches!(result, PendingOperationResult::Drop));
+                } else {
+                    assert!(matches!(
+                        result,
+                        PendingOperationResult::Reprepare(
+                            ReprepareReason::AwaitingValidatorSignatures
+                        )
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn signature_retry_progress_survives_restart_and_manual_reset() {
+        let (_dir, mut pending) = pending_with_mailbox(contract_test_mailbox(), None);
+        let observation = pending
+            .ctx
+            .metrics
+            .record_metadata_wait(pending.message.id(), None);
+        pending.on_metadata_wait(observation);
+        let saved =
+            PendingMessage::get_retry_state(pending.ctx.origin_db.clone(), &pending.message)
+                .unwrap();
+        assert_eq!(saved.retry_delay_millis, Some(500));
+        assert_eq!(saved.retry_count, 0);
+        let restored = PendingMessage::maybe_from_persisted_retries(
+            pending.message.clone(),
+            pending.ctx.clone(),
+            pending.app_context.clone(),
+            pending.max_retries,
+        )
+        .expect("fast polling progress must survive restart");
+        assert_eq!(restored.num_retries, 0);
+        assert_eq!(restored.signature_retry, pending.signature_retry);
+        pending.signature_retry = None;
+        let now = SystemTime::now();
+        pending.num_retries = 5;
+        assert_eq!(
+            pending.signature_retry_delay(now - Duration::from_secs(11)),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(
+            pending.signature_retry_delay(now),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            pending.signature_retry_delay(now),
+            Some(Duration::from_secs(2))
+        );
+        pending.persist_retry_state(
+            Some(Duration::from_secs(2)),
+            Some(ReprepareReason::AwaitingValidatorSignatures),
+        );
+        let mut restored = PendingMessage::maybe_from_persisted_retries(
+            pending.message.clone(),
+            pending.ctx.clone(),
+            pending.app_context.clone(),
+            pending.max_retries,
+        )
+        .unwrap();
+        assert_eq!(restored.signature_retry, pending.signature_retry);
+        assert_eq!(restored.num_retries, 5);
+        assert_eq!(
+            restored.signature_retry_delay(now),
+            Some(Duration::from_secs(3))
+        );
+        restored.inc_attempts(Some(&ReprepareReason::AwaitingValidatorSignatures));
+        assert_eq!(restored.num_retries, 6);
+        let resumed = PendingMessage::maybe_from_persisted_retries(
+            restored.message.clone(),
+            restored.ctx.clone(),
+            restored.app_context.clone(),
+            restored.max_retries,
+        )
+        .expect("normal retry progress must survive restart");
+        assert_eq!(resumed.num_retries, 6);
+        assert_eq!(resumed.signature_retry, restored.signature_retry);
+        assert!(restored.reset_attempts());
+        assert!(restored.signature_retry.is_none());
+        assert_eq!(
+            restored.signature_retry_delay(now),
+            Some(Duration::from_millis(500))
         );
     }
 
@@ -2758,6 +3754,11 @@ mod test {
             Some(app_context.to_owned()),
             1,
         );
+        // Accelerated polls do not consume the normal retry budget.
+        pending_message.signature_retry = Some(SignatureRetryState {
+            started_at: SystemTime::now() - Duration::from_secs(10),
+            backoff_retries: 3,
+        });
         let labels = [app_context, "ethereum", "arbitrum"];
         let observation = pending_message
             .ctx

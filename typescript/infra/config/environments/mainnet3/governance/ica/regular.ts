@@ -78,7 +78,6 @@ export const regularIcas: ChainMap<Address> = {
   somnia: '0xe26f1A5681088b7dCd53c00C9a19143e8bA543Ec',
   lazai: '0xDFEa2EB38AA77EE41D50794aFaA34463EEabD4BB',
   megaeth: '0x8D628b83A2F915fab39f7F09e0cF7A3ea8F9bF42',
-  adichain: '0xD0427bD81a0cDA1AdcdFb49DFDB95Ab3e059FFff',
 
   // Jan 2, 2026
   // ----------------------------------------------------------
@@ -118,4 +117,15 @@ export const regularIcas: ChainMap<Address> = {
   // ----------------------------------------------------------
   arc: '0xb99A2F00E5F30931a8908ae3a27BD25D9a62d237',
   viction: '0x057fd9cae3a84Be7222bE32E5d5e35f2730DE5b8',
+
+  // Oct 27, 2026 - Tempo
+  // ----------------------------------------------------------
+  tempo: '0x889524709d5c1D58254d62e6dc031069EEd67A80',
+
+  // Nov 6, 2026 - Elysium (v2 router)
+  // ----------------------------------------------------------
+  elysium: '0x4eAF5Eef9d8a1d2d32BaA4034Cd4631BD1F597A2',
+  // Nov 10, 2026 - Aevo (v2 router, core 9.0.5)
+  // ----------------------------------------------------------
+  aevo: '0xaE2af12a7c18aAa441b290b7C40Bc3f07C8B9Ab7',
 } as const;

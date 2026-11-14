@@ -1,17 +1,8 @@
 import {
   address as parseAddress,
-  appendTransactionMessageInstructions,
-  blockhash,
-  compileTransactionMessage,
-  createTransactionMessage,
   generateKeyPairSigner,
-  getCompiledTransactionMessageEncoder,
-  getShortU16Encoder,
   isAddress,
-  setTransactionMessageFeePayer,
-  setTransactionMessageLifetimeUsingBlockhash,
   type Address,
-  type Instruction,
   type TransactionSigner,
 } from '@solana/kit';
 
@@ -41,7 +32,6 @@ import {
   type IsmNode,
 } from '../accounts/composite-ism.js';
 import { encodeH160, encodeH256 } from '../codecs/shared.js';
-import { DEFAULT_COMPUTE_UNITS } from '../constants.js';
 import { resolveProgram } from '../deploy/resolve-program.js';
 import {
   getInitializeCompositeIsmInstruction,
@@ -54,7 +44,11 @@ import {
 } from '../instructions/composite-ism.js';
 import { deriveCompositeIsmStoragePda } from '../pda.js';
 import { fetchAccountDataRaw } from '../rpc.js';
-import { getComputeBudgetInstructions } from '../tx.js';
+import {
+  SOLANA_MAX_TRANSACTION_SIZE,
+  chunkInstructionsBySize,
+  estimateTransactionWireSize,
+} from '../tx.js';
 import type { SvmSigner } from '../clients/signer.js';
 import type {
   AnnotatedSvmTransaction,
@@ -66,93 +60,11 @@ import type {
 
 import { validatorBytesToHex } from './ism-query.js';
 
+const DECIMAL_INTEGER_REGEX = /^\d+$/;
+const DOMAIN_ID_REGEX = /^(0|[1-9]\d*)$/;
+const ZERO_HEX_REGEX = /^0x0+$/i;
+
 const logger = rootLogger.child({ module: 'composite-ism' });
-
-// Solana's serialized transaction size limit
-// (https://solana.com/docs/core/transactions#transaction-size). Each domain
-// instruction carries a recursive, variable-sized IsmNode — unlike
-// fixed-width entries elsewhere in this package, a static per-tx count
-// can't safely bound size (a handful of large multisig/aggregation subtrees
-// can already exceed the limit), so domain instructions are batched by
-// actual serialized size instead.
-export const SOLANA_MAX_TRANSACTION_SIZE = 1232;
-const DUMMY_BLOCKHASH = blockhash('11111111111111111111111111111111');
-
-/**
- * Real serialized wire size (signatures + message) for a candidate
- * transaction, including the ComputeBudget instruction `SvmSigner.send()`
- * always prepends (`buildTransactionMessage` in tx.ts) — measuring only the
- * domain instructions themselves undercounts the actual submitted size.
- */
-export function estimateTransactionWireSize(
-  feePayer: Address,
-  instructions: readonly Instruction[],
-): number {
-  const message = appendTransactionMessageInstructions(
-    [...getComputeBudgetInstructions(DEFAULT_COMPUTE_UNITS), ...instructions],
-    setTransactionMessageLifetimeUsingBlockhash(
-      { blockhash: DUMMY_BLOCKHASH, lastValidBlockHeight: 0n },
-      setTransactionMessageFeePayer(
-        feePayer,
-        createTransactionMessage({ version: 0 }),
-      ),
-    ),
-  );
-  const compiled = compileTransactionMessage(message);
-  const messageBytes = getCompiledTransactionMessageEncoder().encode(compiled);
-  const sigCountBytes = getShortU16Encoder().encode(
-    compiled.header.numSignerAccounts,
-  );
-  return (
-    sigCountBytes.length +
-    compiled.header.numSignerAccounts * 64 +
-    messageBytes.length
-  );
-}
-
-/**
- * Greedily groups items into batches whose instructions fit within Solana's
- * transaction size limit, using the real serialized size (not a fixed
- * per-item count) since domain instructions are variable-sized.
- */
-export function chunkInstructionsBySize<T>(
-  items: readonly T[],
-  toInstruction: (item: T) => Instruction,
-  feePayer: Address,
-): T[][] {
-  const chunks: T[][] = [];
-  let current: T[] = [];
-  for (const item of items) {
-    // Checked unconditionally (not just in the "merge" branch below) — an
-    // oversized item that starts a fresh chunk (because it doesn't fit
-    // alongside the previous batch) would otherwise never hit this check
-    // and get pushed as an ordinary single-item chunk, only failing later
-    // with an opaque RPC size error instead of this message.
-    const soloSize = estimateTransactionWireSize(feePayer, [
-      toInstruction(item),
-    ]);
-    assert(
-      soloSize <= SOLANA_MAX_TRANSACTION_SIZE,
-      `Composite ISM domain instruction alone (${soloSize} bytes) exceeds Solana's ` +
-        `${SOLANA_MAX_TRANSACTION_SIZE}-byte transaction size limit — the nested ` +
-        `ISM tree for this domain is too large to submit in a single instruction.`,
-    );
-
-    const candidate = [...current, item];
-    const size = estimateTransactionWireSize(
-      feePayer,
-      candidate.map(toInstruction),
-    );
-    if (current.length > 0 && size > SOLANA_MAX_TRANSACTION_SIZE) {
-      chunks.push(current);
-      current = [item];
-    } else {
-      current = candidate;
-    }
-  }
-  if (current.length > 0) chunks.push(current);
-  return chunks;
-}
 
 /**
  * Deployment-time configuration for the SVM composite ISM writer.
@@ -371,7 +283,7 @@ const ARTIFACT_U64_MAX = 2n ** 64n - 1n;
 const ARTIFACT_U256_MAX = 2n ** 256n - 1n;
 
 function isValidDecimalStringBoundedBy(value: string, max: bigint): boolean {
-  return /^\d+$/.test(value) && BigInt(value) <= max;
+  return DECIMAL_INTEGER_REGEX.test(value) && BigInt(value) <= max;
 }
 
 /**
@@ -404,7 +316,7 @@ export function assertValidCompositeIsmArtifact(
 
 /** A domain map key must be a canonical (no leading zeros, no sign) base-10 u32. */
 function isValidDomainKey(key: string): boolean {
-  return /^(0|[1-9]\d*)$/.test(key) && BigInt(key) <= 0xffffffffn;
+  return DOMAIN_ID_REGEX.test(key) && BigInt(key) <= 0xffffffffn;
 }
 
 function assertValidCompositeIsmArtifactNode(
@@ -508,7 +420,7 @@ function assertValidCompositeIsmArtifactNode(
           assert(false, `Invalid H256 recipient: ${node.recipient}`);
         }
         assert(
-          !/^0x0+$/i.test(node.recipient),
+          !ZERO_HEX_REGEX.test(node.recipient),
           'rateLimited.recipient must be a non-zero address',
         );
       }
@@ -601,6 +513,9 @@ export async function assertCompositeIsmFitsSizeLimit(
     );
   }
 }
+
+const COMPOSITE_OVERSIZED_DOMAIN_DETAIL =
+  ' The nested ISM tree for this domain is too large.';
 
 export class SvmCompositeIsmReader implements ArtifactReader<
   CompositeIsmArtifactConfig,
@@ -764,6 +679,8 @@ export class SvmCompositeIsmWriter
         domainInstructions,
         (ix) => ix,
         this.svmSigner.signer.address,
+        0,
+        COMPOSITE_OVERSIZED_DOMAIN_DETAIL,
       );
       for (const chunk of chunks) {
         receipts.push(await this.svmSigner.send({ instructions: chunk }));
@@ -875,6 +792,8 @@ export class SvmCompositeIsmWriter
       domainIxs,
       (item) => item.instruction,
       this.svmSigner.signer.address,
+      0,
+      COMPOSITE_OVERSIZED_DOMAIN_DETAIL,
     );
     const domainTxs: AnnotatedSvmTransaction[] = domainIxChunks.map(
       (chunk) => ({

@@ -1,5 +1,181 @@
 # @hyperlane-xyz/infra
 
+## 45.2.0
+
+### Patch Changes
+
+- 9ef15ff: Added scraper WebSocket wake-ups configured through a single Secret Manager JSON map, retaining five-second HTTP polling for recovery, batching proxy head updates, and keeping endpoint credentials out of Helm values.
+- Updated dependencies [d2ea605]
+- Updated dependencies [bdeb314]
+- Updated dependencies [048d1f3]
+- Updated dependencies [f265d2f]
+- Updated dependencies [fe5dfda]
+- Updated dependencies [8b65668]
+- Updated dependencies [aa84958]
+- Updated dependencies [e48ffe7]
+- Updated dependencies [4623acb]
+- Updated dependencies [d0ec60c]
+- Updated dependencies [63fa540]
+- Updated dependencies [c520224]
+- Updated dependencies [d770c3b]
+- Updated dependencies [2c32db0]
+- Updated dependencies [bdeb314]
+- Updated dependencies [1baa78e]
+- Updated dependencies [a72f027]
+- Updated dependencies [6e5db5f]
+- Updated dependencies [7be44b5]
+- Updated dependencies [9ef15ff]
+- Updated dependencies [8868234]
+- Updated dependencies [02c6ef4]
+- Updated dependencies [2bc0b3e]
+- Updated dependencies [48cd574]
+  - @hyperlane-xyz/sdk@45.2.0
+  - @hyperlane-xyz/core@12.3.0
+  - @hyperlane-xyz/utils@45.2.0
+  - @hyperlane-xyz/rebalancer@29.1.0
+  - @hyperlane-xyz/relayer@4.1.0
+  - @hyperlane-xyz/metrics@1.0.6
+  - @hyperlane-xyz/sealevel-sdk@45.2.0
+  - @hyperlane-xyz/tron-sdk@26.0.3
+  - @hyperlane-xyz/http-registry-server@45.2.0
+  - @hyperlane-xyz/keyfunder@0.1.54
+  - @hyperlane-xyz/deploy-sdk@11.0.3
+  - @hyperlane-xyz/provider-sdk@11.0.3
+
+## 45.1.0
+
+### Patch Changes
+
+- c3cf9cb: Enabled shared scraper subscriptions for mainnet Fastpath validators using their existing per-chain reorg periods as confirmation delays.
+- cffc252: Updated Fastpath validator images for custom-confirmation WebSocket support and enabled testnet subscriptions with one-block validator reorg periods.
+- Updated dependencies [b6fdd2d]
+- Updated dependencies [a7b65cb]
+- Updated dependencies [1467e4c]
+- Updated dependencies [a27ce72]
+- Updated dependencies [4b0f32c]
+- Updated dependencies [447569f]
+- Updated dependencies [b43bc9f]
+- Updated dependencies [0ceb556]
+- Updated dependencies [7203aec]
+- Updated dependencies [341418a]
+- Updated dependencies [5c6593b]
+- Updated dependencies [62225a3]
+- Updated dependencies [d3b865d]
+- Updated dependencies [0063de6]
+- Updated dependencies [77dbf5d]
+- Updated dependencies [5a8eed5]
+- Updated dependencies [670000c]
+- Updated dependencies [bfbb755]
+  - @hyperlane-xyz/sdk@45.1.0
+  - @hyperlane-xyz/sealevel-sdk@45.1.0
+  - @hyperlane-xyz/keyfunder@0.1.53
+  - @hyperlane-xyz/deploy-sdk@11.0.2
+  - @hyperlane-xyz/http-registry-server@45.1.0
+  - @hyperlane-xyz/metrics@1.0.5
+  - @hyperlane-xyz/rebalancer@29.0.5
+  - @hyperlane-xyz/relayer@4.0.5
+  - @hyperlane-xyz/utils@45.1.0
+  - @hyperlane-xyz/core@12.2.0
+  - @hyperlane-xyz/provider-sdk@11.0.2
+  - @hyperlane-xyz/tron-sdk@26.0.2
+
+## 45.0.1
+
+### Patch Changes
+
+- Updated dependencies [4efffd5]
+- Updated dependencies [35d3002]
+- Updated dependencies [fe26a26]
+- Updated dependencies [19dbb59]
+  - @hyperlane-xyz/sdk@45.0.1
+  - @hyperlane-xyz/sealevel-sdk@45.0.1
+  - @hyperlane-xyz/http-registry-server@45.0.1
+  - @hyperlane-xyz/keyfunder@0.1.52
+  - @hyperlane-xyz/metrics@1.0.4
+  - @hyperlane-xyz/rebalancer@29.0.4
+  - @hyperlane-xyz/relayer@4.0.4
+  - @hyperlane-xyz/deploy-sdk@11.0.1
+  - @hyperlane-xyz/utils@45.0.1
+  - @hyperlane-xyz/core@12.2.0
+  - @hyperlane-xyz/provider-sdk@11.0.1
+  - @hyperlane-xyz/tron-sdk@26.0.1
+
+## 45.0.0
+
+### Minor Changes
+
+- e0d3394: Added an opt-in relayer cutover from direct RPC indexing to scraper-proxy streams with automatic RPC fallback.
+
+### Patch Changes
+
+- Updated dependencies [e0d3394]
+- Updated dependencies [b83bac5]
+- Updated dependencies [9b9de8d]
+- Updated dependencies [4975a40]
+- Updated dependencies [d02c93e]
+- Updated dependencies [a8d6bf0]
+- Updated dependencies [ee50f43]
+- Updated dependencies [12678bc]
+- Updated dependencies [c1576a3]
+- Updated dependencies [0aeb76a]
+- Updated dependencies [a8d6bf0]
+- Updated dependencies [9a59116]
+- Updated dependencies [a8d6bf0]
+- Updated dependencies [d26e4c4]
+- Updated dependencies [ebf3922]
+- Updated dependencies [87b2c63]
+- Updated dependencies [112541b]
+- Updated dependencies [c1576a3]
+- Updated dependencies [28eda66]
+- Updated dependencies [f05bb6d]
+- Updated dependencies [8373a74]
+- Updated dependencies [0015102]
+- Updated dependencies [a8d6bf0]
+- Updated dependencies [c1576a3]
+- Updated dependencies [6f7b511]
+- Updated dependencies [249517a]
+- Updated dependencies [2762075]
+- Updated dependencies [7e357be]
+- Updated dependencies [5e7cc26]
+- Updated dependencies [f9cf910]
+- Updated dependencies [323faae]
+- Updated dependencies [55e6699]
+- Updated dependencies [e994943]
+- Updated dependencies [28eda66]
+- Updated dependencies [6eaa8c6]
+- Updated dependencies [11d5de3]
+- Updated dependencies [98ec7d5]
+- Updated dependencies [2a938f3]
+- Updated dependencies [43f89c6]
+- Updated dependencies [4e2ab65]
+- Updated dependencies [4c644c0]
+- Updated dependencies [4ad4577]
+- Updated dependencies [fc8ee9a]
+- Updated dependencies [f64f992]
+- Updated dependencies [74001ec]
+- Updated dependencies [47d25a1]
+- Updated dependencies [5a3ec14]
+- Updated dependencies [d26e4c4]
+- Updated dependencies [692cdb4]
+- Updated dependencies [ea5b010]
+- Updated dependencies [c1576a3]
+- Updated dependencies [27d55d2]
+- Updated dependencies [b83bac5]
+- Updated dependencies [b83bac5]
+- Updated dependencies [67f3cd3]
+  - @hyperlane-xyz/sdk@45.0.0
+  - @hyperlane-xyz/sealevel-sdk@45.0.0
+  - @hyperlane-xyz/metrics@1.0.3
+  - @hyperlane-xyz/provider-sdk@11.0.0
+  - @hyperlane-xyz/deploy-sdk@11.0.0
+  - @hyperlane-xyz/rebalancer@29.0.3
+  - @hyperlane-xyz/core@12.2.0
+  - @hyperlane-xyz/utils@45.0.0
+  - @hyperlane-xyz/keyfunder@0.1.51
+  - @hyperlane-xyz/tron-sdk@26.0.0
+  - @hyperlane-xyz/http-registry-server@45.0.0
+  - @hyperlane-xyz/relayer@4.0.3
+
 ## 44.0.2
 
 ### Patch Changes

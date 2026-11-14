@@ -1,5 +1,5 @@
 use std::{
-    fmt::Debug,
+    fmt::{self, Debug},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -33,14 +33,23 @@ where
 
 /// HTTP JSON-RPC transport that preserves status-only rate limit responses.
 /// The pinned ethers transport discards HTTP status before decoding the body.
-#[derive(Clone, Debug)]
-pub(crate) struct StatusAwareHttp {
+#[derive(Clone)]
+pub struct StatusAwareHttp {
     client: Client,
     url: Url,
     next_id: Arc<AtomicU64>,
 }
 
+impl Debug for StatusAwareHttp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StatusAwareHttp")
+            .field("host", &self.url.host_str())
+            .finish_non_exhaustive()
+    }
+}
+
 impl StatusAwareHttp {
+    /// Create a transport with a URL whose custom headers have already been extracted.
     pub(crate) fn new(url: Url, client: Client) -> Self {
         Self {
             client,
@@ -78,13 +87,19 @@ impl JsonRpcClient for StatusAwareHttp {
             .post(self.url.clone())
             .json(&payload)
             .send()
-            .await?;
+            .await
+            .map_err(|error| error.without_url())?;
         // Check before reading the body: a 429 body may be empty, non-JSON, or stalled.
         // Other statuses still decode JSON-RPC errors, preserving revert data.
         if response.status() == StatusCode::TOO_MANY_REQUESTS {
-            response.error_for_status_ref()?;
+            response
+                .error_for_status_ref()
+                .map_err(|error| error.without_url())?;
         }
-        let body = response.bytes().await?;
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| error.without_url())?;
         let decode_error = |err| HttpClientError::SerdeJson {
             err,
             text: String::from_utf8_lossy(&body).into_owned(),
@@ -117,6 +132,19 @@ mod tests {
         net::TcpListener,
     };
 
+    #[test]
+    fn debug_omits_endpoint_credentials() {
+        let client = StatusAwareHttp::new(
+            "https://private-user:private-password@rpc.example/private-path?key=private-query#private-fragment"
+                .parse()
+                .unwrap(),
+            Client::new(),
+        );
+        let debug = format!("{client:?}");
+        assert!(debug.contains("rpc.example"));
+        assert!(!debug.contains("private-"));
+    }
+
     async fn request_response<R: DeserializeOwned>(
         status: &str,
         body: &str,
@@ -125,7 +153,7 @@ mod tests {
             .await
             .expect("test listener");
         let url = format!(
-            "http://{}",
+            "http://private-user:private-password@{}/private-path?key=private-query",
             listener.local_addr().expect("listener address")
         );
         let response = format!(
@@ -163,6 +191,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connection_errors_omit_endpoint_credentials() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let client = StatusAwareHttp::new(
+            format!("http://{address}/private-path?key=private-query")
+                .parse()
+                .unwrap(),
+            Client::new(),
+        );
+        let error = client
+            .request::<_, Value>("eth_chainId", ())
+            .await
+            .unwrap_err();
+        assert!(!format!("{error:?} {error}").contains("private-"));
+        let HttpClientError::ReqwestError(error) = error else {
+            panic!("expected HTTP error");
+        };
+        assert!(error.url().is_none());
+        assert!(error.is_connect());
+    }
+
+    #[tokio::test]
     async fn http_429_is_recognized_even_without_a_quota_message() {
         for body in [
             "",
@@ -173,6 +224,12 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(is_rate_limited(&error));
+            let HttpClientError::ReqwestError(error) = error else {
+                panic!("expected HTTP status error")
+            };
+            assert!(error.url().is_none());
+            assert_eq!(error.status(), Some(StatusCode::TOO_MANY_REQUESTS));
+            assert!(!format!("{error:?} {error}").contains("private-"));
         }
     }
 

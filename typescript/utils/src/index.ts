@@ -86,7 +86,15 @@ export {
   toWei,
   tryParseAmount,
 } from './amount.js';
-export { chunk, exclude, randomElement, arrayEqual } from './arrays.js';
+export {
+  chunk,
+  exclude,
+  randomElement,
+  arrayEqual,
+  isNonEmptyArray,
+  nonEmptyArray,
+  type NonEmptyArray,
+} from './arrays.js';
 export {
   AllSettledResult,
   concurrentMap,
@@ -251,3 +259,9 @@ export {
 } from './yaml.js';
 export type { ArraySortConfig } from './yaml.js';
 export { createServiceLogger } from './logging.js';
+export {
+  TransactionSubmission,
+  TransactionSubmissionError,
+  type TransactionSubmissionOptions,
+  type TransactionSubmissionState,
+} from './transactionSubmission.js';

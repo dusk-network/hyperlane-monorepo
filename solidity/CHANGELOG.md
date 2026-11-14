@@ -1,5 +1,36 @@
 # @hyperlane-xyz/core
 
+## 12.3.0
+
+### Minor Changes
+
+- 4623acb: Added a LayerZero V2 hook/ISM that authenticates Hyperlane messages with DVN-verified packets via offchain lookup.
+- 2bc0b3e: `WormholeVaaHookIsm` was added as a combined hook and ISM. It publishes
+  Hyperlane message commitments through Wormhole Core and verifies
+  Guardian-signed VAAs supplied through CCIP-read metadata.
+
+### Patch Changes
+
+- 048d1f3: The rate-limited ISM was changed to meter only messages recorded by the Mailbox in the current block. Replay tests were added for messages previously delivered through a different ISM.
+- f265d2f: Token fee support was disabled for ERC4626, fiat token, xERC20, and xERC20 lockbox routers. Configured token fees caused quotes and outbound transfers to revert until the fee recipient was removed. The SDK rejected unsupported token fee deployments and fee hooks on incompatible router types, including when fee hook update transactions were built directly, rejected adding token fees to xERC20 and xERC20 lockbox routers without an existing fee regardless of the requested contract version, allowed existing fees on those routers to be updated or removed, and required fee removal before upgrading them.
+- e48ffe7: - `LayerZeroV2HookIsm` reads endpoint-to-domain assignments through `domainIdForRemoteLayerZeroEndpointId`.
+- 8868234: Newly deployed message ID authentication hooks were protected against repeated post-dispatch bridge authorizations for the Mailbox's latest message.
+- 02c6ef4: - A `WormholeVaaHookIsm` custom consistency level requires an allowed base level and a nonzero number of additional blocks.
+    - The Wormhole commitment includes the custom base level and additional blocks of the publishing hook, and verification compares them with the values enrolled for the remote route.
+    - The expected consistency level of a remote route is checked against the levels a VAA can carry: the local allowlist plus the Solana values `1` and `32`.
+
+## 12.2.0
+
+### Minor Changes
+
+- ebf3922: ICA fee-token dispatches were fixed to quote the actual remote router, message body, and resolved hook. QuotedCalls ICA commands were changed to reconstruct the messages they execute, and Minimal ICA routers gained support for salted calls. Commit-reveal calls were changed to forward and refund only native value from the current call, leaving existing router balances untouched. Token-pulling child hooks still require explicit approval.
+
+    Existing immutable ICA routers are not supported for these fee-token commands. The updated QuotedCalls and ICA routers must be deployed together, and registry configuration must be migrated to the paired deployments.
+
+### Patch Changes
+
+- 0aeb76a: Reduced contract build times by compiling Tron without shared source mutations, retaining its incremental compiler cache, and parallelizing Starknet artifact generation. Generated contract artifacts were preserved.
+
 ## 12.1.0
 
 ### Minor Changes

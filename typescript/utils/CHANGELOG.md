@@ -1,5 +1,37 @@
 # @hyperlane-xyz/utils
 
+## 45.2.0
+
+### Patch Changes
+
+- aa84958: Removed batch barriers from bounded async maps, parallelized independent gas simulation and fee reads, and bounded concurrent rebalancer monitor reads to reduce polling latency. Failed maps stopped scheduling new work and drained active calls before rejecting, preserving backpressure across retries.
+
+  Failed inventory or confirmed-block supply reads prevented the monitor from emitting a partial polling cycle, avoiding fabricated zero balances or latest-state supplies in confirmed-block events.
+
+  Failed numeric Tron block lookups also prevented latest-state supply from being emitted, while intentional optional named tags remained supported.
+
+- c520224: Invariant regular expressions were reused across calls, redundant URL parsing was removed from RPC-header and explorer helpers, and independent token reads were overlapped with bounded concurrency and failure draining. URL normalization, validation, and dependent read ordering were preserved.
+
+## 45.1.0
+
+## 45.0.1
+
+## 45.0.0
+
+### Major Changes
+
+- 28eda66: Removed `ValidatorMetadata.additional_quorum_rpcs`.
+
+### Minor Changes
+
+- 4e2ab65: Added `SealevelRoutingMessageIdMultisigIsmReader`, `SealevelRoutingMessageIdMultisigIsmWriter` and `SealevelRoutingMessageIdMultisigIsmWriterConfig` to the Sealevel SDK, which read and write a message-id multisig ISM holding an independent validator set and threshold per origin domain. The writer enforces per-domain caps of 24 validators and a threshold of 8 when writing a domain (on create, and for added or changed domains on update, not for unchanged on-chain domains), and the reader and writer take a non-empty list of candidate domain ids. They replace `SealevelMessageIdMultisigIsmReader`, `SealevelMessageIdMultisigIsmWriter` and `SealevelMultisigIsmConfig`, which were removed. The multisig ISM set-validators and transfer-ownership instruction builders now take `Address` owners.
+
+  `NonEmptyArray`, `nonEmptyArray` and `isNonEmptyArray` were added to `@hyperlane-xyz/utils`. `@hyperlane-xyz/provider-sdk/ism` exports `DomainMultisigConfig` and `RoutingMessageIdMultisigIsmArtifactConfig`.
+
+### Patch Changes
+
+- 9a59116: Updated Solana clients to versions with transaction v1 codecs while preserving existing transaction-version defaults.
+
 ## 44.0.2
 
 ## 44.0.1

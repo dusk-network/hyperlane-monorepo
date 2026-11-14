@@ -14,45 +14,19 @@ import {
 } from '../metrics.js';
 import { quoteIdentifier } from '../scraperdb/tables.js';
 
+const WHITESPACE_REGEX = /\s+/g;
+
 const MIN_POOL_CLIENTS = 5;
 const MAX_POOL_CLIENTS = 10;
 const STATS_INTERVAL_MS = 60_000;
 const IDLE_TIMEOUT_MS = 300_000;
+const EVENT_STREAM_SCHEMA_CHECKS = [
+  'scraper_head_exists',
+  'scraper_head_readable',
+];
 const EVENT_STREAM_SCHEMA_QUERY = `
-  SELECT
-    to_regclass('gas_payment_stream_head') IS NOT NULL AS head_exists,
-    to_regclass('gas_payment_stream_cursor') IS NOT NULL AS cursor_exists,
-    to_regclass('gas_payment_stream_cursor_range_key') IS NOT NULL AS range_index_exists,
-    to_regclass('scraper_head') IS NOT NULL AS scraper_head_exists,
-    EXISTS (
-      SELECT 1 FROM pg_attribute
-      WHERE attrelid = to_regclass('gas_payment_stream_head')
-        AND attname = 'legacy_max_id'
-        AND NOT attisdropped
-    ) AS legacy_boundary_exists,
-    EXISTS (
-      SELECT 1 FROM pg_trigger
-      WHERE tgrelid = to_regclass('gas_payment')
-        AND tgname = 'gas_payment_stream_cursor_assign'
-        AND NOT tgisinternal
-        AND tgenabled IN ('O', 'A')
-    ) AS cursor_trigger_exists,
-    COALESCE(
-      has_table_privilege(
-        current_user,
-        to_regclass('gas_payment_stream_head'),
-        'SELECT'
-      ),
-      false
-    ) AS head_readable,
-    COALESCE(
-      has_table_privilege(
-        current_user,
-        to_regclass('gas_payment_stream_cursor'),
-        'SELECT'
-      ),
-      false
-    ) AS cursor_readable
+  SELECT to_regclass('scraper_head') IS NOT NULL AS scraper_head_exists,
+    COALESCE(has_table_privilege(current_user, to_regclass('scraper_head'), 'SELECT'), false) AS scraper_head_readable
 `;
 
 [1114, 1186].forEach((oid) =>
@@ -68,30 +42,12 @@ type Stats = {
   totalMs: number;
 };
 
-type EventStreamSchema = {
-  cursor_exists: boolean;
-  cursor_readable: boolean;
-  cursor_trigger_exists: boolean;
-  head_exists: boolean;
-  head_readable: boolean;
-  legacy_boundary_exists: boolean;
-  range_index_exists: boolean;
-  scraper_head_exists: boolean;
-};
-const EVENT_STREAM_SCHEMA_CHECKS: readonly (keyof EventStreamSchema)[] = [
-  'cursor_exists',
-  'cursor_readable',
-  'cursor_trigger_exists',
-  'head_exists',
-  'head_readable',
-  'legacy_boundary_exists',
-  'range_index_exists',
-  'scraper_head_exists',
-];
-
 export class DbService implements ScraperDbDatabase {
   private readonly listeners = new Set<pg.Client>();
   private mainPool?: pg.Pool;
+  private readonly mainRole = config.DATABASE_READ_REPLICA_URL
+    ? DatabaseQueryRole.GraphqlReplica
+    : DatabaseQueryRole.GraphqlPrimary;
   private nextQueryId = 0;
   private livePool?: pg.Pool;
   private stats = newStats();
@@ -109,31 +65,28 @@ export class DbService implements ScraperDbDatabase {
       this.logger.info(
         'GraphQL db role=read-replica; connections open lazily so replica health cannot gate websocket startup',
       );
-      this.statsTimer = setInterval(() => this.logStats(), STATS_INTERVAL_MS);
-      return;
+    } else {
+      const started = Date.now();
+      const clients = await Promise.all(
+        Array.from({ length: MIN_POOL_CLIENTS }, () => this.pool().connect()),
+      );
+      clients.forEach((client) => client.release());
+      this.logger.info(
+        `warmed ${MIN_POOL_CLIENTS} GraphQL db connections role=primary in ${Date.now() - started}ms`,
+      );
     }
-    const started = Date.now();
-    const clients = await Promise.all(
-      Array.from({ length: MIN_POOL_CLIENTS }, () => this.pool().connect()),
-    );
-    clients.forEach((client) => client.release());
-    this.logger.info(
-      `warmed ${MIN_POOL_CLIENTS} GraphQL db connections role=primary in ${Date.now() - started}ms`,
-    );
     this.statsTimer = setInterval(() => this.logStats(), STATS_INTERVAL_MS);
   }
 
   async close(): Promise<void> {
     if (this.statsTimer) clearInterval(this.statsTimer);
     const { livePool, mainPool } = this;
-    const shutdowns = [
-      ...[...this.listeners].map((client) => () => client.end()),
-      ...(livePool ? [() => livePool.end()] : []),
-      ...(mainPool ? [() => mainPool.end()] : []),
-    ];
+    const resources = [...this.listeners, livePool, mainPool];
     this.listeners.clear();
     const results = await Promise.allSettled(
-      shutdowns.map((shutdown) => Promise.resolve().then(shutdown)),
+      resources.map(async (resource) => {
+        await resource?.end();
+      }),
     );
     const failures = results.flatMap((result) =>
       result.status === 'rejected' ? [result.reason] : [],
@@ -158,14 +111,7 @@ export class DbService implements ScraperDbDatabase {
     text: string,
     values: unknown[] = [],
   ): Promise<T[]> {
-    return this.run(
-      this.pool(),
-      config.DATABASE_READ_REPLICA_URL
-        ? DatabaseQueryRole.GraphqlReplica
-        : DatabaseQueryRole.GraphqlPrimary,
-      text,
-      values,
-    );
+    return this.run(this.pool(), this.mainRole, text, values);
   }
 
   queryLive<T extends pg.QueryResultRow>(
@@ -182,10 +128,9 @@ export class DbService implements ScraperDbDatabase {
   ): Promise<() => Promise<void>> {
     const client = new pg.Client(databaseOptions(config.DATABASE_URL));
     let stopped = false;
-    let disconnected = false;
     const disconnect = (error?: Error): void => {
-      if (stopped || disconnected) return;
-      disconnected = true;
+      if (stopped) return;
+      stopped = true;
       this.listeners.delete(client);
       onDisconnect(error);
     };
@@ -219,9 +164,7 @@ export class DbService implements ScraperDbDatabase {
     const replicaUrl = config.DATABASE_READ_REPLICA_URL;
     this.mainPool ??= this.createPool(
       replicaUrl ?? config.DATABASE_URL,
-      replicaUrl
-        ? DatabaseQueryRole.GraphqlReplica
-        : DatabaseQueryRole.GraphqlPrimary,
+      this.mainRole,
       MIN_POOL_CLIENTS,
       replicaUrl ? config.DATABASE_QUERY_TIMEOUT_MS : undefined,
     );
@@ -229,11 +172,13 @@ export class DbService implements ScraperDbDatabase {
   }
 
   private async validateEventStreamSchema(): Promise<void> {
-    const [schema] = await this.queryLive<EventStreamSchema>(
+    const [schema] = await this.queryLive<Record<string, boolean>>(
       EVENT_STREAM_SCHEMA_QUERY,
     );
     assert(schema, 'Missing event stream schema result');
-    const invalid = EVENT_STREAM_SCHEMA_CHECKS.filter((name) => !schema[name]);
+    const invalid = EVENT_STREAM_SCHEMA_CHECKS.filter(
+      (name) => schema[name] !== true,
+    ).sort();
     assert(
       invalid.length === 0,
       `Event stream schema is not ready: ${invalid.join(', ')}`,
@@ -352,7 +297,7 @@ function json(value: unknown): string {
 }
 
 function queryDetails(text: string, values: unknown[]): string {
-  return `sql=${text.replaceAll(/\s+/g, ' ').trim()} values=${json(values)}`;
+  return `sql=${text.replaceAll(WHITESPACE_REGEX, ' ').trim()} values=${json(values)}`;
 }
 
 function logValue(value: unknown): unknown {
