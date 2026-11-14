@@ -6,10 +6,13 @@
 
 - Dispatch indexing read each message from its finalized `Dispatch` event, matched by the message ID the Mailbox stores (`dispatched_id`), because Mailbox state version 4 no longer stores dispatched messages.
 
+- Finalized-event indexing matched every record of a block in one pass over that block's archive rows, 200 rows per `finalizedEvents` page (Rusk's maximum), instead of rescanning the block from its first row for each record. A block of 256 dispatches took 3 pages instead of 4,224.
+- Archive scan positions were kept in `eventCursorDir`, about one per 200 rows, so a restart resumed near the block it needed instead of at the contract's first row. A position was reused only after the archive returned the row it was taken from, unchanged.
 - Startup refused a Mailbox below `state_version` 4 with an explicit error, instead of every dispatch fetch failing later with an unexplained HTTP 500.
 
 ### Fixed
 
+- A lookup that ran ahead of the archive, between the node finalizing a block and the archive inserting its rows, kept its scan position instead of sending the next scan back to the contract's first row.
 - The `process` simulation passed only on the encoding of the `()` that `process` returns. Any other success reply, such as a proxy's error page sent with status 200, failed the simulation instead of letting the transaction burn its gas limit.
 - Response bodies were cut to 1 KiB before they went into errors or logs, instead of being copied in whole, up to 4 MiB.
 

@@ -24,6 +24,13 @@ use url::Url;
 const CONTRACT: [u8; 32] = [2; 32];
 const HEIGHT: u64 = 85;
 const ORIGIN: u32 = 4242;
+/// Rusk 1.7.3 clamps `finalizedEvents(limit)` to this many rows.
+const RUSK_MAX_PAGE: usize = 200;
+/// Rows that fill the first archive page and leave the second one row.
+const PAGE_BOUNDARY_PREFIX: usize = RUSK_MAX_PAGE - 1;
+/// Earlier rows spanning two pages, so a scan records a position inside
+/// them.
+const OLDER_HISTORY_ROWS: usize = 2 * RUSK_MAX_PAGE;
 
 #[derive(Clone, Copy, Debug)]
 enum Kind {
@@ -229,6 +236,11 @@ impl Fixture {
                                 text.strip_prefix("v1:").unwrap().parse::<i64>().unwrap()
                             })
                             .unwrap_or(-1);
+                        let limit = query
+                            .split_once("limit: ")
+                            .and_then(|(_, text)| text.split(|c: char| !c.is_ascii_digit()).next())
+                            .map_or(50, |limit| limit.parse::<usize>().unwrap())
+                            .clamp(1, RUSK_MAX_PAGE);
                         worker_requests.lock().unwrap().push(after);
                         let pending: Vec<_> = worker_rows
                             .lock()
@@ -237,8 +249,8 @@ impl Fixture {
                             .filter(|r| r["id"].as_i64().unwrap() > after)
                             .cloned()
                             .collect();
-                        let has_next = pending.len() > 16;
-                        let page: Vec<_> = pending.into_iter().take(16).collect();
+                        let has_next = pending.len() > limit;
+                        let page: Vec<_> = pending.into_iter().take(limit).collect();
                         let start = page.first().map(|r| cursor(r["id"].as_i64().unwrap()));
                         let end = page.last().map(|r| cursor(r["id"].as_i64().unwrap()));
                         json!({"finalizedEvents":{"json":{"events":page,"startCursor":start,"endCursor":end,"hasNextPage":has_next}}})
@@ -423,7 +435,7 @@ async fn igp_same_block_reverse_hash_order() {
 }
 #[tokio::test]
 async fn dispatch_reverse_hash_order_across_archive_page_boundary() {
-    must_read(Kind::Dispatch, true, 15, 0..=1, false).await;
+    must_read(Kind::Dispatch, true, PAGE_BOUNDARY_PREFIX, 0..=1, false).await;
 }
 #[tokio::test]
 async fn dispatch_reverse_hash_order_later_sequence_first() {
@@ -436,7 +448,7 @@ async fn dispatch_reverse_hash_order_by_transaction_hash() {
 
 #[tokio::test]
 async fn same_client_can_read_earlier_same_block_sequence_after_later_one() {
-    let fixture = Fixture::start(Kind::Dispatch, true, 15);
+    let fixture = Fixture::start(Kind::Dispatch, true, PAGE_BOUNDARY_PREFIX);
     let rues = fixture.client();
     for sequence in [1, 0, 1, 0] {
         let logs = read(Kind::Dispatch, rues.clone(), sequence..=sequence, None)
@@ -453,7 +465,7 @@ async fn same_client_can_read_earlier_same_block_sequence_after_later_one() {
 
 #[tokio::test]
 async fn concurrent_same_block_lookups_keep_each_rows_provenance() {
-    let fixture = Fixture::start(Kind::Dispatch, true, 15);
+    let fixture = Fixture::start(Kind::Dispatch, true, PAGE_BOUNDARY_PREFIX);
     let rues = fixture.client();
     let (first, second) = tokio::join!(
         read(Kind::Dispatch, rues.clone(), 0..=0, None),
@@ -469,7 +481,8 @@ async fn concurrent_same_block_lookups_keep_each_rows_provenance() {
 
 #[tokio::test]
 async fn same_block_replay_reuses_the_cursor_after_older_blocks() {
-    let fixture = Fixture::start_with_prefix_height(Kind::Dispatch, true, 40, HEIGHT - 1);
+    let fixture =
+        Fixture::start_with_prefix_height(Kind::Dispatch, true, OLDER_HISTORY_ROWS, HEIGHT - 1);
     let rues = fixture.client();
     for sequence in [0, 1] {
         let logs = read(Kind::Dispatch, rues.clone(), sequence..=sequence, None)
@@ -481,9 +494,11 @@ async fn same_block_replay_reuses_the_cursor_after_older_blocks() {
             h512(tx_hash(sequence as usize, true))
         );
     }
+    // The second lookup resumes at the last older-block row (ID 399), which
+    // it checks is unchanged, so it sees every row of the block again.
     assert_eq!(
         *fixture.archive_requests.lock().unwrap(),
-        vec![-1, 15, 31, 39],
+        vec![-1, 199, 399, 398],
         "same-block lookup must retain earlier peers without replaying older-block history"
     );
 }
@@ -505,14 +520,16 @@ async fn a_missing_row_cannot_pin_a_cursor_past_repaired_archive_rows() {
             .await
             .unwrap_or_else(|e| panic!("{kind:?} must recover after a failed archive lookup: {e}"));
         assert_eq!(logs[0].transaction_id, h512(tx_hash(0, true)));
-        assert_eq!(*fixture.archive_requests.lock().unwrap(), vec![-1, -1]);
+        // The miss kept its position after row 1000. The repaired archive has
+        // no such row, so the retry starts over instead of skipping rows 0-1.
+        assert_eq!(*fixture.archive_requests.lock().unwrap(), vec![-1, 999, -1]);
     }
 }
 
 #[tokio::test]
 async fn a_successful_lookup_hint_is_discarded_when_archive_ids_are_rebuilt() {
     for kind in [Kind::Dispatch, Kind::Process, Kind::Merkle, Kind::Igp] {
-        let fixture = Fixture::start_with_prefix_height(kind, true, 40, HEIGHT - 1);
+        let fixture = Fixture::start_with_prefix_height(kind, true, OLDER_HISTORY_ROWS, HEIGHT - 1);
         let rues = fixture.client();
         assert_eq!(
             read(kind, rues.clone(), 0..=0, None).await.unwrap().len(),
@@ -525,16 +542,15 @@ async fn a_successful_lookup_hint_is_discarded_when_archive_ids_are_rebuilt() {
                 row["id"] = json!(index);
             }
         }
-        // The bounded first lookup may exhaust the stale prefix, but the next
-        // retry on this same client must replay the repaired endpoint.
-        assert!(read(kind, rues.clone(), 1..=1, None).await.is_err());
+        // The saved position names row 399, which the rebuilt archive does
+        // not have: the same lookup starts over and finds the renumbered row.
         let logs = read(kind, rues, 1..=1, None)
             .await
             .unwrap_or_else(|e| panic!("{kind:?} stale successful hint must not pin retries: {e}"));
         assert_eq!(logs[0].transaction_id, h512(tx_hash(1, true)));
         assert_eq!(
             *fixture.archive_requests.lock().unwrap(),
-            vec![-1, 15, 31, 39, -1]
+            vec![-1, 199, 399, 398, -1]
         );
     }
 }

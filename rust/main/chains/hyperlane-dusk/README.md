@@ -23,6 +23,14 @@ how to run the local bridge.
   every agent process needs its own copy of. The Mailbox stores only the ID of
   each dispatched message (`dispatched_id`); the message itself comes from the
   finalized `Dispatch` event whose message hashes to that ID.
+- **Archive scans** read a contract's `finalizedEvents` 200 rows at a time
+  (Rusk's maximum) and match every record of a block in one pass over that
+  block's rows. Each scan starts from a saved position just before the block,
+  kept in `eventCursorDir` (about one per 200 rows), so a restart or an archive
+  that lags behind finality does not send the scan back to the contract's
+  first row. Before reusing a position, the scan checks that the archive still
+  has the row it was taken from, unchanged; if not, the archive was rebuilt,
+  and the contract's positions are dropped and the scan starts over.
 - **Writes** are Moonlight transactions built and signed by the `dusk-tx`
   helper from the companion repository. The agent runs it as a subprocess
   (`DUSK_TX_BIN`, or `dusk-tx` on `PATH`) and passes the RPC URL and signing

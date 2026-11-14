@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::{Mutex as StdMutex, OnceLock};
+use std::sync::{Mutex as StdMutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use base64::engine::{general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -12,9 +12,10 @@ use rkyv::ser::serializers::AllocSerializer;
 use rkyv::ser::Serializer;
 use rkyv::validation::validators::DefaultValidator;
 use rkyv::{check_archived_root, Archive, Deserialize, Infallible, Serialize};
-use rocksdb::{Options, WriteBatch, WriteOptions, DB};
+use rocksdb::{Direction, IteratorMode, Options, WriteBatch, WriteOptions, DB};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 use serde_json::Value as JsonValue;
+use tracing::warn;
 use url::Url;
 
 use hyperlane_core::{ReorgPeriod, H256, H512};
@@ -22,8 +23,12 @@ use hyperlane_core::{ReorgPeriod, H256, H512};
 use crate::HyperlaneDuskError;
 
 const MAX_RUES_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
-const FINALIZED_EVENT_PAGE_SIZE: usize = 16;
+/// Rows per `finalizedEvents` page: the most Rusk 1.7.3 returns
+/// (`MAX_LIMIT` in its GraphQL archive module).
+const FINALIZED_EVENT_PAGE_SIZE: usize = 200;
 const MAX_EVENT_TOPIC_BYTES: usize = 256;
+/// Archive rows of one contract between two persisted scan anchors.
+const SCAN_ANCHOR_SPACING: u64 = FINALIZED_EVENT_PAGE_SIZE as u64;
 /// Most bytes of a response body that go into an error or a log line.
 const MAX_ERROR_BODY_BYTES: usize = 1024;
 /// First Mailbox state version that stores only dispatched message IDs
@@ -43,8 +48,9 @@ static SHARED_RUES_CLIENTS: OnceLock<StdMutex<SharedRuesClients>> = OnceLock::ne
 pub struct RuesClient {
     client: reqwest::Client,
     base_url: Url,
-    finalized_event_caches: Arc<tokio::sync::Mutex<HashMap<[u8; 32], FinalizedEventCache>>>,
     event_store: Option<Arc<DB>>,
+    /// Serializes read-modify-write updates of the persisted scan anchors.
+    scan_anchors: Arc<StdMutex<()>>,
 }
 
 impl fmt::Debug for RuesClient {
@@ -122,22 +128,58 @@ struct FinalizedEventPage {
     has_next_page: bool,
 }
 
-#[derive(Debug, Clone, Default)]
-struct FinalizedEventCache {
-    /// Each topic retains only a cursor before its last requested block.
-    /// Same-block peers can then be found in any archive order without an
-    /// unbounded pending-event buffer. These endpoint-owned hints are
-    /// process-local and rebuilt from genesis after restart.
-    scans: HashMap<String, FinalizedEventScan>,
+/// A persisted position in one contract's archive rows, just after the row
+/// `fence_id`. Every row up to and including that row has a block height
+/// below `before_block`, so a scan for any block at or above it may start
+/// here instead of at the contract's first row.
+///
+/// Anchors only decide where a scan starts, never whether a row is accepted.
+/// Archive IDs belong to the endpoint's archive: a rebuilt or replaced archive
+/// may number its rows differently. A scan that resumes from an anchor must
+/// therefore see the fence row first, unchanged; otherwise the contract's
+/// anchors are dropped and the scan starts over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScanAnchor {
+    before_block: u64,
+    /// Archive ID of the last row before the position.
+    fence_id: i64,
+    /// keccak256 of that row as the archive returned it.
+    fence_digest: [u8; 32],
+    /// How many of the contract's rows precede the position.
+    rank: u64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct FinalizedEventScan {
-    cursor: Option<String>,
-    last_id: Option<i64>,
-    /// Every row before this cursor had a height below this bound.
-    before_block: u64,
+impl ScanAnchor {
+    const ENCODED_LEN: usize = 8 + 8 + 32 + 8;
+
+    fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(Self::ENCODED_LEN);
+        bytes.extend_from_slice(&self.before_block.to_be_bytes());
+        bytes.extend_from_slice(&self.fence_id.to_be_bytes());
+        bytes.extend_from_slice(&self.fence_digest);
+        bytes.extend_from_slice(&self.rank.to_be_bytes());
+        bytes
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != Self::ENCODED_LEN {
+            return None;
+        }
+        let (before_block, rest) = bytes.split_at(8);
+        let (fence_id, rest) = rest.split_at(8);
+        let (fence_digest, rank) = rest.split_at(32);
+        let anchor = Self {
+            before_block: u64::from_be_bytes(before_block.try_into().ok()?),
+            fence_id: i64::from_be_bytes(fence_id.try_into().ok()?),
+            fence_digest: fence_digest.try_into().ok()?,
+            rank: u64::from_be_bytes(rank.try_into().ok()?),
+        };
+        (anchor.fence_id >= 0 && anchor.rank > 0).then_some(anchor)
+    }
 }
+
+/// The rows of one block that a scan matched, keyed by sequence.
+type ScannedRows = HashMap<usize, FinalizedContractEvent>;
 
 /// Row-owned provenance for one finalized, state-matched contract event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,14 +213,15 @@ impl RuesClient {
         Ok(Self {
             client,
             base_url,
-            finalized_event_caches: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             event_store: None,
+            scan_anchors: Arc::new(StdMutex::new(())),
         })
     }
 
-    /// Create a RUES client whose validated contract event rows survive
-    /// restart. Endpoint-owned cursors are rebuilt from genesis. The
-    /// configured directory must be owned by one agent process.
+    /// Create a RUES client whose validated contract event rows and archive
+    /// scan positions survive restart. A scan position is checked against
+    /// the archive before it is reused. The configured directory must be
+    /// owned by one agent process.
     pub fn new_with_event_cursor_dir(
         url: Url,
         event_cursor_dir: PathBuf,
@@ -502,213 +545,392 @@ impl RuesClient {
         Ok(payload.get("data").cloned().unwrap_or(payload))
     }
 
-    /// Match one contract-state record to its finalized archive event.
+    /// Match the contract-state records of one block to their finalized
+    /// archive events, reading the block's archive rows once.
     ///
-    /// Archive IDs order transactions by hash within a block, not by contract
-    /// execution sequence. Only the expected height, topic and complete event
-    /// data identify the requested row; sequence names its durable local key.
-    pub(crate) async fn finalized_contract_event(
+    /// `matching_sequences(data)` must return the sequences among `sequences`
+    /// whose contract state implies exactly this event data. For each
+    /// sequence, the first finalized, non-reverted row of `topic` at
+    /// `block_height` that it is assigned becomes the record. Archive IDs
+    /// order a block's rows by transaction hash, not by contract execution,
+    /// so the sequence, not the row's position, names the durable record.
+    ///
+    /// Each record's block must pass `checkBlock(onlyFinalized)`. A record
+    /// persisted by an earlier lookup is checked against `matching_sequences`
+    /// and `checkBlock` again before it is served, and dropped when it no
+    /// longer matches. Returns one match per sequence, in the order given.
+    pub(crate) async fn finalized_contract_events_at_block<F>(
         &self,
         contract_id: &[u8; 32],
         topic: &str,
-        sequence: usize,
-        expected_block_height: u64,
-        expected_data: &[u8],
-    ) -> Result<FinalizedEventProvenance, HyperlaneDuskError> {
-        self.finalized_contract_event_matching(
-            contract_id,
-            topic,
-            sequence,
-            expected_block_height,
-            |data| data == expected_data,
-        )
-        .await
-        .map(|matched| matched.provenance)
-    }
-
-    /// Match one contract-state record to the finalized archive event whose
-    /// data satisfies `is_match`, and return that data with its provenance.
-    ///
-    /// For records whose contract state commits to the event data only
-    /// indirectly, for example by hash. `is_match` must accept only the data
-    /// that contract state implies for this sequence: the first finalized row
-    /// at the expected height and topic that it accepts becomes the record.
-    /// A persisted row must pass `is_match` again before it is served, and is
-    /// dropped when it no longer does.
-    pub(crate) async fn finalized_contract_event_matching<F>(
-        &self,
-        contract_id: &[u8; 32],
-        topic: &str,
-        sequence: usize,
-        expected_block_height: u64,
-        is_match: F,
-    ) -> Result<FinalizedEventMatch, HyperlaneDuskError>
+        block_height: u64,
+        sequences: &[usize],
+        matching_sequences: F,
+    ) -> Result<Vec<FinalizedEventMatch>, HyperlaneDuskError>
     where
-        F: Fn(&[u8]) -> bool + Send + Sync,
+        F: Fn(&[u8]) -> Vec<usize> + Send + Sync,
     {
-        if let Some(event) = self.load_finalized_event(contract_id, topic, sequence)? {
-            let result = self
-                .validate_finalized_event(
-                    contract_id,
-                    topic,
-                    sequence,
-                    expected_block_height,
-                    &is_match,
-                    event,
-                )
-                .await;
-            if matches!(&result, Err(HyperlaneDuskError::FinalizedEventMismatch(_))) {
-                self.invalidate_finalized_event(contract_id, topic, sequence)
-                    .await?;
+        let mut rows = HashMap::new();
+        let mut stale = Vec::new();
+        let mut first_mismatch = None;
+        for &sequence in sequences {
+            let Some(event) = self.load_finalized_event(contract_id, topic, sequence)? else {
+                continue;
+            };
+            match check_event_against_state(
+                contract_id,
+                topic,
+                sequence,
+                block_height,
+                &matching_sequences,
+                &event,
+            ) {
+                Ok(()) => {
+                    rows.insert(sequence, event);
+                }
+                Err(error) => {
+                    stale.push(sequence);
+                    first_mismatch.get_or_insert(error);
+                }
             }
-            return result;
+        }
+        if let Some(error) = first_mismatch {
+            self.invalidate_finalized_events(contract_id, topic, &stale)?;
+            return Err(error);
         }
 
-        let original_scan = {
-            let mut caches = self.finalized_event_caches.lock().await;
-            caches
-                .entry(*contract_id)
-                .or_default()
-                .scans
-                .entry(topic.to_owned())
-                .or_default()
-                .clone()
-        };
-        // A cursor before a later block says nothing about an earlier request.
-        let mut scan = if expected_block_height < original_scan.before_block {
-            FinalizedEventScan::default()
-        } else {
-            original_scan.clone()
-        };
-        let mut anchor = scan.clone();
-        anchor.before_block = expected_block_height;
-        let mut reached_block = false;
-
-        loop {
-            let page = self
-                .finalized_event_page(contract_id, scan.cursor.as_deref())
+        let wanted: HashSet<usize> = sequences
+            .iter()
+            .copied()
+            .filter(|sequence| !rows.contains_key(sequence))
+            .collect();
+        let mut scanned = HashSet::new();
+        if !wanted.is_empty() {
+            let found = self
+                .scan_block_rows(
+                    contract_id,
+                    topic,
+                    block_height,
+                    &wanted,
+                    &matching_sequences,
+                )
                 .await?;
-            validate_finalized_event_page(
-                contract_id,
-                scan.cursor.as_deref(),
-                scan.last_id,
-                &page,
-            )?;
-            let has_next_page = page.has_next_page;
-            let mut candidate = None;
-            for event in page.events {
-                scan.last_id = Some(event.id);
-                scan.cursor = Some(canonical_event_cursor(event.id));
+            scanned.extend(found.keys().copied());
+            rows.extend(found);
+        }
 
-                // Advance only over a prefix entirely below the target height.
-                // Freeze the anchor before its first same-height (or later)
-                // peer, even if the matching row is on a later page. Subsequent
-                // requests for this block must still see earlier archive rows.
-                if !reached_block {
-                    if event.block_height < expected_block_height {
-                        anchor.last_id = scan.last_id;
-                        anchor.cursor = scan.cursor.clone();
-                    } else {
-                        reached_block = true;
-                    }
+        // Every row of one block names the same block, so one check serves
+        // them all. A transport failure keeps persisted rows for a retry.
+        let mut block_checks: HashMap<(u64, String), bool> = HashMap::new();
+        let mut matches = HashMap::new();
+        let mut unfinalized = Vec::new();
+        let mut first_unfinalized = None;
+        for &sequence in sequences {
+            let Some(event) = rows.get(&sequence) else {
+                continue;
+            };
+            let block_hash = parse_h256_hex(&event.block_hash, "finalized event block hash")?;
+            let block = (
+                event.block_height,
+                strip_hex_prefix(&event.block_hash).to_owned(),
+            );
+            let finalized = match block_checks.get(&block) {
+                Some(finalized) => *finalized,
+                None => {
+                    let finalized = self.check_finalized_block(block.0, &block.1).await?;
+                    block_checks.insert(block, finalized);
+                    finalized
                 }
-                if !event.reverted
-                    && event.topic == topic
-                    && event.block_height == expected_block_height
-                    && hex::decode(strip_hex_prefix(&event.data))
-                        .is_ok_and(|data| is_match(data.as_slice()))
-                {
-                    let mut event = event;
-                    event.id = i64::try_from(sequence).map_err(|_| {
-                        HyperlaneDuskError::Other(
-                            "Dusk finalized-event sequence exceeds i64 provenance range".into(),
-                        )
-                    })?;
-                    candidate = Some(event);
-                    break;
-                }
+            };
+            if !finalized {
+                unfinalized.push(sequence);
+                first_unfinalized.get_or_insert_with(|| {
+                    HyperlaneDuskError::FinalizedEventMismatch(format!(
+                        "Finalized Dusk event block {}/{} failed checkBlock",
+                        event.block_height, event.block_hash
+                    ))
+                });
+                continue;
             }
+            matches.insert(sequence, finalized_event_match(event, block_hash)?);
+        }
+        if let Some(error) = first_unfinalized {
+            self.invalidate_finalized_events(contract_id, topic, &unfinalized)?;
+            return Err(error);
+        }
 
-            if let Some(event) = candidate {
-                let result = self
-                    .validate_finalized_event(
-                        contract_id,
-                        topic,
-                        sequence,
-                        expected_block_height,
-                        &is_match,
-                        event.clone(),
-                    )
-                    .await;
-                let matched = match result {
-                    Ok(matched) => matched,
-                    Err(error) => {
-                        if matches!(&error, HyperlaneDuskError::FinalizedEventMismatch(_)) {
-                            self.invalidate_finalized_event(contract_id, topic, sequence)
-                                .await?;
-                        }
-                        return Err(error);
-                    }
-                };
-                // Only this independently state/checkBlock-validated row is
-                // durable. Page peers and cursor hints never gain authority.
-                self.persist_finalized_event(contract_id, topic, sequence, &event)?;
-                self.remember_finalized_event_scan(contract_id, topic, &original_scan, anchor)
-                    .await;
-                return Ok(matched);
-            }
-            if !has_next_page {
-                // Archive IDs are endpoint-local hints. A repaired or replaced
-                // endpoint may assign lower IDs; exhaustion must let the next
-                // retry replay from genesis on this same client.
-                self.forget_finalized_event_scan(contract_id, topic, &original_scan)
-                    .await;
+        // Only rows that passed the state and checkBlock checks are durable.
+        // Page peers and scan anchors never gain authority.
+        let fresh: Vec<(usize, &FinalizedContractEvent)> = sequences
+            .iter()
+            .filter(|sequence| scanned.contains(*sequence))
+            .filter_map(|sequence| rows.get(sequence).map(|event| (*sequence, event)))
+            .collect();
+        self.persist_finalized_events(contract_id, topic, &fresh)?;
+
+        let mut ordered = Vec::with_capacity(sequences.len());
+        for sequence in sequences {
+            let Some(matched) = matches.remove(sequence) else {
                 return Err(HyperlaneDuskError::Other(format!(
                     "Finalized Dusk event {}/{topic} sequence {sequence} matching contract state is not archived yet",
                     hex::encode(contract_id)
                 )));
+            };
+            ordered.push(matched);
+        }
+        Ok(ordered)
+    }
+
+    /// Scan the contract's archive rows once for the rows of `block_height`
+    /// that `matching_sequences` assigns to the `wanted` sequences, starting
+    /// at the closest persisted anchor below the block.
+    async fn scan_block_rows<F>(
+        &self,
+        contract_id: &[u8; 32],
+        topic: &str,
+        block_height: u64,
+        wanted: &HashSet<usize>,
+        matching_sequences: &F,
+    ) -> Result<ScannedRows, HyperlaneDuskError>
+    where
+        F: Fn(&[u8]) -> Vec<usize> + Sync,
+    {
+        let start = self.scan_anchor_at_or_below(contract_id, block_height)?;
+        if let Some(rows) = self
+            .scan_from(
+                contract_id,
+                topic,
+                block_height,
+                start,
+                wanted,
+                matching_sequences,
+            )
+            .await?
+        {
+            return Ok(rows);
+        }
+        // The anchor's fence row is gone or changed, so the endpoint's
+        // archive is not the one the anchors were taken from.
+        warn!(
+            contract = %hex::encode(contract_id),
+            "Dusk archive rows were renumbered; rescanning the contract's events from the start"
+        );
+        self.forget_scan_anchors(contract_id)?;
+        self.scan_from(
+            contract_id,
+            topic,
+            block_height,
+            None,
+            wanted,
+            matching_sequences,
+        )
+        .await?
+        .ok_or_else(|| {
+            HyperlaneDuskError::Other(
+                "Dusk archive scan without an anchor found a stale anchor".into(),
+            )
+        })
+    }
+
+    /// One pass over the contract's archive rows from `start`, or from its
+    /// first row. Stops once every wanted sequence has a row, or at the end
+    /// of the archive. Returns `None` when `start`'s fence row is not the
+    /// first row returned.
+    ///
+    /// A row the archive has not inserted yet is not an error here: the
+    /// caller reports it, and the next lookup resumes from the anchors this
+    /// pass records instead of from the first row.
+    async fn scan_from<F>(
+        &self,
+        contract_id: &[u8; 32],
+        topic: &str,
+        block_height: u64,
+        start: Option<ScanAnchor>,
+        wanted: &HashSet<usize>,
+        matching_sequences: &F,
+    ) -> Result<Option<ScannedRows>, HyperlaneDuskError>
+    where
+        F: Fn(&[u8]) -> Vec<usize> + Sync,
+    {
+        let mut found = ScannedRows::new();
+        let start_before = start.map_or(0, |anchor| anchor.before_block);
+        let mut rank = start.map_or(0, |anchor| anchor.rank);
+        let mut highest_block = None;
+        let mut last_row = None;
+        // The cursor just before the fence row, so the first page starts
+        // with it.
+        let mut previous_id =
+            start.and_then(|anchor| anchor.fence_id.checked_sub(1).filter(|id| *id >= 0));
+        let mut fence = start;
+        loop {
+            let cursor = previous_id.map(canonical_event_cursor);
+            let page = self
+                .finalized_event_page(contract_id, cursor.as_deref())
+                .await?;
+            validate_finalized_event_page(contract_id, cursor.as_deref(), previous_id, &page)?;
+            let has_next_page = page.has_next_page;
+            let mut events = page.events.into_iter();
+            if let Some(anchor) = fence.take() {
+                let Some(first) = events.next() else {
+                    return Ok(None);
+                };
+                if first.id != anchor.fence_id || archive_row_digest(&first)? != anchor.fence_digest
+                {
+                    return Ok(None);
+                }
+                previous_id = Some(first.id);
+            }
+
+            let mut complete = false;
+            for event in events {
+                previous_id = Some(event.id);
+                rank = rank.saturating_add(1);
+                let highest = highest_block.map_or(event.block_height, |height: u64| {
+                    height.max(event.block_height)
+                });
+                highest_block = Some(highest);
+                if rank % SCAN_ANCHOR_SPACING == 0 {
+                    self.offer_scan_anchor(
+                        contract_id,
+                        ScanAnchor {
+                            before_block: start_before.max(highest.saturating_add(1)),
+                            fence_id: event.id,
+                            fence_digest: archive_row_digest(&event)?,
+                            rank,
+                        },
+                    )?;
+                }
+                if !event.reverted && event.topic == topic && event.block_height == block_height {
+                    if let Ok(data) = hex::decode(strip_hex_prefix(&event.data)) {
+                        for sequence in matching_sequences(&data) {
+                            if wanted.contains(&sequence) && !found.contains_key(&sequence) {
+                                let mut row = event.clone();
+                                row.id = i64::try_from(sequence).map_err(|_| {
+                                    HyperlaneDuskError::Other(
+                                        "Dusk finalized-event sequence exceeds i64 provenance range"
+                                            .into(),
+                                    )
+                                })?;
+                                found.insert(sequence, row);
+                            }
+                        }
+                    }
+                }
+                last_row = Some(event);
+                if found.len() == wanted.len() {
+                    complete = true;
+                    break;
+                }
+            }
+
+            if complete || !has_next_page {
+                if let (Some(event), Some(highest)) = (last_row, highest_block) {
+                    self.offer_scan_anchor(
+                        contract_id,
+                        ScanAnchor {
+                            before_block: start_before.max(highest.saturating_add(1)),
+                            fence_id: event.id,
+                            fence_digest: archive_row_digest(&event)?,
+                            rank,
+                        },
+                    )?;
+                }
+                return Ok(Some(found));
             }
         }
     }
 
-    /// Save a bounded replay hint without overwriting a concurrent lookup's
-    /// progress or moving an existing hint back for an older-block request.
-    async fn remember_finalized_event_scan(
+    /// The anchor a scan for `block_height` should start from: the one with
+    /// the highest `before_block` at or below the height.
+    fn scan_anchor_at_or_below(
         &self,
         contract_id: &[u8; 32],
-        topic: &str,
-        original: &FinalizedEventScan,
-        anchor: FinalizedEventScan,
-    ) {
-        let mut caches = self.finalized_event_caches.lock().await;
-        let current = caches
-            .entry(*contract_id)
-            .or_default()
-            .scans
-            .entry(topic.to_owned())
-            .or_default();
-        if current == original && anchor.before_block >= current.before_block {
-            *current = anchor;
+        block_height: u64,
+    ) -> Result<Option<ScanAnchor>, HyperlaneDuskError> {
+        let store = self.event_store()?;
+        let prefix = scan_anchor_prefix(contract_id);
+        let seek = scan_anchor_key(contract_id, block_height);
+        for entry in store.iterator(IteratorMode::From(&seek, Direction::Reverse)) {
+            let (key, value) = entry.map_err(|error| {
+                HyperlaneDuskError::Other(format!(
+                    "Failed to read Dusk archive scan anchors: {error}"
+                ))
+            })?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            match ScanAnchor::decode(&value) {
+                Some(anchor) if *key == *scan_anchor_key(contract_id, anchor.before_block) => {
+                    return Ok(Some(anchor));
+                }
+                // A hint that does not decode is dropped, not trusted.
+                _ => store.delete(&key).map_err(|error| {
+                    HyperlaneDuskError::Other(format!(
+                        "Failed to drop an unreadable Dusk archive scan anchor: {error}"
+                    ))
+                })?,
+            }
         }
+        Ok(None)
     }
 
-    async fn forget_finalized_event_scan(
+    /// Persist `anchor` unless an existing anchor serves the same lookups
+    /// from at least as far along. Keeps about one anchor per
+    /// `SCAN_ANCHOR_SPACING` rows: the furthest one recorded in that span.
+    fn offer_scan_anchor(
         &self,
         contract_id: &[u8; 32],
-        topic: &str,
-        original: &FinalizedEventScan,
-    ) {
-        let mut caches = self.finalized_event_caches.lock().await;
-        let current = caches
-            .entry(*contract_id)
-            .or_default()
-            .scans
-            .entry(topic.to_owned())
-            .or_default();
-        // Do not discard progress installed by a concurrent successful lookup.
-        if current == original {
-            *current = FinalizedEventScan::default();
+        anchor: ScanAnchor,
+    ) -> Result<(), HyperlaneDuskError> {
+        let _guard = self
+            .scan_anchors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut batch = WriteBatch::default();
+        if let Some(previous) = self.scan_anchor_at_or_below(contract_id, anchor.before_block)? {
+            if previous.rank >= anchor.rank {
+                return Ok(());
+            }
+            let span = |rank: u64| rank.saturating_sub(1) / SCAN_ANCHOR_SPACING;
+            if span(previous.rank) == span(anchor.rank) {
+                batch.delete(scan_anchor_key(contract_id, previous.before_block));
+            }
         }
+        batch.put(
+            scan_anchor_key(contract_id, anchor.before_block),
+            anchor.encode(),
+        );
+        self.event_store()?.write(batch).map_err(|error| {
+            HyperlaneDuskError::Other(format!(
+                "Failed to persist a Dusk archive scan anchor: {error}"
+            ))
+        })
+    }
+
+    /// Drop every scan anchor of a contract. The next scan starts from the
+    /// contract's first archive row.
+    fn forget_scan_anchors(&self, contract_id: &[u8; 32]) -> Result<(), HyperlaneDuskError> {
+        let _guard = self
+            .scan_anchors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let store = self.event_store()?;
+        let prefix = scan_anchor_prefix(contract_id);
+        let mut batch = WriteBatch::default();
+        for entry in store.iterator(IteratorMode::From(&prefix, Direction::Forward)) {
+            let (key, _) = entry.map_err(|error| {
+                HyperlaneDuskError::Other(format!(
+                    "Failed to read Dusk archive scan anchors: {error}"
+                ))
+            })?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            batch.delete(key);
+        }
+        store.write(batch).map_err(|error| {
+            HyperlaneDuskError::Other(format!("Failed to drop Dusk archive scan anchors: {error}"))
+        })
     }
 
     fn event_store(&self) -> Result<&DB, HyperlaneDuskError> {
@@ -758,28 +980,32 @@ impl RuesClient {
         Ok(Some(event))
     }
 
-    fn persist_finalized_event(
+    /// Durably persist authenticated rows in one synced write.
+    fn persist_finalized_events(
         &self,
         contract_id: &[u8; 32],
         topic: &str,
-        sequence: usize,
-        event: &FinalizedContractEvent,
+        rows: &[(usize, &FinalizedContractEvent)],
     ) -> Result<(), HyperlaneDuskError> {
-        validate_persisted_event(contract_id, topic, event)?;
-        let bytes = serde_json::to_vec(event).map_err(|error| {
-            HyperlaneDuskError::Other(format!("Failed to encode Dusk finalized event: {error}"))
-        })?;
-        if bytes.len() > MAX_RUES_RESPONSE_BYTES {
-            return Err(HyperlaneDuskError::Other(
-                "Dusk finalized event exceeds the transport bound".into(),
-            ));
+        if rows.is_empty() {
+            return Ok(());
         }
-
         let mut batch = WriteBatch::default();
-        batch.put(
-            finalized_event_row_key(contract_id, topic, sequence)?,
-            bytes,
-        );
+        for (sequence, event) in rows {
+            validate_persisted_event(contract_id, topic, event)?;
+            let bytes = serde_json::to_vec(event).map_err(|error| {
+                HyperlaneDuskError::Other(format!("Failed to encode Dusk finalized event: {error}"))
+            })?;
+            if bytes.len() > MAX_RUES_RESPONSE_BYTES {
+                return Err(HyperlaneDuskError::Other(
+                    "Dusk finalized event exceeds the transport bound".into(),
+                ));
+            }
+            batch.put(
+                finalized_event_row_key(contract_id, topic, *sequence)?,
+                bytes,
+            );
+        }
         let mut write_options = WriteOptions::default();
         write_options.set_sync(true);
         self.event_store()?
@@ -791,29 +1017,31 @@ impl RuesClient {
             })
     }
 
-    async fn invalidate_finalized_event(
+    /// Drop rows that no longer match contract state or finality, together
+    /// with the contract's scan anchors: an endpoint that served them may
+    /// also have served the rows the anchors were taken from.
+    fn invalidate_finalized_events(
         &self,
         contract_id: &[u8; 32],
         topic: &str,
-        sequence: usize,
+        sequences: &[usize],
     ) -> Result<(), HyperlaneDuskError> {
-        let mut caches = self.finalized_event_caches.lock().await;
-        let cache = caches.entry(*contract_id).or_default();
-        cache.scans.remove(topic);
-
+        self.forget_scan_anchors(contract_id)?;
         let mut batch = WriteBatch::default();
-        batch.delete(finalized_event_row_key(contract_id, topic, sequence)?);
+        for sequence in sequences {
+            batch.delete(finalized_event_row_key(contract_id, topic, *sequence)?);
+        }
         let mut write_options = WriteOptions::default();
         write_options.set_sync(true);
         self.event_store()?
             .write_opt(batch, &write_options)
             .map_err(|error| {
                 HyperlaneDuskError::Other(format!(
-                    "Failed to invalidate Dusk finalized event {}/{topic}/{sequence}: {error}",
+                    "Failed to invalidate {} Dusk finalized events {}/{topic}: {error}",
+                    sequences.len(),
                     hex::encode(contract_id)
                 ))
-            })?;
-        Ok(())
+            })
     }
 
     async fn finalized_event_page(
@@ -857,57 +1085,21 @@ impl RuesClient {
         })
     }
 
-    async fn validate_finalized_event<F>(
+    /// `checkBlock(onlyFinalized: true)` for one block.
+    async fn check_finalized_block(
         &self,
-        contract_id: &[u8; 32],
-        topic: &str,
-        sequence: usize,
-        expected_block_height: u64,
-        is_match: &F,
-        event: FinalizedContractEvent,
-    ) -> Result<FinalizedEventMatch, HyperlaneDuskError>
-    where
-        F: Fn(&[u8]) -> bool + Sync,
-    {
-        if event.reverted || event.topic != topic {
-            return Err(HyperlaneDuskError::FinalizedEventMismatch(format!(
-                "Finalized Dusk event {}/{topic} sequence {sequence} is reverted or has the wrong topic",
-                hex::encode(contract_id)
-            )));
-        }
-        if event.block_height != expected_block_height {
-            return Err(HyperlaneDuskError::FinalizedEventMismatch(format!(
-                "Finalized Dusk event {}/{topic} sequence {sequence} has block height {}, contract state says {expected_block_height}",
-                hex::encode(contract_id),
-                event.block_height
-            )));
-        }
-        let data = hex::decode(strip_hex_prefix(&event.data)).map_err(|error| {
-            HyperlaneDuskError::FinalizedEventMismatch(format!(
-                "Finalized Dusk event {}/{topic} sequence {sequence} has invalid data: {error}",
-                hex::encode(contract_id)
+        block_height: u64,
+        block_hash: &str,
+    ) -> Result<bool, HyperlaneDuskError> {
+        let encoded_block_hash = serde_json::to_string(block_hash).map_err(|error| {
+            HyperlaneDuskError::Other(format!(
+                "Failed to encode finalized event block hash: {error}"
             ))
         })?;
-        if !is_match(data.as_slice()) {
-            return Err(HyperlaneDuskError::FinalizedEventMismatch(format!(
-                "Finalized Dusk event {}/{topic} sequence {sequence} does not match contract state",
-                hex::encode(contract_id)
-            )));
-        }
-
-        let block_hash = parse_h256_hex(&event.block_hash, "finalized event block hash")?;
-        let encoded_block_hash = serde_json::to_string(strip_hex_prefix(&event.block_hash))
-            .map_err(|error| {
-                HyperlaneDuskError::Other(format!(
-                    "Failed to encode finalized event block hash: {error}"
-                ))
-            })?;
         let check_query = format!(
-            "query {{ checkBlock(height: {}, hash: {encoded_block_hash}, onlyFinalized: true) }}",
-            event.block_height
+            "query {{ checkBlock(height: {block_height}, hash: {encoded_block_hash}, onlyFinalized: true) }}"
         );
-        let checked = self
-            .graphql_query(&check_query)
+        self.graphql_query(&check_query)
             .await?
             .get("checkBlock")
             .and_then(JsonValue::as_bool)
@@ -915,26 +1107,7 @@ impl RuesClient {
                 HyperlaneDuskError::Other(
                     "Rusk checkBlock response is missing a boolean result".into(),
                 )
-            })?;
-        if !checked {
-            return Err(HyperlaneDuskError::FinalizedEventMismatch(format!(
-                "Finalized Dusk event block {}/{} failed checkBlock",
-                event.block_height, event.block_hash
-            )));
-        }
-
-        let origin = parse_h256_hex(&event.origin, "finalized event origin")?;
-        let mut transaction_id = [0u8; 64];
-        transaction_id[32..].copy_from_slice(origin.as_bytes());
-        Ok(FinalizedEventMatch {
-            provenance: FinalizedEventProvenance {
-                block_height: event.block_height,
-                block_hash,
-                transaction_id: H512::from(transaction_id),
-                event_id: event.id,
-            },
-            data,
-        })
+            })
     }
 
     /// Return the latest block height finalized by the node's consensus view.
@@ -1389,6 +1562,102 @@ fn finalized_event_row_key(
     key.extend_from_slice(&topic_hash);
     key.extend_from_slice(&sequence.to_be_bytes());
     Ok(key)
+}
+
+fn scan_anchor_prefix(contract_id: &[u8; 32]) -> Vec<u8> {
+    let mut key = b"dusk-scan-anchor-v1:".to_vec();
+    key.extend_from_slice(contract_id);
+    key
+}
+
+/// Big-endian heights keep a contract's anchors in height order.
+fn scan_anchor_key(contract_id: &[u8; 32], before_block: u64) -> Vec<u8> {
+    let mut key = scan_anchor_prefix(contract_id);
+    key.extend_from_slice(&before_block.to_be_bytes());
+    key
+}
+
+/// Identify an archive row as the endpoint returned it, ID included.
+fn archive_row_digest(event: &FinalizedContractEvent) -> Result<[u8; 32], HyperlaneDuskError> {
+    let bytes = serde_json::to_vec(event).map_err(|error| {
+        HyperlaneDuskError::Other(format!("Failed to encode a Dusk archive row: {error}"))
+    })?;
+    Ok(hyperlane_dusk_types::message::keccak256(&bytes))
+}
+
+/// Route archive rows to the sequences whose contract state implies exactly
+/// their event bytes. Sequences with identical expected bytes share a row.
+pub(crate) fn exact_event_data(
+    expected: Vec<(usize, Vec<u8>)>,
+) -> impl Fn(&[u8]) -> Vec<usize> + Send + Sync {
+    let mut by_data: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+    for (sequence, data) in expected {
+        by_data.entry(data).or_default().push(sequence);
+    }
+    move |data: &[u8]| by_data.get(data).cloned().unwrap_or_default()
+}
+
+/// The checks a row must pass against contract state before it can be a
+/// sequence's record, whether it comes from the archive or the local store.
+fn check_event_against_state<F>(
+    contract_id: &[u8; 32],
+    topic: &str,
+    sequence: usize,
+    expected_block_height: u64,
+    matching_sequences: &F,
+    event: &FinalizedContractEvent,
+) -> Result<(), HyperlaneDuskError>
+where
+    F: Fn(&[u8]) -> Vec<usize>,
+{
+    if event.reverted || event.topic != topic {
+        return Err(HyperlaneDuskError::FinalizedEventMismatch(format!(
+            "Finalized Dusk event {}/{topic} sequence {sequence} is reverted or has the wrong topic",
+            hex::encode(contract_id)
+        )));
+    }
+    if event.block_height != expected_block_height {
+        return Err(HyperlaneDuskError::FinalizedEventMismatch(format!(
+            "Finalized Dusk event {}/{topic} sequence {sequence} has block height {}, contract state says {expected_block_height}",
+            hex::encode(contract_id),
+            event.block_height
+        )));
+    }
+    let data = hex::decode(strip_hex_prefix(&event.data)).map_err(|error| {
+        HyperlaneDuskError::FinalizedEventMismatch(format!(
+            "Finalized Dusk event {}/{topic} sequence {sequence} has invalid data: {error}",
+            hex::encode(contract_id)
+        ))
+    })?;
+    if !matching_sequences(data.as_slice()).contains(&sequence) {
+        return Err(HyperlaneDuskError::FinalizedEventMismatch(format!(
+            "Finalized Dusk event {}/{topic} sequence {sequence} does not match contract state",
+            hex::encode(contract_id)
+        )));
+    }
+    Ok(())
+}
+
+/// The provenance and data of a row that passed every check.
+fn finalized_event_match(
+    event: &FinalizedContractEvent,
+    block_hash: H256,
+) -> Result<FinalizedEventMatch, HyperlaneDuskError> {
+    let data = hex::decode(strip_hex_prefix(&event.data)).map_err(|error| {
+        HyperlaneDuskError::Other(format!("Finalized Dusk event has invalid data: {error}"))
+    })?;
+    let origin = parse_h256_hex(&event.origin, "finalized event origin")?;
+    let mut transaction_id = [0u8; 64];
+    transaction_id[32..].copy_from_slice(origin.as_bytes());
+    Ok(FinalizedEventMatch {
+        provenance: FinalizedEventProvenance {
+            block_height: event.block_height,
+            block_hash,
+            transaction_id: H512::from(transaction_id),
+            event_id: event.id,
+        },
+        data,
+    })
 }
 
 fn rues_response_error(status: StatusCode, body: &[u8]) -> HyperlaneDuskError {
@@ -1952,70 +2221,302 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn caught_up_finalized_cursor_can_index_later_events() {
-        let contract_id = [7u8; 32];
-        let source = hex::encode(contract_id);
-        let first_data = vec![1u8];
-        let second_data = vec![2u8];
-        let first_page = serde_json::json!({
-            "finalizedEvents": { "json": {
-                "events": [{
-                    "id": 11,
-                    "block_height": 7,
-                    "block_hash": hex::encode([8u8; 32]),
-                    "origin": hex::encode([9u8; 32]),
-                    "topic": "dispatch",
-                    "source": source,
-                    "data": hex::encode(&first_data),
-                    "reverted": false
-                }],
-                "startCursor": "djE6MTE=",
-                "endCursor": "djE6MTE=",
-                "hasNextPage": false
-            }}
-        })
-        .to_string();
-        let second_page = serde_json::json!({
-            "finalizedEvents": { "json": {
-                "events": [{
-                    "id": 12,
-                    "block_height": 8,
-                    "block_hash": hex::encode([10u8; 32]),
-                    "origin": hex::encode([11u8; 32]),
-                    "topic": "dispatch",
-                    "source": hex::encode(contract_id),
-                    "data": hex::encode(&second_data),
-                    "reverted": false
-                }],
-                "startCursor": "djE6MTI=",
-                "endCursor": "djE6MTI=",
-                "hasNextPage": false
-            }}
-        })
-        .to_string();
-        let first_page: &'static str = Box::leak(first_page.into_boxed_str());
-        let second_page: &'static str = Box::leak(second_page.into_boxed_str());
-        let cursor_dir = tempfile::tempdir().unwrap();
-        let client = test_client_with_event_store(
-            test_server(vec![
-                (200, first_page),
-                (200, r#"{"checkBlock":true}"#),
-                (200, second_page),
-                (200, r#"{"checkBlock":true}"#),
-            ]),
-            cursor_dir.path(),
-        );
+    impl RuesClient {
+        /// Match one sequence whose contract state implies exactly
+        /// `expected_data`.
+        async fn finalized_contract_event(
+            &self,
+            contract_id: &[u8; 32],
+            topic: &str,
+            sequence: usize,
+            expected_block_height: u64,
+            expected_data: &[u8],
+        ) -> Result<FinalizedEventProvenance, HyperlaneDuskError> {
+            let matches = self
+                .finalized_contract_events_at_block(
+                    contract_id,
+                    topic,
+                    expected_block_height,
+                    &[sequence],
+                    exact_event_data(vec![(sequence, expected_data.to_vec())]),
+                )
+                .await?;
+            Ok(matches.into_iter().next().unwrap().provenance)
+        }
 
+        fn scan_anchors_of(&self, contract_id: &[u8; 32]) -> Vec<ScanAnchor> {
+            let prefix = scan_anchor_prefix(contract_id);
+            self.event_store()
+                .unwrap()
+                .iterator(IteratorMode::From(&prefix, Direction::Forward))
+                .map(Result::unwrap)
+                .take_while(|(key, _)| key.starts_with(&prefix))
+                .map(|(_, value)| ScanAnchor::decode(&value).unwrap())
+                .collect()
+        }
+    }
+
+    fn archive_row(
+        id: i64,
+        height: u64,
+        origin: u8,
+        topic: &str,
+        contract_id: [u8; 32],
+        data: &[u8],
+    ) -> JsonValue {
+        serde_json::json!({
+            "id": id, "block_height": height, "block_hash": hex::encode([height as u8; 32]),
+            "origin": hex::encode([origin; 32]), "topic": topic,
+            "source": hex::encode(contract_id), "data": hex::encode(data), "reverted": false
+        })
+    }
+
+    /// Read one HTTP request and return its body.
+    fn read_request_body(stream: &mut std::net::TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let count = stream.read(&mut buffer).unwrap();
+            assert!(count > 0, "request ended early");
+            request.extend_from_slice(&buffer[..count]);
+            let Some(header_end) = request.windows(4).position(|v| v == b"\r\n\r\n") else {
+                continue;
+            };
+            let length = String::from_utf8_lossy(&request[..header_end])
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or_default();
+            if request.len() >= header_end + 4 + length {
+                return request[header_end + 4..header_end + 4 + length].to_vec();
+            }
+        }
+    }
+
+    /// An archive endpoint that pages `finalizedEvents` by cursor as Rusk
+    /// 1.7.3 does and answers `checkBlock` with `finalized`.
+    struct Archive {
+        url: Url,
+        rows: Arc<StdMutex<Vec<JsonValue>>>,
+        /// The cursor ID of each `finalizedEvents` request; `None` asks for
+        /// the contract's first rows.
+        pages: Arc<StdMutex<Vec<Option<i64>>>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        worker: Option<thread::JoinHandle<()>>,
+    }
+
+    impl Archive {
+        fn start(rows: Vec<JsonValue>) -> Self {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+            let rows = Arc::new(StdMutex::new(rows));
+            let pages = Arc::new(StdMutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let (worker_rows, worker_pages, worker_stop) =
+                (rows.clone(), pages.clone(), stop.clone());
+            let worker = thread::spawn(move || {
+                while !worker_stop.load(Ordering::SeqCst) {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    let query = String::from_utf8(read_request_body(&mut stream)).unwrap();
+                    let reply = if query.contains("finalizedEvents(") {
+                        let rows = worker_rows.lock().unwrap();
+                        Self::page(&rows, &query, &mut worker_pages.lock().unwrap())
+                    } else if query.contains("checkBlock(") {
+                        serde_json::json!({"checkBlock": true})
+                    } else {
+                        serde_json::json!({"errors": [{"message": "unexpected query"}]})
+                    }
+                    .to_string();
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    )
+                    .unwrap();
+                }
+            });
+            Self {
+                url,
+                rows,
+                pages,
+                stop,
+                worker: Some(worker),
+            }
+        }
+
+        fn page(rows: &[JsonValue], query: &str, pages: &mut Vec<Option<i64>>) -> JsonValue {
+            let source = query
+                .split_once("contractId: \"")
+                .and_then(|(_, rest)| rest.split('"').next())
+                .unwrap();
+            let limit = query
+                .split_once("limit: ")
+                .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
+                .and_then(|limit| limit.parse::<usize>().ok())
+                .unwrap_or(50)
+                .clamp(1, 200);
+            let after = query
+                .split_once("cursor: \"")
+                .and_then(|(_, rest)| rest.split('"').next())
+                .map(|cursor| decode_event_cursor(cursor).unwrap());
+            pages.push(after);
+            let mut events: Vec<JsonValue> = rows
+                .iter()
+                .filter(|row| row["source"] == source)
+                .filter(|row| row["id"].as_i64().unwrap() > after.unwrap_or(-1))
+                .take(limit + 1)
+                .cloned()
+                .collect();
+            let has_next_page = events.len() > limit;
+            events.truncate(limit);
+            let cursor = |row: Option<&JsonValue>| {
+                row.map(|row| canonical_event_cursor(row["id"].as_i64().unwrap()))
+            };
+            serde_json::json!({"finalizedEvents": {"json": {
+                "startCursor": cursor(events.first()),
+                "endCursor": cursor(events.last()),
+                "hasNextPage": has_next_page,
+                "events": events,
+            }}})
+        }
+
+        fn pages(&self) -> Vec<Option<i64>> {
+            self.pages.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for Archive {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_caught_up_scan_resumes_after_its_last_row() {
+        let contract_id = [7u8; 32];
+        let archive = Archive::start(vec![archive_row(11, 7, 9, "dispatch", contract_id, &[1])]);
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(archive.url.clone(), directory.path());
         client
-            .finalized_contract_event(&contract_id, "dispatch", 0, 7, &first_data)
+            .finalized_contract_event(&contract_id, "dispatch", 0, 7, &[1])
             .await
             .unwrap();
+
+        archive
+            .rows
+            .lock()
+            .unwrap()
+            .push(archive_row(12, 8, 11, "dispatch", contract_id, &[2]));
         let later = client
-            .finalized_contract_event(&contract_id, "dispatch", 1, 8, &second_data)
+            .finalized_contract_event(&contract_id, "dispatch", 1, 8, &[2])
             .await
             .unwrap();
         assert_eq!(later.event_id, 1);
+        // The second scan starts with the first scan's last row, which it
+        // checks is unchanged, instead of at the contract's first row.
+        assert_eq!(archive.pages(), vec![None, Some(10)]);
+    }
+
+    #[tokio::test]
+    async fn scan_positions_survive_a_restart_and_stay_sparse() {
+        let contract_id = [7u8; 32];
+        let mut rows: Vec<JsonValue> = (0..450)
+            .map(|id| archive_row(id, 1 + id as u64 / 10, 1, "other", contract_id, &[0]))
+            .collect();
+        rows.push(archive_row(450, 100, 2, "dispatch", contract_id, &[1]));
+        let archive = Archive::start(rows);
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(archive.url.clone(), directory.path());
+        client
+            .finalized_contract_event(&contract_id, "dispatch", 0, 100, &[1])
+            .await
+            .unwrap();
+        assert_eq!(archive.pages(), vec![None, Some(199), Some(399)]);
+        // About one anchor per page of rows, plus the scan's end.
+        assert_eq!(
+            client
+                .scan_anchors_of(&contract_id)
+                .iter()
+                .map(|anchor| (anchor.rank, anchor.before_block))
+                .collect::<Vec<_>>(),
+            vec![(200, 21), (400, 41), (451, 101)]
+        );
+        drop(client);
+
+        archive
+            .rows
+            .lock()
+            .unwrap()
+            .push(archive_row(451, 101, 3, "dispatch", contract_id, &[2]));
+        let restarted = test_client_with_event_store(archive.url.clone(), directory.path());
+        restarted
+            .finalized_contract_event(&contract_id, "dispatch", 1, 101, &[2])
+            .await
+            .unwrap();
+        assert_eq!(archive.pages()[3..], [Some(449)]);
+
+        // A lookup for an earlier block starts from the closest anchor below
+        // it, not from the contract's first row.
+        restarted
+            .finalized_contract_event(&contract_id, "other", 7, 42, &[0])
+            .await
+            .unwrap();
+        assert_eq!(archive.pages()[4..], [Some(398)]);
+    }
+
+    #[tokio::test]
+    async fn tip_following_keeps_one_anchor_per_page_of_rows() {
+        let contract_id = [8u8; 32];
+        let archive = Archive::start(Vec::new());
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(archive.url.clone(), directory.path());
+        for sequence in 0..450u64 {
+            archive.rows.lock().unwrap().push(archive_row(
+                sequence as i64,
+                10 + sequence,
+                1,
+                "dispatch",
+                contract_id,
+                &sequence.to_be_bytes(),
+            ));
+            client
+                .finalized_contract_event(
+                    &contract_id,
+                    "dispatch",
+                    sequence as usize,
+                    10 + sequence,
+                    &sequence.to_be_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        // Each lookup resumed at the previous one's last row.
+        let pages = archive.pages();
+        assert_eq!(pages.len(), 450);
+        assert!(pages[1..]
+            .iter()
+            .enumerate()
+            .all(|(previous, cursor)| *cursor == previous.checked_sub(1).map(|id| id as i64)));
+        assert_eq!(
+            client
+                .scan_anchors_of(&contract_id)
+                .iter()
+                .map(|anchor| anchor.rank)
+                .collect::<Vec<_>>(),
+            vec![200, 400, 450]
+        );
     }
 
     #[test]
@@ -2043,39 +2544,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paired_max_row_id_and_cursor_cannot_poison_restart() {
+    async fn a_poisoned_scan_position_cannot_hide_rows_after_restart() {
         let contract_id = [7u8; 32];
-        let source = hex::encode(contract_id);
-        let first_data = vec![1u8];
-        let second_data = vec![2u8];
-        let poison = canonical_event_cursor(i64::MAX);
-        let poisoned_page = serde_json::json!({
-            "finalizedEvents": { "json": {
-                "events": [{
-                    "id": i64::MAX,
-                    "block_height": 7,
-                    "block_hash": hex::encode([8u8; 32]),
-                    "origin": hex::encode([9u8; 32]),
-                    "topic": "dispatch",
-                    "source": source,
-                    "data": hex::encode(&first_data),
-                    "reverted": false
-                }],
-                "startCursor": poison,
-                "endCursor": poison,
-                "hasNextPage": false
-            }}
-        })
-        .to_string();
-        let poisoned_page: &'static str = Box::leak(poisoned_page.into_boxed_str());
-        let cursor_dir = tempfile::tempdir().unwrap();
-        let store_path = cursor_dir.path().join("event-store");
-        let poisoned = test_client_with_event_store(
-            test_server(vec![(200, poisoned_page), (200, r#"{"checkBlock":true}"#)]),
-            &store_path,
-        );
+        let archive = Archive::start(vec![archive_row(
+            i64::MAX,
+            7,
+            9,
+            "dispatch",
+            contract_id,
+            &[1],
+        )]);
+        let directory = tempfile::tempdir().unwrap();
+        let poisoned = test_client_with_event_store(archive.url.clone(), directory.path());
         let first = poisoned
-            .finalized_contract_event(&contract_id, "dispatch", 0, 7, &first_data)
+            .finalized_contract_event(&contract_id, "dispatch", 0, 7, &[1])
             .await
             .unwrap();
         assert_eq!(
@@ -2084,101 +2566,32 @@ mod tests {
         );
         drop(poisoned);
 
-        let repaired_first = serde_json::json!({
-            "finalizedEvents": { "json": {
-                "events": [{
-                    "id": 11,
-                    "block_height": 7,
-                    "block_hash": hex::encode([8u8; 32]),
-                    "origin": hex::encode([9u8; 32]),
-                    "topic": "dispatch",
-                    "source": hex::encode(contract_id),
-                    "data": hex::encode(&first_data),
-                    "reverted": false
-                }],
-                "startCursor": canonical_event_cursor(11),
-                "endCursor": canonical_event_cursor(11),
-                "hasNextPage": true
-            }}
-        })
-        .to_string();
-        let repaired_second = serde_json::json!({
-            "finalizedEvents": { "json": {
-                "events": [{
-                    "id": 12,
-                    "block_height": 8,
-                    "block_hash": hex::encode([10u8; 32]),
-                    "origin": hex::encode([11u8; 32]),
-                    "topic": "dispatch",
-                    "source": hex::encode(contract_id),
-                    "data": hex::encode(&second_data),
-                    "reverted": false
-                }],
-                "startCursor": canonical_event_cursor(12),
-                "endCursor": canonical_event_cursor(12),
-                "hasNextPage": false
-            }}
-        })
-        .to_string();
-        let repaired_first: &'static str = Box::leak(repaired_first.into_boxed_str());
-        let repaired_second: &'static str = Box::leak(repaired_second.into_boxed_str());
-        let repaired = test_client_with_event_store(
-            test_server(vec![
-                (200, repaired_first),
-                (200, repaired_second),
-                (200, r#"{"checkBlock":true}"#),
-            ]),
-            &store_path,
-        );
+        *archive.rows.lock().unwrap() = vec![
+            archive_row(11, 7, 9, "dispatch", contract_id, &[1]),
+            archive_row(12, 8, 11, "dispatch", contract_id, &[2]),
+        ];
+        let repaired = test_client_with_event_store(archive.url.clone(), directory.path());
         let later = repaired
-            .finalized_contract_event(&contract_id, "dispatch", 1, 8, &second_data)
+            .finalized_contract_event(&contract_id, "dispatch", 1, 8, &[2])
             .await
             .unwrap();
         assert_eq!(later.event_id, 1);
+        // The persisted position names a row the repaired archive does not
+        // have, so the scan starts over instead of skipping its rows.
+        assert_eq!(archive.pages(), vec![None, Some(i64::MAX - 1), None]);
     }
 
     #[tokio::test]
     async fn unrequested_page_peer_cannot_poison_durable_semantic_rows() {
         let contract_id = [17u8; 32];
-        let source = hex::encode(contract_id);
-        let first_data = vec![1u8];
-        let second_data = vec![2u8];
-        let duplicate_page = serde_json::json!({
-            "finalizedEvents": { "json": {
-                "events": [{
-                    "id": 11,
-                    "block_height": 7,
-                    "block_hash": hex::encode([8u8; 32]),
-                    "origin": hex::encode([9u8; 32]),
-                    "topic": "dispatch",
-                    "source": source,
-                    "data": hex::encode(&first_data),
-                    "reverted": false
-                }, {
-                    "id": 12,
-                    "block_height": 7,
-                    "block_hash": hex::encode([8u8; 32]),
-                    "origin": hex::encode([9u8; 32]),
-                    "topic": "dispatch",
-                    "source": hex::encode(contract_id),
-                    "data": hex::encode(&first_data),
-                    "reverted": false
-                }],
-                "startCursor": canonical_event_cursor(11),
-                "endCursor": canonical_event_cursor(12),
-                "hasNextPage": false
-            }}
-        })
-        .to_string();
-        let duplicate_page: &'static str = Box::leak(duplicate_page.into_boxed_str());
-        let cursor_dir = tempfile::tempdir().unwrap();
-        let store_path = cursor_dir.path().join("event-store");
-        let poisoned = test_client_with_event_store(
-            test_server(vec![(200, duplicate_page), (200, r#"{"checkBlock":true}"#)]),
-            &store_path,
-        );
+        let archive = Archive::start(vec![
+            archive_row(11, 7, 9, "dispatch", contract_id, &[1]),
+            archive_row(12, 7, 9, "dispatch", contract_id, &[1]),
+        ]);
+        let directory = tempfile::tempdir().unwrap();
+        let poisoned = test_client_with_event_store(archive.url.clone(), directory.path());
         poisoned
-            .finalized_contract_event(&contract_id, "dispatch", 0, 7, &first_data)
+            .finalized_contract_event(&contract_id, "dispatch", 0, 7, &[1])
             .await
             .unwrap();
         assert!(poisoned
@@ -2187,139 +2600,163 @@ mod tests {
             .is_none());
         drop(poisoned);
 
-        let repaired_page = serde_json::json!({
-            "finalizedEvents": { "json": {
-                "events": [{
-                    "id": 21,
-                    "block_height": 7,
-                    "block_hash": hex::encode([8u8; 32]),
-                    "origin": hex::encode([9u8; 32]),
-                    "topic": "dispatch",
-                    "source": hex::encode(contract_id),
-                    "data": hex::encode(&first_data),
-                    "reverted": false
-                }, {
-                    "id": 22,
-                    "block_height": 8,
-                    "block_hash": hex::encode([10u8; 32]),
-                    "origin": hex::encode([11u8; 32]),
-                    "topic": "dispatch",
-                    "source": hex::encode(contract_id),
-                    "data": hex::encode(&second_data),
-                    "reverted": false
-                }],
-                "startCursor": canonical_event_cursor(21),
-                "endCursor": canonical_event_cursor(22),
-                "hasNextPage": false
-            }}
-        })
-        .to_string();
-        let repaired_page: &'static str = Box::leak(repaired_page.into_boxed_str());
-        let repaired = test_client_with_event_store(
-            test_server(vec![(200, repaired_page), (200, r#"{"checkBlock":true}"#)]),
-            &store_path,
-        );
+        // The archive is rebuilt with other row IDs.
+        *archive.rows.lock().unwrap() = vec![
+            archive_row(21, 7, 9, "dispatch", contract_id, &[1]),
+            archive_row(22, 8, 11, "dispatch", contract_id, &[2]),
+        ];
+        let repaired = test_client_with_event_store(archive.url.clone(), directory.path());
         let later = repaired
-            .finalized_contract_event(&contract_id, "dispatch", 1, 8, &second_data)
+            .finalized_contract_event(&contract_id, "dispatch", 1, 8, &[2])
             .await
             .unwrap();
         assert_eq!(later.event_id, 1);
+        assert_eq!(archive.pages(), vec![None, Some(10), None]);
     }
 
     #[tokio::test]
     async fn repaired_endpoint_can_replace_an_exact_poisoned_cached_row() {
         let contract_id = [37u8; 32];
-        let false_first = vec![41u8];
-        let false_second = vec![42u8];
-        let compromised_page = serde_json::json!({
-            "finalizedEvents": { "json": {
-                "events": [{
-                    "id": 1,
-                    "block_height": 9,
-                    "block_hash": hex::encode([43u8; 32]),
-                    "origin": hex::encode([44u8; 32]),
-                    "topic": "dispatch",
-                    "source": hex::encode(contract_id),
-                    "data": hex::encode(&false_first),
-                    "reverted": false
-                }, {
-                    "id": 2,
-                    "block_height": 10,
-                    "block_hash": hex::encode([45u8; 32]),
-                    "origin": hex::encode([46u8; 32]),
-                    "topic": "dispatch",
-                    "source": hex::encode(contract_id),
-                    "data": hex::encode(&false_second),
-                    "reverted": false
-                }],
-                "startCursor": canonical_event_cursor(1),
-                "endCursor": canonical_event_cursor(2),
-                "hasNextPage": false
-            }}
-        })
-        .to_string();
-        let compromised_page: &'static str = Box::leak(compromised_page.into_boxed_str());
-        let cursor_dir = tempfile::tempdir().unwrap();
-        let store_path = cursor_dir.path().join("event-store");
-        let compromised = test_client_with_event_store(
-            test_server(vec![
-                (200, compromised_page),
-                (200, r#"{"checkBlock":true}"#),
-            ]),
-            &store_path,
-        );
+        let archive = Archive::start(vec![
+            archive_row(1, 9, 44, "dispatch", contract_id, &[41]),
+            archive_row(2, 10, 46, "dispatch", contract_id, &[42]),
+        ]);
+        let directory = tempfile::tempdir().unwrap();
+        let compromised = test_client_with_event_store(archive.url.clone(), directory.path());
         compromised
-            .finalized_contract_event(&contract_id, "dispatch", 1, 10, &false_second)
+            .finalized_contract_event(&contract_id, "dispatch", 1, 10, &[42])
             .await
             .unwrap();
         drop(compromised);
 
-        let honest_first = vec![51u8];
-        let honest_second = vec![52u8];
-        let repaired_page = serde_json::json!({
-            "finalizedEvents": { "json": {
-                "events": [{
-                    "id": 11,
-                    "block_height": 19,
-                    "block_hash": hex::encode([53u8; 32]),
-                    "origin": hex::encode([54u8; 32]),
-                    "topic": "dispatch",
-                    "source": hex::encode(contract_id),
-                    "data": hex::encode(&honest_first),
-                    "reverted": false
-                }, {
-                    "id": 12,
-                    "block_height": 20,
-                    "block_hash": hex::encode([55u8; 32]),
-                    "origin": hex::encode([56u8; 32]),
-                    "topic": "dispatch",
-                    "source": hex::encode(contract_id),
-                    "data": hex::encode(&honest_second),
-                    "reverted": false
-                }],
-                "startCursor": canonical_event_cursor(11),
-                "endCursor": canonical_event_cursor(12),
-                "hasNextPage": false
-            }}
-        })
-        .to_string();
-        let repaired_page: &'static str = Box::leak(repaired_page.into_boxed_str());
-        let repaired = test_client_with_event_store(
-            test_server(vec![(200, repaired_page), (200, r#"{"checkBlock":true}"#)]),
-            &store_path,
-        );
+        *archive.rows.lock().unwrap() = vec![
+            archive_row(11, 19, 54, "dispatch", contract_id, &[51]),
+            archive_row(12, 20, 56, "dispatch", contract_id, &[52]),
+        ];
+        let repaired = test_client_with_event_store(archive.url.clone(), directory.path());
         let error = repaired
-            .finalized_contract_event(&contract_id, "dispatch", 1, 20, &honest_second)
+            .finalized_contract_event(&contract_id, "dispatch", 1, 20, &[52])
             .await
             .unwrap_err();
         assert!(error.to_string().contains("contract state says 20"));
+        // The mismatch dropped the row and the endpoint's scan positions.
+        assert!(repaired.scan_anchors_of(&contract_id).is_empty());
 
         let replaced = repaired
-            .finalized_contract_event(&contract_id, "dispatch", 1, 20, &honest_second)
+            .finalized_contract_event(&contract_id, "dispatch", 1, 20, &[52])
             .await
             .unwrap();
         assert_eq!(replaced.event_id, 1);
         assert_eq!(replaced.block_height, 20);
+        assert_eq!(archive.pages(), vec![None, None]);
+    }
+
+    #[tokio::test]
+    async fn one_block_resolves_every_sequence_in_one_pass() {
+        let contract_id = [57u8; 32];
+        // 300 rows of one block in hash order, with reverted and foreign-topic
+        // peers, after a page of earlier rows.
+        let mut rows: Vec<JsonValue> = (0..200)
+            .map(|id| archive_row(id, 5, 1, "other", contract_id, &[0]))
+            .collect();
+        for position in 0..300u16 {
+            let sequence = (position * 7) % 300;
+            let mut row = archive_row(
+                200 + i64::from(position),
+                6,
+                (sequence % 251) as u8,
+                if position % 10 == 3 {
+                    "other"
+                } else {
+                    "dispatch"
+                },
+                contract_id,
+                &sequence.to_be_bytes(),
+            );
+            row["reverted"] = serde_json::json!(position % 10 == 7);
+            rows.push(row);
+        }
+        let wanted: Vec<usize> = (0..300usize)
+            .filter(|sequence| {
+                let position = (0..300u16)
+                    .find(|position| usize::from((position * 7) % 300) == *sequence)
+                    .unwrap();
+                position % 10 != 3 && position % 10 != 7
+            })
+            .collect();
+        let archive = Archive::start(rows);
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(archive.url.clone(), directory.path());
+        let expected = wanted
+            .iter()
+            .map(|sequence| (*sequence, (*sequence as u16).to_be_bytes().to_vec()))
+            .collect();
+        let matches = client
+            .finalized_contract_events_at_block(
+                &contract_id,
+                "dispatch",
+                6,
+                &wanted,
+                exact_event_data(expected),
+            )
+            .await
+            .unwrap();
+        assert_eq!(matches.len(), wanted.len());
+        for (sequence, matched) in wanted.iter().zip(&matches) {
+            assert_eq!(matched.data, (*sequence as u16).to_be_bytes());
+            assert_eq!(matched.provenance.event_id, *sequence as i64);
+        }
+        assert_eq!(archive.pages(), vec![None, Some(199), Some(399)]);
+        for sequence in &wanted {
+            assert!(client
+                .load_finalized_event(&contract_id, "dispatch", *sequence)
+                .unwrap()
+                .is_some());
+        }
+
+        // A reverted row's sequence stays unmatched, and the error names it.
+        let reverted = (0..300usize)
+            .find(|sequence| !wanted.contains(sequence))
+            .unwrap();
+        let error = client
+            .finalized_contract_events_at_block(
+                &contract_id,
+                "dispatch",
+                6,
+                &[reverted],
+                exact_event_data(vec![(reverted, (reverted as u16).to_be_bytes().to_vec())]),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not archived yet"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn identical_records_in_one_block_share_the_first_matching_row() {
+        let contract_id = [67u8; 32];
+        let archive = Archive::start(vec![
+            archive_row(1, 9, 1, "gas_payment", contract_id, &[5]),
+            archive_row(2, 9, 2, "gas_payment", contract_id, &[5]),
+        ]);
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(archive.url.clone(), directory.path());
+        let matches = client
+            .finalized_contract_events_at_block(
+                &contract_id,
+                "gas_payment",
+                9,
+                &[3, 4],
+                exact_event_data(vec![(3, vec![5]), (4, vec![5])]),
+            )
+            .await
+            .unwrap();
+        for (sequence, matched) in [3, 4].into_iter().zip(matches) {
+            assert_eq!(matched.provenance.event_id, sequence);
+            assert_eq!(
+                &matched.provenance.transaction_id.as_bytes()[32..],
+                &[1u8; 32]
+            );
+        }
     }
 
     #[tokio::test]
@@ -2390,7 +2827,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transient_block_checks_keep_durable_rows_quarantined_until_revalidation() {
+    async fn transient_block_checks_keep_durable_rows_until_revalidation() {
         let contract = [3u8; 32];
         let event = FinalizedContractEvent {
             id: 80,
@@ -2402,6 +2839,12 @@ mod tests {
             data: hex::encode([6]),
             reverted: false,
         };
+        let anchor = ScanAnchor {
+            before_block: 90,
+            fence_id: 79,
+            fence_digest: [1; 32],
+            rank: 1,
+        };
         for response in [
             (503, "temporarily unavailable"),
             (200, "{}"),
@@ -2409,52 +2852,23 @@ mod tests {
         ] {
             let directory = tempfile::tempdir().unwrap();
             let client = test_client_with_event_store(
-                test_server(vec![
-                    (200, r#"{"checkBlock":true}"#),
-                    response,
-                    (200, r#"{"checkBlock":true}"#),
-                ]),
+                test_server(vec![response, (200, r#"{"checkBlock":true}"#)]),
                 directory.path(),
             );
             client
-                .validate_finalized_event(
-                    &contract,
-                    "dispatch",
-                    80,
-                    90,
-                    &|data: &[u8]| data == [6],
-                    event.clone(),
-                )
-                .await
+                .persist_finalized_events(&contract, "dispatch", &[(80, &event)])
                 .unwrap();
-            client
-                .persist_finalized_event(&contract, "dispatch", 80, &event)
-                .unwrap();
-            let scan = FinalizedEventScan {
-                cursor: Some(canonical_event_cursor(79)),
-                last_id: Some(79),
-                before_block: 90,
-            };
-            client
-                .finalized_event_caches
-                .lock()
-                .await
-                .entry(contract)
-                .or_default()
-                .scans
-                .insert("dispatch".into(), scan.clone());
+            client.offer_scan_anchor(&contract, anchor).unwrap();
             assert!(client
                 .finalized_contract_event(&contract, "dispatch", 80, 90, &[6])
                 .await
                 .is_err());
+            // A failed check is not evidence against the row or the anchors.
             assert!(client
                 .load_finalized_event(&contract, "dispatch", 80)
                 .unwrap()
                 .is_some());
-            assert_eq!(
-                client.finalized_event_caches.lock().await[&contract].scans["dispatch"],
-                scan
-            );
+            assert_eq!(client.scan_anchors_of(&contract), vec![anchor]);
             // This server has only a checkBlock response left: no archive replay.
             let recovered = client
                 .finalized_contract_event(&contract, "dispatch", 80, 90, &[6])
@@ -2469,8 +2883,9 @@ mod tests {
             directory.path(),
         );
         client
-            .persist_finalized_event(&contract, "dispatch", 80, &event)
+            .persist_finalized_events(&contract, "dispatch", &[(80, &event)])
             .unwrap();
+        client.offer_scan_anchor(&contract, anchor).unwrap();
         assert!(matches!(
             client
                 .finalized_contract_event(&contract, "dispatch", 80, 90, &[6])
@@ -2481,47 +2896,39 @@ mod tests {
             .load_finalized_event(&contract, "dispatch", 80)
             .unwrap()
             .is_none());
+        assert!(client.scan_anchors_of(&contract).is_empty());
     }
 
     #[tokio::test]
     async fn predicate_rows_return_their_data_and_are_dropped_once_they_stop_matching() {
         let contract_id = [47u8; 32];
-        let row = |id: i64, origin: u8, data: &[u8]| {
-            serde_json::json!({
-                "id": id, "block_height": 7, "block_hash": hex::encode([8u8; 32]),
-                "origin": hex::encode([origin; 32]), "topic": "dispatch",
-                "source": hex::encode(contract_id), "data": hex::encode(data),
-                "reverted": false
-            })
-        };
-        let page = serde_json::json!({
-            "finalizedEvents": { "json": {
-                "events": [row(1, 1, &[1, 0]), row(2, 2, &[2, 0])],
-                "startCursor": canonical_event_cursor(1),
-                "endCursor": canonical_event_cursor(2),
-                "hasNextPage": false
-            }}
-        })
-        .to_string();
-        let page: &'static str = Box::leak(page.into_boxed_str());
+        let archive = Archive::start(vec![
+            archive_row(1, 7, 1, "dispatch", contract_id, &[1, 0]),
+            archive_row(2, 7, 2, "dispatch", contract_id, &[2, 0]),
+        ]);
         let directory = tempfile::tempdir().unwrap();
-        let client = test_client_with_event_store(
-            test_server(vec![
-                (200, page),
-                (200, r#"{"checkBlock":true}"#),
-                (200, r#"{"checkBlock":true}"#),
-                (200, page),
-                (200, r#"{"checkBlock":true}"#),
-            ]),
-            directory.path(),
-        );
-        let tagged = |tag: u8| move |data: &[u8]| data.first() == Some(&tag);
+        let client = test_client_with_event_store(archive.url.clone(), directory.path());
+        let tagged = |tag: u8| {
+            move |data: &[u8]| {
+                if data.first() == Some(&tag) {
+                    vec![0]
+                } else {
+                    Vec::new()
+                }
+            }
+        };
+        let lookup = |tag| {
+            client.finalized_contract_events_at_block(
+                &contract_id,
+                "dispatch",
+                7,
+                &[0],
+                tagged(tag),
+            )
+        };
 
         // The first row the predicate accepts becomes the record, data included.
-        let first = client
-            .finalized_contract_event_matching(&contract_id, "dispatch", 0, 7, tagged(2))
-            .await
-            .unwrap();
+        let first = lookup(2).await.unwrap().remove(0);
         assert_eq!(first.data, vec![2, 0]);
         assert_eq!(
             &first.provenance.transaction_id.as_bytes()[32..],
@@ -2530,19 +2937,14 @@ mod tests {
         assert_eq!(first.provenance.event_id, 0);
 
         // The persisted row is served again only after passing the predicate
-        // and a fresh checkBlock; the server has no archive page for it.
-        let replayed = client
-            .finalized_contract_event_matching(&contract_id, "dispatch", 0, 7, tagged(2))
-            .await
-            .unwrap();
+        // and a fresh checkBlock, without reading the archive.
+        let replayed = lookup(2).await.unwrap().remove(0);
         assert_eq!(replayed, first);
+        assert_eq!(archive.pages(), vec![None]);
 
         // Contract state now implies other data. The persisted row is dropped
-        // without being served, together with the topic's scan hint.
-        let error = client
-            .finalized_contract_event_matching(&contract_id, "dispatch", 0, 7, tagged(1))
-            .await
-            .unwrap_err();
+        // without being served, together with the contract's scan anchors.
+        let error = lookup(1).await.unwrap_err();
         assert!(matches!(
             error,
             HyperlaneDuskError::FinalizedEventMismatch(_)
@@ -2551,20 +2953,16 @@ mod tests {
             .load_finalized_event(&contract_id, "dispatch", 0)
             .unwrap()
             .is_none());
-        assert!(!client.finalized_event_caches.lock().await[&contract_id]
-            .scans
-            .contains_key("dispatch"));
+        assert!(client.scan_anchors_of(&contract_id).is_empty());
 
         // The retry rebuilds the record from the archive.
-        let rebuilt = client
-            .finalized_contract_event_matching(&contract_id, "dispatch", 0, 7, tagged(1))
-            .await
-            .unwrap();
+        let rebuilt = lookup(1).await.unwrap().remove(0);
         assert_eq!(rebuilt.data, vec![1, 0]);
         assert_eq!(
             &rebuilt.provenance.transaction_id.as_bytes()[32..],
             &[1u8; 32]
         );
+        assert_eq!(archive.pages(), vec![None, None]);
     }
 
     #[tokio::test]
@@ -2611,6 +3009,23 @@ mod tests {
             bounded.len()
         );
         assert!(bounded.ends_with(&format!("[truncated, {} bytes]", 4 * MAX_ERROR_BODY_BYTES)));
+    }
+
+    #[test]
+    fn scan_anchors_round_trip_and_reject_malformed_values() {
+        let anchor = ScanAnchor {
+            before_block: 9,
+            fence_id: 7,
+            fence_digest: [3; 32],
+            rank: 5,
+        };
+        assert_eq!(ScanAnchor::decode(&anchor.encode()), Some(anchor));
+        assert_eq!(ScanAnchor::decode(&anchor.encode()[1..]), None);
+        let negative = ScanAnchor {
+            fence_id: -1,
+            ..anchor
+        };
+        assert_eq!(ScanAnchor::decode(&negative.encode()), None);
     }
 
     #[tokio::test]

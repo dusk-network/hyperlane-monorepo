@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 
@@ -10,9 +11,16 @@ use hyperlane_core::{
 };
 use hyperlane_dusk_types::{events, message};
 
-use crate::rues::{rkyv_deserialize, rkyv_serialize};
+use crate::rues::{exact_event_data, rkyv_deserialize, rkyv_serialize};
 use crate::tx_sender::{dusk_tx_id_to_h512, h512_to_dusk_tx_id};
 use crate::RuesClient;
+
+/// What the Mailbox stored for one dispatch.
+struct StoredDispatch {
+    nonce: u32,
+    block_number: u64,
+    message_id: [u8; 32],
+}
 
 /// Dusk mailbox indexer for dispatch and delivery events.
 ///
@@ -97,8 +105,6 @@ impl Indexer<HyperlaneMessage> for DuskMailboxIndexer {
         &self,
         range: RangeInclusive<u32>,
     ) -> ChainResult<Vec<(Indexed<HyperlaneMessage>, LogMeta)>> {
-        let mut results = Vec::new();
-
         // Mailbox.nonce is the next dispatch nonce; messages exist for [0, nonce).
         let current_nonce: u32 = self
             .rues
@@ -106,6 +112,9 @@ impl Indexer<HyperlaneMessage> for DuskMailboxIndexer {
             .await?;
         let (finalized_nonce, _) = self.finalized_dispatch_count(current_nonce).await?;
 
+        // The Mailbox stores only each message's ID and block. The message
+        // itself is in the finalized Dispatch event that hashes to that ID.
+        let mut stored = Vec::new();
         for nonce in range {
             if nonce >= finalized_nonce {
                 break;
@@ -115,52 +124,88 @@ impl Indexer<HyperlaneMessage> for DuskMailboxIndexer {
                 .contract_query(&self.mailbox_id, "dispatched_block_height", &(nonce,))
                 .await?;
             ensure_cursor_height(block_number)?;
-            // The Mailbox stores only the message ID. The message itself is in
-            // the finalized Dispatch event that hashes to it.
             let message_id: [u8; 32] = self
                 .rues
                 .contract_query(&self.mailbox_id, "dispatched_id", &(nonce,))
                 .await?;
-            let local_domain = self.local_domain;
-            let dispatch = self
+            stored.push(StoredDispatch {
+                nonce,
+                block_number,
+                message_id,
+            });
+        }
+
+        // One archive pass per block, however many dispatches it holds.
+        let mut results = Vec::with_capacity(stored.len());
+        let local_domain = self.local_domain;
+        for block in stored.chunk_by(|a, b| a.block_number == b.block_number) {
+            let Some(first) = block.first() else {
+                continue;
+            };
+            let ids: HashMap<u32, [u8; 32]> = block
+                .iter()
+                .map(|dispatch| (dispatch.nonce, dispatch.message_id))
+                .collect();
+            let sequences: Vec<usize> = block
+                .iter()
+                .map(|dispatch| dispatch.nonce as usize)
+                .collect();
+            let matches = self
                 .rues
-                .finalized_contract_event_matching(
+                .finalized_contract_events_at_block(
                     &self.mailbox_id,
                     events::Dispatch::TOPIC,
-                    nonce as usize,
-                    block_number,
-                    |data| decode_dispatch(data, nonce, &message_id, local_domain).is_some(),
+                    first.block_number,
+                    &sequences,
+                    |data| {
+                        // Route by the event's own nonce, then hold it to
+                        // everything the Mailbox stored for that nonce.
+                        dispatch_nonce(data)
+                            .filter(|nonce| {
+                                ids.get(nonce).is_some_and(|message_id| {
+                                    decode_dispatch(data, *nonce, message_id, local_domain)
+                                        .is_some()
+                                })
+                            })
+                            .map(|nonce| vec![nonce as usize])
+                            .unwrap_or_default()
+                    },
                 )
                 .await?;
-            let provenance = dispatch.provenance;
-            let dusk_msg = decode_dispatch(&dispatch.data, nonce, &message_id, local_domain)
-                .ok_or_else(|| {
-                    crate::HyperlaneDuskError::Other(format!(
-                        "Matched Dusk Dispatch event for nonce {nonce} no longer decodes"
-                    ))
-                })?;
 
-            // Convert to hyperlane-core HyperlaneMessage.
-            let core_msg = HyperlaneMessage {
-                version: dusk_msg.version,
-                nonce: dusk_msg.nonce,
-                origin: dusk_msg.origin,
-                sender: H256::from_slice(&dusk_msg.sender),
-                destination: dusk_msg.destination,
-                recipient: H256::from_slice(&dusk_msg.recipient),
-                body: dusk_msg.body,
-            };
+            for (dispatch, matched) in block.iter().zip(matches) {
+                let nonce = dispatch.nonce;
+                let provenance = matched.provenance;
+                let dusk_msg =
+                    decode_dispatch(&matched.data, nonce, &dispatch.message_id, local_domain)
+                        .ok_or_else(|| {
+                            crate::HyperlaneDuskError::Other(format!(
+                                "Matched Dusk Dispatch event for nonce {nonce} no longer decodes"
+                            ))
+                        })?;
 
-            let log_meta = LogMeta {
-                address: self.mailbox_address,
-                block_number: provenance.block_height,
-                block_hash: provenance.block_hash,
-                transaction_id: provenance.transaction_id,
-                transaction_index: 0,
-                log_index: U256::from(nonce),
-            };
-            let indexed = Indexed::from(core_msg).with_sequence(nonce);
-            results.push((indexed, log_meta));
+                // Convert to hyperlane-core HyperlaneMessage.
+                let core_msg = HyperlaneMessage {
+                    version: dusk_msg.version,
+                    nonce: dusk_msg.nonce,
+                    origin: dusk_msg.origin,
+                    sender: H256::from_slice(&dusk_msg.sender),
+                    destination: dusk_msg.destination,
+                    recipient: H256::from_slice(&dusk_msg.recipient),
+                    body: dusk_msg.body,
+                };
+
+                let log_meta = LogMeta {
+                    address: self.mailbox_address,
+                    block_number: provenance.block_height,
+                    block_hash: provenance.block_hash,
+                    transaction_id: provenance.transaction_id,
+                    transaction_index: 0,
+                    log_index: U256::from(nonce),
+                };
+                let indexed = Indexed::from(core_msg).with_sequence(nonce);
+                results.push((indexed, log_meta));
+            }
         }
 
         debug!(count = results.len(), "Fetched dispatch logs");
@@ -297,8 +342,6 @@ impl Indexer<H256> for DuskDeliveryIndexer {
         &self,
         range: RangeInclusive<u32>,
     ) -> ChainResult<Vec<(Indexed<H256>, LogMeta)>> {
-        let mut results = Vec::new();
-
         // Messages exist for [0, processed_count).
         let processed_count: u32 = self
             .rues
@@ -306,6 +349,7 @@ impl Indexer<H256> for DuskDeliveryIndexer {
             .await?;
         let (finalized_count, _) = self.finalized_process_count(processed_count).await?;
 
+        let mut stored = Vec::new();
         for index in range {
             if index >= finalized_count {
                 break;
@@ -324,31 +368,50 @@ impl Indexer<H256> for DuskDeliveryIndexer {
                 )
                 .await?;
             ensure_cursor_height(block_number)?;
+            stored.push((index, block_number, message_id));
+        }
 
-            let expected_event = rkyv_serialize(&events::ProcessId { message_id })?;
-            let provenance = self
+        // One archive pass per block, however many deliveries it holds.
+        let mut results = Vec::with_capacity(stored.len());
+        for block in stored.chunk_by(|a, b| a.1 == b.1) {
+            let Some(&(_, block_number, _)) = block.first() else {
+                continue;
+            };
+            let mut expected = Vec::with_capacity(block.len());
+            for (index, _, message_id) in block {
+                let message_id = *message_id;
+                expected.push((
+                    *index as usize,
+                    rkyv_serialize(&events::ProcessId { message_id })?,
+                ));
+            }
+            let sequences: Vec<usize> = expected.iter().map(|(index, _)| *index).collect();
+            let matches = self
                 .rues
-                .finalized_contract_event(
+                .finalized_contract_events_at_block(
                     &self.mailbox_id,
                     events::ProcessId::TOPIC,
-                    index as usize,
                     block_number,
-                    &expected_event,
+                    &sequences,
+                    exact_event_data(expected),
                 )
                 .await?;
 
-            let log_meta = LogMeta {
-                address: self.mailbox_address,
-                block_number: provenance.block_height,
-                block_hash: provenance.block_hash,
-                transaction_id: provenance.transaction_id,
-                transaction_index: 0,
-                log_index: U256::from(index),
-            };
+            for (&(index, _, message_id), matched) in block.iter().zip(matches) {
+                let provenance = matched.provenance;
+                let log_meta = LogMeta {
+                    address: self.mailbox_address,
+                    block_number: provenance.block_height,
+                    block_hash: provenance.block_hash,
+                    transaction_id: provenance.transaction_id,
+                    transaction_index: 0,
+                    log_index: U256::from(index),
+                };
 
-            let h256_id = H256::from_slice(&message_id);
-            let indexed = Indexed::from(h256_id).with_sequence(index);
-            results.push((indexed, log_meta));
+                let h256_id = H256::from_slice(&message_id);
+                let indexed = Indexed::from(h256_id).with_sequence(index);
+                results.push((indexed, log_meta));
+            }
         }
 
         debug!(count = results.len(), "Fetched delivery logs");
@@ -439,6 +502,14 @@ fn decode_dispatch(
         return None;
     }
     Some(decoded)
+}
+
+/// The nonce a `Dispatch` event's message claims. Only picks which stored
+/// dispatch to hold the event to; `decode_dispatch` decides whether it is
+/// that dispatch.
+fn dispatch_nonce(event_data: &[u8]) -> Option<u32> {
+    let event: events::Dispatch = rkyv_deserialize(event_data).ok()?;
+    Some(message::decode(&event.message)?.nonce)
 }
 
 #[async_trait]

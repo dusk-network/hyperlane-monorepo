@@ -13,7 +13,7 @@ use hyperlane_core::{
 
 use hyperlane_dusk_types::{events, GasPaymentRecord};
 
-use crate::rues::rkyv_serialize;
+use crate::rues::{exact_event_data, rkyv_serialize};
 use crate::tx_sender::{dusk_tx_id_to_h512, h512_to_dusk_tx_id};
 use crate::{DuskProvider, RuesClient};
 
@@ -129,14 +129,13 @@ impl Indexer<InterchainGasPayment> for DuskInterchainGasPaymasterIndexer {
         &self,
         range: RangeInclusive<u32>,
     ) -> ChainResult<Vec<(Indexed<InterchainGasPayment>, LogMeta)>> {
-        let mut results = Vec::new();
-
         let payment_count: u32 = self
             .rues
             .contract_query(&self.igp_id, "gas_payment_count", &())
             .await?;
         let (finalized_count, _) = self.finalized_payment_count(payment_count).await?;
 
+        let mut stored = Vec::new();
         let mut next = *range.start();
         let requested_end = *range.end();
         while next < finalized_count && next <= requested_end {
@@ -154,47 +153,63 @@ impl Indexer<InterchainGasPayment> for DuskInterchainGasPaymasterIndexer {
                 ))
                 .into());
             }
-
             for (offset, record) in records.into_iter().enumerate() {
-                let index = next + offset as u32;
                 ensure_cursor_height(record.block_height)?;
+                stored.push((next + offset as u32, record));
+            }
+            next += limit;
+        }
 
+        // One archive pass per block, however many payments it holds.
+        // Identical payments in one block share the first matching row.
+        let mut results = Vec::with_capacity(stored.len());
+        for block in stored.chunk_by(|a, b| a.1.block_height == b.1.block_height) {
+            let Some((_, first)) = block.first() else {
+                continue;
+            };
+            let mut expected = Vec::with_capacity(block.len());
+            for (index, record) in block {
+                expected.push((
+                    *index as usize,
+                    rkyv_serialize(&events::GasPayment {
+                        message_id: record.message_id,
+                        gas_limit: record.gas_limit,
+                        payment: record.payment,
+                    })?,
+                ));
+            }
+            let sequences: Vec<usize> = expected.iter().map(|(index, _)| *index).collect();
+            let matches = self
+                .rues
+                .finalized_contract_events_at_block(
+                    &self.igp_id,
+                    events::GasPayment::TOPIC,
+                    first.block_height,
+                    &sequences,
+                    exact_event_data(expected),
+                )
+                .await?;
+
+            for ((index, record), matched) in block.iter().zip(matches) {
                 let payment = InterchainGasPayment {
                     message_id: H256::from_slice(&record.message_id),
                     destination: record.destination,
                     payment: U256::from(record.payment),
                     gas_amount: U256::from(record.gas_limit),
                 };
-
-                let expected_event = rkyv_serialize(&events::GasPayment {
-                    message_id: record.message_id,
-                    gas_limit: record.gas_limit,
-                    payment: record.payment,
-                })?;
-                let provenance = self
-                    .rues
-                    .finalized_contract_event(
-                        &self.igp_id,
-                        events::GasPayment::TOPIC,
-                        index as usize,
-                        record.block_height,
-                        &expected_event,
-                    )
-                    .await?;
-
-                let indexed = Indexed::from(payment).with_sequence(index);
+                let provenance = matched.provenance;
+                let indexed = Indexed::from(payment).with_sequence(*index);
                 let meta = LogMeta {
                     address: self.igp_address,
                     block_number: provenance.block_height,
                     block_hash: provenance.block_hash,
                     transaction_id: provenance.transaction_id,
                     transaction_index: 0,
-                    log_index: U256::from(index),
+                    log_index: U256::from(*index),
                 };
 
                 results.push((indexed, meta));
             }
-            next += limit;
         }
 
         debug!(count = results.len(), "Fetched interchain gas payment logs");

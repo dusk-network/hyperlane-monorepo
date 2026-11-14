@@ -10,7 +10,7 @@ use hyperlane_core::{
 };
 use hyperlane_dusk_types::events;
 
-use crate::rues::rkyv_serialize;
+use crate::rues::{exact_event_data, rkyv_serialize};
 use crate::tx_sender::{dusk_tx_id_to_h512, h512_to_dusk_tx_id};
 use crate::RuesClient;
 
@@ -94,8 +94,8 @@ impl Indexer<MerkleTreeInsertion> for DuskMerkleTreeHookIndexer {
             .contract_query(&self.hook_id, "count", &())
             .await?;
         let (finalized_count, _) = self.finalized_insertion_count(count).await?;
-        let mut results = Vec::new();
 
+        let mut stored = Vec::new();
         for index in range {
             if index >= finalized_count {
                 break;
@@ -106,30 +106,49 @@ impl Indexer<MerkleTreeInsertion> for DuskMerkleTreeHookIndexer {
                 .await?;
             let block_number = self.insertion_height(index).await?;
             ensure_cursor_height(block_number)?;
+            stored.push((index, block_number, message_id));
+        }
 
-            let expected_event = rkyv_serialize(&events::InsertedIntoTree { message_id, index })?;
-            let provenance = self
+        // One archive pass per block, however many insertions it holds. The
+        // expected event bytes carry both the message ID and the tree index.
+        let mut results = Vec::with_capacity(stored.len());
+        for block in stored.chunk_by(|a, b| a.1 == b.1) {
+            let Some(&(_, block_number, _)) = block.first() else {
+                continue;
+            };
+            let mut expected = Vec::with_capacity(block.len());
+            for &(index, _, message_id) in block {
+                expected.push((
+                    index as usize,
+                    rkyv_serialize(&events::InsertedIntoTree { message_id, index })?,
+                ));
+            }
+            let sequences: Vec<usize> = expected.iter().map(|(index, _)| *index).collect();
+            let matches = self
                 .rues
-                .finalized_contract_event(
+                .finalized_contract_events_at_block(
                     &self.hook_id,
                     events::InsertedIntoTree::TOPIC,
-                    index as usize,
                     block_number,
-                    &expected_event,
+                    &sequences,
+                    exact_event_data(expected),
                 )
                 .await?;
 
-            let insertion = MerkleTreeInsertion::new(index, H256::from_slice(&message_id));
-            let indexed = Indexed::from(insertion).with_sequence(index);
-            let meta = LogMeta {
-                address: self.hook_address,
-                block_number: provenance.block_height,
-                block_hash: provenance.block_hash,
-                transaction_id: provenance.transaction_id,
-                transaction_index: 0,
-                log_index: U256::from(index),
-            };
-            results.push((indexed, meta));
+            for (&(index, _, message_id), matched) in block.iter().zip(matches) {
+                let provenance = matched.provenance;
+                let insertion = MerkleTreeInsertion::new(index, H256::from_slice(&message_id));
+                let indexed = Indexed::from(insertion).with_sequence(index);
+                let meta = LogMeta {
+                    address: self.hook_address,
+                    block_number: provenance.block_height,
+                    block_hash: provenance.block_hash,
+                    transaction_id: provenance.transaction_id,
+                    transaction_index: 0,
+                    log_index: U256::from(index),
+                };
+                results.push((indexed, meta));
+            }
         }
 
         debug!(count = results.len(), "Fetched merkle tree insertion logs");
