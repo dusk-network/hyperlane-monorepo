@@ -31,8 +31,7 @@ jobs:
             rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 \
             -color \
             .github/workflows/dusk-agent-gate.yml \
-            .github/workflows/dusk-proposal-validation.yml \
-            .github/workflows/dusk-review-policy-gate.yml
+            .github/workflows/dusk-proposal-validation.yml
 
       - name: Check proposed diff
         shell: bash
@@ -58,7 +57,6 @@ jobs:
             case "$path" in
               .github/workflows/dusk-agent-gate.yml|\
               .github/workflows/dusk-proposal-validation.yml|\
-              .github/workflows/dusk-review-policy-gate.yml|\
               .github/workflows/monorepo-docker.yml|\
               .github/workflows/node-services-docker.yml|\
               .github/workflows/rebalancer-e2e-test.yml|\
@@ -68,11 +66,6 @@ jobs:
               .github/workflows/solidity-fork-tests.yml|\
               .github/workflows/svm-v1-integration.yml|\
               .github/workflows/test.yml|\
-              docs/dusk-ci-bootstrap-decisions.md|\
-              docs/dusk-companion-compatibility.md|\
-              docs/dusk-final-red-team-decisions-2026-07-21.md|\
-              docs/dusk-upstream-compatibility-review.md|\
-              docs/dusk-upstream-pr-plan.md|\
               rust/main/Cargo.lock|\
               rust/main/Cargo.toml|\
               rust/main/agents/relayer/src/relayer/destination.rs|\
