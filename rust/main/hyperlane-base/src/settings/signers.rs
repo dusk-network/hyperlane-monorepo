@@ -547,7 +547,8 @@ impl BuildableWithSignerConf for hyperlane_dusk::DuskSigner {
             let key = key.resolve()?;
             hyperlane_dusk::DuskSigner::new(key).map_err(|e| eyre::eyre!(e.to_string()))
         } else {
-            bail!(format!("{conf:?} key is not supported by dusk"));
+            // Name the variant only: Debug would print KMS key identifiers.
+            bail!("{} signer is not supported by dusk", conf.variant_name());
         }
     }
 }
@@ -618,6 +619,22 @@ mod tests {
         assert!(!rendered
             .to_ascii_lowercase()
             .contains(&hex::encode(sentinel)));
+    }
+
+    #[tokio::test]
+    async fn dusk_rejects_other_signers_without_echoing_their_config() {
+        use super::BuildableWithSignerConf;
+        let kms_id = "arn:aws:kms:eu-west-1:123456789012:key/sentinel-key-id";
+        let aws = SignerConf::Aws {
+            id: kms_id.into(),
+            region: "eu-west-1".into(),
+        };
+        let error = hyperlane_dusk::DuskSigner::build(&aws)
+            .await
+            .expect_err("Dusk only supports duskKey signers");
+        let rendered = format!("{error:?}");
+        assert!(rendered.contains("aws signer is not supported by dusk"));
+        assert!(!rendered.contains("sentinel-key-id"));
     }
 
     /// Exercises the exact coalescing mechanism `build_aws_signer` relies on

@@ -1014,7 +1014,9 @@ impl Validator {
                     ) =>
                 {
                     warn!(%error, "Could not observe Dusk announcement; retrying without submitting");
-                    sleep(self.interval).await;
+                    // Same floor as the other Dusk startup retries, so a
+                    // sub-second interval doesn't poll an unavailable node.
+                    sleep(self.interval.max(Duration::from_secs(1))).await;
                     continue;
                 }
                 Err(error) => return Err(error.into()),
