@@ -1,0 +1,99 @@
+# hyperlane-dusk
+
+Hyperlane agent support for Dusk. It implements the chain traits (Mailbox,
+MerkleTreeHook, InterchainSecurityModule, MultisigIsm, ValidatorAnnounce,
+InterchainGasPaymaster, provider and indexers) over a Rusk node's HTTP API, so
+the relayer, validator and scraper can run with Dusk as an origin or
+destination.
+
+The Dusk contracts, deployment tooling and end-to-end tests live in
+[`dusk-network/hyperlane-dusk`](https://github.com/dusk-network/hyperlane-dusk).
+That repository's README covers how the contracts differ from EVM Hyperlane and
+how to run the local bridge.
+
+## How it works
+
+- **Reads** go to Rusk contract queries (`POST /on/contracts:<id>/<method>`)
+  with rkyv-encoded arguments, and to Rusk's GraphQL endpoint for blocks,
+  transactions and finalized events. Events come from the archive, so the
+  node must be built with the `archive` feature.
+- **Indexing** uses finalized contract events only. Each event is matched to
+  its block and transaction, and stored in the agent's `eventCursorDir`, which
+  every agent process needs its own copy of.
+- **Writes** are Moonlight transactions built and signed by the `dusk-tx`
+  helper from the companion repository. The agent runs it as a subprocess
+  (`DUSK_TX_BIN`, or `dusk-tx` on `PATH`) and passes the RPC URL and signing
+  key on stdin. Before retrying an uncertain submission, the agent reconciles
+  it against the transaction hash it prepared.
+- **Identity checks.** On startup the agent checks that the node's chain ID
+  and the configured contracts agree with each other: the Mailbox domain, and
+  the ValidatorAnnounce and Merkle hook bindings to that Mailbox. Startup waits
+  for the node instead of failing when it is unreachable.
+- **Checkpoints** are read at consensus finality, adjusted by the configured
+  reorg period.
+
+## Supported
+
+- `index.mode: sequence` only.
+- Security modules: `MessageIdMultisig`, plus the companion repository's
+  test-only null ISM. Routing, Aggregation and CCIP-read ISMs return an
+  explicit unsupported error.
+- A Merkle hook attached either directly or inside a one-level static
+  AggregationHook as the Mailbox's required hook.
+- One RPC endpoint for indexing and submission. Validators can list several
+  endpoints for checkpoint quorum; there is no provider failover.
+
+## Configuration
+
+```
+"dusk": {
+  "name": "dusk",
+  "protocol": "dusk",
+  "domainId": <domain>,
+  "chainId": <chain id reported by the node>,
+  "rpcUrls": [{ "http": "https://<rusk-node>" }],
+  "eventCursorDir": "/var/lib/hyperlane/dusk-events",
+  "gasLimit": 30000000,
+  "gasPrice": 2000,
+  "mailbox": "0x<contract id>",
+  "interchainGasPaymaster": "0x<contract id>",
+  "validatorAnnounce": "0x<contract id>",
+  "merkleTreeHook": "0x<contract id>",
+  "signer": { "type": "duskKey", "keyFile": "/run/secrets/dusk-signer.key" }
+}
+```
+
+The `duskKey` signer takes exactly one of `keyFile` (a regular file with no
+group or world permissions), `keyEnv` (an environment variable name) or `key`
+(inline; local development only).
+
+## Shared types
+
+Message, metadata and token-message encoding come from the
+`hyperlane-dusk-types` crate, pinned in `Cargo.toml` to an exact
+`hyperlane-dusk` commit. Deploy contracts that match that pin. There is no
+in-place migration between contract ABI versions.
+
+## Testing
+
+From `rust/main`:
+
+```bash
+cargo test -p hyperlane-dusk
+cargo test -p hyperlane-base dusk_
+cargo test -p validator dusk
+cargo test -p validator reorg
+cargo clippy -p hyperlane-dusk --all-targets -- -D warnings
+```
+
+CI runs these through `.github/workflows/dusk-agent-gate.yml`. End-to-end
+tests against a live node are in the companion repository's `demo/`
+directory.
+
+## Changes outside this crate
+
+The integration also touches shared code: Dusk connection and signer parsing
+in `hyperlane-base`, the `Dusk` protocol in `hyperlane-core`, and validator
+startup, checkpoint consensus and reorg reporting. The
+`dusk-proposal-validation.yml` workflow lists every file the fork may change
+relative to upstream.
