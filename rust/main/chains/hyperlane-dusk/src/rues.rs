@@ -26,6 +26,9 @@ const FINALIZED_EVENT_PAGE_SIZE: usize = 16;
 const MAX_EVENT_TOPIC_BYTES: usize = 256;
 /// Most bytes of a response body that go into an error or a log line.
 const MAX_ERROR_BODY_BYTES: usize = 1024;
+/// First Mailbox state version that stores only dispatched message IDs
+/// (`dispatched_id`), which dispatch indexing reads.
+const MIN_MAILBOX_STATE_VERSION: u32 = 4;
 const TX_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 type SharedRuesClients = HashMap<(String, PathBuf), RuesClient>;
@@ -263,6 +266,7 @@ impl RuesClient {
                 )));
             }
         }
+        self.validate_mailbox_state_version(mailbox_id).await?;
         self.validate_mailbox_binding(validator_announce_id, mailbox_id, "ValidatorAnnounce")
             .await?;
 
@@ -319,6 +323,28 @@ impl RuesClient {
         if mailbox != *expected_mailbox {
             return Err(HyperlaneDuskError::Other(format!(
                 "Configured Dusk {label} mailbox does not match the configured deployment"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Dispatch indexing reads `dispatched_id`, which older Mailboxes lack:
+    /// every dispatch fetch would fail with an unexplained node error.
+    async fn validate_mailbox_state_version(
+        &self,
+        mailbox_id: &[u8; 32],
+    ) -> Result<(), HyperlaneDuskError> {
+        let state_version: u32 = self
+            .contract_query(mailbox_id, "state_version", &())
+            .await
+            .map_err(|error| {
+                HyperlaneDuskError::Other(format!(
+                    "Failed to query Dusk Mailbox state_version (this agent needs state_version {MIN_MAILBOX_STATE_VERSION} or later): {error}"
+                ))
+            })?;
+        if state_version < MIN_MAILBOX_STATE_VERSION {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Dusk Mailbox state_version {state_version} is not supported: this agent needs state_version {MIN_MAILBOX_STATE_VERSION} or later, which stores dispatched message IDs (dispatched_id). Deploy a Mailbox that matches this agent's hyperlane-dusk-types pin"
             )));
         }
         Ok(())
@@ -2599,6 +2625,7 @@ mod tests {
                 (200, vec![1]),
                 (200, rkyv_serialize(&4242u32).unwrap()),
                 (200, rkyv_serialize(&4242u32).unwrap()),
+                (200, rkyv_serialize(&MIN_MAILBOX_STATE_VERSION).unwrap()),
                 (200, rkyv_serialize(&mailbox).unwrap()),
             ]
         };
@@ -2633,24 +2660,29 @@ mod tests {
         for (position, bytes, diagnostic) in [
             (
                 3,
+                rkyv_serialize(&(MIN_MAILBOX_STATE_VERSION - 1)).unwrap(),
+                "Dusk Mailbox state_version 3 is not supported",
+            ),
+            (
+                4,
                 rkyv_serialize(&foreign).unwrap(),
                 "ValidatorAnnounce mailbox",
             ),
-            (5, vec![2], "MerkleTree hook_type"),
-            (6, vec![1], "required_hook"),
+            (6, vec![2], "MerkleTree hook_type"),
+            (7, vec![1], "required_hook"),
             (
-                7,
+                8,
                 rkyv_serialize(&foreign).unwrap(),
                 "required aggregation hook mailbox",
             ),
-            (8, rkyv_serialize(&vec![foreign]).unwrap(), "exactly once"),
+            (9, rkyv_serialize(&vec![foreign]).unwrap(), "exactly once"),
             (
-                8,
+                9,
                 rkyv_serialize(&vec![merkle, merkle]).unwrap(),
                 "exactly once",
             ),
             (
-                9,
+                10,
                 rkyv_serialize(&mailbox).unwrap(),
                 "MerkleTreeHook mailbox",
             ),
@@ -2665,6 +2697,43 @@ mod tests {
                 .unwrap_err();
             assert!(error.to_string().contains(diagnostic), "{error}");
         }
+    }
+
+    #[tokio::test]
+    async fn mailboxes_older_than_state_version_4_are_refused() {
+        let mailbox = [3u8; 32];
+        let identity = |state_version: (u16, Vec<u8>)| {
+            RuesClient::new(test_server(vec![
+                (200, vec![1]),
+                (200, rkyv_serialize(&4242u32).unwrap()),
+                (200, rkyv_serialize(&4242u32).unwrap()),
+                state_version,
+            ]))
+            .unwrap()
+        };
+        for version in [0u32, 1, 3] {
+            let error = identity((200, rkyv_serialize(&version).unwrap()))
+                .validate_chain_identity(1, 4242, &mailbox, &[4u8; 32], &[5u8; 32])
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(&format!("state_version {version} is not supported"))
+                    && error.contains("state_version 4 or later"),
+                "{error}"
+            );
+        }
+        // A Mailbox from before state_version existed has no such query.
+        let error = identity((500, br#"{"error":"function not found"}"#.to_vec()))
+            .validate_chain_identity(1, 4242, &mailbox, &[4u8; 32], &[5u8; 32])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Failed to query Dusk Mailbox state_version")
+                && error.contains("state_version 4 or later"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

@@ -1028,6 +1028,8 @@ mod dusk_rpc_tests {
         WrongMerkleMailbox,
         WrongRequiredHook,
         AnnounceUnavailable,
+        /// A Mailbox from before `dispatched_id` (state version 3).
+        OldMailbox,
     }
 
     struct Node {
@@ -1113,7 +1115,8 @@ mod dusk_rpc_tests {
                     let announce_query = path.ends_with(&format!("{:064x}/local_domain", 3));
                     let topology_query = path.ends_with("/mailbox")
                         || path.ends_with("/required_hook")
-                        || path.ends_with("/hook_type");
+                        || path.ends_with("/hook_type")
+                        || path.ends_with("/state_version");
                     if chain_query || mailbox_query || announce_query || topology_query {
                         observed_identity.fetch_add(1, Ordering::SeqCst);
                     } else {
@@ -1154,6 +1157,13 @@ mod dusk_rpc_tests {
                         )
                     } else if path.ends_with("/hook_type") {
                         (200, vec![3])
+                    } else if path.ends_with(&format!("{:064x}/state_version", 1)) {
+                        let version: u32 = if current == Fault::OldMailbox as u8 {
+                            3
+                        } else {
+                            4
+                        };
+                        (200, version.to_le_bytes().to_vec())
                     } else if path.ends_with("/mailbox") {
                         let wrong = (path.ends_with(&format!("{:064x}/mailbox", 3))
                             && current == Fault::WrongAnnounceMailbox as u8)
@@ -1679,8 +1689,8 @@ mod dusk_rpc_tests {
         for checkpoint in votes.iter().flatten() {
             assert_checkpoint(checkpoint);
         }
-        assert_eq!(nodes[0].identity_reads.load(Ordering::SeqCst), 7);
-        assert_eq!(nodes[2].identity_reads.load(Ordering::SeqCst), 7);
+        assert_eq!(nodes[0].identity_reads.load(Ordering::SeqCst), 8);
+        assert_eq!(nodes[2].identity_reads.load(Ordering::SeqCst), 8);
     }
 
     async fn identity_failure_blocks_every_read_and_can_recover(fault: Fault) {
@@ -1743,6 +1753,11 @@ mod dusk_rpc_tests {
     }
 
     #[tokio::test]
+    async fn dusk_old_mailbox_cannot_return_any_state_read() {
+        identity_failure_blocks_every_read_and_can_recover(Fault::OldMailbox).await;
+    }
+
+    #[tokio::test]
     async fn dusk_wrong_required_hook_cannot_return_any_state_read() {
         identity_failure_blocks_every_read_and_can_recover(Fault::WrongRequiredHook).await;
     }
@@ -1762,7 +1777,7 @@ mod dusk_rpc_tests {
         );
         assert_eq!(count.expect("healthy hook returns count"), 1);
         assert_checkpoint(&checkpoint.expect("healthy hook returns checkpoint"));
-        assert_eq!(node.identity_reads.load(Ordering::SeqCst), 7);
+        assert_eq!(node.identity_reads.load(Ordering::SeqCst), 8);
     }
 
     #[tokio::test]

@@ -35,9 +35,10 @@ how to run the local bridge.
   `process` returns, nothing is submitted and the message is retried later.
   The query reports no gas use, so `gasLimit` stays the transaction ceiling.
 - **Identity checks.** On startup the agent checks that the node's chain ID
-  and the configured contracts agree with each other: the Mailbox domain, and
-  the ValidatorAnnounce and Merkle hook bindings to that Mailbox. Startup waits
-  for the node instead of failing when it is unreachable.
+  and the configured contracts agree with each other: the Mailbox domain and
+  `state_version`, and the ValidatorAnnounce and Merkle hook bindings to that
+  Mailbox. A Mailbox below `state_version` 4 is refused with an explicit
+  error. Startup waits for the node instead of failing when it is unreachable.
 - **Checkpoints** are read at consensus finality, adjusted by the configured
   reorg period.
 

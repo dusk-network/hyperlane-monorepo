@@ -6,6 +6,8 @@
 
 - Dispatch indexing read each message from its finalized `Dispatch` event, matched by the message ID the Mailbox stores (`dispatched_id`), because Mailbox state version 4 no longer stores dispatched messages.
 
+- Startup refused a Mailbox below `state_version` 4 with an explicit error, instead of every dispatch fetch failing later with an unexplained HTTP 500.
+
 ### Fixed
 
 - The `process` simulation passed only on the encoding of the `()` that `process` returns. Any other success reply, such as a proxy's error page sent with status 200, failed the simulation instead of letting the transaction burn its gas limit.

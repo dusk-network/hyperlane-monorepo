@@ -1642,6 +1642,8 @@ mod tests {
                             )
                         } else if uri.path().ends_with("/hook_type") {
                             (axum::http::StatusCode::OK, vec![3])
+                        } else if uri.path().ends_with("/state_version") {
+                            (axum::http::StatusCode::OK, 4u32.to_le_bytes().to_vec())
                         } else {
                             (axum::http::StatusCode::NOT_FOUND, Vec::new())
                         }
@@ -1690,14 +1692,14 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(hooks.len(), 2);
-        assert_eq!(first_calls.load(Ordering::SeqCst), 7);
+        assert_eq!(first_calls.load(Ordering::SeqCst), 8);
         assert_eq!(second_calls.load(Ordering::SeqCst), 0);
         for (_, hook) in &hooks {
             // Identity succeeds; this narrow fixture has no checkpoint response.
             assert!(hook.latest_checkpoint(&ReorgPeriod::None).await.is_err());
         }
-        assert_eq!(first_calls.load(Ordering::SeqCst), 15);
-        assert_eq!(second_calls.load(Ordering::SeqCst), 8);
+        assert_eq!(first_calls.load(Ordering::SeqCst), 17);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 9);
         first_server.abort();
         second_server.abort();
     }
