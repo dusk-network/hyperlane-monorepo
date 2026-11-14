@@ -164,6 +164,8 @@ impl HyperlaneProvider for DuskProvider {
             sender,
             recipient,
             receipt: Some(hyperlane_core::TxnReceiptInfo {
+                // The transaction query does not return the including block.
+                block_hash: None,
                 gas_used: U256::from(gas_used),
                 cumulative_gas_used: U256::from(gas_used),
                 effective_gas_price: Some(U256::from(gas_price)),

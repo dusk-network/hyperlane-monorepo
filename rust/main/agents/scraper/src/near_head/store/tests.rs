@@ -5,8 +5,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::near_head::source::EventData;
 use ethers::types::H160;
-use hyperlane_core::HyperlaneMessage;
+use hyperlane_core::{h512_to_bytes, HyperlaneMessage, H512, U256};
 use migration::MigratorTrait;
 use sea_orm::Database;
 use testcontainers::{runners::AsyncRunner, ImageExt};
@@ -25,19 +26,20 @@ fn header(height: u64) -> Header {
     }
 }
 
-fn event(height: u64, index: u64, address: H160, data: EventData) -> Event {
+fn event(height: u64, index: u64, address: hyperlane_core::H256, data: EventData) -> Event {
     Event {
         block_number: height,
         block_hash: header(height).hash,
-        tx_hash: H256::from_low_u64_be(height * 10_000 + index),
+        tx_hash: Some(H256::from_low_u64_be(height * 10_000 + index).into()),
         tx_index: index,
         log_index: index,
         address,
+        sequence: None,
         data,
     }
 }
 
-fn payments(height: u64, count: u64, address: H160) -> Vec<Event> {
+fn payments(height: u64, count: u64, address: hyperlane_core::H256) -> Vec<Event> {
     (0..count)
         .map(|index| {
             event(
@@ -45,7 +47,7 @@ fn payments(height: u64, count: u64, address: H160) -> Vec<Event> {
                 index,
                 address,
                 EventData::Gas {
-                    message_id: H256::from_low_u64_be(index),
+                    message_id: H256::from_low_u64_be(index).into(),
                     destination: 2,
                     gas: "1".into(),
                     payment: "1".into(),
@@ -53,6 +55,278 @@ fn payments(height: u64, count: u64, address: H160) -> Vec<Event> {
             )
         })
         .collect()
+}
+
+#[tokio::test]
+async fn unavailable_transaction_hashes_are_not_enrichment_work() -> Result<()> {
+    let postgres = Postgres::default().with_tag("16-alpine").start().await?;
+    let db = Database::connect(format!(
+        "postgresql://postgres:postgres@127.0.0.1:{}/postgres",
+        postgres.get_host_port_ipv4(5432).await?
+    ))
+    .await?;
+    migration::Migrator::up(&db, None).await?;
+    let receipts = crate::db::ScraperDb::with_connection(db);
+    let store = Store {
+        db: receipts.clone_connection(),
+        domain: 1,
+    };
+    let contracts = Contracts {
+        mailbox: H160::repeat_byte(1).into(),
+        hook: H160::repeat_byte(2).into(),
+        paymaster: H160::repeat_byte(3).into(),
+    };
+    store.initialize(&header(0), &contracts).await?;
+    let initial = store.state().await?.unwrap();
+    store.observe(&initial, &header(0), &header(1)).await?;
+    let mut payment = payments(1, 1, contracts.paymaster).remove(0);
+    payment.tx_hash = None;
+    store
+        .append(
+            &store.state().await?.unwrap(),
+            &[(header(1), vec![payment])],
+        )
+        .await?;
+    store
+        .confirm(&store.state().await?.unwrap(), &header(1), LEASE)
+        .await?;
+
+    assert!(receipts
+        .pending_receipts(store.domain, crate::db::ReceiptStream::GasPayment, 0)
+        .await?
+        .is_empty());
+    let row = store
+        .db
+        .query_one(sql(
+            "SELECT transaction_hash IS NULL AS missing FROM gas_payment",
+            vec![],
+        ))
+        .await?
+        .expect("payment row");
+    assert!(row.try_get::<bool>("", "missing")?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn event_batches_preserve_payloads_and_transaction_scoped_log_indexes() -> Result<()> {
+    let postgres = Postgres::default().with_tag("16-alpine").start().await?;
+    let db = Database::connect(format!(
+        "postgresql://postgres:postgres@127.0.0.1:{}/postgres",
+        postgres.get_host_port_ipv4(5432).await?
+    ))
+    .await?;
+    migration::Migrator::up(&db, None).await?;
+    migration::indexes::create_indexes(&db).await?;
+    let store = Store { db, domain: 1 };
+    let contracts = Contracts {
+        mailbox: H160::repeat_byte(1).into(),
+        hook: H160::repeat_byte(2).into(),
+        paymaster: H160::repeat_byte(3).into(),
+    };
+    store.initialize(&header(0), &contracts).await?;
+    let initial = store.state().await?.unwrap();
+    store.observe(&initial, &header(0), &header(1)).await?;
+    let state = store.state().await?.unwrap();
+    let message = |nonce| HyperlaneMessage {
+        version: 3,
+        nonce,
+        origin: 1,
+        sender: hyperlane_core::H256::repeat_byte(1),
+        destination: 2,
+        recipient: hyperlane_core::H256::repeat_byte(2),
+        body: vec![0, 255, b'\'', b'$'],
+    };
+    let messages = [message(0), message(1)];
+    let message_ids = messages
+        .iter()
+        .map(HyperlaneMessage::id)
+        .collect::<Vec<_>>();
+    let gas = U256::MAX.to_string();
+    let payment = U256::MAX.saturating_sub(U256::one()).to_string();
+    let mut events = vec![
+        event(
+            1,
+            0,
+            contracts.mailbox,
+            EventData::Dispatch(messages[0].clone()),
+        ),
+        event(
+            1,
+            1,
+            contracts.mailbox,
+            EventData::Dispatch(messages[1].clone()),
+        ),
+        event(1, 2, contracts.mailbox, EventData::Delivery(message_ids[0])),
+        event(1, 3, contracts.mailbox, EventData::Delivery(message_ids[1])),
+        event(
+            1,
+            4,
+            contracts.hook,
+            EventData::Insertion {
+                message_id: message_ids[0],
+                index: 0,
+            },
+        ),
+        event(
+            1,
+            5,
+            contracts.hook,
+            EventData::Insertion {
+                message_id: message_ids[1],
+                index: 1,
+            },
+        ),
+        event(
+            1,
+            6,
+            contracts.paymaster,
+            EventData::Gas {
+                message_id: message_ids[0],
+                destination: 2,
+                gas: "1".into(),
+                payment: "1".into(),
+            },
+        ),
+        event(
+            1,
+            7,
+            contracts.paymaster,
+            EventData::Gas {
+                message_id: message_ids[1],
+                destination: 2,
+                gas: gas.clone(),
+                payment: payment.clone(),
+            },
+        ),
+    ];
+    events.iter_mut().for_each(|event| event.log_index = 0);
+    events[0].tx_hash = None;
+    events[3].sequence = Some(77);
+    let dispatch_tx_hash = events[1].tx_hash.unwrap();
+    let wide_tx_hash = H512::repeat_byte(0x55);
+    let last = events.last_mut().unwrap();
+    last.tx_hash = Some(wide_tx_hash);
+    last.sequence = Some(u32::MAX);
+
+    store.append(&state, &[(header(1), events)]).await?;
+
+    let counts = store
+        .db
+        .query_all(sql(
+            "SELECT 'delivery' AS event_type,count(*) AS count FROM delivered_message WHERE domain=1 UNION ALL SELECT 'dispatch',count(*) FROM raw_message_dispatch WHERE origin_domain=1 UNION ALL SELECT 'gas',count(*) FROM gas_payment WHERE domain=1 UNION ALL SELECT 'insertion',count(*) FROM merkle_tree_insertion WHERE domain=1 ORDER BY event_type",
+            vec![],
+        ))
+        .await?
+        .iter()
+        .map(|row| {
+            Ok((
+                row.try_get::<String>("", "event_type")?,
+                row.try_get::<i64>("", "count")?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(
+        counts,
+        vec![
+            ("delivery".into(), 2),
+            ("dispatch".into(), 2),
+            ("gas".into(), 2),
+            ("insertion".into(), 2),
+        ]
+    );
+    // Bind numbering and numeric casts must preserve payloads, not just row counts.
+    let row = store
+        .db
+        .query_one(sql(
+            "SELECT gas_amount::text AS gas,payment::text AS payment,sequence,transaction_hash,
+         transaction_index,log_index,origin,destination FROM gas_payment WHERE transaction_index=7",
+            vec![],
+        ))
+        .await?
+        .unwrap();
+    assert_eq!(row.try_get::<String>("", "gas")?, gas);
+    assert_eq!(row.try_get::<String>("", "payment")?, payment);
+    assert_eq!(row.try_get::<i64>("", "sequence")?, i64::from(u32::MAX));
+    assert_eq!(
+        row.try_get::<Vec<u8>>("", "transaction_hash")?,
+        h512_to_bytes(&wide_tx_hash)
+    );
+    assert_eq!(row.try_get::<i64>("", "transaction_index")?, 7);
+    assert_eq!(row.try_get::<i64>("", "log_index")?, 0);
+    assert_eq!(row.try_get::<i32>("", "origin")?, 1);
+    assert_eq!(row.try_get::<i32>("", "destination")?, 2);
+    let row = store.db.query_one(sql(
+        "SELECT msg_id,msg_body,message_version,sender,recipient,origin_tx_hash,origin_block_hash,origin_mailbox FROM raw_message_dispatch WHERE nonce=1",
+        vec![],
+    )).await?.unwrap();
+    assert_eq!(
+        row.try_get::<Vec<u8>>("", "msg_id")?,
+        messages[1].id().as_bytes()
+    );
+    assert_eq!(row.try_get::<Vec<u8>>("", "msg_body")?, messages[1].body);
+    assert_eq!(
+        row.try_get::<i16>("", "message_version")?,
+        i16::from(messages[1].version)
+    );
+    assert_eq!(
+        row.try_get::<Vec<u8>>("", "sender")?,
+        messages[1].sender.as_bytes()
+    );
+    assert_eq!(
+        row.try_get::<Vec<u8>>("", "recipient")?,
+        messages[1].recipient.as_bytes()
+    );
+    assert_eq!(
+        row.try_get::<Vec<u8>>("", "origin_tx_hash")?,
+        h512_to_bytes(&dispatch_tx_hash)
+    );
+    assert_eq!(
+        row.try_get::<Vec<u8>>("", "origin_block_hash")?,
+        header(1).hash.as_bytes()
+    );
+    assert_eq!(
+        row.try_get::<Vec<u8>>("", "origin_mailbox")?,
+        address_to_bytes(&contracts.mailbox)
+    );
+    let row = store
+        .db
+        .query_one(sql(
+            "SELECT origin_tx_hash FROM raw_message_dispatch WHERE nonce=0",
+            vec![],
+        ))
+        .await?
+        .unwrap();
+    assert_eq!(
+        row.try_get::<Vec<u8>>("", "origin_tx_hash")?,
+        h512_to_bytes(&H512::zero())
+    );
+    let row = store
+        .db
+        .query_one(sql(
+            "SELECT msg_id,sequence FROM delivered_message WHERE transaction_index=3",
+            vec![],
+        ))
+        .await?
+        .unwrap();
+    assert_eq!(
+        row.try_get::<Vec<u8>>("", "msg_id")?,
+        message_ids[1].as_bytes()
+    );
+    assert_eq!(row.try_get::<i64>("", "sequence")?, 77);
+    let row = store
+        .db
+        .query_one(sql(
+            "SELECT message_id,leaf_index FROM merkle_tree_insertion WHERE transaction_index=5",
+            vec![],
+        ))
+        .await?
+        .unwrap();
+    assert_eq!(
+        row.try_get::<Vec<u8>>("", "message_id")?,
+        message_ids[1].as_bytes()
+    );
+    assert_eq!(row.try_get::<i32>("", "leaf_index")?, 1);
+    Ok(())
 }
 
 #[tokio::test]
@@ -66,9 +340,9 @@ async fn confirmation_budget_preserves_blocks_and_measures_gas_dense_publication
     migration::Migrator::up(&db, None).await?;
     let store = Store { db, domain: 1 };
     let contracts = Contracts {
-        mailbox: H160::repeat_byte(1),
-        hook: H160::repeat_byte(2),
-        paymaster: H160::repeat_byte(3),
+        mailbox: H160::repeat_byte(1).into(),
+        hook: H160::repeat_byte(2).into(),
+        paymaster: H160::repeat_byte(3).into(),
     };
     store.initialize(&header(0), &contracts).await?;
     let initial = store.state().await?.unwrap();
@@ -83,7 +357,7 @@ async fn confirmation_budget_preserves_blocks_and_measures_gas_dense_publication
         recipient: hyperlane_core::H256::repeat_byte(2),
         body: vec![],
     };
-    let message_id = H256::from_slice(message.id().as_bytes());
+    let message_id = message.id();
     let mixed = vec![
         event(20, 0, contracts.mailbox, EventData::Dispatch(message)),
         event(20, 1, contracts.mailbox, EventData::Delivery(message_id)),

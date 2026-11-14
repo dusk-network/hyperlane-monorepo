@@ -19,6 +19,8 @@ import {
 } from './deploymentArtifacts.js';
 import { MatchingListSchema } from './matchingList.js';
 
+const WEBSOCKET_URL_PREFIX_REGEX = /^wss?:\/\//i;
+
 // Keep in sync with MAX_SIGN_CONCURRENCY in the validator settings parser.
 const MAX_SIGN_CONCURRENCY = 1_000;
 
@@ -231,7 +233,23 @@ const AgentSealevelChainMetadataSchema = z.object({
     ),
   urReveal: z
     .object({
-      ccsUrl: z.url().describe('CCS endpoint for calldata lookup'),
+      ccsUrl: z
+        .url()
+        .refine((value) => {
+          try {
+            const url = new URL(value);
+            return (
+              url.protocol === 'https:' &&
+              !url.username &&
+              !url.password &&
+              !url.href.includes('?') &&
+              !url.href.includes('#')
+            );
+          } catch {
+            return false;
+          }
+        }, 'CCS requires HTTPS without credentials, query, or fragment')
+        .describe('CCS endpoint for calldata lookup'),
       programId: z
         .string()
         .refine((val) => {
@@ -279,6 +297,16 @@ export const AgentChainMetadataSchema = ChainMetadataSchemaObject.extend(
       .describe(
         'Specify a comma separated list of custom RPC URLs to use for this chain. If not specified, the default RPC urls will be used.',
       ),
+    mevSubmission: z
+      .object({
+        rpcUrls: z.array(z.url({ protocol: /^https$/ })).nonempty(),
+        icaRouter: ZHash,
+        additionalIcaRouters: z.array(ZHash).optional(),
+      })
+      .optional()
+      .describe(
+        'EVM Lander only: submit matching messages exclusively through these protected endpoints. No public fallback.',
+      ),
     additionalQuorumRpcUrls: z
       .never()
       .optional()
@@ -294,7 +322,7 @@ export const AgentChainMetadataSchema = ChainMetadataSchemaObject.extend(
     rpcConsensusType: z
       .enum(RpcConsensusType)
       .describe(
-        'RPC consensus policy. Validators default to majority for ceil(2N/3), with optional quorum for ceil(N/2) matching checkpoint histories across protocols. Majority is validator-only. Lightweight validators always require ceil(2N/3).',
+        'RPC consensus policy. Validators default to majority for ceil(2N/3), with optional quorum for ceil(N/2) matching checkpoint histories across protocols. Majority is validator-only.',
       )
       .optional(),
     fallbackHedgeDelayMillis: ZNzUint.optional().describe(
@@ -303,6 +331,16 @@ export const AgentChainMetadataSchema = ChainMetadataSchemaObject.extend(
     fallbackHedgeTimeoutMillis: ZNzUint.optional().describe(
       'Per-provider timeout for hedged immutable reads. Requires fallbackHedgeDelayMillis and defaults to 30000ms.',
     ),
+    ccsSigner: z
+      .union([
+        AgentSignerHexKeySchema,
+        AgentSignerAwsKeySchema,
+        AgentSignerGcpKeySchema,
+      ])
+      .optional()
+      .describe(
+        'Optional EVM identity for CCS reads on Sealevel; omitting it disables automated UR reveals only.',
+      ),
     signer: AgentSignerSchema.optional().describe(
       'The signer to use for this chain',
     ),
@@ -324,9 +362,16 @@ export const AgentChainMetadataSchema = ChainMetadataSchemaObject.extend(
           .describe(
             'The indexing method to use for this chain; will attempt to choose a suitable default if not specified.',
           ),
-        interval: ZNzUint.optional().describe(
-          'How long to wait between polls when idle/caught up, in seconds. Defaults to 5s.',
-        ),
+        // Match the agent's poll-interval floor (10 ms) and its u64-seconds Duration range.
+        interval: z
+          .number()
+          .finite()
+          .min(0.01)
+          .lt(2 ** 64)
+          .optional()
+          .describe(
+            'How long to wait between polls when idle/caught up, in fractional seconds, at least 0.01 (e.g. 0.1 for 100 ms). Defaults to 5s.',
+          ),
       })
       .optional(),
   })
@@ -357,6 +402,15 @@ export const AgentChainMetadataSchema = ChainMetadataSchemaObject.extend(
     {
       message: 'fallback RPC hedging requires fallback RPC consensus',
       path: ['fallbackHedgeDelayMillis'],
+    },
+  )
+  .refine(
+    (metadata) =>
+      metadata.mevSubmission === undefined ||
+      metadata.protocol === ProtocolType.Ethereum,
+    {
+      message: 'MEV submission is only supported for Ethereum chains',
+      path: ['mevSubmission'],
     },
   )
   .refine((metadata) => {
@@ -600,6 +654,36 @@ export const RelayerAgentConfigSchema = AgentConfigSchema.extend({
     .string()
     .optional()
     .describe('Comma separated list of addresses to blacklist.'),
+  runtimeDenylistUrl: z
+    .url()
+    .refine(
+      (value) => {
+        try {
+          const { protocol, hostname } = new URL(value);
+          return (
+            ((protocol === 'https:' || protocol === 'http:') &&
+              hostname.length > 0) ||
+            (protocol === 'file:' && hostname.length === 0)
+          );
+        } catch {
+          return false;
+        }
+      },
+      {
+        message:
+          'runtimeDenylistUrl must use https://, http:// or a local file:// URL',
+      },
+    )
+    .optional()
+    .describe(
+      'URL (https://, http:// or file://) of a JSON denylist the relayer polls, so rules apply without a redeploy.',
+    ),
+  runtimeDenylistPollIntervalSecs: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe('Seconds between runtime denylist fetches. Defaults to 60.'),
   transactionGasLimit: ZUWei.optional().describe(
     'This is optional. If not specified, any amount of gas will be valid, otherwise this is the max allowed gas in wei to relay a transaction.',
   ),
@@ -640,6 +724,12 @@ export const RelayerAgentConfigSchema = AgentConfigSchema.extend({
     .boolean()
     .optional()
     .describe('Whether to enable IGP indexing'),
+  messageActivityDatabaseUrl: z
+    .url({ protocol: /^postgres(ql)?$/, hostname: /.+/ })
+    .optional()
+    .describe(
+      'Separate diagnostics PostgreSQL URL. Activity writes are best effort; credentials must not be logged.',
+    ),
   websocketUrl: z
     .url()
     .refine(
@@ -650,13 +740,7 @@ export const RelayerAgentConfigSchema = AgentConfigSchema.extend({
     )
     .optional()
     .describe(
-      'Scraper-proxy WebSocket URL used for shared dispatch, Merkle, and gas-payment indexing.',
-    ),
-  websocketAuthorityEnabled: z
-    .boolean()
-    .optional()
-    .describe(
-      'Whether a healthy scraper-proxy stream may replace direct RPC indexing. Defaults to false.',
+      'Preferred live source for dispatch, Merkle, and gas-payment indexing. RPC fills history and handles fallback.',
     ),
   relayApiEnabled: z
     .boolean()
@@ -696,15 +780,6 @@ export const RelayerAgentConfigSchema = AgentConfigSchema.extend({
       'Relay API allowed CORS origins, comma-separated. Defaults to https://nexus.hyperlane.xyz.',
     ),
 }).superRefine((config, ctx) => {
-  if (config.websocketAuthorityEnabled && !config.websocketUrl) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      path: ['websocketUrl'],
-      message:
-        'websocketUrl is required when websocketAuthorityEnabled is true',
-    });
-  }
-
   // Mirror the Rust relayer gate: the current IGP event does not expose the
   // token address, so exact non-native `feeToken` enforcement is rejected.
   const { policies, parseError } = gasPaymentEnforcementPolicies(
@@ -737,6 +812,12 @@ export const RelayerAgentConfigSchema = AgentConfigSchema.extend({
 export type RelayerConfig = z.infer<typeof RelayerAgentConfigSchema>;
 
 export const ScraperAgentConfigSchema = AgentConfigSchema.extend({
+  websocketUrls: z
+    .record(z.string(), z.url({ protocol: /^wss?$/ }))
+    .optional()
+    .describe(
+      'Optional EVM log subscription URLs by chain name. Wake indexing while HTTP polling remains the fallback.',
+    ),
   db: z.string().min(1).describe('Database connection string'),
   chainsToScrape: CommaSeparatedChainList.describe(
     'Comma separated list of chain names to scrape',
@@ -811,49 +892,39 @@ export const ValidatorAgentConfigSchema = AgentConfigSchema.extend({
       })
       .describe('A checkpoint syncer that uses Google Cloud Storage'),
   ]),
-  interval: ZNzUint.optional().describe(
-    'How long to wait between checking for new checkpoints in seconds. Defaults to 2s, falling back to the origin chain’s index.interval if set and this is unset.',
-  ),
+  // Match the agent's poll-interval floor (10 ms) and its u64-seconds Duration range.
+  interval: z
+    .number()
+    .finite()
+    .min(0.01)
+    .lt(2 ** 64)
+    .optional()
+    .describe(
+      'How long to wait between checking for new checkpoints in fractional seconds, at least 0.01 (e.g. 0.1 for 100 ms). Defaults to 2s, falling back to the origin chain’s index.interval if set and this is unset.',
+    ),
   maxSignConcurrency: ZNzUint.max(MAX_SIGN_CONCURRENCY)
     .optional()
     .describe(
       `Maximum number of checkpoints signed concurrently. Defaults to 50; maximum ${MAX_SIGN_CONCURRENCY}.`,
     ),
+  // Reject obsolete settings instead of silently changing an operator's indexing policy.
   lightweight: z
-    .boolean()
+    .never()
     .optional()
-    .describe(
-      'Uses trusted websocket indexing and requires at least two thirds of configured state-read endpoints to match local roots. Signs through the highest index supported by that majority, independently of rpcConsensusType. Disables RPC indexing fallback; insufficient agreement pauses signing.',
-    ),
-  leightweigt: z.boolean().optional().describe('Alias for lightweight.'),
+    .describe('Removed: RPC indexing is required.'),
+  leightweigt: z
+    .never()
+    .optional()
+    .describe('Removed: RPC indexing is required.'),
   websocketUrl: z
     .url()
-    .refine((url) => /^wss?:\/\//i.test(url), {
+    .refine((url) => WEBSOCKET_URL_PREFIX_REGEX.test(url), {
       message: 'Must use ws:// or wss://',
     })
     .optional()
     .describe(
-      'Merkle tree insertion source for replay and live events. RPC indexing fallback is disabled in lightweight mode.',
+      'Live Merkle tree insertion source. RPC indexes history and recovers gaps, then pauses once an overlapping insertion matches.',
     ),
-}).superRefine((config, ctx) => {
-  if (
-    config.lightweight !== undefined &&
-    config.leightweigt !== undefined &&
-    config.lightweight !== config.leightweigt
-  ) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      path: ['lightweight'],
-      message: 'lightweight and leightweigt must agree when both are set',
-    });
-  }
-  if ((config.lightweight ?? config.leightweigt) && !config.websocketUrl) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      path: ['websocketUrl'],
-      message: 'websocketUrl is required in lightweight mode',
-    });
-  }
 });
 
 export type ValidatorConfig = z.infer<typeof ValidatorAgentConfigSchema>;

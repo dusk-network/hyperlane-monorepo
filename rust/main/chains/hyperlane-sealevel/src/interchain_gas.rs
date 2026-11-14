@@ -338,13 +338,13 @@ impl SealevelInterchainGasPaymasterIndexer {
                 payment_pda_slot,
                 |previous_slot| rpc_client.get_block(previous_slot),
             )
-            .await?
+            .await
         {
-            Ok(log_meta) => Ok(Some(log_meta)),
+            Ok(Ok(log_meta)) => Ok(Some(log_meta)),
             // The block will never contain the expected transaction after filtering, so falling
             // back to basic log meta lets the sequence-aware cursor advance instead of rewinding
             // on the same sequence forever.
-            Err(err) if err.is_log_meta_unresolvable() => {
+            Ok(Err(err)) if err.is_log_meta_unresolvable() => {
                 warn!(
                     ?err,
                     ?payment_pda_pubkey,
@@ -354,7 +354,12 @@ impl SealevelInterchainGasPaymasterIndexer {
                 );
                 Ok(None)
             }
-            Err(err) => Err(err.into()),
+            Ok(Err(err)) => Err(err.into()),
+            Err(err) if is_get_block_unresolvable_after_retries(&err) => {
+                warn!(?err, "Previous-slot block unavailable after provider retries; falling back to basic log meta");
+                Ok(None)
+            }
+            Err(err) => Err(err),
         }
     }
 }
@@ -425,20 +430,19 @@ impl Indexer<InterchainGasPayment> for SealevelInterchainGasPaymasterIndexer {
 impl SequenceAwareIndexer<InterchainGasPayment> for SealevelInterchainGasPaymasterIndexer {
     #[allow(clippy::blocks_in_conditions)] // TODO: `rustc` 1.80.1 clippy issue
     async fn latest_sequence_count_and_tip(&self) -> ChainResult<(Option<u32>, u32)> {
-        let program_data_account = self
+        let response = self
             .provider
             .rpc_client()
-            .get_account_with_finalized_commitment(self.igp.data_pda_pubkey)
+            .get_account_with_finalized_commitment_and_context(self.igp.data_pda_pubkey)
             .await?;
-        let program_data = ProgramDataAccount::fetch(&mut program_data_account.data.as_ref())
+        let program_data = ProgramDataAccount::fetch(&mut response.value.data.as_ref())
             .map_err(ChainCommunicationError::from_other)?
             .into_inner();
         let payment_count = program_data
             .payment_count
             .try_into()
             .map_err(StrOrIntParseError::from)?;
-        let tip = self.igp.provider.rpc_client().get_slot().await?;
-        Ok((Some(payment_count), tip))
+        Ok((Some(payment_count), response.context.slot.try_into()?))
     }
 }
 

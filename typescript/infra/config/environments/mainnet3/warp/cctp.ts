@@ -35,6 +35,7 @@ export const tokenMessengerV2Addresses = {
   hyperevm: '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d',
   ink: '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d',
   arc: '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d',
+  monad: '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d',
 } as const;
 
 export const messageTransmitterV2Addresses = {
@@ -52,6 +53,7 @@ export const messageTransmitterV2Addresses = {
   hyperevm: '0x81D40F21F12A8F0E3252Bccb954D722d4c464B64',
   ink: '0x81D40F21F12A8F0E3252Bccb954D722d4c464B64',
   arc: '0x81D40F21F12A8F0E3252Bccb954D722d4c464B64',
+  monad: '0x81D40F21F12A8F0E3252Bccb954D722d4c464B64',
 } as const;
 
 // https://developers.circle.com/cctp/concepts/fees
@@ -83,6 +85,7 @@ export const usdcTokenAddresses = {
   base: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
   bsc: '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d',
   celo: '0xcebA9300f2b948710d2653dD7B07f33A8B32118C',
+  elysium: '0xb47c4C8F73F009CC0C0d3f92B388d13E293F0B65',
   ethereum: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
   flow: 'A.b19436aae4d94622.FiatToken',
   hedera: '0.0.456858',
@@ -104,7 +107,6 @@ export const usdcTokenAddresses = {
   tron: 'TEkxiTehnzSmSe2XqrBj4w32RUN966rdz8',
   unichain: '0x078D782b760474a361dDA0AF3839290b0EF57AD6',
   worldchain: '0x79A02482A880bCE3F13e09Da970dC34db4CD24d1',
-  zksync: '0x1d17CBcF0D6D143135aE902365D2E5e2A16538D4',
   solanamainnet: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
   starknet:
     '0x053C91253BC9682c04929cA02ED00b3E423f6710D2ee7e0D5EBB06F3eCF368A8',

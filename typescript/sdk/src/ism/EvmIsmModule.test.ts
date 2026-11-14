@@ -15,9 +15,11 @@ import { MultiProvider } from '../providers/MultiProvider.js';
 import { contractDouble } from '../test/contractDouble.js';
 import { networkError } from '../test/errors.js';
 import { randomAddress } from '../test/testUtils.js';
+import { WormholeConsistencyType } from '../wormhole/consistency.js';
 
 import { EvmIsmModule } from './EvmIsmModule.js';
 import { EvmIsmReader } from './EvmIsmReader.js';
+import { HyperlaneIsmFactory } from './HyperlaneIsmFactory.js';
 import {
   AggregationIsmConfig,
   BlacklistIsmConfig,
@@ -197,6 +199,31 @@ describe('EvmIsmModule blacklist enumeration probe', () => {
   // deriving it, so a pinned target converges to no transactions when the
   // deployment already matches.
   describe('pinned addresses', () => {
+    it('preserves a top-level Wormhole address for attachment', async () => {
+      const currentAddress = randomAddress();
+      const targetAddress = randomAddress();
+      const owner = randomAddress();
+
+      sandbox
+        .stub(EvmIsmReader.prototype, 'deriveIsmConfig')
+        .withArgs(targetAddress)
+        .resolves({
+          address: targetAddress,
+          type: IsmType.WORMHOLE,
+          owner,
+          core: randomAddress(),
+          wormholeChainId: 2,
+          consistencyLevel: { type: WormholeConsistencyType.Finalized },
+          urls: ['https://vaa.example/v1'],
+        });
+
+      const module = moduleFor(currentAddress, targetAddress);
+      const txs = await module.update(targetAddress);
+
+      expect(txs).to.deep.equal([]);
+      expect(module.serialize().deployedIsm).to.equal(targetAddress);
+    });
+
     it('applies no transactions for a pinned address', async () => {
       stubReader({
         type: IsmType.BLACKLIST,
@@ -250,5 +277,122 @@ describe('EvmIsmModule blacklist enumeration probe', () => {
 
       expect(txs).to.deep.equal([]);
     });
+  });
+});
+
+const SEALEVEL_OWNER = '9bRSUPjfS3xS6n5EfkJzHFTRDa4AHLda8BU2pP4HoWnf';
+
+describe('EvmIsmModule Sealevel-only target guard', () => {
+  let sandbox: sinon.SinonSandbox;
+  let deployInternal: sinon.SinonStub;
+  const owner = randomAddress();
+  const multisigConfig: MultisigIsmConfig = {
+    type: IsmType.MESSAGE_ID_MULTISIG,
+    validators: [randomAddress()],
+    threshold: 1,
+  };
+  const routingMessageIdMultisigConfig: IsmConfig = {
+    type: IsmType.ROUTING_MESSAGE_ID_MULTISIG,
+    owner: SEALEVEL_OWNER,
+    domains: {
+      [TestChainName.test2]: { validators: [randomAddress()], threshold: 1 },
+    },
+  };
+
+  beforeEach(() => {
+    sandbox = sinon.createSandbox();
+    deployInternal = sandbox
+      .stub(HyperlaneIsmFactory.prototype, 'deployInternal')
+      .resolves(contractDouble<StaticAggregationIsm>({}));
+  });
+
+  afterEach(() => {
+    sandbox.restore();
+  });
+
+  function moduleFor(config: IsmConfig): EvmIsmModule {
+    return new EvmIsmModule(MultiProvider.createTestMultiProvider(), {
+      chain,
+      config,
+      addresses: {
+        deployedIsm: randomAddress(),
+        mailbox: randomAddress(),
+        staticMerkleRootMultisigIsmFactory: randomAddress(),
+        staticMessageIdMultisigIsmFactory: randomAddress(),
+        staticAggregationIsmFactory: randomAddress(),
+        staticAggregationHookFactory: randomAddress(),
+        domainRoutingIsmFactory: randomAddress(),
+        incrementalDomainRoutingIsmFactory: randomAddress(),
+        staticMerkleRootWeightedMultisigIsmFactory: randomAddress(),
+        staticMessageIdWeightedMultisigIsmFactory: randomAddress(),
+      },
+    });
+  }
+
+  const cases: Array<{ name: string; target: IsmConfig }> = [
+    {
+      name: 'a later routing child',
+      target: {
+        type: IsmType.ROUTING,
+        owner,
+        domains: {
+          [TestChainName.test1]: multisigConfig,
+          [TestChainName.test2]: routingMessageIdMultisigConfig,
+        },
+      },
+    },
+    {
+      name: 'a child nested under an aggregation',
+      target: {
+        type: IsmType.ROUTING,
+        owner,
+        domains: {
+          [TestChainName.test1]: multisigConfig,
+          [TestChainName.test2]: {
+            type: IsmType.AGGREGATION,
+            threshold: 1,
+            modules: [multisigConfig, routingMessageIdMultisigConfig],
+          },
+        },
+      },
+    },
+  ];
+
+  for (const c of cases) {
+    it(`update rejects ${c.name} before deploying anything`, async () => {
+      let thrown: unknown;
+      try {
+        await moduleFor(c.target).update(c.target);
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(thrown).to.be.instanceOf(Error);
+      expect(thrown)
+        .to.have.property('message')
+        .match(/Sealevel-only/);
+      expect(deployInternal.callCount).to.equal(0);
+    });
+  }
+
+  it('create still deploys a valid target', async () => {
+    await EvmIsmModule.create({
+      chain,
+      config: multisigConfig,
+      proxyFactoryFactories: {
+        staticMerkleRootMultisigIsmFactory: randomAddress(),
+        staticMessageIdMultisigIsmFactory: randomAddress(),
+        staticAggregationIsmFactory: randomAddress(),
+        staticAggregationHookFactory: randomAddress(),
+        domainRoutingIsmFactory: randomAddress(),
+        incrementalDomainRoutingIsmFactory: randomAddress(),
+        staticMerkleRootWeightedMultisigIsmFactory: randomAddress(),
+        staticMessageIdWeightedMultisigIsmFactory: randomAddress(),
+      },
+      mailbox: randomAddress(),
+      multiProvider: MultiProvider.createTestMultiProvider(),
+    });
+
+    expect(deployInternal.callCount).to.equal(1);
   });
 });

@@ -2,7 +2,7 @@
   "abstract": {
     "validators": ["0xa5962efa3ec138bf7ca8f7fde86b7ee32e24bf03"]
   },
-  "adichain": {
+  "aevo": {
     "validators": ["0xa5962efa3ec138bf7ca8f7fde86b7ee32e24bf03"]
   },
   "aleo": {
@@ -23,19 +23,10 @@
   "base": {
     "validators": ["0xa5962efa3ec138bf7ca8f7fde86b7ee32e24bf03"]
   },
-  "berachain": {
-    "validators": ["0xa5962efa3ec138bf7ca8f7fde86b7ee32e24bf03"]
-  },
-  "blast": {
-    "validators": ["0xa5962efa3ec138bf7ca8f7fde86b7ee32e24bf03"]
-  },
   "bob": {
     "validators": ["0xa5962efa3ec138bf7ca8f7fde86b7ee32e24bf03"]
   },
   "bsc": {
-    "validators": ["0xa5962efa3ec138bf7ca8f7fde86b7ee32e24bf03"]
-  },
-  "carrchain": {
     "validators": ["0xa5962efa3ec138bf7ca8f7fde86b7ee32e24bf03"]
   },
   "celestia": {
@@ -57,6 +48,9 @@
     "validators": ["0xa5962efa3ec138bf7ca8f7fde86b7ee32e24bf03"]
   },
   "electroneum": {
+    "validators": ["0xa5962efa3ec138bf7ca8f7fde86b7ee32e24bf03"]
+  },
+  "elysium": {
     "validators": ["0xa5962efa3ec138bf7ca8f7fde86b7ee32e24bf03"]
   },
   "eni": {
@@ -116,9 +110,6 @@
   "mantra": {
     "validators": ["0xa5962efa3ec138bf7ca8f7fde86b7ee32e24bf03"]
   },
-  "megaeth": {
-    "validators": ["0xa5962efa3ec138bf7ca8f7fde86b7ee32e24bf03"]
-  },
   "metal": {
     "validators": ["0xa5962efa3ec138bf7ca8f7fde86b7ee32e24bf03"]
   },
@@ -164,9 +155,6 @@
   "robinhood": {
     "validators": ["0xa5962efa3ec138bf7ca8f7fde86b7ee32e24bf03"]
   },
-  "sei": {
-    "validators": ["0xa5962efa3ec138bf7ca8f7fde86b7ee32e24bf03"]
-  },
   "solanamainnet": {
     "validators": ["0xa5962efa3ec138bf7ca8f7fde86b7ee32e24bf03"]
   },
@@ -197,6 +185,9 @@
   "tea": {
     "validators": ["0xa5962efa3ec138bf7ca8f7fde86b7ee32e24bf03"]
   },
+  "tempo": {
+    "validators": ["0xa5962efa3ec138bf7ca8f7fde86b7ee32e24bf03"]
+  },
   "tron": {
     "validators": ["0xa5962efa3ec138bf7ca8f7fde86b7ee32e24bf03"]
   },
@@ -213,9 +204,6 @@
     "validators": ["0xa5962efa3ec138bf7ca8f7fde86b7ee32e24bf03"]
   },
   "zerogravity": {
-    "validators": ["0xa5962efa3ec138bf7ca8f7fde86b7ee32e24bf03"]
-  },
-  "zksync": {
     "validators": ["0xa5962efa3ec138bf7ca8f7fde86b7ee32e24bf03"]
   }
 }

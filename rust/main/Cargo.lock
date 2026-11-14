@@ -14,7 +14,7 @@ dependencies = [
 
 [[package]]
 name = "abigen"
-version = "2.3.0"
+version = "3.0.0"
 dependencies = [
  "Inflector",
  "cainome",
@@ -157,7 +157,7 @@ dependencies = [
 
 [[package]]
 name = "aleo-serialize"
-version = "2.3.0"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "snarkvm",
@@ -1760,6 +1760,7 @@ version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4"
 dependencies = [
+ "sha2 0.10.8",
  "tinyvec",
 ]
 
@@ -2281,7 +2282,7 @@ version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fde0e0ec90c9dfb3b4b1a0891a7dcd0e2bffde2f7efed5fe7c9bb00e5bfb915e"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -2956,7 +2957,7 @@ checksum = "7a81dae078cea95a014a339291cec439d2f232ebe854a9d672b796c6afafa9b7"
 
 [[package]]
 name = "crypto"
-version = "2.3.0"
+version = "3.0.0"
 dependencies = [
  "elliptic-curve 0.13.8",
  "hex 0.4.3",
@@ -3677,9 +3678,9 @@ dependencies = [
 
 [[package]]
 name = "ecdsa"
-version = "0.17.0-rc.23"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dfa0176db12735e38bffeaa3c19ba4470216007496b2088632369bcee6eb5069"
+checksum = "c0681a4fc24c767085329728d8dfba959af91228aa4610cca4f8ce317ba46ae0"
 dependencies = [
  "der 0.8.0",
  "digest 0.11.3",
@@ -4197,7 +4198,7 @@ dependencies = [
 
 [[package]]
 name = "ethers-prometheus"
-version = "2.3.0"
+version = "3.0.0"
 dependencies = [
  "abigen",
  "async-trait",
@@ -5193,9 +5194,13 @@ name = "hashbrown"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5419bdc4f6a9207fbeba6d11b604d481addf78ecd10c11ad51e76c2f6482748d"
+
+[[package]]
+name = "hashbrown"
+version = "0.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
- "allocator-api2",
- "equivalent",
  "foldhash 0.2.0",
 ]
 
@@ -5624,7 +5629,7 @@ dependencies = [
 
 [[package]]
 name = "hyperlane-aleo"
-version = "2.3.0"
+version = "3.0.0"
 dependencies = [
  "aleo-serialize",
  "aleo-serialize-macro",
@@ -5646,6 +5651,7 @@ dependencies = [
  "prometheus",
  "rand 0.10.2",
  "rand_chacha 0.10.0",
+ "redact",
  "reqwest 0.11.27",
  "reqwest-utils",
  "serde",
@@ -5673,7 +5679,7 @@ dependencies = [
 
 [[package]]
 name = "hyperlane-base"
-version = "2.3.0"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5716,13 +5722,14 @@ dependencies = [
  "hyperlane-starknet",
  "hyperlane-test",
  "hyperlane-tron",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "maplit",
  "mockall",
  "moka",
  "parking_lot 0.12.3",
  "paste",
  "prometheus",
+ "redact",
  "reqwest 0.11.27",
  "rocksdb",
  "rusoto_core",
@@ -5741,6 +5748,7 @@ dependencies = [
  "tracing",
  "tracing-error",
  "tracing-futures",
+ "tracing-log",
  "tracing-subscriber",
  "tracing-test",
  "url",
@@ -5776,7 +5784,7 @@ dependencies = [
  "getrandom 0.2.15",
  "hex 0.4.3",
  "hyperlane-application",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "num 0.4.3",
  "num-derive",
  "num-traits",
@@ -5794,6 +5802,7 @@ dependencies = [
  "tiny-keccak 2.0.2",
  "tokio",
  "tracing",
+ "tracing-test",
  "typetag",
  "uint 0.9.5",
  "uuid 1.11.0",
@@ -5801,7 +5810,7 @@ dependencies = [
 
 [[package]]
 name = "hyperlane-cosmos"
-version = "2.3.0"
+version = "3.0.0"
 dependencies = [
  "async-trait",
  "base64 0.21.7",
@@ -5809,7 +5818,7 @@ dependencies = [
  "cometbft",
  "cometbft-rpc",
  "cosmrs",
- "cosmwasm-std 2.1.3",
+ "cosmwasm-std 1.5.7",
  "crypto",
  "derive-new",
  "futures",
@@ -5826,10 +5835,11 @@ dependencies = [
  "ibc-proto",
  "injective-protobuf",
  "injective-std",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "once_cell",
  "pin-project",
  "protobuf 2.28.0",
+ "redact",
  "ripemd",
  "serde",
  "serde_json",
@@ -5839,7 +5849,7 @@ dependencies = [
  "time",
  "tokio",
  "tonic 0.12.3",
- "tower 0.5.2",
+ "tower 0.4.13",
  "tracing",
  "tracing-futures",
  "url",
@@ -5922,7 +5932,7 @@ dependencies = [
 
 [[package]]
 name = "hyperlane-ethereum"
-version = "2.3.0"
+version = "3.0.0"
 dependencies = [
  "abigen",
  "async-trait",
@@ -5943,12 +5953,13 @@ dependencies = [
  "hyperlane-metric",
  "hyperlane-operation-verifier",
  "hyperlane-warp-route",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "k256 0.13.4",
  "num 0.4.3",
  "num-traits",
  "prometheus",
  "rand 0.8.5",
+ "redact",
  "reqwest 0.11.27",
  "reqwest-utils",
  "serde",
@@ -5963,7 +5974,7 @@ dependencies = [
 
 [[package]]
 name = "hyperlane-metric"
-version = "2.3.0"
+version = "3.0.0"
 dependencies = [
  "async-trait",
  "derive-new",
@@ -5978,7 +5989,7 @@ dependencies = [
 
 [[package]]
 name = "hyperlane-operation-verifier"
-version = "2.3.0"
+version = "3.0.0"
 dependencies = [
  "async-trait",
  "hyperlane-application",
@@ -6006,12 +6017,13 @@ dependencies = [
  "hyperlane-metric",
  "hyperlane-operation-verifier",
  "hyperlane-warp-route",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "once_cell",
  "radix-common",
  "radix-engine-interface",
  "radix-transactions",
  "rand 0.8.5",
+ "redact",
  "regex",
  "reqwest 0.11.27",
  "reqwest-utils",
@@ -6046,6 +6058,7 @@ dependencies = [
  "derive-new",
  "ed25519-dalek",
  "eyre",
+ "futures-util",
  "hex 0.4.3",
  "hyperlane-core",
  "hyperlane-metric",
@@ -6063,6 +6076,7 @@ dependencies = [
  "maplit",
  "multisig-ism",
  "num-traits",
+ "redact",
  "reqwest 0.11.27",
  "rstest",
  "serde",
@@ -6220,7 +6234,7 @@ dependencies = [
 
 [[package]]
 name = "hyperlane-starknet"
-version = "2.3.0"
+version = "3.0.0"
 dependencies = [
  "abigen",
  "anyhow",
@@ -6232,6 +6246,7 @@ dependencies = [
  "hyperlane-metric",
  "hyperlane-operation-verifier",
  "hyperlane-warp-route",
+ "redact",
  "reqwest-utils",
  "serde",
  "serde_json",
@@ -6245,7 +6260,7 @@ dependencies = [
 
 [[package]]
 name = "hyperlane-test"
-version = "2.3.0"
+version = "3.0.0"
 dependencies = [
  "async-trait",
  "hyperlane-core",
@@ -6254,7 +6269,7 @@ dependencies = [
 
 [[package]]
 name = "hyperlane-tron"
-version = "2.3.0"
+version = "3.0.0"
 dependencies = [
  "abigen",
  "async-trait",
@@ -6275,11 +6290,12 @@ dependencies = [
  "hyperlane-metric",
  "hyperlane-operation-verifier",
  "hyperlane-warp-route",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "num 0.4.3",
  "num-traits",
  "prost 0.13.4",
  "prost-types 0.13.4",
+ "redact",
  "regex",
  "reqwest 0.11.27",
  "reqwest-utils",
@@ -6907,14 +6923,14 @@ dependencies = [
 
 [[package]]
 name = "k256"
-version = "0.14.0-rc.15"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78ce7f1aa9a24c53c6572d8017c8c1ceb5d44c6071ff68c9912860fa4d262101"
+checksum = "93f50113171a713f4a4231ef82eb26703607139b35dcb56241f0ceab2ae1f7d8"
 dependencies = [
  "cpubits",
- "ecdsa 0.17.0-rc.23",
+ "ecdsa 0.17.0",
  "elliptic-curve 0.14.1",
- "primeorder 0.14.0-rc.15",
+ "primeorder 0.14.0",
  "sha2 0.11.0",
  "wnaf",
 ]
@@ -6958,11 +6974,12 @@ dependencies = [
 
 [[package]]
 name = "lander"
-version = "2.3.0"
+version = "3.0.0"
 dependencies = [
  "async-trait",
  "chrono",
  "core-api-client",
+ "dashmap",
  "derive-new",
  "ethers",
  "ethers-core",
@@ -6978,7 +6995,7 @@ dependencies = [
  "hyperlane-radix",
  "hyperlane-sealevel",
  "hyperlane-tron",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "mockall",
  "prometheus",
  "radix-common",
@@ -7028,7 +7045,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4979f22fdb869068da03c9f7528f8297c6fd2606bc3a4affe42e6a823fdb8da4"
 dependencies = [
  "cfg-if",
- "windows-targets 0.52.6",
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
@@ -7187,11 +7204,11 @@ dependencies = [
 
 [[package]]
 name = "lru"
-version = "0.16.2"
+version = "0.18.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96051b46fc183dc9cd4a223960ef37b9af631b55191852a8274bfef064cda20f"
+checksum = "ef9ac18847474e638e3702b76c65d4eb93428471a74778ef0f1be711717f89b5"
 dependencies = [
- "hashbrown 0.16.0",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -7302,13 +7319,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "message-activity-migration"
+version = "3.0.0"
+dependencies = [
+ "sea-orm-migration",
+ "tokio",
+]
+
+[[package]]
 name = "migration"
-version = "2.3.0"
+version = "3.0.0"
 dependencies = [
  "eyre",
  "sea-orm",
  "sea-orm-migration",
  "serde",
+ "serde_json",
  "testcontainers",
  "testcontainers-modules",
  "time",
@@ -8437,9 +8463,9 @@ dependencies = [
 
 [[package]]
 name = "primeorder"
-version = "0.14.0-rc.15"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "478aa2e499c7164b21b4c5e8610018e5b83a284da5f9e0896907dd4749cd76c9"
+checksum = "5c9f42978c78a00e3d68f69fc03e57a234debae69da4020a4fb588fcdcd07b06"
 dependencies = [
  "elliptic-curve 0.14.1",
  "primefield",
@@ -8623,7 +8649,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote 1.0.42",
  "syn 2.0.109",
@@ -9187,6 +9213,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "redact"
+version = "0.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dcecefd225c2fb69914585a7a6f8878929feb316a7ecb61c07d79e361d46d8ac"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9267,10 +9302,11 @@ checksum = "ba39f3699c378cd8970968dcbff9c43159ea4cfbd88d43c00b22f2ef10a435d2"
 
 [[package]]
 name = "relayer"
-version = "2.3.0"
+version = "3.0.0"
 dependencies = [
  "async-trait",
  "axum 0.8.4",
+ "bs58 0.5.1",
  "chrono",
  "config",
  "console-subscriber",
@@ -9296,9 +9332,10 @@ dependencies = [
  "hyperlane-operation-verifier",
  "hyperlane-sealevel",
  "hyperlane-test",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "lander",
  "maplit",
+ "message-activity-migration",
  "mockall",
  "moka",
  "num-derive",
@@ -9307,8 +9344,10 @@ dependencies = [
  "parking_lot 0.12.3",
  "prometheus",
  "rand 0.8.5",
+ "redact",
  "regex",
  "reqwest 0.11.27",
+ "sea-orm",
  "serde",
  "serde_json",
  "sha3",
@@ -9320,7 +9359,7 @@ dependencies = [
  "tokio-metrics",
  "tokio-test",
  "tokio-tungstenite 0.30.0",
- "tower 0.5.2",
+ "tower 0.4.13",
  "tower-http",
  "tracing",
  "tracing-futures",
@@ -9486,7 +9525,7 @@ dependencies = [
 
 [[package]]
 name = "reqwest-utils"
-version = "2.3.0"
+version = "3.0.0"
 dependencies = [
  "reqwest 0.11.27",
  "thiserror 1.0.63",
@@ -9694,7 +9733,7 @@ dependencies = [
 
 [[package]]
 name = "run-locally"
-version = "2.3.0"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "core-api-client",
@@ -10245,10 +10284,9 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "scraper"
-version = "2.3.0"
+version = "3.0.0"
 dependencies = [
  "async-trait",
- "config",
  "console-subscriber",
  "derive_more 0.99.18",
  "ethers",
@@ -10258,25 +10296,23 @@ dependencies = [
  "hyperlane-base",
  "hyperlane-core",
  "hyperlane-ethereum",
- "hyperlane-test",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "migration",
  "num-bigint 0.4.6",
- "num-traits",
  "prometheus",
+ "redact",
  "reqwest 0.11.27",
  "sea-orm",
  "serde",
  "serde_json",
  "testcontainers",
  "testcontainers-modules",
- "thiserror 1.0.63",
  "time",
  "tokio",
- "tokio-test",
+ "tokio-tungstenite 0.30.0",
  "tracing",
- "tracing-futures",
  "tracing-test",
+ "url",
 ]
 
 [[package]]
@@ -11022,8 +11058,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm"
-version = "4.8.1"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "anyhow",
  "dotenvy",
@@ -11042,8 +11078,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-algorithms"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "aleo-std",
  "anyhow",
@@ -11069,8 +11105,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-circuit"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "snarkvm-circuit-account",
  "snarkvm-circuit-algorithms",
@@ -11083,8 +11119,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-circuit-account"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "snarkvm-circuit-network",
  "snarkvm-circuit-types",
@@ -11093,8 +11129,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-circuit-algorithms"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "snarkvm-circuit-types",
  "snarkvm-console-algorithms",
@@ -11103,8 +11139,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-circuit-collections"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "snarkvm-circuit-algorithms",
  "snarkvm-circuit-types",
@@ -11113,8 +11149,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-circuit-environment"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "anyhow",
  "indexmap 2.12.0",
@@ -11133,13 +11169,13 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-circuit-environment-witness"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 
 [[package]]
 name = "snarkvm-circuit-network"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "snarkvm-circuit-algorithms",
  "snarkvm-circuit-collections",
@@ -11149,8 +11185,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-circuit-program"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "snarkvm-circuit-account",
  "snarkvm-circuit-algorithms",
@@ -11163,8 +11199,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-circuit-types"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "snarkvm-circuit-environment",
  "snarkvm-circuit-types-address",
@@ -11178,8 +11214,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-circuit-types-address"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "snarkvm-circuit-environment",
  "snarkvm-circuit-types-boolean",
@@ -11191,8 +11227,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-circuit-types-boolean"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "snarkvm-circuit-environment",
  "snarkvm-console-types-boolean",
@@ -11200,8 +11236,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-circuit-types-field"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "snarkvm-circuit-environment",
  "snarkvm-circuit-types-boolean",
@@ -11210,8 +11246,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-circuit-types-group"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "snarkvm-circuit-environment",
  "snarkvm-circuit-types-boolean",
@@ -11222,8 +11258,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-circuit-types-integers"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "snarkvm-circuit-environment",
  "snarkvm-circuit-types-boolean",
@@ -11234,8 +11270,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-circuit-types-scalar"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "snarkvm-circuit-environment",
  "snarkvm-circuit-types-boolean",
@@ -11245,8 +11281,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-circuit-types-string"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "snarkvm-circuit-environment",
  "snarkvm-circuit-types-boolean",
@@ -11257,8 +11293,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-console"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "snarkvm-console-account",
  "snarkvm-console-algorithms",
@@ -11270,8 +11306,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-console-account"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "bs58 0.5.1",
  "snarkvm-console-network",
@@ -11281,12 +11317,13 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-console-algorithms"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "blake2s_simd",
  "hex 0.4.3",
- "k256 0.14.0-rc.15",
+ "k256 0.14.0",
+ "rayon",
  "serde",
  "smallvec",
  "snarkvm-console-types",
@@ -11297,8 +11334,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-console-collections"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "aleo-std",
  "parking_lot 0.12.3",
@@ -11310,8 +11347,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-console-network"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "anyhow",
  "enum-iterator",
@@ -11330,8 +11367,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-console-network-environment"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "anyhow",
  "bech32 0.11.0",
@@ -11348,8 +11385,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-console-program"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "enum-iterator",
  "enum_index",
@@ -11369,8 +11406,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-console-types"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "snarkvm-console-network-environment",
  "snarkvm-console-types-address",
@@ -11384,8 +11421,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-console-types-address"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "snarkvm-console-network-environment",
  "snarkvm-console-types-boolean",
@@ -11395,17 +11432,18 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-console-types-boolean"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "snarkvm-console-network-environment",
 ]
 
 [[package]]
 name = "snarkvm-console-types-field"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
+ "smallvec",
  "snarkvm-console-network-environment",
  "snarkvm-console-types-boolean",
  "zeroize",
@@ -11413,8 +11451,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-console-types-group"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "snarkvm-console-network-environment",
  "snarkvm-console-types-boolean",
@@ -11424,8 +11462,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-console-types-integers"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "snarkvm-console-network-environment",
  "snarkvm-console-types-boolean",
@@ -11435,8 +11473,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-console-types-scalar"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "snarkvm-console-network-environment",
  "snarkvm-console-types-boolean",
@@ -11446,8 +11484,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-console-types-string"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "snarkvm-console-network-environment",
  "snarkvm-console-types-boolean",
@@ -11457,8 +11495,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-curves"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "rand 0.10.2",
  "rustc_version",
@@ -11470,8 +11508,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-fields"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "aleo-std",
  "anyhow",
@@ -11487,14 +11525,14 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-ledger"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "aleo-std",
  "anyhow",
  "cfg-if",
  "indexmap 2.12.0",
- "lru 0.16.2",
+ "lru 0.18.5",
  "parking_lot 0.12.3",
  "rand 0.10.2",
  "rand_chacha 0.10.0",
@@ -11517,8 +11555,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-ledger-authority"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "anyhow",
  "rand 0.10.2",
@@ -11529,8 +11567,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-ledger-block"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "anyhow",
  "indexmap 2.12.0",
@@ -11553,8 +11591,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-ledger-committee"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "indexmap 2.12.0",
  "rayon",
@@ -11565,8 +11603,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-ledger-narwhal"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "snarkvm-ledger-narwhal-batch-certificate",
  "snarkvm-ledger-narwhal-batch-header",
@@ -11578,8 +11616,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-ledger-narwhal-batch-certificate"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "indexmap 2.12.0",
  "rayon",
@@ -11591,8 +11629,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-ledger-narwhal-batch-header"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "indexmap 2.12.0",
  "rayon",
@@ -11603,8 +11641,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-ledger-narwhal-data"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "bytes",
  "serde_json",
@@ -11614,8 +11652,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-ledger-narwhal-subdag"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "indexmap 2.12.0",
  "rayon",
@@ -11629,8 +11667,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-ledger-narwhal-transmission"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "bytes",
  "serde_json",
@@ -11642,8 +11680,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-ledger-narwhal-transmission-id"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "snarkvm-console",
  "snarkvm-ledger-puzzle",
@@ -11651,14 +11689,14 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-ledger-puzzle"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "aleo-std",
  "anyhow",
  "bincode",
  "indexmap 2.12.0",
- "lru 0.16.2",
+ "lru 0.18.5",
  "parking_lot 0.12.3",
  "rand 0.10.2",
  "rand_chacha 0.10.0",
@@ -11671,14 +11709,14 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-ledger-puzzle-epoch"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "aleo-std",
  "anyhow",
  "colored",
  "indexmap 2.12.0",
- "lru 0.16.2",
+ "lru 0.18.5",
  "parking_lot 0.12.3",
  "rand 0.10.2",
  "rand_chacha 0.10.0",
@@ -11693,8 +11731,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-ledger-query"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11710,8 +11748,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-ledger-store"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "aleo-std-storage",
  "anyhow",
@@ -11735,8 +11773,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-parameters"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "aleo-std",
  "anyhow",
@@ -11757,14 +11795,14 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-synthesizer"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "aleo-std",
  "anyhow",
  "indexmap 2.12.0",
  "itertools 0.14.0",
- "lru 0.16.2",
+ "lru 0.18.5",
  "parking_lot 0.12.3",
  "rand 0.10.2",
  "rayon",
@@ -11792,8 +11830,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-synthesizer-error"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "anyhow",
  "snarkvm-circuit-environment",
@@ -11804,8 +11842,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-synthesizer-process"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "aleo-std",
  "colored",
@@ -11830,8 +11868,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-synthesizer-program"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "enum-iterator",
  "indexmap 2.12.0",
@@ -11851,8 +11889,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-synthesizer-snark"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "bincode",
  "serde_json",
@@ -11864,8 +11902,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-utilities"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "aleo-std",
  "anyhow",
@@ -11887,8 +11925,8 @@ dependencies = [
 
 [[package]]
 name = "snarkvm-utilities-derives"
-version = "4.7.3"
-source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=9bf48e7c97cd464d92198d429cf87b3bf5bded44#9bf48e7c97cd464d92198d429cf87b3bf5bded44"
+version = "4.11.0"
+source = "git+https://github.com/hyperlane-xyz/snarkVM.git?rev=6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa#6c5b8762d8058287d1d2ca27c391aeb0eccdf9fa"
 dependencies = [
  "proc-macro2",
  "quote 1.0.42",
@@ -16846,7 +16884,7 @@ dependencies = [
 
 [[package]]
 name = "validator"
-version = "2.3.0"
+version = "3.0.0"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -16868,11 +16906,12 @@ dependencies = [
  "hyperlane-ethereum",
  "hyperlane-metric",
  "hyperlane-test",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "k256 0.13.4",
  "mockall",
  "prometheus",
  "rand 0.8.5",
+ "redact",
  "reqwest 0.11.27",
  "rusoto_core",
  "serde",
@@ -16882,7 +16921,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tokio-tungstenite 0.30.0",
- "tower 0.5.2",
+ "tower 0.4.13",
  "tracing",
  "tracing-futures",
  "tracing-test",
@@ -17235,7 +17274,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -17521,13 +17560,14 @@ dependencies = [
 
 [[package]]
 name = "wnaf"
-version = "0.14.0-rc.2"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbfae175ab8f55e3c604de329bf66f628274c2cda893923670a73ebd1958ead2"
+checksum = "795ca18b3fdb5e62bf982199278341ddcf7ebf7d32e25e212ad05d496e95f6fa"
 dependencies = [
  "ff 0.14.0",
  "group 0.14.0",
  "hybrid-array",
+ "primefield",
 ]
 
 [[package]]

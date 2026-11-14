@@ -31,6 +31,7 @@ pub fn dummy_chain_conf(domain: &HyperlaneDomain) -> ChainConf {
     ChainConf {
         domain: domain.clone(),
         signer: Default::default(),
+        ccs_signer: None,
         identity: None,
         submitter: Default::default(),
         estimated_block_time: Duration::from_secs_f64(1.1),
@@ -38,12 +39,13 @@ pub fn dummy_chain_conf(domain: &HyperlaneDomain) -> ChainConf {
         addresses: Default::default(),
         connection: ChainConnectionConf::Ethereum(hyperlane_ethereum::ConnectionConf {
             rpc_connection: hyperlane_ethereum::RpcConnectionConf::Http {
-                url: "http://example.com".parse().unwrap(),
+                url: "http://example.com".parse::<url::Url>().unwrap().into(),
             },
             transaction_overrides: Default::default(),
             op_submission_config: Default::default(),
             consider_null_transaction_receipt: false,
             fallback_hedge: None,
+            mev_submission: None,
         }),
         metrics_conf: Default::default(),
         index: Default::default(),
@@ -121,5 +123,6 @@ pub fn dummy_message_context(
         transaction_gas_limit: Default::default(),
         metrics: dummy_submission_metrics(),
         application_operation_verifier: Arc::new(DummyApplicationOperationVerifier {}),
+        origin_sender_check: None,
     }
 }

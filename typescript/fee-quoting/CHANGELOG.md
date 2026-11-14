@@ -1,5 +1,120 @@
 # @hyperlane-xyz/fee-quoting
 
+## 27.3.18
+
+### Patch Changes
+
+- Updated dependencies [d2ea605]
+- Updated dependencies [bdeb314]
+- Updated dependencies [f265d2f]
+- Updated dependencies [fe5dfda]
+- Updated dependencies [8b65668]
+- Updated dependencies [aa84958]
+- Updated dependencies [d0ec60c]
+- Updated dependencies [63fa540]
+- Updated dependencies [c520224]
+- Updated dependencies [d770c3b]
+- Updated dependencies [1baa78e]
+- Updated dependencies [a72f027]
+- Updated dependencies [6e5db5f]
+- Updated dependencies [7be44b5]
+- Updated dependencies [9ef15ff]
+- Updated dependencies [48cd574]
+  - @hyperlane-xyz/sdk@45.2.0
+  - @hyperlane-xyz/utils@45.2.0
+  - @hyperlane-xyz/sealevel-sdk@45.2.0
+  - @hyperlane-xyz/provider-sdk@11.0.3
+
+## 27.3.17
+
+### Patch Changes
+
+- Updated dependencies [b6fdd2d]
+- Updated dependencies [a7b65cb]
+- Updated dependencies [1467e4c]
+- Updated dependencies [a27ce72]
+- Updated dependencies [4b0f32c]
+- Updated dependencies [447569f]
+- Updated dependencies [b43bc9f]
+- Updated dependencies [0ceb556]
+- Updated dependencies [7203aec]
+- Updated dependencies [341418a]
+- Updated dependencies [5c6593b]
+- Updated dependencies [62225a3]
+- Updated dependencies [d3b865d]
+- Updated dependencies [0063de6]
+- Updated dependencies [77dbf5d]
+- Updated dependencies [5a8eed5]
+- Updated dependencies [670000c]
+- Updated dependencies [bfbb755]
+  - @hyperlane-xyz/sdk@45.1.0
+  - @hyperlane-xyz/sealevel-sdk@45.1.0
+  - @hyperlane-xyz/utils@45.1.0
+  - @hyperlane-xyz/provider-sdk@11.0.2
+
+## 27.3.16
+
+### Patch Changes
+
+- Updated dependencies [4efffd5]
+- Updated dependencies [35d3002]
+- Updated dependencies [fe26a26]
+- Updated dependencies [19dbb59]
+  - @hyperlane-xyz/sdk@45.0.1
+  - @hyperlane-xyz/sealevel-sdk@45.0.1
+  - @hyperlane-xyz/utils@45.0.1
+  - @hyperlane-xyz/provider-sdk@11.0.1
+
+## 27.3.15
+
+### Patch Changes
+
+- Updated dependencies [e0d3394]
+- Updated dependencies [b83bac5]
+- Updated dependencies [9b9de8d]
+- Updated dependencies [4975a40]
+- Updated dependencies [d02c93e]
+- Updated dependencies [ee50f43]
+- Updated dependencies [12678bc]
+- Updated dependencies [9a59116]
+- Updated dependencies [d26e4c4]
+- Updated dependencies [87b2c63]
+- Updated dependencies [28eda66]
+- Updated dependencies [f05bb6d]
+- Updated dependencies [8373a74]
+- Updated dependencies [0015102]
+- Updated dependencies [6f7b511]
+- Updated dependencies [249517a]
+- Updated dependencies [2762075]
+- Updated dependencies [7e357be]
+- Updated dependencies [5e7cc26]
+- Updated dependencies [f9cf910]
+- Updated dependencies [323faae]
+- Updated dependencies [55e6699]
+- Updated dependencies [e994943]
+- Updated dependencies [28eda66]
+- Updated dependencies [6eaa8c6]
+- Updated dependencies [11d5de3]
+- Updated dependencies [98ec7d5]
+- Updated dependencies [2a938f3]
+- Updated dependencies [43f89c6]
+- Updated dependencies [4e2ab65]
+- Updated dependencies [4c644c0]
+- Updated dependencies [4ad4577]
+- Updated dependencies [f64f992]
+- Updated dependencies [74001ec]
+- Updated dependencies [5a3ec14]
+- Updated dependencies [d26e4c4]
+- Updated dependencies [692cdb4]
+- Updated dependencies [ea5b010]
+- Updated dependencies [b83bac5]
+- Updated dependencies [b83bac5]
+- Updated dependencies [67f3cd3]
+  - @hyperlane-xyz/sdk@45.0.0
+  - @hyperlane-xyz/sealevel-sdk@45.0.0
+  - @hyperlane-xyz/provider-sdk@11.0.0
+  - @hyperlane-xyz/utils@45.0.0
+
 ## 27.3.14
 
 ### Patch Changes

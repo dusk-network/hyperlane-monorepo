@@ -125,6 +125,12 @@ jobs:
           - warp-deploy-2
           - warp-deploy-predicate
           - warp-deploy-remote-routers
+          # wormhole
+          - wormhole-hook-ism
+          - wormhole-warp
+          # layerzero
+          - layerzero-hook-ism
+          - layerzero-warp
           # check
           - warp-check-1
           - warp-check-2
@@ -143,7 +149,6 @@ jobs:
           - warp-send-predicate
           # xerc20
           - xerc20
-          - warp-xerc20-fee
     steps:
       - uses: actions/checkout@v7
         with:
@@ -547,6 +552,7 @@ jobs:
         test:
           - core-deploy
           - core-composite-ism
+          - core-routing-message-id-multisig-ism
           - http-signer
     steps:
       - uses: actions/checkout@v7
@@ -576,6 +582,7 @@ jobs:
           - core-deploy
           - core-apply
           - core-composite-ism
+          - core-routing-message-id-multisig-ism
           - http-signer
           - hook-igp
           - warp-alt
@@ -587,6 +594,7 @@ jobs:
           - warp-legacy-upgrade-fee
           - warp-quote
           - warp-read
+          - warp-routing-message-id-multisig-ism
     steps:
       - uses: actions/checkout@v7
         with:

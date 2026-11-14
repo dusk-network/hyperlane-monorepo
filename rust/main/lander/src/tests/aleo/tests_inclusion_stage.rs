@@ -793,6 +793,7 @@ async fn run_and_expect_successful_inclusion(
         tx_received = finality_stage_receiver.recv() => {
             let tx_received = tx_received.unwrap();
             assert_eq!(tx_received.payload_details[0].uuid, created_tx.payload_details[0].uuid);
+            assert_eq!(tx_received.status, expected_tx_states.last().unwrap().status);
             success = true;
         },
         _ = tokio::time::sleep(Duration::from_millis(5000)) => {}
@@ -859,6 +860,7 @@ async fn mock_aleo_tx(
         to: H256::zero(),
         status: PayloadStatus::InTransaction(status.clone()),
         value: None,
+        gas_limit: Default::default(),
         inclusion_soft_deadline: None,
     };
 
@@ -897,9 +899,14 @@ async fn assert_tx_db_state(
         .unwrap()
         .unwrap();
 
+    // Finalized is forwarded to finality but must remain recoverable in the DB.
+    let expected_persisted_status = match &expected.status {
+        TransactionStatus::Finalized => TransactionStatus::Included,
+        status => status.clone(),
+    };
     assert_eq!(
-        retrieved_tx.status, expected.status,
-        "Transaction status mismatch"
+        retrieved_tx.status, expected_persisted_status,
+        "Persisted transaction status mismatch"
     );
     assert_eq!(
         retrieved_tx.payload_details, created_tx.payload_details,

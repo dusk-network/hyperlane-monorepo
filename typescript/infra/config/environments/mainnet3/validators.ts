@@ -18,7 +18,9 @@ const FASTPATH_VALIDATOR_REORG_PERIOD = 1;
 // bsc (PoSA) and polygon (PoS) have a history of multi-block reorgs, so they
 // use a small non-zero reorg period instead of 1 even on the fast path.
 const FASTPATH_REORG_PRONE_REORG_PERIOD = 3;
-export const fastPathReorgPeriodOverrides: Record<string, number> = {
+// A number of blocks, or a block tag (e.g. 'safe' / 'finalized') for EVM chains
+// whose RPC fork-choice head tracks the tip closely enough to stay on the fast path.
+export const fastPathReorgPeriodOverrides: Record<string, number | string> = {
   arbitrum: FASTPATH_VALIDATOR_REORG_PERIOD,
   base: FASTPATH_VALIDATOR_REORG_PERIOD,
   bsc: FASTPATH_REORG_PRONE_REORG_PERIOD,
@@ -59,6 +61,30 @@ export const validatorChainConfig = (
 ): ValidatorBaseChainConfigMap => {
   const validatorsConfig = validatorBaseConfigsFn(environment, context);
   const configs: ValidatorBaseChainConfigMap = {
+    aevo: {
+      interval: DEFAULT_VALIDATOR_INTERVAL,
+      reorgPeriod: getReorgPeriod('aevo'),
+      validators: validatorsConfig(
+        { [Contexts.Hyperlane]: [AW_VALIDATOR] },
+        'aevo',
+      ),
+    },
+    elysium: {
+      interval: DEFAULT_VALIDATOR_INTERVAL,
+      reorgPeriod: getReorgPeriod('elysium'),
+      validators: validatorsConfig(
+        { [Contexts.Hyperlane]: [AW_VALIDATOR] },
+        'elysium',
+      ),
+    },
+    tempo: {
+      interval: DEFAULT_VALIDATOR_INTERVAL,
+      reorgPeriod: getReorgPeriod('tempo'),
+      validators: validatorsConfig(
+        { [Contexts.Hyperlane]: [AW_VALIDATOR] },
+        'tempo',
+      ),
+    },
     celo: {
       interval: 5,
       reorgPeriod: getReorgPeriod('celo'),
@@ -229,17 +255,6 @@ export const validatorChainConfig = (
         'mantle',
       ),
     },
-    sei: {
-      interval: 5,
-      reorgPeriod: getReorgPeriod('sei'),
-      validators: validatorsConfig(
-        {
-          [Contexts.Hyperlane]: [AW_VALIDATOR],
-          [Contexts.ReleaseCandidate]: [AW_RC_VALIDATOR],
-        },
-        'sei',
-      ),
-    },
     solanamainnet: {
       interval: 5,
       reorgPeriod: getReorgPeriod('solanamainnet'),
@@ -262,17 +277,6 @@ export const validatorChainConfig = (
         'eclipsemainnet',
       ),
     },
-    taiko: {
-      interval: 5,
-      reorgPeriod: getReorgPeriod('taiko'),
-      validators: validatorsConfig(
-        {
-          [Contexts.Hyperlane]: [AW_VALIDATOR],
-          [Contexts.ReleaseCandidate]: [],
-        },
-        'taiko',
-      ),
-    },
     paradex: {
       interval: 5,
       reorgPeriod: getReorgPeriod('paradex'),
@@ -292,17 +296,6 @@ export const validatorChainConfig = (
           [Contexts.ReleaseCandidate]: [AW_RC_VALIDATOR],
         },
         'viction',
-      ),
-    },
-    blast: {
-      interval: 5,
-      reorgPeriod: getReorgPeriod('blast'),
-      validators: validatorsConfig(
-        {
-          [Contexts.Hyperlane]: [AW_VALIDATOR],
-          [Contexts.ReleaseCandidate]: [AW_RC_VALIDATOR],
-        },
-        'blast',
       ),
     },
     mode: {
@@ -347,16 +340,6 @@ export const validatorChainConfig = (
           [Contexts.ReleaseCandidate]: [''],
         },
         'metis',
-      ),
-    },
-    zksync: {
-      interval: 5,
-      reorgPeriod: getReorgPeriod('zksync'),
-      validators: validatorsConfig(
-        {
-          [Contexts.Hyperlane]: [AW_VALIDATOR],
-        },
-        'zksync',
       ),
     },
     apechain: {
@@ -439,16 +422,6 @@ export const validatorChainConfig = (
         'sonicsvm',
       ),
     },
-    berachain: {
-      interval: 5,
-      reorgPeriod: getReorgPeriod('berachain'),
-      validators: validatorsConfig(
-        {
-          [Contexts.Hyperlane]: [AW_VALIDATOR],
-        },
-        'berachain',
-      ),
-    },
     starknet: {
       interval: 5,
       reorgPeriod: getReorgPeriod('starknet'),
@@ -519,16 +492,6 @@ export const validatorChainConfig = (
           [Contexts.Hyperlane]: [AW_VALIDATOR],
         },
         'solaxy',
-      ),
-    },
-    tac: {
-      interval: 5,
-      reorgPeriod: getReorgPeriod('tac'),
-      validators: validatorsConfig(
-        {
-          [Contexts.Hyperlane]: [AW_VALIDATOR],
-        },
-        'tac',
       ),
     },
     galactica: {
@@ -621,16 +584,6 @@ export const validatorChainConfig = (
         'mantra',
       ),
     },
-    carrchain: {
-      interval: 5,
-      reorgPeriod: getReorgPeriod('carrchain'),
-      validators: validatorsConfig(
-        {
-          [Contexts.Hyperlane]: [AW_VALIDATOR],
-        },
-        'carrchain',
-      ),
-    },
     monad: {
       interval: 5,
       reorgPeriod: getReorgPeriod('monad'),
@@ -659,26 +612,6 @@ export const validatorChainConfig = (
           [Contexts.Hyperlane]: [AW_VALIDATOR],
         },
         'lazai',
-      ),
-    },
-    megaeth: {
-      interval: 5,
-      reorgPeriod: getReorgPeriod('megaeth'),
-      validators: validatorsConfig(
-        {
-          [Contexts.Hyperlane]: [AW_VALIDATOR],
-        },
-        'megaeth',
-      ),
-    },
-    adichain: {
-      interval: 5,
-      reorgPeriod: getReorgPeriod('adichain'),
-      validators: validatorsConfig(
-        {
-          [Contexts.Hyperlane]: [AW_VALIDATOR],
-        },
-        'adichain',
       ),
     },
     stable: {

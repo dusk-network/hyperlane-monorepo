@@ -42,6 +42,25 @@ const DEFAULT_POPS_VALIDATOR: ValidatorConfig = {
 
 // TODO: consider migrating these to the registry too
 export const defaultMultisigConfigs: ChainMap<MultisigConfig> = {
+  aevo: {
+    threshold: 1,
+    validators: [DEFAULT_AW_VALIDATOR],
+  },
+  elysium: {
+    threshold: 2,
+    validators: [
+      DEFAULT_AW_VALIDATOR,
+      {
+        address: '0x49ed767e8e971cf77413e3114f8de0b3c34205f9',
+        alias: 'Luganodes',
+      },
+    ],
+  },
+  tempo: {
+    threshold: 2,
+    validators: [DEFAULT_AW_VALIDATOR, DEFAULT_MITOSIS_VALIDATOR],
+  },
+
   abstract: {
     threshold: 2,
     validators: [
@@ -49,11 +68,6 @@ export const defaultMultisigConfigs: ChainMap<MultisigConfig> = {
       DEFAULT_MERKLY_VALIDATOR,
       DEFAULT_MITOSIS_VALIDATOR,
     ],
-  },
-
-  adichain: {
-    threshold: 2,
-    validators: [DEFAULT_AW_VALIDATOR, DEFAULT_MITOSIS_VALIDATOR],
   },
 
   aleo: {
@@ -154,19 +168,6 @@ export const defaultMultisigConfigs: ChainMap<MultisigConfig> = {
     validators: [DEFAULT_AW_TESTNET_VALIDATOR],
   },
 
-  berachain: {
-    threshold: 3,
-    validators: [
-      DEFAULT_AW_VALIDATOR,
-      {
-        address: '0xae09cb3febc4cad59ef5a56c1df741df4eb1f4b6',
-        alias: 'Renzo',
-      },
-      DEFAULT_MERKLY_VALIDATOR,
-      DEFAULT_MITOSIS_VALIDATOR,
-    ],
-  },
-
   blast: {
     threshold: 2,
     validators: [
@@ -217,11 +218,6 @@ export const defaultMultisigConfigs: ChainMap<MultisigConfig> = {
   bsctestnet: {
     threshold: 1,
     validators: [DEFAULT_AW_TESTNET_VALIDATOR],
-  },
-
-  carrchain: {
-    threshold: 2,
-    validators: [DEFAULT_AW_VALIDATOR, DEFAULT_MITOSIS_VALIDATOR],
   },
 
   celestia: {
@@ -555,11 +551,6 @@ export const defaultMultisigConfigs: ChainMap<MultisigConfig> = {
     validators: [DEFAULT_AW_VALIDATOR, DEFAULT_MITOSIS_VALIDATOR],
   },
 
-  megaeth: {
-    threshold: 2,
-    validators: [DEFAULT_AW_VALIDATOR, DEFAULT_MITOSIS_VALIDATOR],
-  },
-
   metal: {
     threshold: 3,
     validators: [
@@ -734,15 +725,6 @@ export const defaultMultisigConfigs: ChainMap<MultisigConfig> = {
     validators: [DEFAULT_AW_VALIDATOR, DEFAULT_MITOSIS_VALIDATOR],
   },
 
-  sei: {
-    threshold: 2,
-    validators: [
-      DEFAULT_AW_VALIDATOR,
-      DEFAULT_MERKLY_VALIDATOR,
-      DEFAULT_MITOSIS_VALIDATOR,
-    ],
-  },
-
   seismictestnet: {
     threshold: 1,
     validators: [DEFAULT_AW_TESTNET_VALIDATOR],
@@ -866,24 +848,6 @@ export const defaultMultisigConfigs: ChainMap<MultisigConfig> = {
     ],
   },
 
-  tac: {
-    threshold: 2,
-    validators: [DEFAULT_AW_VALIDATOR, DEFAULT_MITOSIS_VALIDATOR],
-  },
-
-  taiko: {
-    threshold: 3,
-    validators: [
-      DEFAULT_AW_VALIDATOR,
-      DEFAULT_MERKLY_VALIDATOR,
-      DEFAULT_MITOSIS_VALIDATOR,
-      {
-        address: '0x2F007c82672F2Bb97227D4e3F80Ac481bfB40A2a',
-        alias: 'Luganodes',
-      },
-    ],
-  },
-
   tea: {
     threshold: 2,
     validators: [DEFAULT_AW_VALIDATOR, DEFAULT_MITOSIS_VALIDATOR],
@@ -981,15 +945,6 @@ export const defaultMultisigConfigs: ChainMap<MultisigConfig> = {
         address: '0xd3e6a4e61b5d902a63df6dac9db5585d9f319b09',
         alias: 'Substance Labs',
       },
-    ],
-  },
-
-  zksync: {
-    threshold: 2,
-    validators: [
-      DEFAULT_AW_VALIDATOR,
-      DEFAULT_MERKLY_VALIDATOR,
-      DEFAULT_MITOSIS_VALIDATOR,
     ],
   },
 };

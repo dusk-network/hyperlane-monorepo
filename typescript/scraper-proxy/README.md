@@ -1,56 +1,606 @@
 # Scraper proxy
 
-Exposes the scraper PostgreSQL database through GraphQL at `/graphql`, protocol
-events for agents at `/agents`, enriched message updates at `/messages`, and
-Prometheus metrics at `/metrics`.
+The scraper proxy is the read-only query and streaming gateway for Hyperlane
+message data. It combines:
 
-## Deployment
+- authoritative on-chain data indexed by scrapers;
+- optional relayer diagnostics describing message-processing progress; and
+- live PostgreSQL notifications for low-latency updates.
 
-The proxy is bundled into `hyperlane-node-services` as `scraper-proxy`. The
-dedicated scraper-proxy Helm release runs it with a `cloudflared` sidecar. Its
-ExternalSecret reads the scraper database's read-only URL into `DATABASE_URL`.
+Explorer, Nexus, agents, and other services can query history or consume live
+updates without receiving database credentials.
 
-Before enabling the deployment:
+The proxy does **not** accept data ingestion over HTTP or WebSocket. Scrapers and
+relayers write to their databases; downstream services read through the proxy.
 
-1. Build and publish `hyperlane-node-services`, then set the immutable tag in
-   `mainnetDockerTags.scraperProxy`.
-2. Create a remotely managed Cloudflare tunnel whose public hostname routes
-   only `/graphql*` and `/messages*` to `http://localhost:8383`, followed by a
-   catch-all HTTP 404 rule. Configure Cloudflare per-client rate limits for
-   both public routes.
-3. Store its token in GCP Secret Manager as
-   `hyperlane-mainnet3-scraper-proxy-cloudflared-tunnel-token`.
-4. Set `scraperProxy.enabled` to `true` in the mainnet agent config.
-5. Deploy the scraper-proxy role:
+## Architecture
 
-   ```sh
-   pnpm -C typescript/infra tsx scripts/agents/deploy-agents.ts \
-     --environment mainnet3 --roles scraper-proxy
-   ```
+```text
+ Chain RPCs                              Relayer runtime
+     │                                         │
+     ▼ indexed by                              ▼ writes activity
+┌──────────────────────┐              ┌────────────────────────┐
+│ Scraper agents       │              │ Relayers               │
+└──────────┬───────────┘              └───────────┬────────────┘
+           │ writes chain data                    │
+           ▼                                      ▼
+┌─────────────────────────────┐        ┌─────────────────────────────┐
+│ Scraper PostgreSQL          │        │ Diagnostics PostgreSQL      │
+│                             │        │                             │
+│ dispatches, deliveries,     │        │ message_activity: retries,  │
+│ gas payments, Merkle        │        │ ISM progress, submission,   │
+│ insertions, block heads,    │        │ confirmation, delivery      │
+│ message projections         │        │ observations                │
+└──────────────┬──────────────┘        └──────────────┬──────────────┘
+               │ SELECT + LISTEN/NOTIFY               │
+               └──────────────────┬────────────────────┘
+                                  ▼
+                       ┌──────────────────────────┐
+                       │ scraper-proxy :8383      │
+                       │                          │
+                       │ /graphql   historical    │
+                       │ /agents    protocol WS   │
+                       │ /messages  message WS    │
+                       │ /metrics   Prometheus    │
+                       └──────┬───────────┬───────┘
+                              │           │
+                ┌─────────────▼──┐   ┌────▼──────────────┐
+                │ Nexus/Explorer │   │ Agents and other  │
+                │ message views  │   │ internal services │
+                └────────────────┘   └───────────────────┘
+```
 
-The public endpoints are then:
+The scraper database and diagnostics database remain separate:
 
-- `https://<hostname>/graphql`
-- `wss://<hostname>/messages`
+| Source                         | Writer         | Meaning                                                           | Proxy interfaces                          |
+| ------------------------------ | -------------- | ----------------------------------------------------------------- | ----------------------------------------- |
+| Scraper PostgreSQL             | Scraper agents | Indexed on-chain state and canonical delivery                     | GraphQL, `/agents`, `/messages`           |
+| Relayer diagnostics PostgreSQL | Relayers       | Relayer observations, retries, ISM progress, submission lifecycle | GraphQL, optional `/messages` diagnostics |
 
-`/agents` is not public. Pods use
-`ws://<scraper-proxy-service>.<namespace>.svc:8383/agents` through the
-cluster-only Kubernetes Service.
+Scraper `is_delivered` is the authoritative indexed on-chain state. A diagnostic
+`delivered` phase means a relayer observed delivery; it is useful for latency and
+debugging but does not replace scraper state.
 
-`/messages` automatically streams `message_upsert` events containing normalized
-`message_view` rows. It does not emit gas payments or Merkle tree insertions.
-Production requests must arrive through Cloudflare with a valid
-`CF-Connecting-IP` header; at most five connections are accepted per client IP.
+## Choose an interface
 
-The private `/agents` endpoint always supports historical WebSocket catch-up.
-Replay is paginated without a total row limit. Concurrent catch-ups, session
-duration, database query timeouts, and outbound buffering remain bounded.
+| Interface           | Use it for                                                               | Delivery model                      | Intended clients                  |
+| ------------------- | ------------------------------------------------------------------------ | ----------------------------------- | --------------------------------- |
+| `GET/POST /graphql` | Historical queries, pagination, message snapshots, diagnostic history    | Request/response                    | Explorer, Nexus, services         |
+| `WS /messages`      | Enriched message updates, selected message IDs, block heads, diagnostics | Server pushes after URL negotiation | Explorer, Nexus, public consumers |
+| `WS /agents`        | Live protocol events at canonical or custom confirmations                | Client sends a subscription         | Internal agents and indexers      |
+| `GET /metrics`      | Request, database, WebSocket, queue, and process metrics                 | Prometheus scrape                   | Monitoring                        |
 
-Outbound WebSocket buffering is limited to 1 MiB per socket and 32 MiB across
-all sockets. GraphQL is limited to 25 concurrent requests; Cloudflare owns
-public per-client request-rate enforcement.
+## GraphQL
 
-`/metrics` reports GraphQL request usage and latency; WebSocket connections,
-subscriptions, catch-ups, notification queues, outbound buffering, limits and
-rejections; database pool pressure and listener readiness; and standard Node.js
-process metrics.
+`/graphql` exposes read-only data from the scraper database and, when configured,
+the relayer diagnostics database.
+
+Main queries:
+
+| Query                     | Data                                                                 |
+| ------------------------- | -------------------------------------------------------------------- |
+| `domain` / `domain_by_pk` | Domain metadata                                                      |
+| `message_view`            | Enriched dispatch, delivery, transaction, and gas-payment projection |
+| `message_view_aggregate`  | Counts and aggregate message queries                                 |
+| `raw_message_dispatch`    | Raw indexed dispatches                                               |
+| `message_activity`        | Paginated raw relayer diagnostic history                             |
+| `message_diagnostics`     | Latest diagnostic snapshot/update envelope for one message           |
+
+The complete filter, ordering, cursor, and field contract lives in
+[scraperdb-schema.graphql](src/graphql/scraperdb-schema.graphql).
+
+### Message history
+
+Canonical message history uses scraper finality:
+
+```graphql
+query RecentMessages {
+  message_view(order_by: [{ send_occurred_at: desc }], limit: 25) {
+    msg_id
+    origin_domain
+    destination_domain
+    sender
+    recipient
+    send_occurred_at
+    is_delivered
+    delivery_occurred_at
+    origin_tx_hash
+    destination_tx_hash
+    total_payment
+  }
+}
+```
+
+Pass `confirmations: N` to request a provisional snapshot at `N` blocks behind
+the current chain head. Domains without near-head scraper state remain canonical.
+Custom snapshots support 0–1,000 confirmations, reject non-zero offsets, and cap
+the affected event scan at 10,000 rows. Narrow large provisional queries by
+`msg_id`.
+
+For a combined live list:
+
+1. Page canonical history normally.
+2. Query provisional rows with `confirmations: 0` and
+   `where: {is_provisional: {_eq: true}}`.
+3. Merge by `msg_id`, prefer provisional fields, and sort by send time.
+
+Only canonical pages should be used as durable history cursors.
+
+### Relayer diagnostics
+
+```graphql
+query MessageDiagnostics {
+  message_activity(message_id: "0x...", limit: 100) {
+    activities {
+      id
+      relayer
+      observed_at
+      received_at
+      version
+      activity
+    }
+    has_more
+    next_before_id
+  }
+
+  message_diagnostics(message_id: "0x...") {
+    version
+    message_id
+    partial
+    relayers {
+      relayer
+      phase
+      observed_at
+      retry {
+        reason
+        count
+        next_attempt_at_millis
+      }
+      modules {
+        ism
+        module_type
+        verification
+        verified
+        threshold
+        routed_module
+        modules
+        signatures {
+          collected
+          threshold
+          unavailable {
+            validator
+            reason
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+`message_activity` is newest first. `before_id` is exclusive; use
+`next_before_id` to fetch the next page. Limits are 1–500, defaulting to 100.
+IDs are strings to preserve PostgreSQL bigint precision in JavaScript.
+The proxy does not prune diagnostic history; current relayer database retention
+is indefinite.
+
+`message_diagnostics` returns the latest full snapshot and newest cumulative
+update per relayer in `activities`. Apply those activities to render the current
+ISM tree and lifecycle. The `relayers` field remains a compatibility reduction
+for older diagnostic event rows. Raw paginated history remains available when a
+consumer needs the exact timeline.
+
+Diagnostics errors use the GraphQL code `DIAGNOSTICS_UNAVAILABLE` when the
+diagnostics database is disabled or unavailable. Other scraper queries continue
+to work.
+
+## Message WebSocket: `/messages`
+
+`/messages` is the consumer-facing stream used by Explorer and Nexus. The
+subscription is declared in URL query parameters; clients do not send a
+`subscribe` frame. Reconnect with a new URL to change the subscription.
+
+### Connection modes
+
+| URL                                          | Result                                                              |
+| -------------------------------------------- | ------------------------------------------------------------------- |
+| `/messages`                                  | All canonical enriched message updates                              |
+| `/messages?messageIds=0xID1,0xID2`           | Updates only for the selected IDs                                   |
+| `/messages?messageIds=`                      | No message updates; useful with `blocks=true`                       |
+| `/messages?blocks=true`                      | Message updates plus indexed block-head snapshots and changes       |
+| `/messages?confirmations=2&domains=1,42161`  | Message projection two blocks behind the head for supported domains |
+| `/messages?diagnostics=true&messageIds=0xID` | Message updates plus relayer diagnostics for selected IDs           |
+
+`messageIds` accepts at most 50 IDs. It filters ordinary message updates before
+database enrichment. Diagnostics requires between 1 and 50 explicit IDs.
+
+Production `/messages` requests must include a valid `CF-Connecting-IP` header.
+At most five connections are allowed per client IP.
+
+### Frames
+
+The first frame describes the negotiated stream:
+
+```json
+{
+  "type": "ready",
+  "eventTypes": [
+    "message_upsert",
+    "block",
+    "diagnostics",
+    "diagnostics_unavailable"
+  ],
+  "messageIds": ["\\x..."],
+  "confirmations": 2,
+  "domains": [1, 42161],
+  "customDomains": [1],
+  "canonicalDomains": [42161]
+}
+```
+
+Fields not requested are omitted. `customDomains` identifies domains using the
+requested confirmation delay; `canonicalDomains` identifies domains retaining
+scraper finality.
+
+Server frame types:
+
+| `type`                    | Meaning                                                               | Important fields                                                      |
+| ------------------------- | --------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| `message_upsert`          | Insert or replace the enriched message projection                     | `data`, optional `confirmations`                                      |
+| `rollback`                | Previously exposed custom-confirmation data above a height is invalid | `domain`, `fromHeight`, `toHeight`, `confirmations`                   |
+| `block`                   | Current indexed block for a domain                                    | `domain`, `height`, `hash`, `headHeight`                              |
+| `diagnostics`             | Current diagnostic snapshot for one message                           | `data.version`, `data.message_id`, `data.relayers`, `data.activities` |
+| `diagnostics_unavailable` | Diagnostic reads failed without closing normal message updates        | `message_ids`, `message`                                              |
+| `error`                   | Negotiation or runtime error                                          | `error`                                                               |
+
+Treat `message_upsert` as replacement state keyed by message ID. After a
+`rollback`, remove or reload state above `toHeight`; replacement upserts follow.
+Block heights are decimal strings and can decrease or change hash after a reorg.
+
+### Diagnostics behavior
+
+Relayers persist versioned `snapshot` and `snapshot_update` activities:
+
+- a full snapshot anchors initial state, `ready_to_submit`, and terminal state;
+- intermediate updates replace only changed ISM nodes and message-level state;
+- stable `node_id` values let consumers update the existing ISM tree; and
+- retries, failures, signature progress, offchain reads, and submission stages
+  remain available without repeating an unchanged full tree.
+
+The proxy packages the latest anchor and cumulative update into the
+`diagnostics` frame's `data.activities`. `snapshot` and `snapshot_update` are
+nested activity types, not separate top-level WebSocket frame types. Replace the
+previous state for that message; do not append the entire frame as new history.
+GraphQL remains the source for older activity pages.
+
+The `relayers` projection in both GraphQL and WebSocket responses understands
+full snapshots and cumulative updates, including node replacements and removals.
+Snapshot nodes use `node_id` identity, so repeated ISM addresses remain distinct.
+Collection IDs and offchain attempt counters are nullable when omitted by the
+snapshot producer; legacy events retain their original values.
+
+The bounded snapshot selection retains anchors and updates together. Legacy
+events newer than a reporter's latest snapshot state are included, so rolling
+back a writer does not leave its status frozen at an older snapshot. Truncated
+responses remain marked `partial`; older history is available through GraphQL.
+
+PostgreSQL notifications are wakeups, not the data payload. Notifications are
+coalesced, and the proxy reloads only affected watched IDs. New subscriptions are
+read once; there is no periodic polling. After a listener reconnect, the proxy
+refreshes watched IDs to repair missed notifications.
+
+Diagnostic streaming is best effort. If its database is down, normal message
+updates stay connected and `diagnostics_unavailable` marks the last snapshot as
+stale. The proxy retries affected IDs and publishes fresh state after recovery.
+
+Capacity is 200 unique diagnostic IDs globally and 50 per client IP across
+connections. Frames may be skipped and retried when normal message traffic or
+outbound byte limits have priority.
+
+Missing diagnostic fields mean unobserved, not zero or success. Never infer ISM
+verification from signature counts, metadata success, absent events, or a failed
+validator read. The proxy performs no background signature reads or verification.
+
+## Agent WebSocket: `/agents`
+
+`/agents` provides live protocol events for agents and indexers. The endpoint is
+cluster-only:
+
+```text
+ws://scraper-proxy.<namespace>.svc:8383/agents
+```
+
+Agents must recover startup history and reconnect gaps through RPC before
+cutting over to live events.
+
+On connection, the server advertises its capabilities:
+
+```json
+{
+  "type": "ready",
+  "eventTypes": [
+    "dispatch",
+    "delivery",
+    "gas_payment",
+    "merkle_tree_insertion",
+    "blocks"
+  ],
+  "historicalStreaming": false,
+  "liveStartVersion": 1,
+  "confirmations": { "unit": "blocks", "liveOnly": true }
+}
+```
+
+Send one subscription containing each desired event type at most once. Omit
+`domains` for all domains, or list explicit domains. Client frames are limited to
+64 KiB:
+
+```json
+{
+  "type": "subscribe",
+  "streams": [
+    { "eventType": "dispatch", "domains": [1, 42161] },
+    { "eventType": "gas_payment", "domains": [1, 42161] },
+    { "eventType": "delivery" },
+    { "eventType": "blocks", "domains": [1, 42161] }
+  ]
+}
+```
+
+### Available streams
+
+| `eventType`             | Data                                                                         |
+| ----------------------- | ---------------------------------------------------------------------------- |
+| `dispatch`              | Raw dispatch, origin/destination, mailbox, sender, recipient, body, tx/block |
+| `delivery`              | Delivered message ID, destination mailbox/domain, destination transaction    |
+| `gas_payment`           | Message ID, payment, gas amount, IGP, origin/destination, tx/log metadata    |
+| `merkle_tree_insertion` | Message ID, Merkle tree hook, leaf index, domain, block                      |
+| `blocks`                | Current indexed block snapshot followed by live changes                      |
+
+Every event subscription starts live, including after reconnect. Replay options
+such as `cursors`, `streamCursorVersion`, `afterSequence`, `afterStreamCursor`,
+`afterId`, and `allowReplay` are rejected, even when empty. No historical database
+scan or `caught_up` message is issued. Gas payment events retain their row ID and
+log metadata, without replay cursors or legacy cursor boundaries.
+
+### Live-start boundary
+
+Live agent event subscriptions automatically receive handoff boundaries; there
+is no opt-in flag. Check `liveStartVersion: 1` in `ready` for server support.
+Blocks-only subscriptions do not receive a boundary.
+This applies to `/agents`, not the Explorer `/messages` endpoint.
+A validator can request only Merkle insertions; a relayer requests all three:
+
+```json
+{
+  "type": "subscribe",
+  "streams": [
+    { "eventType": "dispatch", "domains": [1] },
+    { "eventType": "merkle_tree_insertion", "domains": [1] },
+    { "eventType": "gas_payment", "domains": [1] }
+  ]
+}
+```
+
+After `subscribed`, canonical streams receive one boundary for each requested
+domain, including quiet chains with no events. Unscoped subscriptions receive
+boundaries for available domains:
+
+```json
+{
+  "type": "live_start",
+  "domain": 1,
+  "height": "100",
+  "hash": "<checkpoint hash as 0x-prefixed 32-byte hex>",
+  "streams": [
+    {
+      "eventType": "dispatch",
+      "address": "0x1111111111111111111111111111111111111111"
+    },
+    {
+      "eventType": "merkle_tree_insertion",
+      "address": "0x2222222222222222222222222222222222222222"
+    },
+    {
+      "eventType": "gas_payment",
+      "address": "0x3333333333333333333333333333333333333333"
+    }
+  ]
+}
+```
+
+For canonical streams, the proxy registers **all requested event streams before
+reading the boundary** from the primary database. One SQL snapshot joins the healthy, non-halted
+`scraper_head.confirmed_height` to its retained `scraper_checkpoint` hash and
+contract addresses. The proxy DB role needs SELECT access to both tables.
+
+Custom streams (e.g. `"confirmations": 2`) receive a boundary per event type and
+domain with `"confirmations": 2` on the frame. Its height is the latest retained
+checkpoint at or below `min(indexed_height, head_height - 2)`, using the same
+primary SQL snapshot that initializes that stream. Streams with the same
+confirmation count and domain set share that snapshot; setup rollbacks force a
+fresh read. It never substitutes the
+canonical confirmation policy. Sparse checkpoints can place the boundary below
+the numeric target; live reading then covers the interval above that boundary.
+With `includeZeroConfirmations`, the requested and additional zero-confirmation
+streams get separate markers; the latter has `"confirmations": 0`. No historical replay is
+requested or performed.
+
+If the requested frontier is older than retained checkpoints, the boundary is
+unavailable. A rollback during initialization retries the snapshot; a rollback
+after initialization invalidates that boundary. A missing boundary never grants
+permission to switch to WebSocket authority.
+
+**Consumer handoff contract:**
+
+1. Buffer live events from `subscribed` onward, including events arriving before
+   `live_start` while its database read is in flight.
+2. Verify the returned contract addresses and boundary hash against independent
+   RPC. Complete RPC history through **at least** that boundary for every required
+   event type, respecting the consumer's confirmation policy and indexing window.
+3. Stop and join the RPC indexers, then drain the buffered live events with overlap
+   deduplication and sequence checks. No new dispatch or insertion is required.
+4. For custom streams, match the marker's confirmation count as well as domain
+   and event type. Handle rollback frames throughout recovery and live operation;
+   invalidate the affected handoff and recover through RPC before trusting a new
+   boundary. This marker does not replace independent validator root, block-hash,
+   or confirmation checks.
+
+The boundary means RPC must cover through `height`, while the registered stream
+covers subsequent events above it under that stream's confirmation policy. It is
+**not** a promise that events at or below that height have already been sent; late
+overlap events are allowed.
+Do not interpret the highest event nonce or the existing `block` feed as this
+boundary. Heights and hashes use each adapter's native units (including Solana
+slots and Radix state versions); heights are decimal strings and addresses can
+be 20 or 32 bytes.
+
+A domain without a healthy, valid retained checkpoint receives
+`{"type":"live_start_unavailable","domain":1,"eventTypes":["dispatch"],"reason":"No healthy live-start scraper checkpoint"}`.
+Custom unavailable frames also carry `confirmations`. Keep RPC indexing for that
+stream. A malformed checkpoint or contract identity affects only that domain;
+other domains stay connected. A database query failure closes the socket.
+Reconnects require a fresh boundary and RPC gap recovery; never reuse the prior
+connection's marker. A missing marker, disconnect, or failed verification must
+not authorize takeover. Existing clients must ignore unknown frame types.
+
+Event delivery is independent per event type and can begin in the middle of a
+block range or page sequence. A `subscribed` acknowledgement alone is not a
+shared block boundary or a completeness guarantee. Buffer from `subscribed` and
+use `live_start` as the explicit RPC recovery target for every required stream,
+including gas payments. Dispatch/Merkle sequence agreement alone cannot establish
+gas completeness. If a boundary is unavailable, keep RPC indexing for that stream.
+
+To use a custom confirmation delay, provide both `confirmations` and explicit
+`domains` on a stream:
+
+```json
+{
+  "type": "subscribe",
+  "streams": [{ "eventType": "dispatch", "domains": [1], "confirmations": 2 }]
+}
+```
+
+Custom-confirmation eligibility is the minimum of indexed height and chain head
+minus confirmations. `/agents` requires near-head state for every requested
+custom domain.
+
+Set `includeZeroConfirmations: true` on any event stream to also receive live
+zero-confirmation events on the same connection. For example,
+`{ "eventType": "dispatch", "domains": [1], "confirmations": 15, "includeZeroConfirmations": true }`
+sends events with `confirmations: 0` and again at `confirmations: 15`.
+The extra stream leaves canonical live delivery unchanged. At depth 0,
+events are sent once. Rollback frames
+identify the affected stream by `eventType` and `confirmations`.
+Provisional Merkle event envelopes also include `blockHash`.
+The extra stream is best-effort: domains without near-head state are logged and
+skipped until reconnect, without rejecting canonical live delivery. Explicit numeric
+confirmation subscriptions still require near-head state for every requested domain.
+
+Server frame types:
+
+| `type`       | Meaning                                                                          |
+| ------------ | -------------------------------------------------------------------------------- |
+| `subscribed` | Echoes the normalized accepted stream configuration                              |
+| `event`      | Protocol event with `eventType`, `domain`, `data`, and native sequence or row ID |
+| `rollback`   | Custom-confirmation event range was invalidated by a reorg                       |
+| `block`      | Current indexed block snapshot or update                                         |
+| `pong`       | Response to `{ "type": "ping" }`                                                 |
+| `error`      | Invalid subscription or stream failure                                           |
+
+On `rollback`, undo or reload effects above `toHeight`; replacement events
+follow. On disconnect, recover missing history through RPC before resuming
+live processing.
+
+## Data and consistency rules
+
+- Canonical scraper rows use the scraper's configured finality.
+- Custom confirmation data is provisional and can roll back.
+- WebSocket streams provide live state only; recover historical state through RPC.
+- GraphQL pagination observes committed rows at query time.
+- Large integers are serialized as strings.
+- Addresses and message IDs may be normalized to PostgreSQL bytea form
+  (`\\x...`) on the wire.
+- LISTEN/NOTIFY triggers reads; database rows remain the source of truth.
+- The diagnostics database is optional and cannot block scraper-backed APIs.
+
+## Configuration and deployment
+
+Required and optional database settings:
+
+| Variable                    | Purpose                                             |
+| --------------------------- | --------------------------------------------------- |
+| `DATABASE_URL`              | Scraper database primary; required for live streams |
+| `DATABASE_READ_REPLICA_URL` | Optional GraphQL read replica                       |
+| `DIAGNOSTICS_DATABASE_URL`  | Optional SELECT-only relayer diagnostics database   |
+
+Startup validates the `scraper_head` table and its read privileges before
+accepting traffic. Gas replay cursor tables and triggers are no longer required. The
+diagnostics pool opens lazily; diagnostics downtime does not block startup.
+
+See [config.ts](src/config.ts) for connection, request, buffering, and
+rate limits.
+
+The `hyperlane-node-services` image includes this service. The dedicated
+`scraper-proxy` Helm release syncs database URLs through ExternalSecrets.
+[mainnet3](../infra/config/environments/mainnet3/agent.ts) and
+[testnet4](../infra/config/environments/testnet4/agent.ts) enable it. Image tags
+live in [docker.ts](../infra/config/docker.ts).
+
+Deploy from the repository root:
+
+```sh
+pnpm -C typescript/infra tsx scripts/agents/deploy-agents.ts \
+  --environment mainnet3 --roles scraper-proxy
+```
+
+Use `testnet4` for testnet. When enabling the tunnel, supply the GCP secret
+`{context}-{environment}-scraper-proxy-cloudflared-tunnel-token`. Route only
+`/graphql*` and `/messages*` publicly; keep `/agents` cluster-only.
+
+The configured SELECT-only Secret Manager values are
+`hyperlane-mainnet-relayer-postgres-reader-url` for mainnet3 and
+`hyperlane-testnet4-relayer-postgres-reader-url` for testnet4. Environments
+without `scraperProxy.diagnosticsDatabaseSecret` leave diagnostics disabled.
+
+## Development
+
+With workspace dependencies installed and built:
+
+```sh
+cd typescript/scraper-proxy
+cp .env.example .env
+# Set DATABASE_URL to a scraper database read-only URL.
+pnpm dev
+```
+
+The service listens on `http://localhost:8383`.
+
+Useful commands:
+
+```sh
+pnpm test
+pnpm debug:websocket --help
+```
+
+Set `SCRAPER_TEST_DATABASE_URL` to include PostgreSQL projection tests. Set
+`DIAGNOSTICS_TEST_DATABASE_URL` to run diagnostic ordering tests against a
+session-local temporary table:
+
+```sh
+DIAGNOSTICS_TEST_DATABASE_URL='postgresql://...' \
+pnpm exec node --import tsx --test src/diagnostics/*.test.ts
+```
+
+The test requires `TEMP` permission and does not modify existing relayer data.
+
+Implementation entry points:
+
+| Area                                | Source                                                                                                                       |
+| ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| Startup and shutdown                | [main.ts](src/main.ts)                                                                                                       |
+| GraphQL schema and SQL projection   | [scraperdb-schema.graphql](src/graphql/scraperdb-schema.graphql), [scraperdb.service.ts](src/scraperdb/scraperdb.service.ts) |
+| WebSocket server                    | [event-websocket.ts](src/live/event-websocket.ts)                                                                            |
+| Wire validation                     | [protocol.ts](src/live/protocol.ts)                                                                                          |
+| Custom confirmations and rollbacks  | [confirmation-stream.ts](src/live/confirmation-stream.ts)                                                                    |
+| Diagnostics reduction and streaming | [diagnostics](src/diagnostics)                                                                                               |

@@ -1,5 +1,55 @@
 # @hyperlane-xyz/aleo-sdk
 
+## 45.2.0
+
+### Patch Changes
+
+- c520224: Invariant regular expressions were reused across calls, redundant URL parsing was removed from RPC-header and explorer helpers, and independent token reads were overlapped with bounded concurrency and failure draining. URL normalization, validation, and dependent read ordering were preserved.
+- Updated dependencies [aa84958]
+- Updated dependencies [c520224]
+  - @hyperlane-xyz/utils@45.2.0
+  - @hyperlane-xyz/provider-sdk@11.0.3
+
+## 45.1.0
+
+### Patch Changes
+
+- 78a31fa: Resolved token discovery with transitive ARC imports, added Aleo v3 warp route support for ARC-22 token metadata and supply queries and documented deployment with compiled program overrides.
+
+  Fixed empty Aleo view inputs and preserved decimal scaling for newly deployed warp route legs.
+  - @hyperlane-xyz/utils@45.1.0
+  - @hyperlane-xyz/provider-sdk@11.0.2
+
+## 45.0.1
+
+### Patch Changes
+
+- @hyperlane-xyz/utils@45.0.1
+- @hyperlane-xyz/provider-sdk@11.0.1
+
+## 45.0.0
+
+### Major Changes
+
+- 1925ccb: The Aleo SDK was migrated to the stricter shared TypeScript configuration.
+
+### Patch Changes
+
+- c52b728: ARC-22 token imports were recognized when reading v2 Aleo warp routes.
+- a90a845: Fixed Aleo synthetic warp deployments to derive remote decimals from the configured scale instead of always using local decimals. Invalid scales and decimal ranges were rejected before deployment.
+- 4975a40: The Provable SDK dependency was upgraded to 0.12.0 for Aleo mainnet consensus V21 and Varuna V3 proof support.
+- 1c1737e: Updated the Provable SDK and WASM dependencies to use the current Aleo consensus fee model.
+- Updated dependencies [ee50f43]
+- Updated dependencies [12678bc]
+- Updated dependencies [9a59116]
+- Updated dependencies [28eda66]
+- Updated dependencies [43f89c6]
+- Updated dependencies [4e2ab65]
+- Updated dependencies [4ad4577]
+- Updated dependencies [f64f992]
+  - @hyperlane-xyz/provider-sdk@11.0.0
+  - @hyperlane-xyz/utils@45.0.0
+
 ## 44.0.2
 
 ### Patch Changes

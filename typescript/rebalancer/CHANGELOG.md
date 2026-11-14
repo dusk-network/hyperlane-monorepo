@@ -1,5 +1,152 @@
 # @hyperlane-xyz/rebalancer
 
+## 29.1.0
+
+### Minor Changes
+
+- 2c32db0: The `relayerDenylist` pending transfer middleware was extended to rebalance messages, to which only `match` rules that set nothing but `messageId` apply. Denied rebalance messages are no longer recovered at startup or on later syncs, and a tracked rebalance intent whose in-progress messages are all denied stops counting as incoming collateral without any change to its status, so delivery checks and the intent TTL still apply. Broader `match` rules and `address` rules do not affect rebalance accounting, and inventory intents are unaffected. A rebalance message is meant to be denied only after its funds settled another way: an unsettled denied one is replaced by the strategy, and removing or expiring the rule makes it count again. Explorer queries made while a denylist refresh is in progress now wait for it instead of filtering with the previous rules.
+- bdeb314: An optional `pendingTransferMiddlewares` config was added to skip pending transfers that will never be delivered. The `relayerDenylist` middleware applies the relayer runtime denylist, and the `blacklistIsm` middleware applies BlacklistIsms in the destination router's ISM.
+
+### Patch Changes
+
+- aa84958: Removed batch barriers from bounded async maps, parallelized independent gas simulation and fee reads, and bounded concurrent rebalancer monitor reads to reduce polling latency. Failed maps stopped scheduling new work and drained active calls before rejecting, preserving backpressure across retries.
+
+  Failed inventory or confirmed-block supply reads prevented the monitor from emitting a partial polling cycle, avoiding fabricated zero balances or latest-state supplies in confirmed-block events.
+
+  Failed numeric Tron block lookups also prevented latest-state supply from being emitted, while intentional optional named tags remained supported.
+
+- c520224: Invariant regular expressions were reused across calls, redundant URL parsing was removed from RPC-header and explorer helpers, and independent token reads were overlapped with bounded concurrency and failure draining. URL normalization, validation, and dependent read ordering were preserved.
+- Updated dependencies [d2ea605]
+- Updated dependencies [bdeb314]
+- Updated dependencies [048d1f3]
+- Updated dependencies [f265d2f]
+- Updated dependencies [fe5dfda]
+- Updated dependencies [8b65668]
+- Updated dependencies [aa84958]
+- Updated dependencies [e48ffe7]
+- Updated dependencies [4623acb]
+- Updated dependencies [d0ec60c]
+- Updated dependencies [63fa540]
+- Updated dependencies [c520224]
+- Updated dependencies [d770c3b]
+- Updated dependencies [1baa78e]
+- Updated dependencies [6e5db5f]
+- Updated dependencies [7be44b5]
+- Updated dependencies [9ef15ff]
+- Updated dependencies [8868234]
+- Updated dependencies [02c6ef4]
+- Updated dependencies [2bc0b3e]
+- Updated dependencies [48cd574]
+  - @hyperlane-xyz/sdk@45.2.0
+  - @hyperlane-xyz/core@12.3.0
+  - @hyperlane-xyz/utils@45.2.0
+  - @hyperlane-xyz/metrics@1.0.6
+  - @hyperlane-xyz/provider-sdk@11.0.3
+
+## 29.0.5
+
+### Patch Changes
+
+- Updated dependencies [b6fdd2d]
+- Updated dependencies [a7b65cb]
+- Updated dependencies [1467e4c]
+- Updated dependencies [a27ce72]
+- Updated dependencies [4b0f32c]
+- Updated dependencies [447569f]
+- Updated dependencies [b43bc9f]
+- Updated dependencies [0ceb556]
+- Updated dependencies [7203aec]
+- Updated dependencies [341418a]
+- Updated dependencies [5c6593b]
+- Updated dependencies [62225a3]
+- Updated dependencies [0063de6]
+- Updated dependencies [77dbf5d]
+- Updated dependencies [5a8eed5]
+- Updated dependencies [670000c]
+- Updated dependencies [bfbb755]
+  - @hyperlane-xyz/sdk@45.1.0
+  - @hyperlane-xyz/metrics@1.0.5
+  - @hyperlane-xyz/utils@45.1.0
+  - @hyperlane-xyz/core@12.2.0
+  - @hyperlane-xyz/provider-sdk@11.0.2
+
+## 29.0.4
+
+### Patch Changes
+
+- Updated dependencies [4efffd5]
+- Updated dependencies [35d3002]
+- Updated dependencies [fe26a26]
+- Updated dependencies [19dbb59]
+  - @hyperlane-xyz/sdk@45.0.1
+  - @hyperlane-xyz/metrics@1.0.4
+  - @hyperlane-xyz/utils@45.0.1
+  - @hyperlane-xyz/core@12.2.0
+  - @hyperlane-xyz/provider-sdk@11.0.1
+
+## 29.0.3
+
+### Patch Changes
+
+- 12678bc: Added opt-in Sealevel v1 sending and configurable receipt reads per chain. V1 transactions moved compute limits and priority fees into the header and enforced version-specific size limits, while other SVMs retained v0 defaults.
+
+  Separated v1 sending activation from RPC read support, preserved v0 offline governance, and carried caller-configured heap and loaded-data budgets across transaction versions.
+
+- c1576a3: Skipped Explorer rebalance-action discovery when no bridge addresses were configured, avoiding an empty-result HTTP query while retaining tracked-action delivery checks.
+- a8d6bf0: Reused the collateral address from the current managed-lockbox balance observation when reading token metadata, avoiding a duplicate contract lookup while retaining fresh metadata and standalone lookup behavior.
+- 9a59116: Updated Solana clients to versions with transaction v1 codecs while preserving existing transaction-version defaults.
+- c1576a3: Deferred LiFi SDK initialization until a configured external bridge was needed, reducing startup work for rebalancers without LiFi inventory execution.
+- c1576a3: Reused the transfer gas quote within native-token cost estimation, avoiding a duplicate quote request while preserving fee reservations and standalone estimation behavior.
+- c1576a3: Coalesced concurrent CoinGecko lookups for the same token ID, reducing duplicate metrics price requests while preserving cache expiry and retries after failures.
+- 27d55d2: Removed unused Express dependencies from the rebalancer package.
+- Updated dependencies [e0d3394]
+- Updated dependencies [b83bac5]
+- Updated dependencies [9b9de8d]
+- Updated dependencies [4975a40]
+- Updated dependencies [d02c93e]
+- Updated dependencies [a8d6bf0]
+- Updated dependencies [ee50f43]
+- Updated dependencies [12678bc]
+- Updated dependencies [0aeb76a]
+- Updated dependencies [a8d6bf0]
+- Updated dependencies [9a59116]
+- Updated dependencies [a8d6bf0]
+- Updated dependencies [d26e4c4]
+- Updated dependencies [ebf3922]
+- Updated dependencies [87b2c63]
+- Updated dependencies [28eda66]
+- Updated dependencies [f05bb6d]
+- Updated dependencies [8373a74]
+- Updated dependencies [0015102]
+- Updated dependencies [a8d6bf0]
+- Updated dependencies [6f7b511]
+- Updated dependencies [249517a]
+- Updated dependencies [2762075]
+- Updated dependencies [f9cf910]
+- Updated dependencies [323faae]
+- Updated dependencies [55e6699]
+- Updated dependencies [e994943]
+- Updated dependencies [28eda66]
+- Updated dependencies [6eaa8c6]
+- Updated dependencies [11d5de3]
+- Updated dependencies [98ec7d5]
+- Updated dependencies [2a938f3]
+- Updated dependencies [43f89c6]
+- Updated dependencies [4e2ab65]
+- Updated dependencies [4c644c0]
+- Updated dependencies [4ad4577]
+- Updated dependencies [f64f992]
+- Updated dependencies [d26e4c4]
+- Updated dependencies [692cdb4]
+- Updated dependencies [ea5b010]
+- Updated dependencies [b83bac5]
+- Updated dependencies [67f3cd3]
+  - @hyperlane-xyz/sdk@45.0.0
+  - @hyperlane-xyz/metrics@1.0.3
+  - @hyperlane-xyz/provider-sdk@11.0.0
+  - @hyperlane-xyz/core@12.2.0
+  - @hyperlane-xyz/utils@45.0.0
+
 ## 29.0.2
 
 ### Patch Changes

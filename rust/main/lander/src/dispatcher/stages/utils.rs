@@ -38,6 +38,8 @@ pub(super) fn sort_transactions_for_mutation(transactions: &mut [Transaction]) {
 #[derive(Clone, Copy)]
 pub(super) enum FinalizedStatusRead {
     Query,
+    /// Trust finality already observed in the snapshot; payload verification
+    /// may still be pending before the terminal transaction status is persisted.
     TrustPersisted,
 }
 
@@ -127,6 +129,9 @@ where
         match f().await {
             Ok(result) => return Ok(result),
             Err(err) => {
+                if matches!(err, LanderError::TxSubmissionDeferred) {
+                    return Err(err);
+                }
                 if err.is_retryable() {
                     error!(?err, ?action, "Error making call. Retrying...");
                     sleep(Duration::from_secs(1)).await;

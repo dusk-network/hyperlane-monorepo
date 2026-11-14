@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { it } from 'node:test';
+import { connect } from 'node:net';
+import { once } from 'node:events';
 
 process.env.DATABASE_URL ??= 'postgresql://unused:unused@localhost/unused';
 
@@ -16,13 +18,13 @@ void it('serves GraphQL through Mercurius with compatibility validation', async 
     { jit: 1 },
   );
   try {
-    assert.equal(app.server.requestTimeout, 300_000);
+    assert.equal(app.server.requestTimeout, 10_000);
     const response = await app.inject({
       headers: { origin: 'https://example.com' },
       method: 'POST',
       payload: {
         query:
-          'query Domains($unused: String) { domain(limit: 1) { id name } }',
+          'query Domains($unused: String!, $missing: Int!) { domain(limit: 1) { id name } }',
         variables: { unused: 'legacy-client-variable' },
       },
       url: '/graphql',
@@ -36,7 +38,8 @@ void it('serves GraphQL through Mercurius with compatibility validation', async 
     assert.equal(queries, 1);
 
     const getQuery = new URLSearchParams({
-      query: 'query Domains($unused: String) { domain(limit: 1) { id name } }',
+      query:
+        'query Domains($unused: String!, $missing: Int!) { domain(limit: 1) { id name } }',
       variables: JSON.stringify({ unused: 'legacy-client-variable' }),
     });
     const getResponse = await app.inject({
@@ -283,6 +286,7 @@ void it('bounds concurrent pathological GraphQL requests', async () => {
     const rejected = await app.inject(operation);
     assert.equal(rejected.statusCode, 503);
     assert.equal(rejected.headers['retry-after'], '1');
+    assert.equal((await app.inject({ url: '/metrics' })).statusCode, 200);
 
     assert(release);
     release();
@@ -424,6 +428,8 @@ void it('preserves the CSRF request contract', async () => {
 });
 
 void it('returns useful GraphQL parse, validation, and execution errors', async () => {
+  const { graphqlErrors } = await import('./metrics.js');
+  const before = (await graphqlErrors.get()).values[0].value;
   const { createScraperProxyApp } = await import('./module.js');
   const app = await createScraperProxyApp({
     async query<T extends Record<string, unknown>>(): Promise<T[]> {
@@ -444,6 +450,7 @@ void it('returns useful GraphQL parse, validation, and execution errors', async 
     const executed = await request('{ domain(limit: 1) { id } }');
     assert.equal(executed.statusCode, 200);
     assert.equal(executed.json().errors[0].message, 'database unavailable');
+    assert.equal((await graphqlErrors.get()).values[0].value - before, 3);
   } finally {
     await app.close();
   }
@@ -477,3 +484,124 @@ void it('does not cache pathological resolver failures', async () => {
     await app.close();
   }
 });
+
+void it('keeps incomplete uploads outside GraphQL execution admission', async () => {
+  const { createScraperProxyApp } = await import('./module.js');
+  const { config } = await import('./config.js');
+  const app = await createScraperProxyApp({
+    async query<T extends Record<string, unknown>>(): Promise<T[]> {
+      return [];
+    },
+  });
+  const sockets = [];
+  try {
+    await app.listen({ port: 0, host: '127.0.0.1' });
+    const address = app.server.address();
+    assert(address && typeof address !== 'string');
+    for (let i = 0; i < config.GRAPHQL_MAX_ACTIVE_REQUESTS; i++) {
+      const socket = connect(address.port, '127.0.0.1');
+      sockets.push(socket);
+      await new Promise<void>((resolve) => socket.once('connect', resolve));
+      socket.write(
+        'POST /graphql HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{',
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const healthy = await app.inject({
+      method: 'POST',
+      url: '/graphql',
+      payload: { query: '{ domain(limit: 1) { id } }' },
+    });
+    assert.equal(healthy.statusCode, 200);
+  } finally {
+    sockets.forEach((socket) => socket.destroy());
+    await app.close();
+  }
+});
+
+void it(
+  'bounds near-limit uploads and recovers capacity after cancellation and parsing errors',
+  { timeout: 10_000 },
+  async () => {
+    const { createScraperProxyApp } = await import('./module.js');
+    const { config } = await import('./config.js');
+    let queries = 0;
+    const app = await createScraperProxyApp({
+      async query<T extends Record<string, unknown>>(): Promise<T[]> {
+        queries++;
+        return [];
+      },
+    });
+    const sockets = [];
+    const healthy = () =>
+      app.inject({
+        method: 'POST',
+        url: '/graphql',
+        payload: { query: '{ domain(limit: 1) { id } }' },
+      });
+    try {
+      await app.listen({ port: 0, host: '127.0.0.1' });
+      const address = app.server.address();
+      assert(address && typeof address !== 'string');
+      const payload = Buffer.alloc(102_399, ' ');
+      payload[0] = '{'.charCodeAt(0);
+      for (let i = 0; i < config.GRAPHQL_MAX_ACTIVE_UPLOADS; i++) {
+        const socket = connect(address.port, '127.0.0.1');
+        sockets.push(socket);
+        await once(socket, 'connect');
+        socket.write(
+          'POST /GraphQL/ HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 102400\r\n\r\n',
+        );
+        socket.write(payload);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      // Excess near-limit uploads receive an error and a closed connection.
+      for (let i = 0; i < 4; i++) {
+        const socket = connect(address.port, '127.0.0.1');
+        sockets.push(socket);
+        await once(socket, 'connect');
+        let response = '';
+        socket.on('data', (chunk) => {
+          response += chunk.toString();
+        });
+        socket.on('error', (error) => {
+          assert.equal(error.message, 'read ECONNRESET');
+        });
+        const closed = new Promise<void>((resolve) =>
+          socket.once('close', () => resolve()),
+        );
+        socket.write(
+          'POST /graphql HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 102400\r\n\r\n',
+        );
+        socket.write(payload);
+        await closed;
+        assert.match(response, /HTTP\/1.1 503/);
+        assert.match(response, /connection: close/i);
+      }
+      assert.equal((await healthy()).statusCode, 503);
+      assert.equal(queries, 0);
+      const withoutUpload = await app.inject({
+        method: 'GET',
+        headers: { 'mercurius-require-preflight': 'true' },
+        url: `/graphql?${new URLSearchParams({ query: '{ domain(limit: 1) { id } }' })}`,
+      });
+      assert.equal(withoutUpload.statusCode, 200);
+
+      // Completing an invalid body releases its upload slot despite parser failure.
+      const parsed = once(sockets[0], 'data');
+      sockets[0].write(']');
+      await parsed;
+      assert.equal((await healthy()).statusCode, 200);
+
+      // Aborted uploads also return capacity; completed requests can reuse it.
+      sockets.forEach((socket) => socket.destroy());
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      for (let i = 0; i < config.GRAPHQL_MAX_ACTIVE_UPLOADS + 1; i++) {
+        assert.equal((await healthy()).statusCode, 200);
+      }
+    } finally {
+      sockets.forEach((socket) => socket.destroy());
+      await app.close();
+    }
+  },
+);
