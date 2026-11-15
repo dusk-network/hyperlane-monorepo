@@ -12,6 +12,8 @@
 
 ### Fixed
 
+- A saved archive scan position was reused only when its row is below the block the position names. A position that contradicts its own row was dropped and the scan started over, instead of resuming after that block's first rows and missing them on every retry.
+- When the row a saved scan position was taken from was missing, and the archive had not finalized that row's block yet, the lookup failed until the archive caught up and kept the position, instead of dropping the contract's positions and rescanning from its first row. An archive that had finalized the block without the row numbers its rows differently, and the scan still started over. Positions saved by the previous version lack the row's block, are dropped once, and the next scan of each contract starts from its first row.
 - A `finalizedEvents` page over the agent's 4 MiB response limit was asked for again at the same position with half the rows, down to one, instead of failing at that position on every retry. 200 Mailbox rows exceed the limit once dispatched message bodies average more than about 20 KiB, and dispatch and delivery indexing stopped for good at the first such page.
 - A lookup that ran ahead of the archive, between the node finalizing a block and the archive inserting its rows, kept its scan position instead of sending the next scan back to the contract's first row.
 - The `process` simulation passed only on the encoding of the `()` that `process` returns. Any other success reply, such as a proxy's error page sent with status 200, failed the simulation instead of letting the transaction burn its gas limit.

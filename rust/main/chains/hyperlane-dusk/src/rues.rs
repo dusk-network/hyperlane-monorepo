@@ -205,8 +205,14 @@ impl PageSize {
 /// Anchors only decide where a scan starts, never whether a row is accepted.
 /// Archive IDs belong to the endpoint's archive: a rebuilt or replaced archive
 /// may number its rows differently. A scan that resumes from an anchor must
-/// therefore see the fence row first, unchanged; otherwise the contract's
-/// anchors are dropped and the scan starts over.
+/// therefore see the fence row first, unchanged and below `before_block`.
+/// When the archive returns another row there, the anchor is wrong for this
+/// archive, the contract's anchors are dropped and the scan starts over. When
+/// the fence row is missing, the archive may only be behind: the scan asks
+/// whether the archive has finalized the fence row's block, which Rusk does
+/// in the same transaction that inserts the block's rows. If it has, its rows
+/// are numbered differently and the scan starts over; if not, the lookup
+/// fails until the archive catches up, and the anchors are kept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ScanAnchor {
     before_block: u64,
@@ -216,10 +222,46 @@ struct ScanAnchor {
     fence_digest: [u8; 32],
     /// How many of the contract's rows precede the position.
     rank: u64,
+    /// Height of the fence row's block, below `before_block`.
+    fence_block: u64,
+    /// Hash of the fence row's block.
+    fence_block_hash: [u8; 32],
 }
 
 impl ScanAnchor {
-    const ENCODED_LEN: usize = 8 + 8 + 32 + 8;
+    const ENCODED_LEN: usize = 8 + 8 + 32 + 8 + 8 + 32;
+
+    /// An anchor just after `row`, the `rank`th row of the contract. `None`
+    /// when the row's block hash does not parse, since the anchor could not
+    /// be checked against the archive's finalized blocks.
+    fn after_row(
+        row: &FinalizedContractEvent,
+        before_block: u64,
+        rank: u64,
+    ) -> Result<Option<Self>, HyperlaneDuskError> {
+        let Ok(fence_block_hash) = parse_h256_hex(&row.block_hash, "archive row block hash") else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            before_block,
+            fence_id: row.id,
+            fence_digest: archive_row_digest(row)?,
+            rank,
+            fence_block: row.block_height,
+            fence_block_hash: fence_block_hash.0,
+        }))
+    }
+
+    /// Whether `row`, which the archive returned at `fence_id`, is the row
+    /// this anchor was taken after.
+    fn is_fence(&self, row: &FinalizedContractEvent) -> Result<bool, HyperlaneDuskError> {
+        Ok(row.id == self.fence_id
+            && archive_row_digest(row)? == self.fence_digest
+            && row.block_height == self.fence_block
+            && row.block_height < self.before_block
+            && parse_h256_hex(&row.block_hash, "archive row block hash")
+                .is_ok_and(|hash| hash.0 == self.fence_block_hash))
+    }
 
     fn encode(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(Self::ENCODED_LEN);
@@ -227,24 +269,45 @@ impl ScanAnchor {
         bytes.extend_from_slice(&self.fence_id.to_be_bytes());
         bytes.extend_from_slice(&self.fence_digest);
         bytes.extend_from_slice(&self.rank.to_be_bytes());
+        bytes.extend_from_slice(&self.fence_block.to_be_bytes());
+        bytes.extend_from_slice(&self.fence_block_hash);
         bytes
     }
 
+    /// Anchors that do not decode, including ones whose fence row is not
+    /// below `before_block`, are dropped as unreadable.
     fn decode(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != Self::ENCODED_LEN {
             return None;
         }
         let (before_block, rest) = bytes.split_at(8);
         let (fence_id, rest) = rest.split_at(8);
-        let (fence_digest, rank) = rest.split_at(32);
+        let (fence_digest, rest) = rest.split_at(32);
+        let (rank, rest) = rest.split_at(8);
+        let (fence_block, fence_block_hash) = rest.split_at(8);
         let anchor = Self {
             before_block: u64::from_be_bytes(before_block.try_into().ok()?),
             fence_id: i64::from_be_bytes(fence_id.try_into().ok()?),
             fence_digest: fence_digest.try_into().ok()?,
             rank: u64::from_be_bytes(rank.try_into().ok()?),
+            fence_block: u64::from_be_bytes(fence_block.try_into().ok()?),
+            fence_block_hash: fence_block_hash.try_into().ok()?,
         };
-        (anchor.fence_id >= 0 && anchor.rank > 0).then_some(anchor)
+        (anchor.fence_id >= 0 && anchor.rank > 0 && anchor.fence_block < anchor.before_block)
+            .then_some(anchor)
     }
+}
+
+/// How a scan from an anchor, or from the contract's first row, ended.
+enum ScanOutcome {
+    /// The scan ran; the rows it matched.
+    Done(ScannedRows),
+    /// The archive returned another row where the anchor's fence row was,
+    /// or has finalized the fence row's block without that row, so the
+    /// anchor does not belong to this archive.
+    WrongAnchor,
+    /// The archive has not reached the anchor's fence row yet.
+    ArchiveBehind(ScanAnchor),
 }
 
 /// The rows of one block that a scan matched, keyed by sequence.
@@ -758,7 +821,7 @@ impl RuesClient {
         F: Fn(&[u8]) -> Vec<usize> + Sync,
     {
         let start = self.scan_anchor_at_or_below(contract_id, block_height)?;
-        if let Some(rows) = self
+        match self
             .scan_from(
                 contract_id,
                 topic,
@@ -769,35 +832,48 @@ impl RuesClient {
             )
             .await?
         {
-            return Ok(rows);
+            ScanOutcome::Done(rows) => return Ok(rows),
+            // The anchors stay: the archive reaches them once it catches up.
+            ScanOutcome::ArchiveBehind(anchor) => {
+                return Err(HyperlaneDuskError::Other(format!(
+                    "Dusk archive of contract {} has not reached the saved scan position after row {} of block {} yet; retrying later",
+                    hex::encode(contract_id),
+                    anchor.fence_id,
+                    anchor.fence_block
+                )))
+            }
+            ScanOutcome::WrongAnchor => {}
         }
-        // The anchor's fence row is gone or changed, so the endpoint's
-        // archive is not the one the anchors were taken from.
+        // The endpoint's archive is not the one the anchors were taken from.
         warn!(
             contract = %hex::encode(contract_id),
             "Dusk archive rows were renumbered; rescanning the contract's events from the start"
         );
         self.forget_scan_anchors(contract_id)?;
-        self.scan_from(
-            contract_id,
-            topic,
-            block_height,
-            None,
-            wanted,
-            matching_sequences,
-        )
-        .await?
-        .ok_or_else(|| {
-            HyperlaneDuskError::Other(
-                "Dusk archive scan without an anchor found a stale anchor".into(),
+        match self
+            .scan_from(
+                contract_id,
+                topic,
+                block_height,
+                None,
+                wanted,
+                matching_sequences,
             )
-        })
+            .await?
+        {
+            ScanOutcome::Done(rows) => Ok(rows),
+            ScanOutcome::WrongAnchor | ScanOutcome::ArchiveBehind(_) => {
+                Err(HyperlaneDuskError::Other(
+                    "Dusk archive scan without an anchor found a stale anchor".into(),
+                ))
+            }
+        }
     }
 
     /// One pass over the contract's archive rows from `start`, or from its
     /// first row. Stops once every wanted sequence has a row, or at the end
-    /// of the archive. Returns `None` when `start`'s fence row is not the
-    /// first row returned.
+    /// of the archive. A resumed scan first checks `start`'s fence row, as
+    /// `ScanAnchor` describes.
     ///
     /// A row the archive has not inserted yet is not an error here: the
     /// caller reports it, and the next lookup resumes from the anchors this
@@ -810,7 +886,7 @@ impl RuesClient {
         start: Option<ScanAnchor>,
         wanted: &HashSet<usize>,
         matching_sequences: &F,
-    ) -> Result<Option<ScannedRows>, HyperlaneDuskError>
+    ) -> Result<ScanOutcome, HyperlaneDuskError>
     where
         F: Fn(&[u8]) -> Vec<usize> + Sync,
     {
@@ -841,14 +917,29 @@ impl RuesClient {
             let has_next_page = page.has_next_page;
             let mut events = page.events.into_iter();
             if let Some(anchor) = fence.take() {
-                let Some(first) = events.next() else {
-                    return Ok(None);
-                };
-                if first.id != anchor.fence_id || archive_row_digest(&first)? != anchor.fence_digest
-                {
-                    return Ok(None);
+                match events.next() {
+                    Some(first) if first.id == anchor.fence_id => {
+                        if !anchor.is_fence(&first)? {
+                            return Ok(ScanOutcome::WrongAnchor);
+                        }
+                        previous_id = Some(first.id);
+                    }
+                    // The fence row is missing: the page is empty or starts
+                    // after it.
+                    _ => {
+                        let fence_block_hash = hex::encode(anchor.fence_block_hash);
+                        return Ok(
+                            if self
+                                .check_finalized_block(anchor.fence_block, &fence_block_hash)
+                                .await?
+                            {
+                                ScanOutcome::WrongAnchor
+                            } else {
+                                ScanOutcome::ArchiveBehind(anchor)
+                            },
+                        );
+                    }
                 }
-                previous_id = Some(first.id);
             }
 
             let mut complete = false;
@@ -860,15 +951,10 @@ impl RuesClient {
                 });
                 highest_block = Some(highest);
                 if rank % SCAN_ANCHOR_SPACING == 0 {
-                    self.offer_scan_anchor(
-                        contract_id,
-                        ScanAnchor {
-                            before_block: start_before.max(highest.saturating_add(1)),
-                            fence_id: event.id,
-                            fence_digest: archive_row_digest(&event)?,
-                            rank,
-                        },
-                    )?;
+                    let before_block = start_before.max(highest.saturating_add(1));
+                    if let Some(anchor) = ScanAnchor::after_row(&event, before_block, rank)? {
+                        self.offer_scan_anchor(contract_id, anchor)?;
+                    }
                 }
                 if !event.reverted && event.topic == topic && event.block_height == block_height {
                     if let Ok(data) = hex::decode(strip_hex_prefix(&event.data)) {
@@ -895,17 +981,12 @@ impl RuesClient {
 
             if complete || !has_next_page {
                 if let (Some(event), Some(highest)) = (last_row, highest_block) {
-                    self.offer_scan_anchor(
-                        contract_id,
-                        ScanAnchor {
-                            before_block: start_before.max(highest.saturating_add(1)),
-                            fence_id: event.id,
-                            fence_digest: archive_row_digest(&event)?,
-                            rank,
-                        },
-                    )?;
+                    let before_block = start_before.max(highest.saturating_add(1));
+                    if let Some(anchor) = ScanAnchor::after_row(&event, before_block, rank)? {
+                        self.offer_scan_anchor(contract_id, anchor)?;
+                    }
                 }
-                return Ok(Some(found));
+                return Ok(ScanOutcome::Done(found));
             }
         }
     }
@@ -2490,6 +2571,9 @@ mod tests {
         /// for more than `rows` rows gets this reply instead, as from a node
         /// or proxy that refuses large replies.
         refusal: Arc<StdMutex<Option<(usize, u16, String)>>>,
+        /// The block of each `checkBlock` request. The archive has finalized
+        /// a block when it holds a row of it.
+        block_checks: Arc<StdMutex<Vec<(u64, String)>>>,
         stop: Arc<std::sync::atomic::AtomicBool>,
         worker: Option<thread::JoinHandle<()>>,
     }
@@ -2504,14 +2588,14 @@ mod tests {
             let pages = Arc::new(StdMutex::new(Vec::new()));
             let limits = Arc::new(StdMutex::new(Vec::new()));
             let refusal = Arc::new(StdMutex::new(None));
+            let block_checks = Arc::new(StdMutex::new(Vec::new()));
             let stop = Arc::new(AtomicBool::new(false));
-            let (worker_rows, worker_pages, worker_limits, worker_refusal, worker_stop) = (
-                rows.clone(),
-                pages.clone(),
-                limits.clone(),
-                refusal.clone(),
-                stop.clone(),
-            );
+            let worker_rows = rows.clone();
+            let worker_pages = pages.clone();
+            let worker_limits = limits.clone();
+            let worker_refusal = refusal.clone();
+            let worker_block_checks = block_checks.clone();
+            let worker_stop = stop.clone();
             let worker = thread::spawn(move || {
                 while !worker_stop.load(Ordering::SeqCst) {
                     let Ok((mut stream, _)) = listener.accept() else {
@@ -2537,7 +2621,24 @@ mod tests {
                             }
                         }
                     } else if query.contains("checkBlock(") {
-                        (200, serde_json::json!({"checkBlock": true}).to_string())
+                        let height = query
+                            .split_once("height: ")
+                            .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
+                            .and_then(|height| height.parse::<u64>().ok())
+                            .unwrap();
+                        let hash = query
+                            .split_once("hash: \"")
+                            .and_then(|(_, rest)| rest.split('"').next())
+                            .unwrap()
+                            .to_owned();
+                        let finalized = worker_rows.lock().unwrap().iter().any(|row| {
+                            row["block_height"] == height && row["block_hash"] == hash.as_str()
+                        });
+                        worker_block_checks.lock().unwrap().push((height, hash));
+                        (
+                            200,
+                            serde_json::json!({ "checkBlock": finalized }).to_string(),
+                        )
                     } else {
                         (
                             200,
@@ -2558,6 +2659,7 @@ mod tests {
                 pages,
                 limits,
                 refusal,
+                block_checks,
                 stop,
                 worker: Some(worker),
             }
@@ -2609,6 +2711,15 @@ mod tests {
 
         fn limits(&self) -> Vec<usize> {
             self.limits.lock().unwrap().clone()
+        }
+
+        fn checked_heights(&self) -> Vec<u64> {
+            self.block_checks
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(height, _)| *height)
+                .collect()
         }
     }
 
@@ -3067,6 +3178,8 @@ mod tests {
             fence_id: 79,
             fence_digest: [1; 32],
             rank: 1,
+            fence_block: 89,
+            fence_block_hash: [2; 32],
         };
         for response in [
             (503, "temporarily unavailable"),
@@ -3241,14 +3354,25 @@ mod tests {
             fence_id: 7,
             fence_digest: [3; 32],
             rank: 5,
+            fence_block: 8,
+            fence_block_hash: [4; 32],
         };
         assert_eq!(ScanAnchor::decode(&anchor.encode()), Some(anchor));
         assert_eq!(ScanAnchor::decode(&anchor.encode()[1..]), None);
-        let negative = ScanAnchor {
-            fence_id: -1,
-            ..anchor
-        };
-        assert_eq!(ScanAnchor::decode(&negative.encode()), None);
+        for malformed in [
+            ScanAnchor {
+                fence_id: -1,
+                ..anchor
+            },
+            ScanAnchor { rank: 0, ..anchor },
+            // Its fence row would not be below the position it names.
+            ScanAnchor {
+                fence_block: 9,
+                ..anchor
+            },
+        ] {
+            assert_eq!(ScanAnchor::decode(&malformed.encode()), None);
+        }
     }
 
     #[tokio::test]
@@ -3514,5 +3638,144 @@ mod tests {
             archive.limits(),
             [200, 100, 50, 25, 12, 12, 12, 12, 24, 48, 96, 192, 200]
         );
+    }
+
+    /// Ten dispatch rows, one per block from 5 to 14, with IDs 0 to 9.
+    fn one_row_per_block(contract_id: [u8; 32]) -> Vec<JsonValue> {
+        (0..10)
+            .map(|id| archive_row(id, 5 + id as u64, 1, "dispatch", contract_id, &[id as u8]))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_resumed_anchor_whose_fence_row_is_not_below_it_is_dropped() {
+        let contract_id = [87u8; 32];
+        let rows = vec![
+            archive_row(11, 7, 9, "dispatch", contract_id, &[1]),
+            archive_row(12, 8, 11, "dispatch", contract_id, &[2]),
+        ];
+        let fence: FinalizedContractEvent = serde_json::from_value(rows[1].clone()).unwrap();
+        let archive = Archive::start(rows);
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(archive.url.clone(), directory.path());
+        // Well formed, and its fence row is the archive's row 12, unchanged.
+        // But row 12 is in block 8, not below the block-8 position the anchor
+        // names, so resuming after it would skip block 8's only dispatch.
+        let poisoned = ScanAnchor {
+            before_block: 8,
+            fence_id: 12,
+            fence_digest: archive_row_digest(&fence).unwrap(),
+            rank: 2,
+            fence_block: 7,
+            fence_block_hash: [7; 32],
+        };
+        client.offer_scan_anchor(&contract_id, poisoned).unwrap();
+        assert_eq!(client.scan_anchors_of(&contract_id), vec![poisoned]);
+
+        let matched = client
+            .finalized_contract_event(&contract_id, "dispatch", 0, 8, &[2])
+            .await
+            .unwrap();
+        assert_eq!(&matched.transaction_id.as_bytes()[32..], &[11u8; 32]);
+        // The scan read row 12 at the anchor, dropped the anchor and started
+        // over from the first row.
+        assert_eq!(archive.pages(), vec![Some(11), None]);
+        assert!(!client.scan_anchors_of(&contract_id).contains(&poisoned));
+    }
+
+    #[tokio::test]
+    async fn an_archive_behind_its_saved_position_keeps_it_until_it_catches_up() {
+        let contract_id = [88u8; 32];
+        let rows = one_row_per_block(contract_id);
+        let archive = Archive::start(rows.clone());
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(archive.url.clone(), directory.path());
+        client
+            .finalized_contract_event(&contract_id, "dispatch", 0, 14, &[9])
+            .await
+            .unwrap();
+        let anchors = client.scan_anchors_of(&contract_id);
+        assert_eq!(
+            anchors
+                .iter()
+                .map(|anchor| (anchor.fence_id, anchor.before_block, anchor.fence_block))
+                .collect::<Vec<_>>(),
+            vec![(9, 15, 14)]
+        );
+
+        // The node's archive is restored from an older copy and has not
+        // inserted blocks 10 to 14 again yet. The contract records a
+        // dispatch at block 15.
+        archive.rows.lock().unwrap().truncate(5);
+        let error = client
+            .finalized_contract_event(&contract_id, "dispatch", 1, 15, &[10])
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("has not reached the saved scan position"),
+            "{error}"
+        );
+        // The page at the position was empty and the archive has not
+        // finalized block 14, the fence row's block: the position is kept
+        // and the scan does not start over from the first row.
+        assert_eq!(archive.checked_heights(), [14, 14]);
+        assert_eq!(client.scan_anchors_of(&contract_id), anchors);
+        assert_eq!(archive.pages(), vec![None, Some(8)]);
+
+        // Once the archive has caught up, the scan resumes at the position.
+        {
+            let mut archived = archive.rows.lock().unwrap();
+            *archived = rows;
+            archived.push(archive_row(10, 15, 1, "dispatch", contract_id, &[10]));
+        }
+        let matched = client
+            .finalized_contract_event(&contract_id, "dispatch", 1, 15, &[10])
+            .await
+            .unwrap();
+        assert_eq!(matched.block_height, 15);
+        assert_eq!(archive.pages(), vec![None, Some(8), Some(8)]);
+    }
+
+    #[tokio::test]
+    async fn a_missing_fence_row_is_waited_for_until_its_block_is_finalized() {
+        let contract_id = [89u8; 32];
+        let archive = Archive::start(one_row_per_block(contract_id));
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(archive.url.clone(), directory.path());
+        client
+            .finalized_contract_event(&contract_id, "dispatch", 0, 14, &[9])
+            .await
+            .unwrap();
+
+        // The endpoint now serves another node's archive. It numbers the same
+        // rows from 20 and has archived blocks 5 to 9 so far.
+        let renumbered =
+            |n: i64| archive_row(20 + n, 5 + n as u64, 1, "dispatch", contract_id, &[n as u8]);
+        *archive.rows.lock().unwrap() = (0..5).map(renumbered).collect();
+        let error = client
+            .finalized_contract_event(&contract_id, "dispatch", 1, 15, &[10])
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("has not reached the saved scan position"),
+            "{error}"
+        );
+        assert_eq!(client.scan_anchors_of(&contract_id).len(), 1);
+
+        // It catches up. It has now finalized block 14 but still has no row
+        // 9, which proves it numbers its rows differently: the scan starts
+        // over from the first row.
+        archive.rows.lock().unwrap().extend((5..11).map(renumbered));
+        let matched = client
+            .finalized_contract_event(&contract_id, "dispatch", 1, 15, &[10])
+            .await
+            .unwrap();
+        assert_eq!(matched.block_height, 15);
+        assert_eq!(archive.pages(), vec![None, Some(8), Some(8), None]);
+        assert_eq!(archive.checked_heights(), [14, 14, 14, 15]);
     }
 }
