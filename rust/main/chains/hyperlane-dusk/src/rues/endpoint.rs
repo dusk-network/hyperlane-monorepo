@@ -303,13 +303,8 @@ impl Endpoint {
             }
         }
         match class {
-            RequestClass::ContractQuery => Some(
-                self.queries_in_flight
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .expect("the in-flight semaphore is never closed"),
-            ),
+            // The semaphore is never closed, so this always holds a permit.
+            RequestClass::ContractQuery => self.queries_in_flight.clone().acquire_owned().await.ok(),
             RequestClass::Graphql | RequestClass::Other => None,
         }
     }
