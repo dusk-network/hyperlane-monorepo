@@ -31,6 +31,15 @@ const MERKLE_HISTORY_PAGE_SIZE: u32 = 256;
 const DELIVERED_LOG_PAGES: usize = 4;
 /// Messages whose last delivery check a Mailbox keeps.
 const MAX_DELIVERY_CHECKS: usize = 4096;
+/// How long a passed `process` simulation stands for the same arguments.
+/// The relayer simulates a delivery when it prepares it, again just before
+/// it submits it, and the Mailbox did a third time in `process`: when the
+/// submission follows the preparation at once, the three ran within a few
+/// hundred milliseconds of each other on the same state. A Dusk block takes
+/// about 10 s, and the transaction waits as long again for its block.
+const SIMULATION_REUSE: Duration = Duration::from_secs(2);
+/// Simulations a Mailbox remembers.
+const MAX_REMEMBERED_SIMULATIONS: usize = 1024;
 
 /// What a delivery check found.
 #[derive(Debug, Clone)]
@@ -92,6 +101,9 @@ pub struct DuskMailbox {
     insertions: Arc<FinalRecords>,
     /// The last delivery check of each message, shared by every clone.
     delivery_checks: Arc<StdMutex<DeliveryChecks>>,
+    /// When `process` last passed its simulation, by the keccak256 of its
+    /// arguments, shared by every clone.
+    simulations: Arc<StdMutex<HashMap<[u8; 32], std::time::Instant>>>,
 }
 
 /// The MerkleTreeHook keeps no root per insertion, so checkpoints compute
@@ -132,6 +144,7 @@ impl DuskMailbox {
             conn,
             merkle: Arc::new(tokio::sync::Mutex::new(MerkleCache::default())),
             delivery_checks: Arc::default(),
+            simulations: Arc::default(),
         }
     }
 
@@ -164,14 +177,39 @@ impl DuskMailbox {
     /// encoding. Any other success reply, such as a proxy's error page sent
     /// with status 200, did not come from running `process` and fails the
     /// simulation.
+    ///
+    /// A simulation of the same arguments that passed less than
+    /// `SIMULATION_REUSE` ago stands for this one: it ran on the state this
+    /// one would read, as far as a delivery can tell.
     async fn simulate_process(&self, message: &HyperlaneMessage, args: &[u8]) -> ChainResult<()> {
+        let key = hyperlane_dusk_types::message::keccak256(args);
+        let passed_recently = self
+            .simulations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .is_some_and(|passed| passed.elapsed() < SIMULATION_REUSE);
+        if passed_recently {
+            debug!(message_id = ?message.id(), "Dusk process simulation passed moments ago; not running it again");
+            return Ok(());
+        }
         let unit = rkyv_serialize(&())?;
         let failure = match self
             .rues
             .contract_query_raw(&self.mailbox_id, "process", args)
             .await
         {
-            Ok(reply) if reply == unit => return Ok(()),
+            Ok(reply) if reply == unit => {
+                let mut simulations = self
+                    .simulations
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if simulations.len() >= MAX_REMEMBERED_SIMULATIONS {
+                    simulations.retain(|_, passed| passed.elapsed() < SIMULATION_REUSE);
+                }
+                simulations.insert(key, std::time::Instant::now());
+                return Ok(());
+            }
             Ok(reply) => format!(
                 "replied with {} bytes instead of the encoding of (): {}",
                 reply.len(),
@@ -644,7 +682,8 @@ impl Mailbox for DuskMailbox {
             .transpose()?;
 
         // The relayer simulates through process_estimate_costs before calling
-        // this. Simulate again here, at the only call that spends gas, so no
+        // this, and that simulation stands when it passed moments ago.
+        // Otherwise it runs here, at the only call that spends gas, so no
         // caller submits a delivery that would revert.
         self.simulate_process(message, &args).await?;
 

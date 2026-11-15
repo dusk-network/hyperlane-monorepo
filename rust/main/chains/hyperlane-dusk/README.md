@@ -157,7 +157,12 @@ how to run the local bridge.
   contract query, which Rusk executes in a throwaway session. If the query
   fails, or replies with anything other than the encoding of the `()` that
   `process` returns, nothing is submitted and the message is retried later.
-  The query reports no gas use, so `gasLimit` stays the transaction ceiling.
+  A simulation of the same arguments that passed less than 2 s before
+  stands for the next one, so the relayer's preparation, its dry run before
+  submitting and `process` itself, which ran three in a row, run one when
+  the submission follows the preparation. Rusk's query reports no gas use,
+  and its transaction simulation needs a signed transaction a node could
+  include, so `gasLimit` stays the estimate of every delivery.
 - **Delivery and announcement finality.** Contract queries read the node's
   tip, which Rusk can roll back until a block is final, and Rusk 1.7.3 has
   no query of contract state at the last finalized block. The relayer stops

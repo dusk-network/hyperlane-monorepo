@@ -430,6 +430,33 @@ async fn passing_simulation_proceeds_to_submission() {
 }
 
 #[tokio::test]
+async fn a_delivery_right_after_its_estimate_is_simulated_once() {
+    let _env_guard = HELPER_ENV.lock().await;
+    let fixture = Fixture::start(Helper::Success);
+    // The relayer's preparation, its dry run before submitting, and the
+    // Mailbox's own check, moments apart, on one adapter.
+    let mailbox = fixture.mailbox();
+    for _ in 0..2 {
+        mailbox
+            .process_estimate_costs(&message(), &Metadata::new(vec![]))
+            .await
+            .unwrap();
+    }
+    assert_failed_outcome(
+        mailbox
+            .process(
+                &message(),
+                &Metadata::new(vec![]),
+                Some(U256::from(FULL_GAS)),
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(fixture.simulations(), 1);
+    assert!(fixture.helper_invoked());
+}
+
+#[tokio::test]
 async fn failed_simulation_never_invokes_the_helper() {
     let _env_guard = HELPER_ENV.lock().await;
     let fixture = Fixture::start_with_simulation(Helper::Success, Simulation::Panics);
