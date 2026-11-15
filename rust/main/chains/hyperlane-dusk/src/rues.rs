@@ -97,8 +97,11 @@ pub struct DeploymentIdentity {
     pub chain_id: u8,
     /// Hyperlane domain of the Mailbox and ValidatorAnnounce.
     pub domain: u32,
+    /// Mailbox contract ID.
     pub mailbox: [u8; 32],
+    /// ValidatorAnnounce contract ID, bound to the Mailbox.
     pub validator_announce: [u8; 32],
+    /// MerkleTreeHook contract ID, the Mailbox's required hook or in it.
     pub merkle_tree_hook: [u8; 32],
 }
 

@@ -230,12 +230,15 @@ impl RuesClient {
             for event in events {
                 if let Some((height, _)) = &pending {
                     if event.block_height < *height {
-                        return Err(HyperlaneDuskError::Other(format!(
+                        let error = HyperlaneDuskError::Other(format!(
                             "Dusk archive row {} of contract {} is in block {}, below block {height} before it",
                             event.id,
                             hex::encode(contract_id),
                             event.block_height
-                        )));
+                        ));
+                        // Keep the blocks taken before it.
+                        self.write_event_log(log, state, batch)?;
+                        return Err(error);
                     }
                     if event.block_height > *height {
                         // The block being read ends before this row.

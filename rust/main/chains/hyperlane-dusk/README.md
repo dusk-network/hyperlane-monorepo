@@ -114,21 +114,21 @@ how to run the local bridge.
   read with `lastBlockPair` before the state, the delivery counts only once
   its `ProcessId` row is in a block `checkBlock(onlyFinalized)` accepts,
   which no rollback can undo; until then the check names the non-final block
-  that holds it, and when no block does, the block was rolled back during the
-  check or the node's archive skipped it, which it logs as a warning. Where
-  the log does not reach that far yet, or
-  the client has no `eventCursorDir`, the delivery counts once no block
-  above the last finalized one emitted its `ProcessId` event, whoever
-  delivered it: the check reads the blocks above the last finalized one
-  (`blocks`), which must still hold the tip it read, so a rollback in
-  between is noticed, though not a block accepted and rolled back entirely
-  within the check's own requests; each block's events come from the archive
-  (`contractEvents`). Until the delivery is final, the check fails and the
-  relayer tries again later with its usual backoff; a rolled-back delivery
-  reads as not delivered, and the message is relayed again. A validator's
-  startup waits the same way until its announcement is final. When finality
-  falls more than 64 blocks behind the tip, the checks wait for it to catch
-  up instead of reading every block.
+  that holds it, and when no block does, the block was rolled back during
+  the check or the node's archive skipped it, which it logs as a warning.
+  Where the log does not reach that far yet, or the client has no
+  `eventCursorDir`, the delivery counts once no block above the last
+  finalized one emitted its `ProcessId` event, whoever delivered it: the
+  check reads the blocks above the last finalized one (`blocks`), which must
+  still hold the tip it read, so a rollback in between is noticed, though
+  not a block accepted and rolled back entirely within the check's own
+  requests; each block's events come from the archive (`contractEvents`).
+  Until the delivery is final, the check fails and the relayer tries again
+  later with its usual backoff; a rolled-back delivery reads as not
+  delivered, and the message is relayed again. A validator's startup waits
+  the same way until its announcement is final. When finality falls more
+  than 64 blocks behind the tip, the checks wait for it to catch up instead
+  of reading every block.
 - **Identity checks.** Building the agent's Dusk components makes no
   request. Before its first request, each client checks, once, that the
   endpoint serves the configured deployment: the node's chain ID, the
