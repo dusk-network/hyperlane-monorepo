@@ -32,6 +32,7 @@ mod interchain_security_module;
 mod mailbox;
 mod mailbox_indexer;
 mod merkle_tree_hook;
+pub mod multicall;
 mod multisig_ism;
 mod provider;
 mod rues;
