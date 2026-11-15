@@ -13,6 +13,15 @@ use hyperlane_core::{
     HyperlaneDomainProtocol, HyperlaneDomainTechnicalStack, MerkleTreeHook, NativeToken,
     ReorgPeriod, H256,
 };
+
+/// The root hyperlane-core computes for the fixture's first `count` IDs.
+fn expected_root(count: usize) -> H256 {
+    let mut tree = IncrementalMerkle::default();
+    for id in [[3u8; 32], [4u8; 32]].into_iter().take(count) {
+        tree.ingest(H256::from(id));
+    }
+    tree.root()
+}
 use hyperlane_dusk::{ConnectionConf, DuskMailbox, DuskMerkleTreeHook, DuskProvider, RuesClient};
 use url::Url;
 
@@ -31,14 +40,10 @@ impl ArchiveFixture {
         let worker_stop = stop.clone();
         let worker = thread::spawn(move || {
             let ids = [[3u8; 32], [4u8; 32]];
-            let mut tree = IncrementalMerkle::default();
-            let roots: Vec<_> = ids
-                .iter()
-                .map(|id| {
-                    tree.ingest(H256::from(*id));
-                    tree.root().0
-                })
-                .collect();
+            let mut tree = hyperlane_dusk_types::merkle::IncrementalMerkle::new();
+            for id in ids {
+                tree.insert(id);
+            }
             while !worker_stop.load(Ordering::SeqCst) {
                 let (mut stream, _) = match listener.accept() {
                     Ok(connection) => connection,
@@ -86,10 +91,11 @@ impl ArchiveFixture {
                             let index = u32::from_le_bytes(body.try_into().unwrap()) as usize;
                             [60u64, 85][index].to_le_bytes().to_vec()
                         }
-                        "root_at" => {
+                        "message_id_at" => {
                             let index = u32::from_le_bytes(body.try_into().unwrap()) as usize;
-                            roots[index].to_vec()
+                            ids[index].to_vec()
                         }
+                        "tree" => rkyv::to_bytes::<_, 256>(&tree).unwrap().to_vec(),
                         "message_ids" => {
                             assert_eq!(body.len(), 8);
                             let start = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
@@ -218,6 +224,7 @@ async fn checkpoint_reads_respect_delay_without_exceeding_finality() {
             assert_eq!(checkpoint.block_height, Some(height));
             assert_eq!(checkpoint.checkpoint.index, count - 1);
             assert_eq!(checkpoint.checkpoint.root, tree.tree.root());
+            assert_eq!(checkpoint.checkpoint.root, expected_root(count as usize));
             assert_eq!(
                 checkpoint.checkpoint.merkle_tree_hook_address,
                 H256::from([2; 32])

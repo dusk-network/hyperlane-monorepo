@@ -1014,6 +1014,8 @@ mod dusk_rpc_tests {
 
     const DOMAIN: u32 = 1337;
     const CHAIN_ID: u8 = 7;
+    /// The one message ID the fake MerkleTreeHook stores.
+    const LEAF: [u8; 32] = [9; 32];
     const READ_DEADLINE: Duration = Duration::from_secs(5);
 
     #[derive(Clone, Copy)]
@@ -1193,8 +1195,22 @@ mod dusk_rpc_tests {
                         (200, 1u32.to_le_bytes().to_vec())
                     } else if path.ends_with("/inserted_block_height") {
                         (200, 85u64.to_le_bytes().to_vec())
-                    } else if path.ends_with("/root_at") {
-                        (200, vec![9; 32])
+                    } else if path.ends_with("/message_ids") {
+                        // rkyv Vec<[u8; 32]> of one ID: the ID, then a
+                        // relative pointer back to it and the length.
+                        let mut reply = LEAF.to_vec();
+                        reply.extend_from_slice(&(-32i32).to_le_bytes());
+                        reply.extend_from_slice(&1u32.to_le_bytes());
+                        (200, reply)
+                    } else if path.ends_with("/message_id_at") {
+                        (200, LEAF.to_vec())
+                    } else if path.ends_with("/tree") {
+                        // The hook's tree of one leaf: the leaf at level 0,
+                        // zero above it, and the count.
+                        let mut reply = LEAF.to_vec();
+                        reply.resize(32 * 32, 0);
+                        reply.extend_from_slice(&1u32.to_le_bytes());
+                        (200, reply)
                     } else {
                         panic!("unexpected fixture path {path}");
                     };
@@ -1321,7 +1337,9 @@ mod dusk_rpc_tests {
             H256::from_low_u64_be(4)
         );
         assert_eq!(checkpoint.checkpoint.index, 0);
-        assert_eq!(checkpoint.checkpoint.root, H256::from([9; 32]));
+        let mut tree = hyperlane_core::accumulator::incremental::IncrementalMerkle::default();
+        tree.ingest(H256::from(LEAF));
+        assert_eq!(checkpoint.checkpoint.root, tree.root());
     }
 
     async fn build_hooks(

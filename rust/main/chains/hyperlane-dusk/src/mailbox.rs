@@ -13,11 +13,13 @@ use hyperlane_core::{
 };
 
 use hyperlane_dusk_types::events;
+use hyperlane_dusk_types::merkle::{IncrementalMerkle as HookTree, TREE_DEPTH};
 
 use crate::rues::{bounded_body, bounded_json, bounded_text, rkyv_deserialize, rkyv_serialize};
 use crate::{ConnectionConf, DuskProvider, DuskSigner, HyperlaneDuskError, RuesClient};
 
 const TX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(120);
+/// Most message IDs one `message_ids` query returns.
 const MERKLE_HISTORY_PAGE_SIZE: u32 = 256;
 
 /// Dusk Mailbox contract adapter.
@@ -30,6 +32,22 @@ pub struct DuskMailbox {
     domain: HyperlaneDomain,
     signer: Option<DuskSigner>,
     conn: ConnectionConf,
+    /// The hook's Merkle tree as far as checkpoints have read it, shared by
+    /// every clone.
+    merkle: Arc<tokio::sync::Mutex<MerkleCache>>,
+}
+
+/// The MerkleTreeHook keeps no root per insertion, so checkpoints compute
+/// roots from the message IDs it stores: this is the tree of its first
+/// `tree.count()` leaves. It only ever holds leaves of final insertions,
+/// which no rollback can change, so it is extended, never rebuilt, unless a
+/// check against the hook fails. It takes 32 branch nodes and a count,
+/// however many leaves it holds.
+#[derive(Debug, Default)]
+struct MerkleCache {
+    tree: IncrementalMerkle,
+    /// The last leaf ingested, `None` for an empty tree.
+    last: Option<H256>,
 }
 
 impl DuskMailbox {
@@ -51,6 +69,7 @@ impl DuskMailbox {
             domain,
             signer,
             conn,
+            merkle: Arc::new(tokio::sync::Mutex::new(MerkleCache::default())),
         }
     }
 
@@ -157,22 +176,53 @@ impl DuskMailbox {
         Ok((finalized_count, finalized_height))
     }
 
-    async fn merkle_root_at(&self, index: u32) -> ChainResult<H256> {
-        let root: [u8; 32] = self
-            .rues
-            .contract_query(&self.merkle_tree_hook_id, "root_at", &(index,))
-            .await?;
-        Ok(H256::from_slice(&root))
+    /// The tree of the hook's first `count` leaves, ingested from the
+    /// message IDs it stores, and checked against the hook (`verify_tree`).
+    ///
+    /// The shared tree is extended page by page, so a call that is cancelled
+    /// or fails to read keeps the pages it read. A tree of fewer leaves than
+    /// the shared one holds, for an earlier height, is built on its own. A
+    /// failed check drops the shared tree, so the next call rebuilds it from
+    /// the hook's first leaf: no root is computed from IDs that disagree
+    /// with the hook.
+    async fn tree_at(&self, count: u32) -> ChainResult<IncrementalMerkle> {
+        let mut shared = self.merkle.lock().await;
+        let (tree, last) = if shared.tree.count() <= count as usize {
+            self.extend_tree(&mut shared, count).await?;
+            (shared.tree.clone(), shared.last)
+        } else {
+            let mut earlier = MerkleCache::default();
+            self.extend_tree(&mut earlier, count).await?;
+            (earlier.tree, earlier.last)
+        };
+        if let Err(detail) = self.verify_tree(&tree, last).await? {
+            *shared = MerkleCache::default();
+            warn!(
+                hook = %hex::encode(self.merkle_tree_hook_id),
+                leaves = tree.count(),
+                %detail,
+                "Dusk Merkle tree computed from the hook's stored IDs disagrees with the hook; discarding it"
+            );
+            return Err(HyperlaneDuskError::Other(format!(
+                "Dusk Merkle tree of {} leaves computed from MerkleTreeHook message IDs disagrees with the hook: {detail}",
+                tree.count()
+            ))
+            .into());
+        }
+        Ok(tree)
     }
 
-    async fn finalized_tree(
-        &self,
-        reorg_period: &ReorgPeriod,
-    ) -> ChainResult<IncrementalMerkleAtBlock> {
-        let (count, finalized_height) = self.finalized_merkle_view(reorg_period).await?;
-        let mut tree = IncrementalMerkle::default();
-        let mut start = 0u32;
-        while start < count {
+    /// Ingest the hook's stored message IDs from `cache`'s leaf count up to
+    /// `count`, a page of at most `MERKLE_HISTORY_PAGE_SIZE` at a time, each
+    /// page as long as asked.
+    async fn extend_tree(&self, cache: &mut MerkleCache, count: u32) -> ChainResult<()> {
+        loop {
+            let start = u32::try_from(cache.tree.count()).map_err(|_| {
+                HyperlaneDuskError::Other("Dusk Merkle tree count exceeds u32".into())
+            })?;
+            if start >= count {
+                return Ok(());
+            }
             let limit = (count - start).min(MERKLE_HISTORY_PAGE_SIZE);
             let message_ids: Vec<[u8; 32]> = self
                 .rues
@@ -186,24 +236,66 @@ impl DuskMailbox {
                 .into());
             }
             for message_id in message_ids {
-                tree.ingest(H256::from_slice(&message_id));
-            }
-            start += limit;
-        }
-
-        if count > 0 {
-            let expected_root = self.merkle_root_at(count - 1).await?;
-            if tree.root() != expected_root {
-                return Err(HyperlaneDuskError::Other(format!(
-                    "Reconstructed finalized merkle root mismatch: on-chain={expected_root:?} local={:?} count={count}",
-                    tree.root()
-                ))
-                .into());
+                let leaf = H256::from(message_id);
+                cache.tree.ingest(leaf);
+                cache.last = Some(leaf);
             }
         }
+    }
 
+    /// Check a tree computed from the hook's stored IDs against the hook
+    /// itself: `Ok(Err(detail))` when they disagree. Its last leaf must be
+    /// the ID the hook stores at that index (`message_id_at`). When the hook
+    /// holds exactly these leaves, its own tree (`tree`, one read of its
+    /// branch and count, so a dispatch in between is told apart from a
+    /// mismatch) must have the same count, root and root-making branch nodes
+    /// (`matches_hook_tree`). A tree of fewer leaves than the hook holds can
+    /// only be checked by its last ID: the hook keeps no earlier roots.
+    async fn verify_tree(
+        &self,
+        tree: &IncrementalMerkle,
+        last: Option<H256>,
+    ) -> ChainResult<Result<(), String>> {
+        let Some(index) = tree.count().checked_sub(1) else {
+            return Ok(Ok(()));
+        };
+        let index = u32::try_from(index)
+            .map_err(|_| HyperlaneDuskError::Other("Dusk Merkle tree index exceeds u32".into()))?;
+        let stored: [u8; 32] = self
+            .rues
+            .contract_query(&self.merkle_tree_hook_id, "message_id_at", &(index,))
+            .await?;
+        if last != Some(H256::from(stored)) {
+            return Ok(Err(format!(
+                "message_id_at({index}) is {:?}, the last ingested ID {last:?}",
+                H256::from(stored)
+            )));
+        }
+        let hook: HookTree = self
+            .rues
+            .contract_query(&self.merkle_tree_hook_id, "tree", &())
+            .await?;
+        if hook.count as usize != tree.count() {
+            return Ok(Ok(()));
+        }
+        if !matches_hook_tree(tree, &hook) {
+            return Ok(Err(format!(
+                "the hook's own tree of {} leaves has root {:?}, the computed one {:?}",
+                hook.count,
+                H256::from(hook.root()),
+                tree.root()
+            )));
+        }
+        Ok(Ok(()))
+    }
+
+    async fn finalized_tree(
+        &self,
+        reorg_period: &ReorgPeriod,
+    ) -> ChainResult<IncrementalMerkleAtBlock> {
+        let (count, finalized_height) = self.finalized_merkle_view(reorg_period).await?;
         Ok(IncrementalMerkleAtBlock {
-            tree,
+            tree: self.tree_at(count).await?,
             block_height: Some(finalized_height),
         })
     }
@@ -221,17 +313,32 @@ impl DuskMailbox {
             ))
             .into());
         }
-        let index = count - 1;
+        let tree = self.tree_at(count).await?;
         Ok(CheckpointAtBlock {
             checkpoint: Checkpoint {
                 merkle_tree_hook_address: H256::from_slice(&self.merkle_tree_hook_id),
                 mailbox_domain: self.domain.id(),
-                root: self.merkle_root_at(index).await?,
-                index,
+                root: tree.root(),
+                index: count - 1,
             },
             block_height: Some(effective_height),
         })
     }
+}
+
+/// Whether `tree`, computed from the hook's stored IDs, is the hook's own
+/// tree `hook`: the same leaf count, the same branch nodes at the levels the
+/// count's set bits select, and the same root. Those levels alone determine
+/// the root. The others are not compared: the hook starts every branch node
+/// at zero, where hyperlane-core starts each at the empty subtree's hash, so
+/// two trees of the same leaves differ there.
+fn matches_hook_tree(tree: &IncrementalMerkle, hook: &HookTree) -> bool {
+    let count = hook.count as usize;
+    count == tree.count()
+        && (0..TREE_DEPTH)
+            .filter(|level| (count >> level) & 1 == 1)
+            .all(|level| hook.branch[level] == tree.branch[level].0)
+        && H256::from(hook.root()) == tree.root()
 }
 
 impl HyperlaneChain for DuskMailbox {
@@ -539,9 +646,9 @@ impl Mailbox for DuskMailbox {
 #[async_trait]
 impl MerkleTreeHook for DuskMerkleTreeHook {
     async fn tree(&self, reorg_period: &ReorgPeriod) -> ChainResult<IncrementalMerkleAtBlock> {
-        // Rusk does not expose historical contract-state queries. Reconstruct
-        // the one-time validator start tree from hook-owned insertion history,
-        // capped at consensus finality, and verify it against the stored root.
+        // Rusk does not expose historical contract-state queries. Build the
+        // tree from the IDs the hook stores, up to the count at consensus
+        // finality, and check it against the hook (`tree_at`).
         self.ensure_identity().await?;
         self.inner.finalized_tree(reorg_period).await
     }
@@ -579,6 +686,64 @@ mod tests {
     use hyperlane_core::config::OpSubmissionConfig;
     use hyperlane_core::{HyperlaneDomainProtocol, HyperlaneDomainTechnicalStack, NativeToken};
     use url::Url;
+
+    /// Insert leaves `0..count` into a tree built the hook's way and one
+    /// built hyperlane-core's way.
+    fn both_trees(count: usize) -> (HookTree, IncrementalMerkle) {
+        let mut hook = HookTree::new();
+        let mut core = IncrementalMerkle::default();
+        for leaf in 0..count {
+            let id = hyperlane_dusk_types::message::keccak256(&(leaf as u64).to_be_bytes());
+            hook.insert(id);
+            core.ingest(H256::from(id));
+        }
+        (hook, core)
+    }
+
+    /// The hook's tree (`types/src/merkle.rs` in the Dusk repository)
+    /// starts every branch node at zero, hyperlane-core's at the empty
+    /// subtree's hash. Their roots agree at every count, and so do the
+    /// branch nodes the count's set bits select, but not all branch nodes.
+    #[test]
+    fn hook_and_core_trees_agree_on_roots_and_on_the_levels_that_make_them() {
+        for count in [
+            1usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100, 127, 128, 129,
+            255, 256, 257, 1000, 1023, 1024, 1025,
+        ] {
+            let (hook, core) = both_trees(count);
+            assert_eq!(hook.count as usize, core.count(), "count {count}");
+            assert_eq!(H256::from(hook.root()), core.root(), "count {count}");
+            assert!(matches_hook_tree(&core, &hook), "count {count}");
+            for level in (0..TREE_DEPTH).filter(|level| (count >> level) & 1 == 1) {
+                assert_eq!(hook.branch[level], core.branch[level].0, "count {count}");
+            }
+        }
+        // After one leaf, levels 1 to 31 hold zero in the hook's tree and the
+        // empty subtrees' hashes in hyperlane-core's: comparing whole branch
+        // arrays would reject trees with the same root.
+        let (hook, core) = both_trees(1);
+        assert_ne!(hook.branch[1], core.branch[1].0);
+        assert_eq!(hook.branch[1], [0u8; 32]);
+    }
+
+    #[test]
+    fn a_hook_tree_with_another_count_or_root_level_does_not_match() {
+        let (hook, core) = both_trees(5);
+        // 5 = 0b101: levels 0 and 2 make the root.
+        let mut tampered = hook.clone();
+        tampered.branch[2][0] ^= 1;
+        assert!(!matches_hook_tree(&core, &tampered));
+        let mut tampered = hook.clone();
+        tampered.branch[0][31] ^= 1;
+        assert!(!matches_hook_tree(&core, &tampered));
+        let mut tampered = hook.clone();
+        tampered.count = 6;
+        assert!(!matches_hook_tree(&core, &tampered));
+        // A level the count does not select leaves the root as it is.
+        let mut unused = hook;
+        unused.branch[1] = [7u8; 32];
+        assert!(matches_hook_tree(&core, &unused));
+    }
 
     #[test]
     fn mailbox_and_hook_adapters_report_distinct_contract_identities() {

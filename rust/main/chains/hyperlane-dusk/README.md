@@ -103,7 +103,17 @@ how to run the local bridge.
   another version lacks queries the agent uses. Startup waits for the node
   instead of failing when it is unreachable.
 - **Checkpoints** are read at consensus finality, adjusted by the configured
-  reorg period.
+  reorg period. The Merkle hook keeps no root per insertion, so a
+  checkpoint's root is computed: the agent reads the message IDs the hook
+  stores (`message_ids`, pages of 256, each as long as asked) and inserts
+  them into hyperlane-core's incremental tree, which it keeps between
+  checkpoints and only extends (32 branch nodes and a count, whatever the
+  tree's size). Before the root is used, the tree's last ID must be the
+  hook's `message_id_at` for that index, and when the hook holds exactly
+  those leaves, the hook's own `tree` must have the same count, root and
+  root-making branch nodes. Otherwise the read fails, the tree is dropped and
+  the next read rebuilds it, so a validator never signs a root computed from
+  IDs that disagree with the hook.
 
 ## Supported
 
