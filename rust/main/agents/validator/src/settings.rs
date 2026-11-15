@@ -1181,14 +1181,19 @@ mod dusk_rpc_tests {
                                 .as_bytes()
                                 .to_vec(),
                         )
+                    } else if path == "/on/graphql/query"
+                        && String::from_utf8_lossy(&body).contains("finalizedEvents(")
+                    {
+                        // An archive with no announcement yet.
+                        (200, br#"{"finalizedEvents":{"json":{"events":[],"startCursor":null,"endCursor":null,"hasNextPage":false}}}"#.to_vec())
                     } else if path == "/on/graphql/query" {
                         assert_eq!(body, b"query { lastBlockPair { json } }");
                         (200, br#"{"lastBlockPair":{"json":{"last_block":[100,"tip"],"last_finalized_block":[90,"final"]}}}"#.to_vec())
-                    } else if path.ends_with("/get_announced_storage_locations_for_validator") {
+                    } else if path.ends_with("/get_announced_storage_location_hashes") {
                         if current == Fault::AnnounceUnavailable as u8 {
                             (503, b"temporarily unavailable".to_vec())
                         } else {
-                            // rkyv archived empty Vec<String>: zero offset and length.
+                            // rkyv archived empty Vec<[u8; 32]>: zero offset and length.
                             (200, vec![0; 8])
                         }
                     } else if path.ends_with("/count") {
@@ -1488,7 +1493,9 @@ mod dusk_rpc_tests {
             .expect_err("an event-store path must be usable");
         assert!(!is_dusk_identity_observation_error(&error));
         for kind in [
-            AnnouncementClientKind::Reader,
+            AnnouncementClientKind::Reader {
+                location: "file:///fixture/checkpoints",
+            },
             AnnouncementClientKind::Submission,
         ] {
             let error = tokio::time::timeout(
@@ -1578,7 +1585,9 @@ mod dusk_rpc_tests {
     async fn dusk_announcement_factories_retry_initial_observation_errors() {
         use crate::rpc::{build_announcement_client, AnnouncementClientKind};
         for kind in [
-            AnnouncementClientKind::Reader,
+            AnnouncementClientKind::Reader {
+                location: "file:///fixture/checkpoints",
+            },
             AnnouncementClientKind::Submission,
         ] {
             let node = Node::start(Fault::Unavailable);
@@ -1630,7 +1639,7 @@ mod dusk_rpc_tests {
         let metrics = metrics();
         let strict = configuration
             .chain
-            .build_validator_self_announce_reader(&metrics)
+            .build_validator_self_announce_reader(&metrics, "file:///fixture/checkpoints")
             .await
             .expect("valid Dusk announcement fixture result");
         let partial = configuration

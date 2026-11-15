@@ -11,10 +11,11 @@ use std::{collections::HashSet, future::Future, sync::Arc, time::Duration};
 use tracing::warn;
 use url::Url;
 
-/// Distinguishes strict observation from the signer-backed submission client.
+/// Distinguishes strict observation of the validator's own announced
+/// location from the signer-backed submission client.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum AnnouncementClientKind {
-    Reader,
+pub(crate) enum AnnouncementClientKind<'a> {
+    Reader { location: &'a str },
     Submission,
 }
 
@@ -23,13 +24,15 @@ pub(crate) enum AnnouncementClientKind {
 pub(crate) async fn build_announcement_client(
     chain: &ChainConf,
     metrics: &CoreMetrics,
-    kind: AnnouncementClientKind,
+    kind: AnnouncementClientKind<'_>,
     retry_interval: Duration,
 ) -> eyre::Result<Box<dyn ValidatorAnnounce>> {
     build_with_dusk_rpc_retry(chain, "announcement client", retry_interval, || async {
         match kind {
-            AnnouncementClientKind::Reader => {
-                chain.build_validator_self_announce_reader(metrics).await
+            AnnouncementClientKind::Reader { location } => {
+                chain
+                    .build_validator_self_announce_reader(metrics, location)
+                    .await
             }
             AnnouncementClientKind::Submission => chain.build_validator_announce(metrics).await,
         }

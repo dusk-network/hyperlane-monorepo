@@ -992,7 +992,9 @@ impl Validator {
         let validator_announce = build_announcement_client(
             &self.origin_chain_conf,
             &self.core.metrics,
-            AnnouncementClientKind::Reader,
+            AnnouncementClientKind::Reader {
+                location: &announcement.storage_location,
+            },
             self.interval,
         )
         .await?;

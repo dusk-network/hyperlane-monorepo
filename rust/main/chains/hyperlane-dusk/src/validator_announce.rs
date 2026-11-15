@@ -3,23 +3,74 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use hyperlane_core::{
     Announcement, ChainResult, FixedPointNumber, HyperlaneChain, HyperlaneContract,
     HyperlaneDomain, HyperlaneProvider, SignedType, TxOutcome, ValidatorAnnounce, H256, U256,
 };
 
+use hyperlane_dusk_types::message::keccak256;
 use hyperlane_dusk_types::{events, EthAddress};
 
-use crate::rues::{rkyv_deserialize, BlockPair};
+use crate::rues::{rkyv_deserialize, rkyv_serialize, BlockPair, EventLog, LogLookup};
 use crate::{ConnectionConf, DuskProvider, DuskSigner, HyperlaneDuskError, RuesClient};
 
 const TX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_ANNOUNCED_LOCATION_BYTES: usize = 1024;
 const MAX_LOCATIONS_PER_VALIDATOR: usize = 16;
+/// Archive pages a read of announced locations reads to bring the
+/// announcement log up to date, on to the end of the block being read.
+const ANNOUNCEMENT_LOG_PAGES: usize = 16;
+
+/// The finalized event log of a ValidatorAnnounce's announcements, keyed by
+/// validator and location hash.
+fn announcement_log(va_id: [u8; 32]) -> EventLog {
+    EventLog {
+        contract_id: va_id,
+        topic: events::ValidatorAnnouncement::TOPIC,
+        key_of: announcement_key,
+    }
+}
+
+/// The key of a validator's announced location: its address and the
+/// keccak256 of the location, as the contract lists it.
+fn location_key(validator: &[u8; 20], location_hash: &[u8; 32]) -> Vec<u8> {
+    let mut key = validator.to_vec();
+    key.extend_from_slice(location_hash);
+    key
+}
+
+/// The key an announcement event names, if its data is exactly the encoding
+/// of an announcement the contract accepts: a location of 1 to 1024 bytes.
+fn announcement_key(data: &[u8]) -> Option<Vec<u8>> {
+    let announcement = decode_announcement(data)?;
+    Some(location_key(
+        &announcement.validator.0,
+        &keccak256(announcement.storage_location.as_bytes()),
+    ))
+}
+
+fn decode_announcement(data: &[u8]) -> Option<events::ValidatorAnnouncement> {
+    let announcement: events::ValidatorAnnouncement = rkyv_deserialize(data).ok()?;
+    let location = &announcement.storage_location;
+    (!location.is_empty()
+        && location.len() <= MAX_ANNOUNCED_LOCATION_BYTES
+        && rkyv_serialize(&announcement).ok()? == data)
+        .then_some(announcement)
+}
+
+fn eth_address(validator: &H256) -> [u8; 20] {
+    let mut address = [0u8; 20];
+    address.copy_from_slice(&validator.as_bytes()[12..]);
+    address
+}
 
 /// Dusk ValidatorAnnounce implementation.
+///
+/// The contract keeps the keccak256 of each location a validator announced,
+/// oldest first, and the locations are in its `ValidatorAnnouncement`
+/// events. A location is the validator's when its hash is in the list.
 #[derive(Debug, Clone)]
 pub struct DuskValidatorAnnounce {
     provider: Arc<DuskProvider>,
@@ -28,7 +79,8 @@ pub struct DuskValidatorAnnounce {
     domain: HyperlaneDomain,
     signer: Option<DuskSigner>,
     conn: ConnectionConf,
-    require_all_reads: bool,
+    /// The location a validator's own startup check looks for.
+    own_location: Option<String>,
 }
 
 impl DuskValidatorAnnounce {
@@ -48,42 +100,155 @@ impl DuskValidatorAnnounce {
             domain,
             signer,
             conn,
-            require_all_reads: false,
+            own_location: None,
         }
     }
 
-    /// Require observed, final announcement state before making a submission
-    /// decision. Relayer aggregation retains the default per-validator
-    /// partial results, which may include announcements that are not final.
-    pub fn with_strict_reads(mut self) -> Self {
-        self.require_all_reads = true;
+    /// The reader of a validator's startup check, which decides whether to
+    /// announce `location`. A validator has announced it iff its hash is in
+    /// the validator's list, and the check reports it only once its
+    /// announcement is final, failing until then: Rusk can still roll the
+    /// block back, and the validator would sign checkpoints that relayers
+    /// cannot find. Reads fail instead of reporting partial results.
+    pub fn with_own_location(mut self, location: impl Into<String>) -> Self {
+        self.own_location = Some(location.into());
         self
     }
 
-    /// Fail while any of `locations`, read from the node's tip after `pair`,
-    /// was announced in a block that is not final yet. A validator's startup
-    /// waits for its announcement until then: Rusk can still roll the block
-    /// back, and the validator would sign checkpoints that relayers cannot
-    /// find.
-    async fn ensure_final_locations(
+    /// The hashes of the locations `validator` announced at the node's tip,
+    /// oldest first.
+    async fn location_hashes(&self, validator: [u8; 20]) -> ChainResult<Vec<[u8; 32]>> {
+        let hashes: Vec<[u8; 32]> = self
+            .rues
+            .contract_query(
+                &self.va_id,
+                "get_announced_storage_location_hashes",
+                &EthAddress(validator),
+            )
+            .await?;
+        if hashes.len() > MAX_LOCATIONS_PER_VALIDATOR {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Dusk ValidatorAnnounce lists {} locations for validator 0x{}, more than its {MAX_LOCATIONS_PER_VALIDATOR}",
+                hashes.len(),
+                hex::encode(validator)
+            ))
+            .into());
+        }
+        Ok(hashes)
+    }
+
+    /// The locations of `hashes` that `validator` announced in finalized
+    /// events the log has read, in the list's order. A hash with no event
+    /// read yet is left out.
+    fn announced_locations(
         &self,
-        pair: &BlockPair,
-        validators: &[H256],
-        locations: &[Vec<String>],
-    ) -> ChainResult<()> {
-        if locations.iter().all(Vec::is_empty) {
-            return Ok(());
+        log: &EventLog,
+        validator: [u8; 20],
+        hashes: &[[u8; 32]],
+    ) -> ChainResult<Vec<String>> {
+        let mut locations = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            let found = self
+                .rues
+                .event_log_find(log, &location_key(&validator, hash))?
+                .into_iter()
+                .find_map(|entry| decode_announcement(&entry.data))
+                .filter(|announcement| {
+                    announcement.validator.0 == validator
+                        && keccak256(announcement.storage_location.as_bytes()) == *hash
+                });
+            match found {
+                Some(announcement) => locations.push(announcement.storage_location),
+                None => debug!(
+                    validator = %hex::encode(validator),
+                    location_hash = %hex::encode(hash),
+                    "No finalized Dusk announcement event read yet for a listed location"
+                ),
+            }
+        }
+        Ok(locations)
+    }
+
+    /// Whether `validator` has announced `location` in a final block: `[]`
+    /// when its hash is not in the list, `[location]` once the announcement
+    /// is final, and an error until then.
+    ///
+    /// Where the announcement log holds every finalized announcement up to
+    /// the last final block, read before the list, that takes the
+    /// announcement in a block `checkBlock(onlyFinalized)` accepts. Where it
+    /// does not reach that far yet, it takes no block above the last final
+    /// one holding the announcement.
+    async fn own_announcement(
+        &self,
+        log: &EventLog,
+        validator: [u8; 20],
+        location: &str,
+    ) -> ChainResult<Vec<String>> {
+        let location_hash = keccak256(location.as_bytes());
+        // An unannounced location reads no blocks.
+        if !self
+            .location_hashes(validator)
+            .await?
+            .contains(&location_hash)
+        {
+            return Ok(Vec::new());
+        }
+        // Read the chain before the list the check holds, so that no
+        // rollback in between goes unnoticed.
+        let pair = self.rues.block_pair().await?;
+        if !self
+            .location_hashes(validator)
+            .await?
+            .contains(&location_hash)
+        {
+            return Ok(Vec::new());
         }
         let not_final = |detail: String| {
             HyperlaneDuskError::NotFinal(format!(
-                "Dusk validator announcements are at the tip, but {detail}"
+                "Dusk validator 0x{} announced {} at the tip, but {detail}",
+                hex::encode(validator),
+                crate::rues::bounded_text(location)
             ))
         };
+        let key = location_key(&validator, &location_hash);
+        match self
+            .rues
+            .finalized_event_log_lookup(log, &key, &pair, ANNOUNCEMENT_LOG_PAGES)
+            .await
+        {
+            Ok(LogLookup::Found(_)) => return Ok(vec![location.to_owned()]),
+            Ok(LogLookup::Absent { final_block }) => {
+                return Err(not_final(format!(
+                    "no finalized block up to block {final_block}, the last final one, holds the announcement"
+                ))
+                .into())
+            }
+            Ok(LogLookup::Unknown(reason)) => {
+                debug!(%reason, "Dusk announcement log cannot show finality; checking the blocks that are not final");
+            }
+            Err(error) => {
+                debug!(%error, "Dusk announcement log is unavailable; checking the blocks that are not final");
+            }
+        }
+        self.ensure_not_pending(&pair, validator, location, not_final)
+            .await?;
+        Ok(vec![location.to_owned()])
+    }
+
+    /// Fail while a block above `pair`'s last final one holds `validator`'s
+    /// announcement of `location`.
+    async fn ensure_not_pending(
+        &self,
+        pair: &BlockPair,
+        validator: [u8; 20],
+        location: &str,
+        not_final: impl Fn(String) -> HyperlaneDuskError,
+    ) -> ChainResult<()> {
         let pending = self
             .rues
             .non_final_events(pair, &self.va_id, events::ValidatorAnnouncement::TOPIC)
             .await
-            .map_err(|error| not_final(format!("their finality cannot be checked yet: {error}")))?;
+            .map_err(|error| not_final(format!("its finality cannot be checked yet: {error}")))?;
         for event in pending {
             let announcement = rkyv_deserialize::<events::ValidatorAnnouncement>(&event.data)
                 .map_err(|error| {
@@ -92,20 +257,10 @@ impl DuskValidatorAnnounce {
                         event.block_height
                     ))
                 })?;
-            let announced = validators
-                .iter()
-                .zip(locations)
-                .any(|(validator, locations)| {
-                    validator.as_bytes()[12..] == announcement.validator.0
-                        && locations.contains(&announcement.storage_location)
-                });
-            if announced {
+            if announcement.validator.0 == validator && announcement.storage_location == location {
                 return Err(not_final(format!(
-                    "validator 0x{} announced {} in block {} ({:?}), which is not final yet",
-                    hex::encode(announcement.validator.0),
-                    crate::rues::bounded_text(&announcement.storage_location),
-                    event.block_height,
-                    event.block_hash
+                    "block {} ({:?}) holds the announcement and is not final yet",
+                    event.block_height, event.block_hash
                 ))
                 .into());
             }
@@ -130,51 +285,46 @@ impl HyperlaneContract for DuskValidatorAnnounce {
     }
 }
 
-impl DuskValidatorAnnounce {
-    /// Each validator's announced storage locations at the node's tip.
-    async fn tip_storage_locations(&self, validators: &[H256]) -> ChainResult<Vec<Vec<String>>> {
-        // Query one validator at a time. A legacy/poisoned record or one
-        // unavailable response must not prevent the relayer from using enough
-        // healthy validators to satisfy the ISM threshold.
+#[async_trait]
+impl ValidatorAnnounce for DuskValidatorAnnounce {
+    /// Each validator's announced locations, oldest first: those whose hash
+    /// the contract lists for it, from the finalized announcement events the
+    /// agent has read. A validator whose list cannot be read gets none, so
+    /// enough healthy validators can still meet an ISM threshold. A reader
+    /// made `with_own_location` instead reports, for each validator, whether
+    /// it has announced that location in a final block.
+    async fn get_announced_storage_locations(
+        &self,
+        validators: &[H256],
+    ) -> ChainResult<Vec<Vec<String>>> {
+        let log = announcement_log(self.va_id);
+        if let Some(location) = &self.own_location {
+            let mut all_locations = Vec::with_capacity(validators.len());
+            for validator in validators {
+                all_locations.push(
+                    self.own_announcement(&log, eth_address(validator), location)
+                        .await?,
+                );
+            }
+            return Ok(all_locations);
+        }
+        if let Err(error) = self
+            .rues
+            .advance_event_log(&log, ANNOUNCEMENT_LOG_PAGES, None)
+            .await
+        {
+            warn!(%error, "Could not read new Dusk validator announcements; using those read before");
+        }
         let mut all_locations = Vec::with_capacity(validators.len());
         for validator in validators {
-            let mut address = [0u8; 20];
-            address.copy_from_slice(&validator.as_bytes()[12..]);
-            let result: Result<Vec<String>, _> = self
-                .rues
-                .contract_query(
-                    &self.va_id,
-                    "get_announced_storage_locations_for_validator",
-                    &EthAddress(address),
-                )
-                .await;
-            match result {
-                Ok(locations)
-                    if locations.len() <= MAX_LOCATIONS_PER_VALIDATOR
-                        && locations.iter().all(|location| {
-                            !location.is_empty() && location.len() <= MAX_ANNOUNCED_LOCATION_BYTES
-                        }) =>
-                {
-                    all_locations.push(locations)
-                }
-                Ok(locations) => {
-                    if self.require_all_reads {
-                        return Err(HyperlaneDuskError::Other(
-                            "Invalid Dusk validator location history".into(),
-                        )
-                        .into());
-                    }
-                    warn!(
-                        validator = ?validator,
-                        locations = locations.len(),
-                        "Ignoring invalid Dusk validator location history"
-                    );
-                    all_locations.push(Vec::new());
-                }
+            let address = eth_address(validator);
+            let locations = match self.location_hashes(address).await {
+                Ok(hashes) => self.announced_locations(&log, address, &hashes),
+                Err(error) => Err(error),
+            };
+            match locations {
+                Ok(locations) => all_locations.push(locations),
                 Err(error) => {
-                    if self.require_all_reads {
-                        return Err(error.into());
-                    }
                     warn!(
                         validator = ?validator,
                         %error,
@@ -185,27 +335,6 @@ impl DuskValidatorAnnounce {
             }
         }
         Ok(all_locations)
-    }
-}
-
-#[async_trait]
-impl ValidatorAnnounce for DuskValidatorAnnounce {
-    async fn get_announced_storage_locations(
-        &self,
-        validators: &[H256],
-    ) -> ChainResult<Vec<Vec<String>>> {
-        let locations = self.tip_storage_locations(validators).await?;
-        if !self.require_all_reads || locations.iter().all(Vec::is_empty) {
-            return Ok(locations);
-        }
-        // A strict read reports locations only once they are final. Read the
-        // chain before the locations it checks, so that no rollback in
-        // between goes unnoticed.
-        let pair = self.rues.block_pair().await?;
-        let locations = self.tip_storage_locations(validators).await?;
-        self.ensure_final_locations(&pair, validators, &locations)
-            .await?;
-        Ok(locations)
     }
 
     async fn announce(&self, announcement: SignedType<Announcement>) -> ChainResult<TxOutcome> {
@@ -294,7 +423,6 @@ impl ValidatorAnnounce for DuskValidatorAnnounce {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rues::rkyv_serialize;
     use hyperlane_core::{
         config::OpSubmissionConfig, HyperlaneDomainProtocol, HyperlaneDomainTechnicalStack,
         NativeToken,
@@ -304,8 +432,13 @@ mod tests {
     use std::thread;
     use std::time::Instant;
 
+    const LOCATION: &str = "file:///fixture/checkpoints";
+
+    /// A reader of a node that answers `responses` in order, with an event
+    /// store when `with_store` is set.
     fn reader(
         responses: Vec<(u16, Vec<u8>)>,
+        with_store: bool,
     ) -> (
         DuskValidatorAnnounce,
         thread::JoinHandle<()>,
@@ -338,8 +471,9 @@ mod tests {
                 let mut first = String::new();
                 request.read_line(&mut first).unwrap();
                 assert!(
-                    first.contains("/get_announced_storage_locations_for_validator ")
-                        || first.contains("/on/graphql/query ")
+                    first.contains("/get_announced_storage_location_hashes ")
+                        || first.contains("/on/graphql/query "),
+                    "{first}"
                 );
                 let mut length = 0;
                 loop {
@@ -371,9 +505,14 @@ mod tests {
             HyperlaneDomainTechnicalStack::Other,
         )
         .unwrap();
-        let rues = Arc::new(RuesClient::new(url.clone()).unwrap());
-        let provider = Arc::new(DuskProvider::new(domain.clone(), rues.clone()));
         let directory = tempfile::tempdir().unwrap();
+        let rues = Arc::new(if with_store {
+            RuesClient::new_with_event_cursor_dir(url.clone(), directory.path().join("events"))
+                .unwrap()
+        } else {
+            RuesClient::new(url.clone()).unwrap()
+        });
+        let provider = Arc::new(DuskProvider::new(domain.clone(), rues.clone()));
         let reader = DuskValidatorAnnounce::new(
             provider,
             rues,
@@ -393,84 +532,141 @@ mod tests {
         (reader, worker, directory)
     }
 
-    #[tokio::test]
-    async fn strict_announcement_observation_rejects_errors_and_recovers() {
-        let existing = vec!["file:///fixture/checkpoints".to_owned()];
-        let invalid_histories = [
-            vec![String::new()],
-            vec!["x".repeat(1025)],
-            vec!["file:///fixture".to_owned(); 17],
-        ];
-        let mut failures = vec![
-            (503, b"temporarily unavailable".to_vec()),
-            (200, vec![1, 2, 3]),
-        ];
-        failures.extend(
-            invalid_histories
-                .into_iter()
-                .map(|locations| (200, rkyv_serialize(&locations).unwrap())),
+    fn hashes(locations: &[&str]) -> Vec<u8> {
+        let hashes: Vec<[u8; 32]> = locations
+            .iter()
+            .map(|location| keccak256(location.as_bytes()))
+            .collect();
+        rkyv_serialize(&hashes).unwrap()
+    }
+
+    fn validator(byte: u8) -> H256 {
+        let mut validator = [0u8; 32];
+        validator[12..].copy_from_slice(&[byte; 20]);
+        H256::from(validator)
+    }
+
+    fn announcement_row(id: i64, validator: u8, location: &str) -> serde_json::Value {
+        let data = rkyv_serialize(&events::ValidatorAnnouncement {
+            validator: EthAddress([validator; 20]),
+            storage_location: location.to_owned(),
+        })
+        .unwrap();
+        serde_json::json!({
+            "id": id, "block_height": 9, "block_hash": "ab".repeat(32),
+            "origin": hex::encode([validator; 32]), "topic": events::ValidatorAnnouncement::TOPIC,
+            "source": hex::encode([2u8; 32]), "data": hex::encode(data), "reverted": false,
+        })
+    }
+
+    #[test]
+    fn announcement_keys_need_the_exact_encoding_of_a_valid_announcement() {
+        let encode = |location: &str| {
+            rkyv_serialize(&events::ValidatorAnnouncement {
+                validator: EthAddress([1; 20]),
+                storage_location: location.to_owned(),
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            announcement_key(&encode(LOCATION)),
+            Some(location_key(&[1; 20], &keccak256(LOCATION.as_bytes())))
         );
-        // A location counts once its block is final; here every block is.
+        assert_eq!(announcement_key(&encode("")), None);
+        assert_eq!(announcement_key(&encode(&"x".repeat(1025))), None);
+        let mut padded = vec![0u8; 8];
+        padded.extend_from_slice(&encode(LOCATION));
+        assert_eq!(announcement_key(&padded), None);
+    }
+
+    #[tokio::test]
+    async fn locations_are_resolved_from_finalized_events_by_their_listed_hashes() {
+        let page = serde_json::json!({"finalizedEvents": {"json": {
+            "events": [
+                announcement_row(0, 1, "s3://first/old"),
+                announcement_row(1, 1, "s3://first/new"),
+                announcement_row(2, 3, "s3://third"),
+            ],
+            "startCursor": "djE6MA==", "endCursor": "djE6Mg==", "hasNextPage": false,
+        }}});
+        let (client, worker, _directory) = reader(
+            vec![
+                (200, page.to_string().into_bytes()),
+                (200, br#"{"checkBlock":true}"#.to_vec()),
+                // Listed in order of announcement; one listed hash has no
+                // event read yet and is left out.
+                (
+                    200,
+                    hashes(&["s3://first/old", "s3://first/new", "s3://first/pending"]),
+                ),
+                (503, b"temporarily unavailable".to_vec()),
+                (200, hashes(&["s3://third"])),
+            ],
+            true,
+        );
+        assert_eq!(
+            client
+                .get_announced_storage_locations(&[validator(1), validator(2), validator(3)])
+                .await
+                .unwrap(),
+            vec![
+                vec!["s3://first/old".to_owned(), "s3://first/new".to_owned()],
+                vec![],
+                vec!["s3://third".to_owned()],
+            ]
+        );
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_validators_own_check_rejects_errors_and_recovers() {
+        // Every block is final.
         let hash = "ab".repeat(32);
         let final_tip = format!(
             r#"{{"lastBlockPair":{{"json":{{"last_block":[9,"{hash}"],"last_finalized_block":[9,"{hash}"]}}}}}}"#
         )
         .into_bytes();
-        for failure in failures {
-            let (client, worker, _directory) = reader(vec![
-                failure,
-                (200, rkyv_serialize(&existing).unwrap()),
-                (200, final_tip.clone()),
-                (200, rkyv_serialize(&existing).unwrap()),
-                (200, br#"{"blocks":[]}"#.to_vec()),
-            ]);
-            let client = client.with_strict_reads();
+        let too_many: Vec<String> = (0..17).map(|n| format!("s3://{n}")).collect();
+        let too_many: Vec<&str> = too_many.iter().map(String::as_str).collect();
+        for failure in [
+            (503, b"temporarily unavailable".to_vec()),
+            (200, vec![1, 2, 3]),
+            (200, hashes(&too_many)),
+        ] {
+            let (client, worker, _directory) = reader(
+                vec![
+                    failure,
+                    (200, hashes(&[LOCATION])),
+                    (200, final_tip.clone()),
+                    (200, hashes(&[LOCATION])),
+                    (200, br#"{"blocks":[]}"#.to_vec()),
+                ],
+                false,
+            );
+            let client = client.with_own_location(LOCATION);
             assert!(client
-                .get_announced_storage_locations(&[H256::repeat_byte(1)])
+                .get_announced_storage_locations(&[validator(1)])
                 .await
                 .is_err());
             assert_eq!(
                 client
-                    .get_announced_storage_locations(&[H256::repeat_byte(1)])
+                    .get_announced_storage_locations(&[validator(1)])
                     .await
                     .unwrap(),
-                vec![existing.clone()]
+                vec![vec![LOCATION.to_owned()]]
             );
             worker.join().unwrap();
         }
     }
 
     #[tokio::test]
-    async fn partial_announcement_observation_retains_healthy_validator_positions() {
-        let first = vec!["file:///fixture/first".to_owned()];
-        let last = vec!["file:///fixture/last".to_owned()];
-        let (client, worker, _directory) = reader(vec![
-            (200, rkyv_serialize(&first).unwrap()),
-            (503, vec![]),
-            (200, rkyv_serialize(&last).unwrap()),
-        ]);
+    async fn a_validators_own_check_reads_its_location_and_no_other() {
+        // Another location's hash is listed, not this one: not announced.
+        let (client, worker, _directory) = reader(vec![(200, hashes(&["s3://another"]))], false);
         assert_eq!(
             client
-                .get_announced_storage_locations(&[
-                    H256::repeat_byte(1),
-                    H256::repeat_byte(2),
-                    H256::repeat_byte(3)
-                ])
-                .await
-                .unwrap(),
-            vec![first, vec![], last]
-        );
-        worker.join().unwrap();
-    }
-
-    #[tokio::test]
-    async fn strict_announcement_observation_accepts_confirmed_absence() {
-        let (client, worker, _directory) =
-            reader(vec![(200, rkyv_serialize(&Vec::<String>::new()).unwrap())]);
-        assert_eq!(
-            client
-                .with_strict_reads()
-                .get_announced_storage_locations(&[H256::repeat_byte(1)])
+                .with_own_location(LOCATION)
+                .get_announced_storage_locations(&[validator(1)])
                 .await
                 .unwrap(),
             vec![Vec::<String>::new()]

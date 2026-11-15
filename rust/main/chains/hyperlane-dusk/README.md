@@ -39,6 +39,17 @@ how to run the local bridge.
   that `checkBlock` no longer accepts when a delivery is served drops the log,
   which is then rebuilt. The delivery indexer's tip is the height up to which
   the log holds every finalized delivery.
+- **Announced locations.** ValidatorAnnounce keeps only the keccak256 of
+  each location a validator announced, oldest first
+  (`get_announced_storage_location_hashes`), and the locations are in its
+  `ValidatorAnnouncement` events. A relayer keeps a log of the finalized
+  announcements like the deliveries' (at most 16 pages per read) and returns,
+  for each validator, the logged locations whose hash the contract lists for
+  it, in the list's order, so the last is the latest. A listed hash whose
+  announcement it has not read yet, such as one that is not final, is left
+  out until it has. A validator's startup check has announced its location
+  iff the location's hash is in its own list, and reports it only once the
+  announcement is final (see below); otherwise the validator announces.
 - **Archive scans** read a contract's `finalizedEvents` 200 rows at a time
   (Rusk's maximum) and match every record of a block in one pass over that
   block's rows. The agent reads at most 4 MiB of a reply, and 200 rows of

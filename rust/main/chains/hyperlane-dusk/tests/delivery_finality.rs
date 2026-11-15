@@ -187,9 +187,14 @@ impl Node {
             return reply;
         }
         if let Some(method) = path.strip_prefix(&announce) {
-            assert_eq!(method, "get_announced_storage_locations_for_validator");
+            assert_eq!(method, "get_announced_storage_location_hashes");
             assert_eq!(body, &VALIDATOR[..]);
-            return rkyv::to_bytes::<_, 256>(&self.locations).unwrap().to_vec();
+            let hashes: Vec<[u8; 32]> = self
+                .locations
+                .iter()
+                .map(|location| hyperlane_dusk_types::message::keccak256(location.as_bytes()))
+                .collect();
+            return rkyv::to_bytes::<_, 256>(&hashes).unwrap().to_vec();
         }
         panic!("unexpected request {path}");
     }
@@ -472,6 +477,28 @@ impl Fixture {
         )
     }
 
+    /// An announcement reader whose client keeps the announcement log in
+    /// the fixture's event store, as relayers read locations.
+    fn announcements_with_log(&self) -> DuskValidatorAnnounce {
+        let (domain, _, _, conf) = self.parts();
+        let rues = Arc::new(
+            RuesClient::new_with_event_cursor_dir(
+                self.url.clone(),
+                self._directory.path().join("events"),
+            )
+            .unwrap(),
+        );
+        let provider = Arc::new(DuskProvider::new(domain.clone(), rues.clone()));
+        DuskValidatorAnnounce::new(
+            provider,
+            rues,
+            H256::from(VALIDATOR_ANNOUNCE),
+            domain,
+            None,
+            conf,
+        )
+    }
+
     fn announcements(&self) -> DuskValidatorAnnounce {
         let (domain, rues, provider, conf) = self.parts();
         DuskValidatorAnnounce::new(
@@ -691,7 +718,7 @@ async fn validator_startup_waits_until_its_announcement_is_final() {
     node.push(vec![]);
     node.locations = vec![LOCATION.to_owned()];
     let fixture = Fixture::start(node);
-    let strict = fixture.announcements().with_strict_reads();
+    let strict = fixture.announcements().with_own_location(LOCATION);
 
     let error = strict
         .get_announced_storage_locations(&[validator()])
@@ -699,18 +726,18 @@ async fn validator_startup_waits_until_its_announcement_is_final() {
         .unwrap_err()
         .to_string();
     assert!(
-        error.contains(LOCATION) && error.contains(&format!("in block {block}")),
+        error.contains(LOCATION) && error.contains(&format!("block {block} (")),
         "{error}"
     );
 
-    // Relayers may use an announced location before it is final.
+    // Relayers read locations from finalized announcements only.
+    let relayer = fixture.announcements_with_log();
     assert_eq!(
-        fixture
-            .announcements()
+        relayer
             .get_announced_storage_locations(&[validator()])
             .await
             .unwrap(),
-        vec![vec![LOCATION.to_owned()]]
+        vec![Vec::<String>::new()]
     );
 
     fixture.node().finalized = block;
@@ -721,6 +748,47 @@ async fn validator_startup_waits_until_its_announcement_is_final() {
             .unwrap(),
         vec![vec![LOCATION.to_owned()]]
     );
+    assert_eq!(
+        relayer
+            .get_announced_storage_locations(&[validator()])
+            .await
+            .unwrap(),
+        vec![vec![LOCATION.to_owned()]]
+    );
+}
+
+#[tokio::test]
+async fn with_an_announcement_log_startup_counts_only_a_finalized_announcement() {
+    let mut node = Node::new(100);
+    let block = node.push(vec![Event::announced(VALIDATOR, LOCATION)]);
+    node.push(vec![]);
+    node.locations = vec![LOCATION.to_owned()];
+    let fixture = Fixture::start(node);
+    let strict = fixture.announcements_with_log().with_own_location(LOCATION);
+    let error = strict
+        .get_announced_storage_locations(&[validator()])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("no finalized block up to block 100"),
+        "{error}"
+    );
+    fixture.node().finalized = block;
+    assert_eq!(
+        strict
+            .get_announced_storage_locations(&[validator()])
+            .await
+            .unwrap(),
+        vec![vec![LOCATION.to_owned()]]
+    );
+    // The finalized announcement settled it: no block above the last final
+    // one was read.
+    assert!(fixture
+        .node()
+        .queries
+        .iter()
+        .all(|query| !query.contains("blocks(range")));
 }
 
 #[tokio::test]
@@ -731,7 +799,7 @@ async fn a_validator_that_has_not_announced_reads_no_blocks() {
     assert_eq!(
         fixture
             .announcements()
-            .with_strict_reads()
+            .with_own_location(LOCATION)
             .get_announced_storage_locations(&[validator()])
             .await
             .unwrap(),
@@ -746,7 +814,7 @@ async fn a_rolled_back_announcement_is_not_announced() {
     node.push(vec![Event::announced(VALIDATOR, LOCATION)]);
     node.locations = vec![LOCATION.to_owned()];
     let fixture = Fixture::start(node);
-    let strict = fixture.announcements().with_strict_reads();
+    let strict = fixture.announcements().with_own_location(LOCATION);
     assert!(strict
         .get_announced_storage_locations(&[validator()])
         .await
@@ -777,7 +845,7 @@ async fn another_validators_pending_announcement_does_not_hold_startup() {
     assert_eq!(
         fixture
             .announcements()
-            .with_strict_reads()
+            .with_own_location(LOCATION)
             .get_announced_storage_locations(&[validator()])
             .await
             .unwrap(),
