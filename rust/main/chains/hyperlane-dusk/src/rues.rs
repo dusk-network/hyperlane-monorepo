@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::{Mutex as StdMutex, OnceLock, PoisonError};
 use std::time::Duration;
@@ -89,6 +90,33 @@ fn archive_gap_report_due(contract_id: &[u8; 32], topic: &str, block_height: u64
     true
 }
 
+/// The Hyperlane deployment an agent is configured for on a Dusk chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DeploymentIdentity {
+    /// Dusk chain ID the endpoint must report.
+    pub chain_id: u8,
+    /// Hyperlane domain of the Mailbox and ValidatorAnnounce.
+    pub domain: u32,
+    pub mailbox: [u8; 32],
+    pub validator_announce: [u8; 32],
+    pub merkle_tree_hook: [u8; 32],
+}
+
+/// Whether an endpoint has been shown to serve a deployment, shared by the
+/// clients that require it.
+#[derive(Debug)]
+struct IdentityGate {
+    identity: DeploymentIdentity,
+    verified: AtomicBool,
+    /// Attempts that have finished, and the last one's failure. Callers that
+    /// waited while an attempt ran share its result instead of each making
+    /// one, so an endpoint that does not answer is asked once at a time.
+    finished: AtomicU64,
+    attempt: tokio::sync::Mutex<Option<String>>,
+}
+
+type IdentityGates = HashMap<DeploymentIdentity, Arc<IdentityGate>>;
+
 /// RUES (Rusk Unified Event System) HTTP client.
 ///
 /// Communicates with Dusk nodes using the RUES protocol:
@@ -107,6 +135,12 @@ pub struct RuesClient {
     non_final_cache: Arc<StdMutex<NonFinalEventCache>>,
     /// Serializes the advances of each finalized event log.
     event_logs: Arc<StdMutex<EventLogLocks>>,
+    /// The deployment every request first checks the endpoint serves, if
+    /// any (`with_identity`).
+    identity: Option<Arc<IdentityGate>>,
+    /// The gates of the deployments this client's clones require, so they
+    /// verify each deployment once.
+    identity_gates: Arc<StdMutex<IdentityGates>>,
 }
 
 impl fmt::Debug for RuesClient {
@@ -759,7 +793,81 @@ impl RuesClient {
             block_cache: Arc::new(StdMutex::new(BlockCache::new(BLOCK_CACHE_LIMITS))),
             non_final_cache: Arc::new(StdMutex::new(NonFinalEventCache::default())),
             event_logs: Arc::new(StdMutex::new(HashMap::new())),
+            identity: None,
+            identity_gates: Arc::new(StdMutex::new(HashMap::new())),
         })
+    }
+
+    /// This client, but every request it sends first checks, once, that the
+    /// endpoint serves `identity` (`validate_chain_identity`): building it
+    /// makes no request. Until a check succeeds, every request fails without
+    /// being sent and the next one checks again; callers that wait while a
+    /// check runs share its result. Clones share the outcome.
+    pub fn with_identity(&self, identity: DeploymentIdentity) -> Self {
+        let gate = self
+            .identity_gates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(identity)
+            .or_insert_with(|| {
+                Arc::new(IdentityGate {
+                    identity,
+                    verified: AtomicBool::new(false),
+                    finished: AtomicU64::new(0),
+                    attempt: tokio::sync::Mutex::new(None),
+                })
+            })
+            .clone();
+        Self {
+            identity: Some(gate),
+            ..self.clone()
+        }
+    }
+
+    /// Check, once, that the endpoint serves the deployment this client
+    /// requires, if any. Fails, without retrying, until a check succeeds.
+    pub async fn ensure_identity(&self) -> Result<(), HyperlaneDuskError> {
+        let Some(gate) = &self.identity else {
+            return Ok(());
+        };
+        if gate.verified.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let observed = gate.finished.load(Ordering::Acquire);
+        let mut last_failure = gate.attempt.lock().await;
+        if gate.verified.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if gate.finished.load(Ordering::Acquire) != observed {
+            // A check finished while this call waited for it.
+            return Err(HyperlaneDuskError::IdentityUnverified(
+                last_failure.clone().unwrap_or_default(),
+            ));
+        }
+        let identity = gate.identity;
+        let result = self
+            .validate_chain_identity(
+                identity.chain_id,
+                identity.domain,
+                &identity.mailbox,
+                &identity.validator_announce,
+                &identity.merkle_tree_hook,
+            )
+            .await;
+        gate.finished.fetch_add(1, Ordering::AcqRel);
+        match result {
+            Ok(()) => {
+                gate.verified.store(true, Ordering::Release);
+                *last_failure = None;
+                Ok(())
+            }
+            Err(error) => {
+                let detail = bounded_error(&error);
+                warn!(error = %detail, "Dusk endpoint does not serve the configured deployment yet");
+                *last_failure = Some(detail.clone());
+                Err(HyperlaneDuskError::IdentityUnverified(detail))
+            }
+        }
     }
 
     /// Create a RUES client whose validated contract event rows and archive
@@ -804,10 +912,15 @@ impl RuesClient {
 
     /// Query the native Dusk chain ID from the transfer contract.
     pub async fn chain_id(&self) -> Result<u8, HyperlaneDuskError> {
+        self.ensure_identity().await?;
+        self.chain_id_unchecked().await
+    }
+
+    async fn chain_id_unchecked(&self) -> Result<u8, HyperlaneDuskError> {
         let mut transfer_contract = [0u8; 32];
         transfer_contract[0] = 1;
         let bytes = self
-            .contract_query_raw(&transfer_contract, "chain_id", &[])
+            .contract_query_raw_unchecked(&transfer_contract, "chain_id", &[])
             .await?;
         match bytes.as_slice() {
             [chain_id] => Ok(*chain_id),
@@ -819,7 +932,8 @@ impl RuesClient {
     }
 
     /// Validate the endpoint and deployed Hyperlane contracts before an agent
-    /// indexes or submits anything.
+    /// indexes or submits anything. Its own queries do not wait for
+    /// `ensure_identity`, which runs this.
     pub async fn validate_chain_identity(
         &self,
         expected_chain_id: u8,
@@ -828,7 +942,7 @@ impl RuesClient {
         validator_announce_id: &[u8; 32],
         merkle_tree_hook_id: &[u8; 32],
     ) -> Result<(), HyperlaneDuskError> {
-        let observed_chain_id = self.chain_id().await?;
+        let observed_chain_id = self.chain_id_unchecked().await?;
         if observed_chain_id != expected_chain_id {
             return Err(HyperlaneDuskError::Other(format!(
                 "Configured Dusk chainId {expected_chain_id} does not match endpoint chain ID {observed_chain_id}"
@@ -840,7 +954,7 @@ impl RuesClient {
             ("ValidatorAnnounce", validator_announce_id),
         ] {
             let observed_domain: u32 = self
-                .contract_query(contract_id, "local_domain", &())
+                .contract_query_unchecked(contract_id, "local_domain", &())
                 .await
                 .map_err(|error| {
                     HyperlaneDuskError::Other(format!(
@@ -874,10 +988,10 @@ impl RuesClient {
         // child of the required static aggregation. A matching local domain
         // alone cannot identify the deployment whose checkpoints we sign.
         let required: [u8; 32] = self
-            .contract_query(mailbox_id, "required_hook", &())
+            .contract_query_unchecked(mailbox_id, "required_hook", &())
             .await?;
         let hook_type: u8 = self
-            .contract_query(merkle_tree_hook_id, "hook_type", &())
+            .contract_query_unchecked(merkle_tree_hook_id, "hook_type", &())
             .await?;
         if hook_type != 3 {
             return Err(HyperlaneDuskError::Other(
@@ -895,7 +1009,9 @@ impl RuesClient {
             self.validate_mailbox_binding(merkle_tree_hook_id, mailbox_id, "MerkleTreeHook")
                 .await?;
         } else {
-            let required_type: u8 = self.contract_query(&required, "hook_type", &()).await?;
+            let required_type: u8 = self
+                .contract_query_unchecked(&required, "hook_type", &())
+                .await?;
             if required_type != 2 {
                 return Err(HyperlaneDuskError::Other(
                     "Dusk Mailbox required_hook must be the configured MerkleTreeHook or its static aggregation".into(),
@@ -903,7 +1019,9 @@ impl RuesClient {
             }
             self.validate_mailbox_binding(&required, mailbox_id, "required aggregation hook")
                 .await?;
-            let hooks: Vec<[u8; 32]> = self.contract_query(&required, "hooks", &()).await?;
+            let hooks: Vec<[u8; 32]> = self
+                .contract_query_unchecked(&required, "hooks", &())
+                .await?;
             if hooks
                 .iter()
                 .filter(|hook| *hook == merkle_tree_hook_id)
@@ -926,7 +1044,9 @@ impl RuesClient {
         expected_mailbox: &[u8; 32],
         label: &str,
     ) -> Result<(), HyperlaneDuskError> {
-        let mailbox: [u8; 32] = self.contract_query(contract, "mailbox", &()).await?;
+        let mailbox: [u8; 32] = self
+            .contract_query_unchecked(contract, "mailbox", &())
+            .await?;
         if mailbox != *expected_mailbox {
             return Err(HyperlaneDuskError::Other(format!(
                 "Configured Dusk {label} mailbox does not match the configured deployment"
@@ -947,7 +1067,7 @@ impl RuesClient {
         what: &str,
     ) -> Result<(), HyperlaneDuskError> {
         let state_version: u32 = self
-            .contract_query(contract, "state_version", &())
+            .contract_query_unchecked(contract, "state_version", &())
             .await
             .map_err(|error| {
                 HyperlaneDuskError::Other(format!(
@@ -964,6 +1084,17 @@ impl RuesClient {
 
     /// Query a contract method, sending and receiving raw bytes.
     pub async fn contract_query_raw(
+        &self,
+        contract_id: &[u8; 32],
+        method: &str,
+        body: &[u8],
+    ) -> Result<Vec<u8>, HyperlaneDuskError> {
+        self.ensure_identity().await?;
+        self.contract_query_raw_unchecked(contract_id, method, body)
+            .await
+    }
+
+    async fn contract_query_raw_unchecked(
         &self,
         contract_id: &[u8; 32],
         method: &str,
@@ -994,6 +1125,7 @@ impl RuesClient {
         &self,
         contract_id: &[u8; 32],
     ) -> Result<ContractMetadata, HyperlaneDuskError> {
+        self.ensure_identity().await?;
         let contract_hex = hex::encode(contract_id);
         let url = self.endpoint(&format!("/on/contract:{contract_hex}/metadata"));
 
@@ -1037,8 +1169,27 @@ impl RuesClient {
         rkyv_deserialize(&response_bytes)
     }
 
+    async fn contract_query_unchecked<I, O>(
+        &self,
+        contract_id: &[u8; 32],
+        method: &str,
+        args: &I,
+    ) -> Result<O, HyperlaneDuskError>
+    where
+        I: Serialize<AllocSerializer<256>>,
+        O: Archive,
+        O::Archived: Deserialize<O, Infallible> + for<'b> rkyv::CheckBytes<DefaultValidator<'b>>,
+    {
+        let body = rkyv_serialize(args)?;
+        let response_bytes = self
+            .contract_query_raw_unchecked(contract_id, method, &body)
+            .await?;
+        rkyv_deserialize(&response_bytes)
+    }
+
     /// Propagate a serialized transaction to the network.
     pub async fn propagate_tx(&self, tx_bytes: &[u8]) -> Result<(), HyperlaneDuskError> {
+        self.ensure_identity().await?;
         // Preverify first
         let preverify_url = self.endpoint("/on/transactions/preverify");
         let response = self
@@ -1083,6 +1234,7 @@ impl RuesClient {
     /// Send a GraphQL query and parse its JSON reply, without looking at any
     /// GraphQL errors in it. Also returns the size of the reply in bytes.
     async fn graphql_reply(&self, query: &str) -> Result<(JsonValue, usize), HyperlaneDuskError> {
+        self.ensure_identity().await?;
         let url = self.endpoint("/on/graphql/query");
 
         let response = self
@@ -2455,6 +2607,7 @@ impl RuesClient {
 
     /// Query a Moonlight account status by bs58-encoded BLS public key.
     pub async fn account_status(&self, bs58_pk: &str) -> Result<AccountStatus, HyperlaneDuskError> {
+        self.ensure_identity().await?;
         let url = self.endpoint(&format!("/on/account:{bs58_pk}/status"));
 
         let response = self
@@ -2511,6 +2664,7 @@ impl RuesClient {
         &self,
         max_transactions: usize,
     ) -> Result<GasPriceStats, HyperlaneDuskError> {
+        self.ensure_identity().await?;
         let url = self.endpoint("/on/blocks/gas-price");
 
         let response = self
@@ -4828,6 +4982,70 @@ mod tests {
             error.contains("Failed to query Dusk Mailbox state_version")
                 && error.contains("needs state_version 5"),
             "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn requests_wait_until_the_endpoint_serves_the_configured_deployment() {
+        let identity = DeploymentIdentity {
+            chain_id: 1,
+            domain: 4242,
+            mailbox: [3; 32],
+            validator_announce: [4; 32],
+            merkle_tree_hook: [5; 32],
+        };
+        // The node is unavailable for the first check, then serves the
+        // deployment with its Merkle hook attached directly.
+        let mut responses = vec![(503, b"unavailable".to_vec())];
+        responses.extend([
+            (200, vec![1]),
+            (200, rkyv_serialize(&4242u32).unwrap()),
+            (200, rkyv_serialize(&4242u32).unwrap()),
+            (200, rkyv_serialize(&MAILBOX_STATE_VERSION).unwrap()),
+            (
+                200,
+                rkyv_serialize(&VALIDATOR_ANNOUNCE_STATE_VERSION).unwrap(),
+            ),
+            (200, rkyv_serialize(&[3u8; 32]).unwrap()),
+            (200, rkyv_serialize(&[5u8; 32]).unwrap()),
+            (200, vec![3]),
+            (
+                200,
+                rkyv_serialize(&MERKLE_TREE_HOOK_STATE_VERSION).unwrap(),
+            ),
+            (200, rkyv_serialize(&[3u8; 32]).unwrap()),
+        ]);
+        responses.extend([(200, vec![42]), (200, vec![43])]);
+        // Building the client sends nothing.
+        let client = RuesClient::new(test_server(responses))
+            .unwrap()
+            .with_identity(identity);
+        // The query is not sent while the check fails.
+        let error = client
+            .contract_query_raw(&[9; 32], "nonce", &[])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, HyperlaneDuskError::IdentityUnverified(_)),
+            "{error}"
+        );
+        // The next request checks again, then is sent.
+        assert_eq!(
+            client
+                .contract_query_raw(&[9; 32], "nonce", &[])
+                .await
+                .unwrap(),
+            vec![42]
+        );
+        // Clones, and clients that require the same deployment, share the
+        // outcome: no check precedes this query.
+        assert_eq!(
+            client
+                .with_identity(identity)
+                .contract_query_raw(&[9; 32], "nonce", &[])
+                .await
+                .unwrap(),
+            vec![43]
         );
     }
 

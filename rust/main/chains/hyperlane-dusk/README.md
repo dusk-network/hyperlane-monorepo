@@ -126,14 +126,20 @@ how to run the local bridge.
   startup waits the same way until its announcement is final. When finality
   falls more than 64 blocks behind the tip, the checks wait for it to catch
   up instead of reading every block.
-- **Identity checks.** On startup the agent checks that the node's chain ID
-  and the configured contracts agree with each other: the Mailbox and
-  ValidatorAnnounce domains, each contract's `state_version`, and the
-  ValidatorAnnounce and Merkle hook bindings to that Mailbox. The agent
-  accepts only the state versions it reads (Mailbox 5, MerkleTreeHook 2,
-  ValidatorAnnounce 2) and refuses any other with an explicit error, since
-  another version lacks queries the agent uses. Startup waits for the node
-  instead of failing when it is unreachable.
+- **Identity checks.** Building the agent's Dusk components makes no
+  request. Before its first request, each client checks, once, that the
+  endpoint serves the configured deployment: the node's chain ID, the
+  Mailbox and ValidatorAnnounce domains, each contract's `state_version`,
+  and the ValidatorAnnounce and Merkle hook bindings to that Mailbox. Until a
+  check succeeds, every request fails without being sent and the next one
+  checks again; requests that wait while a check runs share its result. A
+  node that is unreachable, or serves another deployment, when an agent
+  starts therefore delays its reads, and the relayer keeps the chain instead
+  of dropping it. Submissions through the `dusk-tx` helper are checked the
+  same way first. The agent accepts only the state versions it reads
+  (Mailbox 5, MerkleTreeHook 2, ValidatorAnnounce 2) and refuses any other
+  with an explicit error, since another version lacks queries the agent
+  uses.
 - **Checkpoints** are read at consensus finality, adjusted by the configured
   reorg period. The Merkle hook keeps no root per insertion, so a
   checkpoint's root is computed: the agent reads the message IDs the hook

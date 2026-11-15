@@ -1401,7 +1401,7 @@ mod dusk_rpc_tests {
     }
 
     #[tokio::test]
-    async fn dusk_validator_startup_recovers_before_announcement() {
+    async fn dusk_validator_builds_without_reaching_the_node_and_waits_on_its_first_reads() {
         // Classic RPC indexing and WebSocket with RPC recovery both use the
         // real validator construction sequence.
         for mode in 0..2 {
@@ -1415,65 +1415,49 @@ mod dusk_rpc_tests {
                         .expect("fixture websocket URL"),
                 );
             }
-            let build = configuration.build_validator();
-            tokio::pin!(build);
-            let observe_failure = async {
-                while node.unavailable_responses.load(Ordering::SeqCst) == 0 {
-                    tokio::time::sleep(Duration::from_millis(2)).await;
-                }
-            };
-            tokio::select! {
-                _ = &mut build => panic!("startup must await indexer identity recovery"),
-                observed = tokio::time::timeout(READ_DEADLINE, observe_failure) => {
-                    observed.expect("indexer construction attempts identity read");
-                },
-            }
-            assert_eq!(node.state_reads.load(Ordering::SeqCst), 0);
-            node.set_fault(Fault::None);
-            let validator = tokio::time::timeout(READ_DEADLINE, &mut build)
+            let _validator = tokio::time::timeout(READ_DEADLINE, configuration.build_validator())
                 .await
-                .expect("validator construction recovers")
-                .expect("validated validator");
+                .expect("construction makes no request")
+                .expect("validator builds while the node is unavailable");
+            assert_eq!(node.identity_reads.load(Ordering::SeqCst), 0);
+            assert_eq!(node.state_reads.load(Ordering::SeqCst), 0);
 
-            // This is the next RPC constructor called by Validator::run, before
-            // announcement. It must stay pending, then recover in the same process.
-            node.set_fault(Fault::Unavailable);
-            node.unavailable_responses.store(0, Ordering::SeqCst);
-            let before_state_reads = node.state_reads.load(Ordering::SeqCst);
-            let metrics_build = validator.build_metrics_updater();
-            tokio::pin!(metrics_build);
-            let observe_failure = async {
-                while node.unavailable_responses.load(Ordering::SeqCst) == 0 {
-                    tokio::time::sleep(Duration::from_millis(2)).await;
-                }
-            };
-            tokio::select! {
-                _ = &mut metrics_build => panic!("metrics initialization must await identity recovery"),
-                observed = tokio::time::timeout(READ_DEADLINE, observe_failure) => {
-                    observed.expect("metrics construction attempts identity read");
-                },
-            }
+            // The next step of Validator::run reads announcement state: it
+            // fails, without reaching that state, until the node is back and
+            // serves the configured deployment.
+            let reader = configuration
+                .chain
+                .build_validator_self_announce_reader(&metrics(), "file:///fixture/checkpoints")
+                .await
+                .expect("reader builds while the node is unavailable");
+            let validators = [H256::repeat_byte(7)];
+            assert!(reader
+                .get_announced_storage_locations(&validators)
+                .await
+                .is_err());
+            assert!(node.unavailable_responses.load(Ordering::SeqCst) > 0);
             assert_eq!(
                 node.state_reads.load(Ordering::SeqCst),
-                before_state_reads,
+                0,
                 "unverified startup cannot reach announcement or checkpoint state"
             );
             node.set_fault(Fault::None);
-            let _updater = tokio::time::timeout(READ_DEADLINE, &mut metrics_build)
-                .await
-                .expect("metrics initialization recovers")
-                .expect("validated metrics provider");
+            assert_eq!(
+                reader
+                    .get_announced_storage_locations(&validators)
+                    .await
+                    .expect("verified reader observes announcement state"),
+                vec![Vec::<String>::new()]
+            );
+            assert_eq!(node.identity_reads.load(Ordering::SeqCst), 11);
         }
     }
 
     #[tokio::test]
-    async fn dusk_local_initialization_errors_return_without_rpc_retry() {
-        use crate::rpc::{build_announcement_client, AnnouncementClientKind};
-        use hyperlane_base::settings::{
-            is_dusk_identity_observation_error, ChainConnectionConf, DuskSignerKeyConf, SignerConf,
-        };
+    async fn dusk_local_initialization_errors_are_reported_at_construction() {
+        use hyperlane_base::settings::{ChainConnectionConf, DuskSignerKeyConf, SignerConf};
 
-        let node = Node::start(Fault::Unavailable);
+        let node = Node::start(Fault::None);
         let mut configuration = Configuration::new(&[node.url.clone()]);
         configuration.validator.interval = Duration::from_millis(10);
         let invalid_directory = configuration._directory.path().join("events-is-a-file");
@@ -1487,79 +1471,50 @@ mod dusk_rpc_tests {
             configuration.validator.origin_chain.clone(),
             configuration.chain.clone(),
         );
-        let error = tokio::time::timeout(READ_DEADLINE, configuration.build_validator())
+        tokio::time::timeout(READ_DEADLINE, configuration.build_validator())
             .await
-            .expect("local indexer error returns instead of retrying forever")
+            .expect("local indexer error returns promptly")
             .expect_err("an event-store path must be usable");
-        assert!(!is_dusk_identity_observation_error(&error));
-        for kind in [
-            AnnouncementClientKind::Reader {
-                location: "file:///fixture/checkpoints",
-            },
-            AnnouncementClientKind::Submission,
-        ] {
-            let error = tokio::time::timeout(
-                READ_DEADLINE,
-                build_announcement_client(
-                    &configuration.chain,
-                    &metrics(),
-                    kind,
-                    Duration::from_millis(10),
-                ),
-            )
-            .await
-            .expect("local announcement-client error returns promptly")
-            .expect_err("an event-store path must be usable");
-            assert!(!is_dusk_identity_observation_error(&error));
-        }
-        assert_eq!(node.identity_reads.load(Ordering::SeqCst), 0);
+        let metrics = metrics();
+        tokio::time::timeout(
+            READ_DEADLINE,
+            configuration
+                .chain
+                .build_validator_self_announce_reader(&metrics, "file:///fixture/checkpoints"),
+        )
+        .await
+        .expect("local announcement-reader error returns promptly")
+        .expect_err("an event-store path must be usable");
+        tokio::time::timeout(
+            READ_DEADLINE,
+            configuration.chain.build_validator_announce(&metrics),
+        )
+        .await
+        .expect("local announcement-client error returns promptly")
+        .expect_err("an event-store path must be usable");
 
-        // An invalid chain key must fail the later metrics/submission factories
-        // promptly instead of entering the RPC retry loop.
+        // An invalid chain key fails the signer-backed factories promptly.
         let mut configuration = Configuration::new(&[node.url.clone()]);
         configuration.chain.signer = Some(SignerConf::DuskKey {
             key: DuskSignerKeyConf::Inline {
                 key: "0x00".to_owned(),
             },
         });
-        configuration.validator.base.chains.insert(
-            configuration.validator.origin_chain.clone(),
-            configuration.chain.clone(),
-        );
-        node.set_fault(Fault::None);
-        let validator = tokio::time::timeout(READ_DEADLINE, configuration.build_validator())
-            .await
-            .expect("validator construction finishes")
-            .expect("validator construction does not use the chain signer");
-        node.set_fault(Fault::Unavailable);
-        let identity_reads = node.identity_reads.load(Ordering::SeqCst);
-        let result = tokio::time::timeout(READ_DEADLINE, validator.build_metrics_updater())
-            .await
-            .expect("invalid local signer cannot enter an RPC retry loop");
-        let error = match result {
-            Ok(_) => panic!("invalid local signer must fail"),
-            Err(error) => error,
-        };
-        assert!(!is_dusk_identity_observation_error(&error));
-        let error = tokio::time::timeout(
+        tokio::time::timeout(
             READ_DEADLINE,
-            build_announcement_client(
-                &configuration.chain,
-                &metrics(),
-                AnnouncementClientKind::Submission,
-                Duration::from_millis(10),
-            ),
+            configuration.chain.build_validator_announce(&metrics),
         )
         .await
         .expect("submission signer error returns promptly")
         .expect_err("invalid local signer must fail");
-        assert!(!is_dusk_identity_observation_error(&error));
-        assert_eq!(node.identity_reads.load(Ordering::SeqCst), identity_reads);
+        assert_eq!(node.identity_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(node.state_reads.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
-    async fn dusk_identity_observation_errors_retain_retry_classification() {
-        use hyperlane_base::settings::is_dusk_identity_observation_error;
+    async fn dusk_identity_failures_block_every_provider_read_and_can_recover() {
+        use hyperlane_core::HyperlaneProvider;
+
         for fault in [
             Fault::Unavailable,
             Fault::WrongChain,
@@ -1567,68 +1522,61 @@ mod dusk_rpc_tests {
         ] {
             let node = Node::start(fault);
             let configuration = Configuration::new(&[node.url.clone()]);
-            let error = configuration
+            let provider: Box<dyn HyperlaneProvider> = configuration
                 .chain
                 .build_provider(&metrics())
                 .await
-                .expect_err("unverified identity cannot produce a provider");
-            assert!(is_dusk_identity_observation_error(&error));
-            assert!(
-                is_dusk_identity_observation_error(&error.wrap_err("factory context")),
-                "retry classification survives caller context"
-            );
+                .expect("provider construction makes no request");
+            assert_eq!(node.identity_reads.load(Ordering::SeqCst), 0);
+            let error = provider
+                .get_block_by_height(1)
+                .await
+                .expect_err("unverified identity cannot serve a read")
+                .to_string();
+            assert!(error.contains("identity is not verified yet"), "{error}");
             assert_eq!(node.state_reads.load(Ordering::SeqCst), 0);
         }
     }
 
     #[tokio::test]
-    async fn dusk_announcement_factories_retry_initial_observation_errors() {
-        use crate::rpc::{build_announcement_client, AnnouncementClientKind};
-        for kind in [
-            AnnouncementClientKind::Reader {
-                location: "file:///fixture/checkpoints",
-            },
-            AnnouncementClientKind::Submission,
-        ] {
+    async fn dusk_announcement_clients_wait_for_identity_on_their_first_read() {
+        let metrics = metrics();
+        for submission in [false, true] {
             let node = Node::start(Fault::Unavailable);
             let configuration = Configuration::new(&[node.url.clone()]);
-            let metrics = metrics();
-            let build = build_announcement_client(
-                &configuration.chain,
-                &metrics,
-                kind,
-                Duration::from_millis(10),
-            );
-            tokio::pin!(build);
-            let observe_failure = async {
-                while node.unavailable_responses.load(Ordering::SeqCst) == 0 {
-                    tokio::time::sleep(Duration::from_millis(2)).await;
-                }
-            };
-            tokio::select! {
-                result = &mut build => panic!("construction must wait for identity recovery: {result:?}"),
-                observed = tokio::time::timeout(READ_DEADLINE, observe_failure) => {
-                    observed.expect("fixture receives initial identity request");
-                },
+            let client = if submission {
+                configuration.chain.build_validator_announce(&metrics).await
+            } else {
+                configuration
+                    .chain
+                    .build_validator_self_announce_reader(&metrics, "file:///fixture/checkpoints")
+                    .await
             }
-            assert!(node.unavailable_responses.load(Ordering::SeqCst) >= 1);
+            .expect("announcement clients build without a request");
+            assert_eq!(node.identity_reads.load(Ordering::SeqCst), 0);
+            let validators = [H256::repeat_byte(7)];
+            let result = client.get_announced_storage_locations(&validators).await;
+            // A relayer-style reader reports a validator it cannot read as
+            // having no locations; the validator's own check fails.
+            if submission {
+                assert_eq!(result.expect("partial results"), vec![Vec::<String>::new()]);
+            } else {
+                assert!(result.is_err());
+            }
             assert_eq!(
                 node.state_reads.load(Ordering::SeqCst),
                 0,
-                "unverified construction cannot reach announcement reads or writes"
+                "unverified clients cannot reach announcement reads or writes"
             );
             node.set_fault(Fault::None);
-            let client = tokio::time::timeout(READ_DEADLINE, &mut build)
-                .await
-                .expect("factory recovers after the endpoint")
-                .expect("validated client");
             assert_eq!(
                 client
-                    .get_announced_storage_locations(&[H256::repeat_byte(7)])
+                    .get_announced_storage_locations(&validators)
                     .await
                     .expect("valid Dusk announcement fixture result"),
                 vec![Vec::<String>::new()]
             );
+            assert!(node.state_reads.load(Ordering::SeqCst) > 0);
         }
     }
 

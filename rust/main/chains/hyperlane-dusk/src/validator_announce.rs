@@ -342,6 +342,9 @@ impl ValidatorAnnounce for DuskValidatorAnnounce {
             .signer
             .as_ref()
             .ok_or(HyperlaneDuskError::SignerUnavailable)?;
+        // The helper submits to the endpoint directly: check first that it
+        // serves the configured deployment.
+        self.rues.ensure_identity().await?;
 
         info!(
             validator = ?announcement.value.validator,

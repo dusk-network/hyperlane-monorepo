@@ -1245,6 +1245,65 @@ mod test {
         );
     }
 
+    #[tokio::test]
+    async fn dusk_chain_components_build_without_reaching_the_node() {
+        use hyperlane_core::H256;
+
+        let directory = tempfile::tempdir().unwrap();
+        // Nothing listens on this port any more: the node is unreachable, as
+        // a relayer starting before its Rusk node would find it.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let value = json!({
+            "domainid": 1337, "chainid": 7, "name": "test", "protocol": "dusk",
+            "rpcurls": [{"http": format!("http://127.0.0.1:{port}")}],
+            "eventcursordir": directory.path().join("events"),
+            "mailbox": "0x0000000000000000000000000000000000000001",
+            "interchaingaspaymaster": "0x0000000000000000000000000000000000000002",
+            "validatorannounce": "0x0000000000000000000000000000000000000003",
+            "merkletreehook": "0x0000000000000000000000000000000000000004"
+        });
+        let chain = parse_chain(
+            ValueParser::new(Default::default(), &value),
+            "test",
+            "fallback",
+        )
+        .unwrap();
+        let metrics =
+            crate::CoreMetrics::new("dusk-offline", 0, prometheus::Registry::new()).unwrap();
+        // Everything a relayer builds for the chain, without a request.
+        let mailbox = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            chain.build_provider(&metrics).await?;
+            chain.build_message_indexer(&metrics, false).await?;
+            chain.build_delivery_indexer(&metrics, false).await?;
+            chain
+                .build_interchain_gas_payment_indexer(&metrics, false)
+                .await?;
+            chain
+                .build_merkle_tree_hook_indexer(&metrics, false)
+                .await?;
+            chain.build_validator_announce(&metrics).await?;
+            chain.build_merkle_tree_hook(&metrics).await?;
+            chain.build_mailbox(&metrics).await
+        })
+        .await
+        .expect("building makes no request")
+        .unwrap();
+        // Reads fail until the endpoint is shown to serve the configured
+        // deployment, and each one tries again.
+        for _ in 0..2 {
+            let error = mailbox
+                .delivered(H256::zero())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("not verified yet"), "{error}");
+        }
+    }
+
     #[test]
     fn dusk_gas_limit_defaults_to_five_million() {
         let mut value = json!({

@@ -65,6 +65,10 @@ pub enum HyperlaneDuskError {
     /// finalized block provenance. Transport failures must not use this variant.
     #[error("{0}")]
     FinalizedEventMismatch(String),
+    /// The endpoint has not been shown to serve the configured deployment
+    /// yet: its chain ID, contracts and their bindings. No request was sent.
+    #[error("Dusk endpoint identity is not verified yet: {0}")]
+    IdentityUnverified(String),
     /// A record is in the node's current state, but the agent cannot show
     /// yet that the block holding it is final. The caller checks again later.
     #[error("{0}")]
