@@ -10,8 +10,9 @@ use hyperlane_core::{
     HyperlaneDomain, HyperlaneProvider, SignedType, TxOutcome, ValidatorAnnounce, H256, U256,
 };
 
-use hyperlane_dusk_types::EthAddress;
+use hyperlane_dusk_types::{events, EthAddress};
 
+use crate::rues::{rkyv_deserialize, BlockPair};
 use crate::{ConnectionConf, DuskProvider, DuskSigner, HyperlaneDuskError, RuesClient};
 
 const TX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(120);
@@ -51,11 +52,65 @@ impl DuskValidatorAnnounce {
         }
     }
 
-    /// Require observed announcement state before making a submission decision.
-    /// Relayer aggregation retains the default per-validator partial results.
+    /// Require observed, final announcement state before making a submission
+    /// decision. Relayer aggregation retains the default per-validator
+    /// partial results, which may include announcements that are not final.
     pub fn with_strict_reads(mut self) -> Self {
         self.require_all_reads = true;
         self
+    }
+
+    /// Fail while any of `locations`, read from the node's tip after `pair`,
+    /// was announced in a block that is not final yet. A validator's startup
+    /// waits for its announcement until then: Rusk can still roll the block
+    /// back, and the validator would sign checkpoints that relayers cannot
+    /// find.
+    async fn ensure_final_locations(
+        &self,
+        pair: &BlockPair,
+        validators: &[H256],
+        locations: &[Vec<String>],
+    ) -> ChainResult<()> {
+        if locations.iter().all(Vec::is_empty) {
+            return Ok(());
+        }
+        let not_final = |detail: String| {
+            HyperlaneDuskError::NotFinal(format!(
+                "Dusk validator announcements are at the tip, but {detail}"
+            ))
+        };
+        let pending = self
+            .rues
+            .non_final_events(pair, &self.va_id, events::ValidatorAnnouncement::TOPIC)
+            .await
+            .map_err(|error| not_final(format!("their finality cannot be checked yet: {error}")))?;
+        for event in pending {
+            let announcement = rkyv_deserialize::<events::ValidatorAnnouncement>(&event.data)
+                .map_err(|error| {
+                    not_final(format!(
+                        "non-final block {} holds an undecodable announcement: {error}",
+                        event.block_height
+                    ))
+                })?;
+            let announced = validators
+                .iter()
+                .zip(locations)
+                .any(|(validator, locations)| {
+                    validator.as_bytes()[12..] == announcement.validator.0
+                        && locations.contains(&announcement.storage_location)
+                });
+            if announced {
+                return Err(not_final(format!(
+                    "validator 0x{} announced {} in block {} ({:?}), which is not final yet",
+                    hex::encode(announcement.validator.0),
+                    crate::rues::bounded_text(&announcement.storage_location),
+                    event.block_height,
+                    event.block_hash
+                ))
+                .into());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -75,12 +130,9 @@ impl HyperlaneContract for DuskValidatorAnnounce {
     }
 }
 
-#[async_trait]
-impl ValidatorAnnounce for DuskValidatorAnnounce {
-    async fn get_announced_storage_locations(
-        &self,
-        validators: &[H256],
-    ) -> ChainResult<Vec<Vec<String>>> {
+impl DuskValidatorAnnounce {
+    /// Each validator's announced storage locations at the node's tip.
+    async fn tip_storage_locations(&self, validators: &[H256]) -> ChainResult<Vec<Vec<String>>> {
         // Query one validator at a time. A legacy/poisoned record or one
         // unavailable response must not prevent the relayer from using enough
         // healthy validators to satisfy the ISM threshold.
@@ -133,6 +185,27 @@ impl ValidatorAnnounce for DuskValidatorAnnounce {
             }
         }
         Ok(all_locations)
+    }
+}
+
+#[async_trait]
+impl ValidatorAnnounce for DuskValidatorAnnounce {
+    async fn get_announced_storage_locations(
+        &self,
+        validators: &[H256],
+    ) -> ChainResult<Vec<Vec<String>>> {
+        let locations = self.tip_storage_locations(validators).await?;
+        if !self.require_all_reads || locations.iter().all(Vec::is_empty) {
+            return Ok(locations);
+        }
+        // A strict read reports locations only once they are final. Read the
+        // chain before the locations it checks, so that no rollback in
+        // between goes unnoticed.
+        let pair = self.rues.block_pair().await?;
+        let locations = self.tip_storage_locations(validators).await?;
+        self.ensure_final_locations(&pair, validators, &locations)
+            .await?;
+        Ok(locations)
     }
 
     async fn announce(&self, announcement: SignedType<Announcement>) -> ChainResult<TxOutcome> {
@@ -264,7 +337,10 @@ mod tests {
                 let mut request = BufReader::new(&mut stream);
                 let mut first = String::new();
                 request.read_line(&mut first).unwrap();
-                assert!(first.contains("/get_announced_storage_locations_for_validator "));
+                assert!(
+                    first.contains("/get_announced_storage_locations_for_validator ")
+                        || first.contains("/on/graphql/query ")
+                );
                 let mut length = 0;
                 loop {
                     let mut header = String::new();
@@ -334,9 +410,20 @@ mod tests {
                 .into_iter()
                 .map(|locations| (200, rkyv_serialize(&locations).unwrap())),
         );
+        // A location counts once its block is final; here every block is.
+        let hash = "ab".repeat(32);
+        let final_tip = format!(
+            r#"{{"lastBlockPair":{{"json":{{"last_block":[9,"{hash}"],"last_finalized_block":[9,"{hash}"]}}}}}}"#
+        )
+        .into_bytes();
         for failure in failures {
-            let (client, worker, _directory) =
-                reader(vec![failure, (200, rkyv_serialize(&existing).unwrap())]);
+            let (client, worker, _directory) = reader(vec![
+                failure,
+                (200, rkyv_serialize(&existing).unwrap()),
+                (200, final_tip.clone()),
+                (200, rkyv_serialize(&existing).unwrap()),
+                (200, br#"{"blocks":[]}"#.to_vec()),
+            ]);
             let client = client.with_strict_reads();
             assert!(client
                 .get_announced_storage_locations(&[H256::repeat_byte(1)])

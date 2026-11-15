@@ -65,6 +65,10 @@ pub enum HyperlaneDuskError {
     /// finalized block provenance. Transport failures must not use this variant.
     #[error("{0}")]
     FinalizedEventMismatch(String),
+    /// A record is in the node's current state, but the agent cannot show
+    /// yet that the block holding it is final. The caller checks again later.
+    #[error("{0}")]
+    NotFinal(String),
     /// Generic error.
     #[error("{0}")]
     Other(String),

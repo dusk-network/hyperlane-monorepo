@@ -1,0 +1,675 @@
+//! Deliveries and validator announcements count only once their block is
+//! final, through the public adapters and a scripted Rusk node whose chain a
+//! test extends, finalizes and rolls back.
+use std::collections::HashSet;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use hyperlane_core::{
+    config::OpSubmissionConfig, HyperlaneDomain, HyperlaneDomainProtocol,
+    HyperlaneDomainTechnicalStack, Mailbox, NativeToken, ValidatorAnnounce, H256,
+};
+use hyperlane_dusk::{
+    ConnectionConf, DuskMailbox, DuskProvider, DuskValidatorAnnounce, RuesClient,
+};
+use hyperlane_dusk_types::{events, EthAddress};
+use url::Url;
+
+const MAILBOX: [u8; 32] = [0x02; 32];
+const VALIDATOR_ANNOUNCE: [u8; 32] = [0x05; 32];
+const STAKE: [u8; 32] = {
+    let mut id = [0u8; 32];
+    id[0] = 2;
+    id
+};
+const MESSAGE: [u8; 32] = [0x11; 32];
+const VALIDATOR: [u8; 20] = [0x22; 20];
+const LOCATION: &str = "s3://fixture/checkpoints";
+
+#[derive(Clone, Debug)]
+struct Event {
+    source: [u8; 32],
+    topic: &'static str,
+    data: Vec<u8>,
+    reverted: bool,
+}
+
+impl Event {
+    fn processed(message_id: [u8; 32]) -> Self {
+        Self {
+            source: MAILBOX,
+            topic: events::ProcessId::TOPIC,
+            data: rkyv::to_bytes::<_, 256>(&events::ProcessId { message_id })
+                .unwrap()
+                .to_vec(),
+            reverted: false,
+        }
+    }
+
+    fn announced(validator: [u8; 20], storage_location: &str) -> Self {
+        Self {
+            source: VALIDATOR_ANNOUNCE,
+            topic: events::ValidatorAnnouncement::TOPIC,
+            data: rkyv::to_bytes::<_, 256>(&events::ValidatorAnnouncement {
+                validator: EthAddress(validator),
+                storage_location: storage_location.to_owned(),
+            })
+            .unwrap()
+            .to_vec(),
+            reverted: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Block {
+    height: u64,
+    hash: [u8; 32],
+    prev: [u8; 32],
+    events: Vec<Event>,
+    archived: bool,
+}
+
+/// Changes a node once the Mailbox's `delivered` query was answered a
+/// number of times.
+type Hook = (usize, Box<dyn FnOnce(&mut Node) + Send>);
+
+/// A Rusk node: its ledger chain and finality, its archive, and the
+/// contract state its queries read.
+struct Node {
+    chain: Vec<Block>,
+    finalized: u64,
+    /// Newest blocks that `lastBlockPair` does not report yet.
+    unreported: u64,
+    /// Message IDs the Mailbox reports delivered.
+    delivered: HashSet<[u8; 32]>,
+    /// Locations ValidatorAnnounce reports for `VALIDATOR`.
+    locations: Vec<String>,
+    /// GraphQL queries the node answered.
+    queries: Vec<String>,
+    delivered_queries: usize,
+    after_delivered_queries: Option<Hook>,
+    forks: u8,
+}
+
+impl Node {
+    /// Blocks 0 to `height`, all final.
+    fn new(height: u64) -> Self {
+        let mut node = Self {
+            chain: Vec::new(),
+            finalized: 0,
+            unreported: 0,
+            delivered: HashSet::new(),
+            locations: Vec::new(),
+            queries: Vec::new(),
+            delivered_queries: 0,
+            after_delivered_queries: None,
+            forks: 0,
+        };
+        for _ in 0..=height {
+            node.push(vec![]);
+        }
+        node.finalized = height;
+        node
+    }
+
+    fn tip(&self) -> u64 {
+        self.chain.len() as u64 - 1
+    }
+
+    /// Append a block with `events` and the stake reward every block emits.
+    fn push(&mut self, mut events: Vec<Event>) -> u64 {
+        let height = self.chain.len() as u64;
+        let prev = self.chain.last().map_or([0; 32], |block| block.hash);
+        let mut hash = [0xaa; 32];
+        hash[..8].copy_from_slice(&height.to_be_bytes());
+        hash[8] = self.forks;
+        events.push(Event {
+            source: STAKE,
+            topic: "reward",
+            data: vec![1],
+            reverted: false,
+        });
+        self.chain.push(Block {
+            height,
+            hash,
+            prev,
+            events,
+            archived: true,
+        });
+        height
+    }
+
+    /// Drop every block above `height`; later blocks fork from it.
+    fn roll_back_to(&mut self, height: u64) {
+        assert!(
+            height >= self.finalized,
+            "final blocks are never rolled back"
+        );
+        self.chain.truncate(height as usize + 1);
+        self.forks += 1;
+    }
+
+    fn block(&self, height: u64) -> &Block {
+        &self.chain[height as usize]
+    }
+
+    fn reply(&mut self, path: &str, body: &[u8]) -> Vec<u8> {
+        if path == "/on/graphql/query" {
+            let query = String::from_utf8(body.to_vec()).unwrap();
+            self.queries.push(query.clone());
+            return self.graphql(&query).to_string().into_bytes();
+        }
+        let mailbox = format!("/on/contracts:{}/", hex::encode(MAILBOX));
+        let announce = format!("/on/contracts:{}/", hex::encode(VALIDATOR_ANNOUNCE));
+        if let Some(method) = path.strip_prefix(&mailbox) {
+            assert_eq!(method, "delivered");
+            let id: [u8; 32] = body.try_into().unwrap();
+            let reply = rkyv::to_bytes::<_, 256>(&self.delivered.contains(&id))
+                .unwrap()
+                .to_vec();
+            self.delivered_queries += 1;
+            if self
+                .after_delivered_queries
+                .as_ref()
+                .is_some_and(|(queries, _)| *queries == self.delivered_queries)
+            {
+                let (_, hook) = self.after_delivered_queries.take().unwrap();
+                hook(self);
+            }
+            return reply;
+        }
+        if let Some(method) = path.strip_prefix(&announce) {
+            assert_eq!(method, "get_announced_storage_locations_for_validator");
+            assert_eq!(body, &VALIDATOR[..]);
+            return rkyv::to_bytes::<_, 256>(&self.locations).unwrap().to_vec();
+        }
+        panic!("unexpected request {path}");
+    }
+
+    fn graphql(&self, query: &str) -> serde_json::Value {
+        if query == "query { lastBlockPair { json } }" {
+            let tip = self.block(self.tip() - self.unreported);
+            let finalized = self.block(self.finalized);
+            return serde_json::json!({"lastBlockPair": {"json": {
+                "last_block": [tip.height, hex::encode(tip.hash)],
+                "last_finalized_block": [finalized.height, hex::encode(finalized.hash)],
+            }}});
+        }
+        if let Some(range) = query.strip_prefix("query { blocks(range: [") {
+            let (range, rest) = range.split_once("])").unwrap();
+            assert_eq!(rest, " { header { height hash prevBlockHash } } }");
+            let (first, last) = range.split_once(", ").unwrap();
+            let (first, last): (u64, u64) = (first.parse().unwrap(), last.parse().unwrap());
+            let blocks: Vec<_> = (first..=last.min(self.tip()))
+                .map(|height| {
+                    let block = self.block(height);
+                    serde_json::json!({"header": {
+                        "height": block.height,
+                        "hash": hex::encode(block.hash),
+                        "prevBlockHash": hex::encode(block.prev),
+                    }})
+                })
+                .collect();
+            return serde_json::json!({ "blocks": blocks });
+        }
+        if let Some(hash) = query.strip_prefix("query { contractEvents(hash: \"") {
+            let (hash, rest) = hash.split_once('"').unwrap();
+            assert_eq!(rest, ") { json } }");
+            // The archive drops a rolled-back block's events.
+            let rows: Vec<_> = self
+                .chain
+                .iter()
+                .filter(|block| hex::encode(block.hash) == hash && block.archived)
+                .flat_map(|block| block.events.iter())
+                .map(|event| {
+                    serde_json::json!({
+                        "origin": "33".repeat(32),
+                        "topic": event.topic,
+                        "source": hex::encode(event.source),
+                        "data": hex::encode(&event.data),
+                        "reverted": event.reverted,
+                    })
+                })
+                .collect();
+            return serde_json::json!({"contractEvents": {"json": rows}});
+        }
+        panic!("unexpected GraphQL query {query}");
+    }
+}
+
+struct Fixture {
+    url: Url,
+    node: Arc<Mutex<Node>>,
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+    _directory: tempfile::TempDir,
+}
+
+impl Fixture {
+    fn start(node: Node) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let node = Arc::new(Mutex::new(node));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let node = node.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let mut stream = match listener.accept() {
+                        Ok((stream, _)) => stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(2));
+                            continue;
+                        }
+                        Err(error) => panic!("fixture accept failed: {error}"),
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    let mut reader = BufReader::new(&mut stream);
+                    let mut request = String::new();
+                    reader.read_line(&mut request).unwrap();
+                    let path = request.split_whitespace().nth(1).unwrap().to_owned();
+                    let mut length = 0;
+                    loop {
+                        let mut header = String::new();
+                        reader.read_line(&mut header).unwrap();
+                        if header == "\r\n" {
+                            break;
+                        }
+                        if let Some(value) =
+                            header.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    reader.read_exact(&mut body).unwrap();
+                    let reply = node.lock().unwrap().reply(&path, &body);
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        reply.len()
+                    )
+                    .unwrap();
+                    stream.write_all(&reply).unwrap();
+                }
+            })
+        };
+        Self {
+            url,
+            node,
+            stop,
+            worker: Some(worker),
+            _directory: tempfile::tempdir().unwrap(),
+        }
+    }
+
+    fn node(&self) -> std::sync::MutexGuard<'_, Node> {
+        self.node.lock().unwrap()
+    }
+
+    fn parts(
+        &self,
+    ) -> (
+        HyperlaneDomain,
+        Arc<RuesClient>,
+        Arc<DuskProvider>,
+        ConnectionConf,
+    ) {
+        let domain = HyperlaneDomain::from_config(
+            4242,
+            "dusk-finality",
+            HyperlaneDomainProtocol::Dusk,
+            HyperlaneDomainTechnicalStack::Other,
+        )
+        .unwrap();
+        let rues = Arc::new(RuesClient::new(self.url.clone()).unwrap());
+        let provider = Arc::new(DuskProvider::new(domain.clone(), rues.clone()));
+        let conf = ConnectionConf {
+            url: self.url.clone(),
+            chain_id: 0,
+            event_cursor_dir: self._directory.path().to_path_buf(),
+            gas_limit: 5_000_000,
+            gas_price: 2_000,
+            native_token: NativeToken::default(),
+            op_submission_config: OpSubmissionConfig::default(),
+        };
+        (domain, rues, provider, conf)
+    }
+
+    fn mailbox(&self) -> DuskMailbox {
+        let (domain, rues, provider, conf) = self.parts();
+        DuskMailbox::new(
+            provider,
+            rues,
+            H256::from(MAILBOX),
+            H256::repeat_byte(3),
+            domain,
+            None,
+            conf,
+        )
+    }
+
+    fn announcements(&self) -> DuskValidatorAnnounce {
+        let (domain, rues, provider, conf) = self.parts();
+        DuskValidatorAnnounce::new(
+            provider,
+            rues,
+            H256::from(VALIDATOR_ANNOUNCE),
+            domain,
+            None,
+            conf,
+        )
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Err(panic) = self.worker.take().unwrap().join() {
+            if !thread::panicking() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+}
+
+fn message_id() -> H256 {
+    H256::from(MESSAGE)
+}
+
+fn validator() -> H256 {
+    let mut validator = [0u8; 32];
+    validator[12..].copy_from_slice(&VALIDATOR);
+    H256::from(validator)
+}
+
+async fn delivered(fixture: &Fixture) -> Result<bool, String> {
+    fixture
+        .mailbox()
+        .delivered(message_id())
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tokio::test]
+async fn a_delivery_counts_only_once_its_block_is_final() {
+    let mut node = Node::new(100);
+    let block = node.push(vec![Event::processed(MESSAGE)]);
+    node.push(vec![]);
+    node.delivered.insert(MESSAGE);
+    let fixture = Fixture::start(node);
+
+    // The tip holds the delivery, but its block can still be rolled back.
+    let error = delivered(&fixture).await.unwrap_err();
+    assert!(
+        error.contains(&format!("delivered in Dusk block {block}")) && error.contains("not final"),
+        "{error}"
+    );
+
+    // Once that block is final, the delivery counts.
+    fixture.node().finalized = block;
+    assert_eq!(delivered(&fixture).await, Ok(true));
+}
+
+#[tokio::test]
+async fn a_rolled_back_delivery_is_not_delivered_and_counts_again_once_final() {
+    let mut node = Node::new(100);
+    node.push(vec![Event::processed(MESSAGE)]);
+    node.delivered.insert(MESSAGE);
+    let fixture = Fixture::start(node);
+    assert!(delivered(&fixture).await.is_err());
+
+    // A rollback drops the delivery: the relayer must relay the message again.
+    {
+        let mut node = fixture.node();
+        node.roll_back_to(100);
+        node.push(vec![]);
+        node.delivered.clear();
+    }
+    assert_eq!(delivered(&fixture).await, Ok(false));
+
+    // A new delivery waits for its own block.
+    let block = {
+        let mut node = fixture.node();
+        node.delivered.insert(MESSAGE);
+        let block = node.push(vec![Event::processed(MESSAGE)]);
+        node.push(vec![]);
+        block
+    };
+    assert!(delivered(&fixture).await.is_err());
+    fixture.node().finalized = block + 1;
+    assert_eq!(delivered(&fixture).await, Ok(true));
+}
+
+#[tokio::test]
+async fn a_rollback_while_a_delivery_is_checked_is_noticed() {
+    // The state shows the delivery when the check reads it, and its block is
+    // rolled back before the blocks above the last final one are read. Read
+    // after the rollback alone, those blocks hold no event for it.
+    for replaced in [false, true] {
+        let mut node = Node::new(100);
+        node.push(vec![Event::processed(MESSAGE)]);
+        node.delivered.insert(MESSAGE);
+        node.after_delivered_queries = Some((
+            2,
+            Box::new(move |node: &mut Node| {
+                node.roll_back_to(100);
+                if replaced {
+                    node.push(vec![]);
+                }
+                node.delivered.clear();
+            }),
+        ));
+        let fixture = Fixture::start(node);
+        let error = delivered(&fixture).await.unwrap_err();
+        assert!(
+            error.contains("chain changed since its tip was block 101"),
+            "{error}"
+        );
+        assert_eq!(delivered(&fixture).await, Ok(false));
+    }
+}
+
+#[tokio::test]
+async fn an_undelivered_message_reads_no_blocks() {
+    let mut node = Node::new(100);
+    node.push(vec![Event::processed([0x12; 32])]);
+    let fixture = Fixture::start(node);
+    assert_eq!(delivered(&fixture).await, Ok(false));
+    assert!(fixture.node().queries.is_empty());
+}
+
+#[tokio::test]
+async fn a_delivery_without_events_in_non_final_blocks_is_final() {
+    let mut node = Node::new(100);
+    node.push(vec![
+        // Another message's delivery.
+        Event::processed([0x12; 32]),
+        // A failed attempt to deliver this message.
+        Event {
+            reverted: true,
+            ..Event::processed(MESSAGE)
+        },
+        // The same bytes from another contract.
+        Event {
+            source: VALIDATOR_ANNOUNCE,
+            ..Event::processed(MESSAGE)
+        },
+    ]);
+    node.push(vec![]);
+    node.delivered.insert(MESSAGE);
+    let fixture = Fixture::start(node);
+    let mailbox = fixture.mailbox();
+    assert!(mailbox.delivered(message_id()).await.unwrap());
+
+    // A client reads each block's events once.
+    assert!(mailbox.delivered(message_id()).await.unwrap());
+    let events_read = fixture
+        .node()
+        .queries
+        .iter()
+        .filter(|query| query.contains("contractEvents"))
+        .count();
+    assert_eq!(events_read, 2);
+}
+
+#[tokio::test]
+async fn a_block_the_archive_has_not_stored_keeps_the_delivery_unsettled() {
+    let mut node = Node::new(100);
+    let block = node.push(vec![]);
+    node.chain[block as usize].archived = false;
+    node.delivered.insert(MESSAGE);
+    let fixture = Fixture::start(node);
+    let error = delivered(&fixture).await.unwrap_err();
+    assert!(error.contains("has not stored the events"), "{error}");
+
+    fixture.node().chain[block as usize].archived = true;
+    assert_eq!(delivered(&fixture).await, Ok(true));
+}
+
+#[tokio::test]
+async fn a_block_stored_after_the_reported_tip_is_read_too() {
+    // The state a query reads can hold a block that the ledger stores only
+    // after `lastBlockPair` has answered.
+    let mut node = Node::new(100);
+    node.push(vec![]);
+    node.push(vec![Event::processed(MESSAGE)]);
+    node.unreported = 1;
+    node.delivered.insert(MESSAGE);
+    let fixture = Fixture::start(node);
+    let error = delivered(&fixture).await.unwrap_err();
+    assert!(error.contains("delivered in Dusk block 102"), "{error}");
+}
+
+#[tokio::test]
+async fn a_finality_stall_waits_instead_of_reading_every_block() {
+    let mut node = Node::new(100);
+    for _ in 0..65 {
+        node.push(vec![]);
+    }
+    node.delivered.insert(MESSAGE);
+    let fixture = Fixture::start(node);
+    let error = delivered(&fixture).await.unwrap_err();
+    assert!(error.contains("65 blocks behind the tip"), "{error}");
+    assert_eq!(
+        fixture.node().queries,
+        vec!["query { lastBlockPair { json } }"]
+    );
+
+    // At 64 blocks behind, the check reads them.
+    fixture.node().finalized = 101;
+    assert_eq!(delivered(&fixture).await, Ok(true));
+}
+
+#[tokio::test]
+async fn validator_startup_waits_until_its_announcement_is_final() {
+    let mut node = Node::new(100);
+    let block = node.push(vec![Event::announced(VALIDATOR, LOCATION)]);
+    node.push(vec![]);
+    node.locations = vec![LOCATION.to_owned()];
+    let fixture = Fixture::start(node);
+    let strict = fixture.announcements().with_strict_reads();
+
+    let error = strict
+        .get_announced_storage_locations(&[validator()])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(LOCATION) && error.contains(&format!("in block {block}")),
+        "{error}"
+    );
+
+    // Relayers may use an announced location before it is final.
+    assert_eq!(
+        fixture
+            .announcements()
+            .get_announced_storage_locations(&[validator()])
+            .await
+            .unwrap(),
+        vec![vec![LOCATION.to_owned()]]
+    );
+
+    fixture.node().finalized = block;
+    assert_eq!(
+        strict
+            .get_announced_storage_locations(&[validator()])
+            .await
+            .unwrap(),
+        vec![vec![LOCATION.to_owned()]]
+    );
+}
+
+#[tokio::test]
+async fn a_validator_that_has_not_announced_reads_no_blocks() {
+    let mut node = Node::new(100);
+    node.push(vec![Event::announced([0x44; 20], LOCATION)]);
+    let fixture = Fixture::start(node);
+    assert_eq!(
+        fixture
+            .announcements()
+            .with_strict_reads()
+            .get_announced_storage_locations(&[validator()])
+            .await
+            .unwrap(),
+        vec![Vec::<String>::new()]
+    );
+    assert!(fixture.node().queries.is_empty());
+}
+
+#[tokio::test]
+async fn a_rolled_back_announcement_is_not_announced() {
+    let mut node = Node::new(100);
+    node.push(vec![Event::announced(VALIDATOR, LOCATION)]);
+    node.locations = vec![LOCATION.to_owned()];
+    let fixture = Fixture::start(node);
+    let strict = fixture.announcements().with_strict_reads();
+    assert!(strict
+        .get_announced_storage_locations(&[validator()])
+        .await
+        .is_err());
+
+    // The validator announces again once the location is gone from state.
+    {
+        let mut node = fixture.node();
+        node.roll_back_to(100);
+        node.push(vec![]);
+        node.locations.clear();
+    }
+    assert_eq!(
+        strict
+            .get_announced_storage_locations(&[validator()])
+            .await
+            .unwrap(),
+        vec![Vec::<String>::new()]
+    );
+}
+
+#[tokio::test]
+async fn another_validators_pending_announcement_does_not_hold_startup() {
+    let mut node = Node::new(100);
+    node.push(vec![Event::announced([0x44; 20], LOCATION)]);
+    node.locations = vec![LOCATION.to_owned()];
+    let fixture = Fixture::start(node);
+    assert_eq!(
+        fixture
+            .announcements()
+            .with_strict_reads()
+            .get_announced_storage_locations(&[validator()])
+            .await
+            .unwrap(),
+        vec![vec![LOCATION.to_owned()]]
+    );
+}

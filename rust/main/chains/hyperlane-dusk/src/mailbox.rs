@@ -12,7 +12,9 @@ use hyperlane_core::{
     Metadata, QueueOperation, ReorgPeriod, TxCostEstimate, TxOutcome, H256, U256,
 };
 
-use crate::rues::{bounded_body, bounded_json, bounded_text, rkyv_serialize};
+use hyperlane_dusk_types::events;
+
+use crate::rues::{bounded_body, bounded_json, bounded_text, rkyv_deserialize, rkyv_serialize};
 use crate::{ConnectionConf, DuskProvider, DuskSigner, HyperlaneDuskError, RuesClient};
 
 const TX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(120);
@@ -338,13 +340,57 @@ impl Mailbox for DuskMailbox {
         Ok(self.finalized_merkle_view(reorg_period).await?.0)
     }
 
+    /// Whether the message is delivered in a final block.
+    ///
+    /// The relayer stops retrying a message once this returns `true`, but
+    /// the `delivered` query reads the node's tip, which Rusk can still roll
+    /// back. So a delivery the tip holds counts only once no non-final block
+    /// emitted its `ProcessId` event, whoever delivered it. Until then this
+    /// fails and the relayer checks again later; a delivery that is rolled
+    /// back reads as not delivered, and the message is relayed again.
     async fn delivered(&self, id: H256) -> ChainResult<bool> {
         let id_bytes: [u8; 32] = id.into();
-        let delivered: bool = self
+        let delivered_at_tip = || async {
+            self.rues
+                .contract_query::<_, bool>(&self.mailbox_id, "delivered", &(id_bytes,))
+                .await
+        };
+        if !delivered_at_tip().await? {
+            return Ok(false);
+        }
+        // Read the chain before the state the check holds, so that no
+        // rollback in between goes unnoticed.
+        let pair = self.rues.block_pair().await?;
+        if !delivered_at_tip().await? {
+            return Ok(false);
+        }
+        let pending = self
             .rues
-            .contract_query(&self.mailbox_id, "delivered", &(id_bytes,))
-            .await?;
-        Ok(delivered)
+            .non_final_events(&pair, &self.mailbox_id, events::ProcessId::TOPIC)
+            .await
+            .map_err(|error| {
+                HyperlaneDuskError::NotFinal(format!(
+                    "Message {id:?} is delivered at the Dusk tip, but its finality cannot be checked yet: {error}"
+                ))
+            })?;
+        for event in pending {
+            let processed = rkyv_deserialize::<events::ProcessId>(&event.data).map_err(|error| {
+                HyperlaneDuskError::NotFinal(format!(
+                    "Message {id:?} is delivered at the Dusk tip, but non-final block {} holds an undecodable ProcessId event: {error}",
+                    event.block_height
+                ))
+            })?;
+            if processed.message_id == id_bytes {
+                return Err(HyperlaneDuskError::NotFinal(format!(
+                    "Message {id:?} is delivered in Dusk block {} ({:?}, transaction {}), which is not final yet",
+                    event.block_height,
+                    event.block_hash,
+                    bounded_text(&event.origin)
+                ))
+                .into());
+            }
+        }
+        Ok(true)
     }
 
     async fn default_ism(&self) -> ChainResult<H256> {

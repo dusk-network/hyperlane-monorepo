@@ -63,6 +63,21 @@ how to run the local bridge.
   fails, or replies with anything other than the encoding of the `()` that
   `process` returns, nothing is submitted and the message is retried later.
   The query reports no gas use, so `gasLimit` stays the transaction ceiling.
+- **Delivery and announcement finality.** Contract queries read the node's
+  tip, which Rusk can roll back until a block is final, and Rusk 1.7.3 has
+  no query of contract state at the last finalized block. The relayer stops
+  retrying a message once the Mailbox reports it delivered, so `delivered`
+  reports a delivery the tip holds only once no block above the last
+  finalized one emitted its `ProcessId` event, whoever delivered it. The
+  check reads `lastBlockPair` before the state and then the blocks above the
+  last finalized one (`blocks`), which must still hold that tip, so a
+  rollback in between is noticed; each block's events come from the archive
+  (`contractEvents`). Until the delivery is final, the check fails and the
+  relayer tries again later with its usual backoff; a rolled-back delivery
+  reads as not delivered, and the message is relayed again. A validator's
+  startup waits the same way until its announcement is final. When finality
+  falls more than 64 blocks behind the tip, the checks wait for it to catch
+  up instead of reading every block.
 - **Identity checks.** On startup the agent checks that the node's chain ID
   and the configured contracts agree with each other: the Mailbox domain and
   `state_version`, and the ValidatorAnnounce and Merkle hook bindings to that

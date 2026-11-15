@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,6 +35,13 @@ const MAX_ERROR_BODY_BYTES: usize = 1024;
 /// (`dispatched_id`), which dispatch indexing reads.
 const MIN_MAILBOX_STATE_VERSION: u32 = 4;
 const TX_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Most non-final blocks a finality check reads. Rusk finalizes a block a
+/// few blocks after accepting it; a longer non-final chain means finality
+/// has stalled, and checks wait for it to catch up instead.
+const MAX_NON_FINAL_BLOCKS: u64 = 64;
+/// Blocks whose archived events of one contract and topic a client keeps for
+/// finality checks.
+const NON_FINAL_EVENT_CACHE_BLOCKS: usize = 256;
 
 type SharedRuesClients = HashMap<(String, PathBuf), RuesClient>;
 static SHARED_RUES_CLIENTS: OnceLock<StdMutex<SharedRuesClients>> = OnceLock::new();
@@ -53,6 +60,8 @@ pub struct RuesClient {
     scan_anchors: Arc<StdMutex<()>>,
     /// Finalized blocks' archive rows, shared by every clone of the client.
     block_cache: Arc<StdMutex<BlockCache>>,
+    /// Archived events of blocks that finality checks read.
+    non_final_cache: Arc<StdMutex<NonFinalEventCache>>,
 }
 
 impl fmt::Debug for RuesClient {
@@ -592,6 +601,64 @@ pub(crate) struct FinalizedEventMatch {
     pub data: Vec<u8>,
 }
 
+/// A non-reverted contract event in a block that is not final yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NonFinalEvent {
+    pub block_height: u64,
+    pub block_hash: H256,
+    /// Hash of the transaction that emitted the event, as the archive
+    /// returned it.
+    pub origin: String,
+    pub data: Vec<u8>,
+}
+
+/// A block above the last finalized one.
+#[derive(Debug, Clone, Copy)]
+struct NonFinalBlock {
+    height: u64,
+    hash: H256,
+}
+
+/// One event row of `contractEvents`, as Rusk's archive returns it.
+#[derive(Debug, SerdeDeserialize)]
+struct ArchivedBlockEvent {
+    origin: String,
+    topic: String,
+    source: String,
+    data: String,
+    reverted: bool,
+}
+
+/// The archived events of one contract and topic in one block.
+type NonFinalEventKey = (H256, [u8; 32], String);
+
+/// The archived events of blocks that finality checks read, so that a check
+/// reads only the blocks that are new to it. The archive stores a block's
+/// events at once and never changes them, so an entry stays right for as
+/// long as the block exists. The oldest entry goes first.
+#[derive(Debug, Default)]
+struct NonFinalEventCache {
+    entries: HashMap<NonFinalEventKey, Arc<Vec<NonFinalEvent>>>,
+    order: VecDeque<NonFinalEventKey>,
+}
+
+impl NonFinalEventCache {
+    fn get(&self, key: &NonFinalEventKey) -> Option<Arc<Vec<NonFinalEvent>>> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: NonFinalEventKey, events: Arc<Vec<NonFinalEvent>>) {
+        if self.entries.insert(key.clone(), events).is_none() {
+            self.order.push_back(key);
+        }
+        while self.order.len() > NON_FINAL_EVENT_CACHE_BLOCKS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+}
+
 impl RuesClient {
     /// Create a new RUES client.
     pub fn new(url: Url) -> Result<Self, HyperlaneDuskError> {
@@ -610,6 +677,7 @@ impl RuesClient {
             event_store: None,
             scan_anchors: Arc::new(StdMutex::new(())),
             block_cache: Arc::new(StdMutex::new(BlockCache::new(BLOCK_CACHE_LIMITS))),
+            non_final_cache: Arc::new(StdMutex::new(NonFinalEventCache::default())),
         })
     }
 
@@ -1766,6 +1834,211 @@ impl RuesClient {
         })
     }
 
+    /// The node's tip and last finalized block. A finality check reads them
+    /// before the contract state it checks; see `non_final_events`.
+    pub(crate) async fn block_pair(&self) -> Result<BlockPair, HyperlaneDuskError> {
+        parse_block_pair(
+            &self
+                .graphql_query("query { lastBlockPair { json } }")
+                .await?,
+        )
+    }
+
+    /// The non-reverted `topic` events of `contract_id` in the blocks above
+    /// `pair`'s last finalized block, oldest block first.
+    ///
+    /// Contract queries read the node's tip, and Rusk can roll a block back
+    /// until it is final. To check that a record the tip holds is final, read
+    /// `pair` with `block_pair`, then the state, then this: when none of the
+    /// blocks this returns emitted the record's event, the record is in a
+    /// final block.
+    ///
+    /// The blocks are the ledger's chain from the child of `pair`'s last
+    /// finalized block to two blocks past `pair`'s tip, where the ledger has
+    /// them: the state may hold a block accepted after `pair` was read, and
+    /// Rusk updates the state a query reads just before it stores a block in
+    /// the ledger. The chain must still hold `pair`'s tip, so that no block
+    /// the state could hold was rolled back in between. Their events come
+    /// from the archive, which stores all of a block's events at once. Every
+    /// block emits at least the stake contract's reward event, so a block
+    /// without events is one the archive has not stored yet.
+    ///
+    /// Fails, and the caller checks again later, when finality is more than
+    /// `MAX_NON_FINAL_BLOCKS` blocks behind the tip, the chain changed
+    /// since `pair` was read, or the archive lacks one of the blocks.
+    pub(crate) async fn non_final_events(
+        &self,
+        pair: &BlockPair,
+        contract_id: &[u8; 32],
+        topic: &str,
+    ) -> Result<Vec<NonFinalEvent>, HyperlaneDuskError> {
+        let behind = pair.latest.saturating_sub(pair.finalized);
+        if behind > MAX_NON_FINAL_BLOCKS {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Dusk finality is {behind} blocks behind the tip (last final block {}); waiting for it to catch up instead of reading more than {MAX_NON_FINAL_BLOCKS} non-final blocks",
+                pair.finalized
+            )));
+        }
+        let mut events = Vec::new();
+        for block in self.non_final_blocks(pair).await? {
+            events.extend(
+                self.non_final_block_events(block, contract_id, topic)
+                    .await?
+                    .iter()
+                    .cloned(),
+            );
+        }
+        Ok(events)
+    }
+
+    /// The ledger's chain above `pair`'s last finalized block, which must
+    /// still hold `pair`'s tip, up to two blocks past it.
+    async fn non_final_blocks(
+        &self,
+        pair: &BlockPair,
+    ) -> Result<Vec<NonFinalBlock>, HyperlaneDuskError> {
+        let first = pair.finalized + 1;
+        let last = pair.latest + 2;
+        let query = format!(
+            "query {{ blocks(range: [{first}, {last}]) {{ header {{ height hash prevBlockHash }} }} }}"
+        );
+        let data = self.graphql_query(&query).await?;
+        let headers = data
+            .get("blocks")
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| {
+                HyperlaneDuskError::Other(format!(
+                    "Rusk blocks response is not a list: {}",
+                    bounded_json(&data)
+                ))
+            })?;
+        let changed = |detail: String| {
+            HyperlaneDuskError::Other(format!(
+                "Dusk chain changed since its tip was block {} ({detail}); retrying later",
+                pair.latest
+            ))
+        };
+        if headers.len() as u64 > (last + 1).saturating_sub(first) {
+            return Err(changed(format!("{} blocks returned", headers.len())));
+        }
+        let mut parent = pair.finalized_hash;
+        let mut blocks = Vec::with_capacity(headers.len());
+        for (expected_height, block) in (first..).zip(headers) {
+            let header = block.get("header").unwrap_or(&JsonValue::Null);
+            let field = |name: &str| {
+                header.get(name).ok_or_else(|| {
+                    HyperlaneDuskError::Other(format!(
+                        "Rusk block header is missing {name}: {}",
+                        bounded_json(block)
+                    ))
+                })
+            };
+            let height = field("height")?.as_u64().ok_or_else(|| {
+                HyperlaneDuskError::Other(format!(
+                    "Rusk block header has a non-numeric height: {}",
+                    bounded_json(block)
+                ))
+            })?;
+            let hash = parse_h256_hex(
+                field("hash")?.as_str().unwrap_or_default(),
+                "block header hash",
+            )?;
+            let prev = parse_h256_hex(
+                field("prevBlockHash")?.as_str().unwrap_or_default(),
+                "block header prevBlockHash",
+            )?;
+            if height != expected_height || prev != parent {
+                return Err(changed(format!(
+                    "block {height} does not follow block {}",
+                    expected_height - 1
+                )));
+            }
+            if height == pair.latest && hash != pair.latest_hash {
+                return Err(changed(format!("block {height} was replaced")));
+            }
+            parent = hash;
+            blocks.push(NonFinalBlock { height, hash });
+        }
+        if blocks.last().map_or(pair.finalized, |block| block.height) < pair.latest {
+            return Err(changed("it was rolled back".to_owned()));
+        }
+        Ok(blocks)
+    }
+
+    /// The non-reverted `topic` events of `contract_id` in `block`, from the
+    /// archive.
+    async fn non_final_block_events(
+        &self,
+        block: NonFinalBlock,
+        contract_id: &[u8; 32],
+        topic: &str,
+    ) -> Result<Arc<Vec<NonFinalEvent>>, HyperlaneDuskError> {
+        let key = (block.hash, *contract_id, topic.to_owned());
+        if let Some(events) = self.non_final_cache().get(&key) {
+            return Ok(events);
+        }
+        let query = format!(
+            "query {{ contractEvents(hash: \"{}\") {{ json }} }}",
+            hex::encode(block.hash)
+        );
+        let data = self.graphql_query(&query).await?;
+        let rows = data
+            .get("contractEvents")
+            .and_then(|events| events.get("json"))
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| {
+                HyperlaneDuskError::Other(format!(
+                    "Rusk archive response is missing contractEvents.json: {}",
+                    bounded_json(&data)
+                ))
+            })?;
+        if rows.is_empty() {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Dusk archive has not stored the events of non-final block {} ({:?}) yet; retrying later",
+                block.height, block.hash
+            )));
+        }
+        let source = hex::encode(contract_id);
+        let mut events = Vec::new();
+        for row in rows {
+            let row: ArchivedBlockEvent = serde_json::from_value(row.clone()).map_err(|error| {
+                HyperlaneDuskError::Other(format!(
+                    "Failed to decode a Rusk archive event of block {}: {}",
+                    block.height,
+                    bounded_error(error)
+                ))
+            })?;
+            if row.reverted
+                || row.topic != topic
+                || !strip_hex_prefix(&row.source).eq_ignore_ascii_case(&source)
+            {
+                continue;
+            }
+            let data = hex::decode(strip_hex_prefix(&row.data)).map_err(|error| {
+                HyperlaneDuskError::Other(format!(
+                    "Rusk archive event of block {} has invalid data: {}",
+                    block.height,
+                    bounded_error(error)
+                ))
+            })?;
+            events.push(NonFinalEvent {
+                block_height: block.height,
+                block_hash: block.hash,
+                origin: row.origin,
+                data,
+            });
+        }
+        let events = Arc::new(events);
+        self.non_final_cache().insert(key, events.clone());
+        Ok(events)
+    }
+
+    fn non_final_cache(&self) -> std::sync::MutexGuard<'_, NonFinalEventCache> {
+        self.non_final_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Resolve the canonical block height containing a transaction.
     pub(crate) async fn transaction_block_height(
         &self,
@@ -2024,6 +2297,40 @@ fn parse_block_heights(data: &JsonValue) -> Result<(u64, u64), HyperlaneDuskErro
         )));
     }
     Ok((latest, finalized))
+}
+
+/// The node's tip and last finalized block, from one `lastBlockPair` reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BlockPair {
+    latest: u64,
+    latest_hash: H256,
+    finalized: u64,
+    finalized_hash: H256,
+}
+
+fn parse_block_pair(data: &JsonValue) -> Result<BlockPair, HyperlaneDuskError> {
+    let (latest, finalized) = parse_block_heights(data)?;
+    let pair = &data["lastBlockPair"]["json"];
+    let hash = |field: &str| {
+        let hash = pair
+            .get(field)
+            .and_then(JsonValue::as_array)
+            .and_then(|block| block.get(1))
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                HyperlaneDuskError::Other(format!(
+                    "Rusk archive response is missing the {field} hash: {}",
+                    bounded_json(pair)
+                ))
+            })?;
+        parse_h256_hex(hash, field)
+    };
+    Ok(BlockPair {
+        latest,
+        latest_hash: hash("last_block")?,
+        finalized,
+        finalized_hash: hash("last_finalized_block")?,
+    })
 }
 
 fn validate_finalized_event_page(
@@ -2747,6 +3054,131 @@ mod tests {
         }))
         .is_err());
         assert!(parse_block_heights(&serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn block_pairs_carry_both_block_hashes() {
+        let reply = |last: &str, finalized: &str| {
+            serde_json::json!({"lastBlockPair": {"json": {
+                "last_block": [46, last],
+                "last_finalized_block": [45, finalized],
+            }}})
+        };
+        assert_eq!(
+            parse_block_pair(&reply(&"ab".repeat(32), &"cd".repeat(32))).unwrap(),
+            BlockPair {
+                latest: 46,
+                latest_hash: H256::repeat_byte(0xab),
+                finalized: 45,
+                finalized_hash: H256::repeat_byte(0xcd),
+            }
+        );
+        assert!(parse_block_pair(&reply("latest", &"cd".repeat(32))).is_err());
+        assert!(parse_block_pair(&reply(&"ab".repeat(32), "finalized")).is_err());
+    }
+
+    #[tokio::test]
+    async fn non_final_blocks_must_extend_the_last_final_block_through_the_tip() {
+        let pair = BlockPair {
+            latest: 11,
+            latest_hash: H256::repeat_byte(11),
+            finalized: 10,
+            finalized_hash: H256::repeat_byte(10),
+        };
+        let header = |height: u64, hash: u8, prev: u8| {
+            serde_json::json!({"header": {
+                "height": height,
+                "hash": hex::encode([hash; 32]),
+                "prevBlockHash": hex::encode([prev; 32]),
+            }})
+        };
+        for (blocks, expected) in [
+            (vec![header(11, 11, 9)], "block 11 does not follow block 10"),
+            (
+                vec![header(12, 12, 11)],
+                "block 12 does not follow block 10",
+            ),
+            (vec![header(11, 12, 10)], "block 11 was replaced"),
+            (vec![], "it was rolled back"),
+            (
+                (11..=14)
+                    .map(|height| header(height, height as u8, height as u8 - 1))
+                    .collect(),
+                "4 blocks returned",
+            ),
+        ] {
+            let url = test_server(vec![(
+                200,
+                serde_json::json!({ "blocks": blocks }).to_string(),
+            )]);
+            let error = RuesClient::new(url)
+                .unwrap()
+                .non_final_blocks(&pair)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn non_final_block_events_reject_malformed_archive_replies() {
+        let block = NonFinalBlock {
+            height: 11,
+            hash: H256::repeat_byte(11),
+        };
+        let row = |data: &str| {
+            serde_json::json!({
+                "origin": "33".repeat(32),
+                "topic": "process_id",
+                "source": hex::encode([2u8; 32]),
+                "data": data,
+                "reverted": false,
+            })
+        };
+        for (reply, expected) in [
+            (
+                serde_json::json!({"contractEvents": null}),
+                "missing contractEvents.json",
+            ),
+            (
+                serde_json::json!({"contractEvents": {"json": [{"topic": "process_id"}]}}),
+                "Failed to decode",
+            ),
+            (
+                serde_json::json!({"contractEvents": {"json": [row("not hex")]}}),
+                "invalid data",
+            ),
+        ] {
+            let url = test_server(vec![(200, reply.to_string())]);
+            let error = RuesClient::new(url)
+                .unwrap()
+                .non_final_block_events(block, &[2; 32], "process_id")
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn the_non_final_event_cache_keeps_its_bound() {
+        let mut cache = NonFinalEventCache::default();
+        let key = |block: usize| {
+            let mut hash = [0u8; 32];
+            hash[..8].copy_from_slice(&(block as u64).to_be_bytes());
+            (H256::from(hash), [2; 32], "process_id".to_owned())
+        };
+        for block in 0..=NON_FINAL_EVENT_CACHE_BLOCKS {
+            cache.insert(key(block), Arc::new(Vec::new()));
+        }
+        // Inserting a block again does not grow the cache.
+        cache.insert(key(NON_FINAL_EVENT_CACHE_BLOCKS), Arc::new(Vec::new()));
+        assert_eq!(cache.entries.len(), NON_FINAL_EVENT_CACHE_BLOCKS);
+        assert_eq!(cache.order.len(), NON_FINAL_EVENT_CACHE_BLOCKS);
+        assert!(cache.get(&key(0)).is_none());
+        assert!(cache.get(&key(1)).is_some());
+        assert!(cache.get(&key(NON_FINAL_EVENT_CACHE_BLOCKS)).is_some());
     }
 
     #[tokio::test]

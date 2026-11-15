@@ -1013,7 +1013,8 @@ impl Validator {
                         hyperlane_base::settings::ChainConnectionConf::Dusk(_)
                     ) =>
                 {
-                    warn!(%error, "Could not observe Dusk announcement; retrying without submitting");
+                    // This includes an announcement that is not final yet.
+                    warn!(%error, "Could not observe a final Dusk announcement; retrying without submitting");
                     // Same floor as the other Dusk startup retries, so a
                     // sub-second interval doesn't poll an unavailable node.
                     sleep(self.interval.max(Duration::from_secs(1))).await;
