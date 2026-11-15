@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::{Mutex as StdMutex, OnceLock, PoisonError};
@@ -883,10 +883,7 @@ impl RuesClient {
         url: Url,
         event_cursor_dir: PathBuf,
     ) -> Result<Self, HyperlaneDuskError> {
-        let mut canonical_url = url.clone();
-        canonical_url.set_path(url.path().trim_end_matches('/'));
-        canonical_url.set_fragment(None);
-        let key = (canonical_url.to_string(), event_cursor_dir.clone());
+        let key = shared_client_key(&url, &event_cursor_dir);
         let shared = SHARED_RUES_CLIENTS.get_or_init(|| StdMutex::new(HashMap::new()));
         let mut shared = shared.lock().map_err(|_| {
             HyperlaneDuskError::Other("Shared Dusk RUES client registry is poisoned".into())
@@ -906,6 +903,22 @@ impl RuesClient {
         client.event_store = Some(Arc::new(event_store));
         shared.insert(key, client.clone());
         Ok(client)
+    }
+
+    /// Forget this process's shared client of `url` and `event_cursor_dir`,
+    /// as an agent's exit would: its event store closes once the last clone
+    /// of the client is dropped, and `new_with_event_cursor_dir` opens it
+    /// again. For tests that restart an agent within one process. Whether
+    /// there was such a client.
+    #[doc(hidden)]
+    pub fn forget_shared_client(url: &Url, event_cursor_dir: &Path) -> bool {
+        SHARED_RUES_CLIENTS.get().is_some_and(|shared| {
+            shared
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&shared_client_key(url, event_cursor_dir))
+                .is_some()
+        })
     }
 
     fn endpoint(&self, path: &str) -> Url {
@@ -2734,6 +2747,15 @@ impl RuesClient {
         );
         headers
     }
+}
+
+/// The key of the shared client of an endpoint and an event store: the
+/// endpoint without a trailing slash or fragment.
+fn shared_client_key(url: &Url, event_cursor_dir: &Path) -> (String, PathBuf) {
+    let mut canonical_url = url.clone();
+    canonical_url.set_path(url.path().trim_end_matches('/'));
+    canonical_url.set_fragment(None);
+    (canonical_url.to_string(), event_cursor_dir.to_path_buf())
 }
 
 fn validate_transaction_id(tx_id: &str) -> Result<(), HyperlaneDuskError> {

@@ -89,6 +89,10 @@ struct Node {
     /// When set, the archive serves rows of this block without end after its
     /// own rows: every page is full and has a next one.
     endless: Option<u64>,
+    /// Most rows the archive serves a page, when fewer than Rusk's.
+    page_limit: Option<usize>,
+    /// The `finalizedEvents` request, counted from 1, that fails once.
+    failing_page: Option<usize>,
 }
 
 impl Node {
@@ -141,13 +145,19 @@ impl Node {
                 .split_once("limit: ")
                 .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
                 .map_or(50, |limit| limit.parse::<usize>().unwrap())
-                .clamp(1, RUSK_MAX_PAGE);
+                .clamp(1, self.page_limit.unwrap_or(RUSK_MAX_PAGE));
             let after = query.split_once("cursor: \"").map(|(_, rest)| {
                 let cursor = rest.split('"').next().unwrap();
                 let text = String::from_utf8(STANDARD.decode(cursor).unwrap()).unwrap();
                 text.strip_prefix("v1:").unwrap().parse::<i64>().unwrap()
             });
             self.pages.push(after);
+            if self.failing_page == Some(self.pages.len()) {
+                self.failing_page = None;
+                return json!({"errors": [{"message": "archive unavailable"}]})
+                    .to_string()
+                    .into_bytes();
+            }
             let mut rows: Vec<(i64, u64, Row)> = self
                 .rows
                 .iter()
@@ -267,8 +277,22 @@ impl Fixture {
         self.node.lock().unwrap()
     }
 
-    /// A delivery indexer over a client that owns the fixture's event store,
-    /// as after a restart when called again.
+    /// Restart the agent: drop `indexer` and the process's client of the
+    /// event store, check that its RocksDB is closed by opening it alone,
+    /// and open a new indexer over it.
+    fn restart(&self, indexer: DuskDeliveryIndexer) -> DuskDeliveryIndexer {
+        drop(indexer);
+        assert!(RuesClient::forget_shared_client(
+            &self.url,
+            self.directory.path()
+        ));
+        // RocksDB locks a store per process: it opens only once closed.
+        drop(rocksdb::DB::open_default(self.directory.path()).expect("the event store is closed"));
+        self.indexer()
+    }
+
+    /// A delivery indexer over the process's client of the fixture's event
+    /// store.
     fn indexer(&self) -> DuskDeliveryIndexer {
         let rues = Arc::new(
             RuesClient::new_with_event_cursor_dir(
@@ -444,7 +468,8 @@ async fn the_log_keeps_its_numbering_across_restarts_and_renumbered_archives() {
     node.finalize(10, vec![Row::delivery(1, message(1))]);
     node.finalize(11, vec![Row::delivery(2, message(2))]);
     let fixture = Fixture::start(node);
-    assert_eq!(all_deliveries(&fixture.indexer()).await.len(), 2);
+    let indexer = fixture.indexer();
+    assert_eq!(all_deliveries(&indexer).await.len(), 2);
 
     // The endpoint now serves another node's archive of the same blocks,
     // numbered from 100, and block 12 has finalized since.
@@ -456,10 +481,12 @@ async fn the_log_keeps_its_numbering_across_restarts_and_renumbered_archives() {
         node.next_id += 100;
         node.finalize(12, vec![Row::delivery(3, message(3))]);
     }
-    // A restarted indexer reads on from block 12 without numbering blocks
-    // 10 and 11 again.
+    // The agent restarts, its event store closed and opened again. The
+    // indexer checks blocks 10 and 11 against the log, keeps their numbers,
+    // and reads on from block 12.
+    let indexer = fixture.restart(indexer);
     assert_eq!(
-        all_deliveries(&fixture.indexer()).await,
+        all_deliveries(&indexer).await,
         [
             (0, message(1), 1, 10),
             (1, message(2), 2, 11),
@@ -820,5 +847,44 @@ async fn rows_restored_under_deliveries_already_read_halt_the_log() {
             .to_string(),
         11,
         1,
+    );
+}
+
+#[tokio::test]
+async fn a_crash_between_an_entry_batch_and_the_completeness_update_loses_nothing() {
+    let mut node = Node::default();
+    for height in 10..14u64 {
+        node.finalize(
+            height,
+            vec![Row::delivery(height as u8, message(height as u8))],
+        );
+    }
+    // Two rows a page, and the second page request fails: the pass dies
+    // after saving block 10's delivery and before saving how far the log is
+    // complete.
+    node.page_limit = Some(2);
+    node.failing_page = Some(2);
+    let fixture = Fixture::start(node);
+    let indexer = fixture.indexer();
+    assert!(indexer.latest_sequence_count_and_tip().await.is_err());
+    let saved = indexer.fetch_logs_in_range(0..=3).await.unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].0.inner().0, message(10));
+
+    // The agent restarts and the log reads on: every delivery once, and
+    // the log complete through block 13.
+    let indexer = fixture.restart(indexer);
+    assert_eq!(
+        indexer.latest_sequence_count_and_tip().await.unwrap(),
+        (Some(4), 13)
+    );
+    assert_eq!(
+        all_deliveries(&indexer).await,
+        [
+            (0, message(10), 10, 10),
+            (1, message(11), 11, 11),
+            (2, message(12), 12, 12),
+            (3, message(13), 13, 13)
+        ]
     );
 }
