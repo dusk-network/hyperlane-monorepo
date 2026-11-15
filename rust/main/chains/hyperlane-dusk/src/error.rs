@@ -69,6 +69,11 @@ pub enum HyperlaneDuskError {
     /// yet that the block holding it is final. The caller checks again later.
     #[error("{0}")]
     NotFinal(String),
+    /// Finalized contract state proves rows exist in a finalized block that
+    /// the endpoint's archive has passed without them. Retrying the same
+    /// archive does not help; its node has to repair it.
+    #[error("{0}")]
+    ArchiveMissingRows(String),
     /// Generic error.
     #[error("{0}")]
     Other(String),

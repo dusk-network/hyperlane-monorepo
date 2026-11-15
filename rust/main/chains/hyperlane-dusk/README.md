@@ -46,6 +46,15 @@ how to run the local bridge.
   block under the position's hash, and the node has not finalized the block
   yet or the archive has not finalized the node's last final block either.
   Otherwise the archive will never return the row, and the scan starts over.
+- **Missing archive rows.** When contract state records an event in a
+  finalized block and the archive has finalized rows of a later block but
+  none matching it, the archive will not add it: Rusk archives a block's
+  rows in one transaction and blocks in height order, and a node whose
+  archive write fails skips the block for good. The lookup then fails with an
+  error naming the block, its hash, the contract and the records, and the
+  agent logs it as a critical error at most every 10 minutes per block. Its
+  node's archive has to be repaired or rebuilt, or another endpoint used; the
+  agent never accepts a record without its row.
 - **Block cache.** A scan reads the whole block it is looking in, and the
   block's rows stay in memory, so other lookups in the same block (a cursor
   with a small `index.chunk`, or one lookup per transaction) match against
