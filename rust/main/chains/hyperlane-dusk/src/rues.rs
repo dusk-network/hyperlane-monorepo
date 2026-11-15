@@ -2674,6 +2674,9 @@ impl RuesClient {
     /// block, within `timeout`. The node accepts a propagated transaction
     /// before its mempool stores it, and checks a transaction with a later
     /// nonce of the same account against the mempool.
+    ///
+    /// Each query, with its waits for the endpoint's rate limit, ends at the
+    /// deadline: an answer that would come after it does not count.
     pub(crate) async fn wait_until_held(
         &self,
         tx_id: &str,
@@ -2685,7 +2688,11 @@ impl RuesClient {
         );
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let data = self.graphql_query(&query).await?;
+            let Ok(data) = tokio::time::timeout_at(deadline, self.graphql_query(&query)).await
+            else {
+                return Ok(false);
+            };
+            let data = data?;
             let held = |field: &str| data.get(field).is_some_and(|value| !value.is_null());
             if held("mempoolTx") || held("tx") {
                 return Ok(true);
@@ -3859,6 +3866,69 @@ mod tests {
             .unwrap();
         assert_eq!(confirmed.gas_spent, 42);
         assert_eq!(confirmed.error, None);
+    }
+
+    /// A node that answers every request `delay` late, with `status`,
+    /// `headers` and `body`.
+    fn slow_server(
+        delay: Duration,
+        status: &'static str,
+        headers: &'static str,
+        body: &'static str,
+    ) -> Url {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                thread::spawn(move || {
+                    read_request_body(&mut stream);
+                    thread::sleep(delay);
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                });
+            }
+        });
+        Url::parse(&format!("http://{address}")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn waiting_for_a_held_transaction_ends_at_its_deadline() {
+        let tx_id = "ab".repeat(32);
+        let budget = Duration::from_millis(400);
+        // The node holds the transaction, but says so only after the budget:
+        // that answer comes too late to count.
+        let held = r#"{"mempoolTx":{"id":"ab"},"tx":null}"#;
+        let client =
+            RuesClient::new(slow_server(Duration::from_secs(3), "200 OK", "", held)).unwrap();
+        let started = std::time::Instant::now();
+        assert!(!client.wait_until_held(&tx_id, budget).await.unwrap());
+        assert!(
+            started.elapsed() < Duration::from_millis(1_500),
+            "{:?}",
+            started.elapsed()
+        );
+        // A node that refuses the query for its rate limit, and asks for a
+        // wait longer than the budget, does not hold it up either.
+        let client = RuesClient::new(slow_server(
+            Duration::ZERO,
+            "429 Too Many Requests",
+            "Retry-After: 1\r\n",
+            "{}",
+        ))
+        .unwrap();
+        let started = std::time::Instant::now();
+        assert!(!client.wait_until_held(&tx_id, budget).await.unwrap());
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

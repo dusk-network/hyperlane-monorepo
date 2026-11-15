@@ -215,7 +215,10 @@ how to run the local bridge.
   `next_nonce`, each once the node holds the one before, and they share a
   block. A delivery the node refuses, or whose submission outcome is
   unknown, ends the batch: the deliveries after it are submitted one at a
-  time. The batch then follows each transaction to its block; one that is
+  time. So does a delivery the node does not hold within 5 s, a wait that
+  every query it sends, with its waits for the node's rate limit, ends with,
+  and so does the end of the batch's 60 s to send: no delivery is sent
+  after it. The batch then follows each transaction to its block; one that is
   in none by then still counts as sent, and the relayer checks that its
   message was delivered before it relays it again. At most 64 go in a batch,
   Rusk's queue of an account's future nonces. With another helper, every

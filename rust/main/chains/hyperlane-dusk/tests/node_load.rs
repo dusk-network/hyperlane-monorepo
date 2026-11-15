@@ -30,7 +30,7 @@ use hyperlane_dusk::multicall::{Aggregate, Call};
 use hyperlane_dusk::{
     ConnectionConf, DeploymentIdentity, DuskDeliveryIndexer, DuskInterchainGasPaymasterIndexer,
     DuskMailbox, DuskMailboxIndexer, DuskMerkleTreeHook, DuskMerkleTreeHookIndexer, DuskProvider,
-    DuskSigner, QueryRateLimit, RuesClient,
+    DuskSigner, QueryRateLimit, RuesClient, SubmissionTimeouts,
 };
 use hyperlane_dusk_types::{events, merkle::IncrementalMerkle, message, GasPaymentRecord};
 use serde_json::{json, Value};
@@ -1179,6 +1179,7 @@ done
 if [ -z "$nonce" ]; then
   nonce=$(( $(wc -l < "$dir/included") + 1 ))
 fi
+if [ -f "$dir/slow" ]; then sleep "$(cat "$dir/slow")"; fi
 tx=$(printf '%064x' "$nonce")
 printf '  Prepared TX %s; reconcile this exact hash before retrying if submission is interrupted\n' "$tx" >&2
 if [ -f "$dir/refuse" ] && [ "$(cat "$dir/refuse")" = "$nonce" ]; then
@@ -1290,5 +1291,31 @@ async fn a_refused_delivery_ends_the_batch_and_the_rest_go_one_at_a_time() {
         &hex::decode(tx_id(1)).unwrap()[..]
     );
     assert_eq!(mempool(chain.directory.path()), vec![1, 2]);
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+#[tokio::test]
+async fn a_batch_sends_no_delivery_after_its_deadline() {
+    let _env = HELPER_ENV.lock().await;
+    // Each submission takes the helper 300 ms.
+    let chain = TxChain::start(true, None);
+    std::fs::write(chain.directory.path().join("slow"), "0.3").unwrap();
+    std::env::set_var("DUSK_TX_BIN", chain.helper());
+    let mailbox = chain
+        .mailbox()
+        .with_submission_timeouts(SubmissionTimeouts {
+            batch: Duration::from_secs(1),
+            ..SubmissionTimeouts::default()
+        });
+    let batch = mailbox
+        .process_deliveries(&(0..10).map(delivery).collect::<Vec<_>>())
+        .await
+        .unwrap();
+    // Those sent within the second, and the rest left to be sent one at a
+    // time, in order.
+    let sent = 10 - batch.failed_indexes.len();
+    assert!((1..=5).contains(&sent), "{sent} sent");
+    assert_eq!(batch.failed_indexes, (sent..10).collect::<Vec<_>>());
+    assert!(batch.outcome.unwrap().executed);
     std::env::remove_var("DUSK_TX_BIN");
 }

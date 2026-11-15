@@ -51,6 +51,9 @@ pub const RUSK_BLOCK_GAS_LIMIT: u64 = 3_000_000_000;
 /// How long a batch waits for the node to hold one delivery before it sends
 /// the next.
 const HELD_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a batch sends deliveries: it sends none after this, and leaves
+/// the rest to be sent one at a time.
+const BATCH_SEND_TIMEOUT: Duration = Duration::from_secs(60);
 /// Rusk 1.7.3 queues at most this many transactions of one account whose
 /// earlier nonces it has not seen yet (`max_moonlight_future_nonce_per_account`).
 const MAX_PIPELINED_DELIVERIES: usize = 64;
@@ -98,6 +101,28 @@ impl DeliveryChecks {
     }
 }
 
+/// How long a Mailbox waits while it submits deliveries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmissionTimeouts {
+    /// For a sent transaction to be in a block.
+    pub receipt: Duration,
+    /// For the node to hold a pipelined transaction before the next is
+    /// sent.
+    pub held: Duration,
+    /// For a batch to send its transactions: it sends none after this.
+    pub batch: Duration,
+}
+
+impl Default for SubmissionTimeouts {
+    fn default() -> Self {
+        Self {
+            receipt: TX_CONFIRMATION_TIMEOUT,
+            held: HELD_TIMEOUT,
+            batch: BATCH_SEND_TIMEOUT,
+        }
+    }
+}
+
 /// Dusk Mailbox contract adapter.
 #[derive(Debug, Clone)]
 pub struct DuskMailbox {
@@ -121,6 +146,7 @@ pub struct DuskMailbox {
     /// Held while a delivery or a batch of them uses the signer's nonces,
     /// shared by every clone.
     submissions: Arc<tokio::sync::Mutex<()>>,
+    timeouts: SubmissionTimeouts,
 }
 
 /// The MerkleTreeHook keeps no root per insertion, so checkpoints compute
@@ -163,7 +189,16 @@ impl DuskMailbox {
             delivery_checks: Arc::default(),
             simulations: Arc::default(),
             submissions: Arc::default(),
+            timeouts: SubmissionTimeouts::default(),
         }
+    }
+
+    /// This Mailbox, waiting `timeouts` while it submits deliveries, for
+    /// tests that cannot wait minutes.
+    #[doc(hidden)]
+    pub fn with_submission_timeouts(mut self, timeouts: SubmissionTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
     }
 
     /// Encode a HyperlaneMessage to the Dusk wire format.
@@ -323,7 +358,16 @@ impl DuskMailbox {
             .next_nonce;
         let mut sent = Vec::new();
         let mut stopped = false;
+        // Every wait of the batch, for the helper or the node, ends by this.
+        let send_deadline = tokio::time::Instant::now() + self.timeouts.batch;
         for (index, message_id, args, gas_limit) in ready {
+            if !stopped && tokio::time::Instant::now() >= send_deadline {
+                warn!(
+                    ?message_id,
+                    "Dusk delivery batch has used its time to send; its later deliveries are sent one at a time"
+                );
+                stopped = true;
+            }
             if stopped {
                 left_out.push(index);
                 continue;
@@ -372,7 +416,11 @@ impl DuskMailbox {
             info!(?message_id, %tx_id, nonce, "Dusk delivery sent");
             nonce = nonce.saturating_add(1);
             if !stopped {
-                let held = self.rues.wait_until_held(&tx_id, HELD_TIMEOUT).await;
+                let wait = self
+                    .timeouts
+                    .held
+                    .min(send_deadline.saturating_duration_since(tokio::time::Instant::now()));
+                let held = self.rues.wait_until_held(&tx_id, wait).await;
                 if !matches!(held, Ok(true)) {
                     warn!(
                         %tx_id,
@@ -393,7 +441,7 @@ impl DuskMailbox {
         };
 
         // Follow every sent transaction to its block.
-        let deadline = tokio::time::Instant::now() + TX_CONFIRMATION_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + self.timeouts.receipt;
         let mut gas_spent = 0u64;
         let mut executed = true;
         for tx_id in &sent {
@@ -1135,10 +1183,7 @@ impl Mailbox for DuskMailbox {
             Err(error) => return Err(error.into()),
         };
         let transaction_id = crate::tx_sender::dusk_tx_id_to_h512(&tx_id)?;
-        let confirmed = self
-            .rues
-            .wait_for_tx(&tx_id, TX_CONFIRMATION_TIMEOUT)
-            .await?;
+        let confirmed = self.rues.wait_for_tx(&tx_id, self.timeouts.receipt).await?;
         let executed = confirmed.error.is_none();
         if let Some(error) = &confirmed.error {
             let error = bounded_text(error);
