@@ -14,7 +14,9 @@ use hyperlane_core::{
 use hyperlane_dusk_types::message::keccak256;
 use hyperlane_dusk_types::{events, EthAddress};
 
-use crate::rues::{list_reply, rkyv_deserialize, rkyv_serialize, EventLog, LogLookup, Read};
+use crate::rues::{
+    list_reply, rkyv_deserialize, rkyv_serialize, CheckHold, EventLog, LogLookup, Read,
+};
 use crate::{ConnectionConf, DuskProvider, DuskSigner, HyperlaneDuskError, RuesClient};
 
 const TX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(120);
@@ -26,19 +28,32 @@ const ANNOUNCEMENT_LOG_PAGES: usize = 16;
 /// Validators whose last read a ValidatorAnnounce keeps.
 const MAX_ANNOUNCEMENT_READS: usize = 1024;
 
-/// A validator's own startup check: its location, or why it is not final.
-type OwnCheck = Result<Vec<String>, String>;
+/// What a validator's own startup check found.
+#[derive(Debug, Clone)]
+enum OwnCheck {
+    /// `[location]` once its announcement is final, and `[]` when the
+    /// validator has not announced it.
+    Known(Vec<String>),
+    /// No final block up to the last final one holds the announcement; why.
+    Pending(String),
+    /// The announcement log could not settle whether a final block holds
+    /// it: it cannot be read, or does not reach the last final block; why.
+    Unsettled(String),
+}
 
-/// The last read of each validator's announced locations, and the last final
-/// block it was made at. Only final announcements are reported, so a read
-/// holds until the node finalizes another block.
+/// The last read of each validator's announced locations, and how long it
+/// holds. Only final announcements are reported, so a read the
+/// announcement log settled holds until the node finalizes another block.
+/// One it could not settle, because the archive failed or the log has not
+/// read up to the last final block yet, holds only briefly, and only while
+/// the log has not read on.
 #[derive(Debug, Default)]
 struct AnnouncementReads {
     /// The locations a relayer reads, by validator.
-    locations: HashMap<[u8; 20], (u64, Vec<String>)>,
-    /// A validator's own startup check, by validator: its location, or why
-    /// it is not final yet. A final location holds for good.
-    own: HashMap<[u8; 20], (u64, OwnCheck)>,
+    locations: HashMap<[u8; 20], (CheckHold, Vec<String>)>,
+    /// A validator's own startup check, by validator. A final location
+    /// holds for good.
+    own: HashMap<[u8; 20], (CheckHold, OwnCheck)>,
 }
 
 impl AnnouncementReads {
@@ -260,7 +275,11 @@ impl DuskValidatorAnnounce {
     /// That no block above the last final one holds the announcement never
     /// shows that it is final: a block accepted and rolled back within the
     /// check's own requests leaves no trace there. A check holds until the
-    /// node finalizes another block, and a final announcement for good.
+    /// node finalizes another block, and a final announcement for good; one
+    /// the announcement log could not settle holds for at most
+    /// `UNSETTLED_REUSE`, and only while the log has not read on, so that a
+    /// validator whose announcement is final starts once the archive
+    /// answers, or once the log has read that far.
     async fn own_announcement(
         &self,
         log: &EventLog,
@@ -271,8 +290,8 @@ impl DuskValidatorAnnounce {
         // rollback in between goes unnoticed.
         let pair = self.rues.block_pair().await?;
         let finalized = pair.finalized();
-        let known = self.reads().own.get(&validator).and_then(|(at, check)| {
-            (*at == finalized || check.as_ref().is_ok_and(|found| !found.is_empty()))
+        let known = self.reads().own.get(&validator).and_then(|(hold, check)| {
+            hold.holds(finalized, || self.rues.event_log_progress(log))
                 .then(|| check.clone())
         });
         let check = match known {
@@ -281,20 +300,30 @@ impl DuskValidatorAnnounce {
                 let check = self
                     .check_own_announcement(log, validator, location, &pair)
                     .await?;
+                let hold = match &check {
+                    OwnCheck::Known(found) if !found.is_empty() => CheckHold::Forever,
+                    OwnCheck::Known(_) | OwnCheck::Pending(_) => CheckHold::FinalBlock(finalized),
+                    OwnCheck::Unsettled(_) => {
+                        CheckHold::unsettled(finalized, self.rues.event_log_progress(log))
+                    }
+                };
                 let mut reads = self.reads();
-                reads.own.insert(validator, (finalized, check.clone()));
+                reads.own.insert(validator, (hold, check.clone()));
                 reads.bound();
                 check
             }
         };
-        check.map_err(|reason| {
-            HyperlaneDuskError::NotFinal(format!(
-                "Dusk validator 0x{} announced {} at the tip, but {reason}",
-                hex::encode(validator),
-                crate::rues::bounded_text(location)
-            ))
-            .into()
-        })
+        match check {
+            OwnCheck::Known(found) => Ok(found),
+            OwnCheck::Pending(reason) | OwnCheck::Unsettled(reason) => {
+                Err(HyperlaneDuskError::NotFinal(format!(
+                    "Dusk validator 0x{} announced {} at the tip, but {reason}",
+                    hex::encode(validator),
+                    crate::rues::bounded_text(location)
+                ))
+                .into())
+            }
+        }
     }
 
     /// One check of `own_announcement`, whose list is read after `pair`.
@@ -313,32 +342,34 @@ impl DuskValidatorAnnounce {
             .await?
             .contains(&location_hash)
         {
-            return Ok(Ok(Vec::new()));
+            return Ok(OwnCheck::Known(Vec::new()));
         }
         let key = location_key(&validator, &location_hash);
-        Ok(Err(
+        Ok(
             match self
                 .rues
                 .finalized_event_log_lookup(log, &key, pair, ANNOUNCEMENT_LOG_PAGES)
                 .await
             {
-                Ok(LogLookup::Found(_)) => return Ok(Ok(vec![location.to_owned()])),
-                Ok(LogLookup::Absent { final_block }) => format!(
+                Ok(LogLookup::Found(_)) => OwnCheck::Known(vec![location.to_owned()]),
+                Ok(LogLookup::Absent { final_block }) => OwnCheck::Pending(format!(
                     "no finalized block up to block {final_block}, the last final one, holds the announcement"
-                ),
+                )),
                 Ok(LogLookup::Unknown(reason)) => {
                     debug!(%reason, "Dusk announcement log cannot show the announcement final yet");
-                    format!("the announcement log cannot show it final yet: {reason}")
+                    OwnCheck::Unsettled(format!(
+                        "the announcement log cannot show it final yet: {reason}"
+                    ))
                 }
                 Err(error) => {
                     let error = crate::rues::bounded_error(&error);
                     debug!(%error, "Dusk announcement log cannot be read; the announcement does not count yet");
-                    format!(
+                    OwnCheck::Unsettled(format!(
                         "the announcement log that would show it final cannot be read: {error}"
-                    )
+                    ))
                 }
             },
-        ))
+        )
     }
 }
 
@@ -381,24 +412,37 @@ impl ValidatorAnnounce for DuskValidatorAnnounce {
             }
             return Ok(all_locations);
         }
-        // Only final announcements are reported, so reads hold until the
-        // node finalizes another block.
-        let finalized = match self.rues.block_pair().await {
+        // Only final announcements are reported, so reads the log settles
+        // hold until the node finalizes another block.
+        let (finalized, log_state) = match self.rues.block_pair().await {
             Ok(pair) => {
-                if let Err(error) = self
+                let state = match self
                     .rues
                     .advance_event_log(&log, ANNOUNCEMENT_LOG_PAGES, Some(&pair))
                     .await
                 {
-                    warn!(%error, "Could not read new Dusk validator announcements; using those read before");
-                }
-                Some(pair.finalized())
+                    Ok(state) => Some(state),
+                    Err(error) => {
+                        warn!(%error, "Could not read new Dusk validator announcements; using those read before");
+                        None
+                    }
+                };
+                (Some(pair.finalized()), state)
             }
             Err(error) => {
                 warn!(%error, "Could not read the Dusk node's last final block; using the announcements read before");
-                None
+                (None, None)
             }
         };
+        // A listed location whose announcement a log that holds every final
+        // block lacks is not final; one the log lacks otherwise may only be
+        // further on in the archive.
+        let complete = finalized.is_some_and(|finalized| {
+            log_state
+                .and_then(|state| state.complete_through)
+                .is_some_and(|through| through >= finalized)
+        });
+        let progress = self.rues.event_log_progress(&log);
         let addresses: Vec<[u8; 20]> = validators.iter().map(eth_address).collect();
         let known: Vec<Option<Vec<String>>> = addresses
             .iter()
@@ -407,7 +451,7 @@ impl ValidatorAnnounce for DuskValidatorAnnounce {
                     self.reads()
                         .locations
                         .get(address)
-                        .filter(|(at, _)| *at == finalized)
+                        .filter(|(hold, _)| hold.holds(finalized, || progress))
                         .map(|(_, locations)| locations.clone())
                 })
             })
@@ -427,7 +471,9 @@ impl ValidatorAnnounce for DuskValidatorAnnounce {
                 continue;
             }
             let locations = match hashes.next() {
-                Some(Ok(hashes)) => self.announced_locations(&log, address, &hashes),
+                Some(Ok(hashes)) => self
+                    .announced_locations(&log, address, &hashes)
+                    .map(|locations| (locations, hashes.len())),
                 Some(Err(error)) => Err(error),
                 None => Err(HyperlaneDuskError::Other(
                     "Dusk ValidatorAnnounce read returned too few lists".into(),
@@ -435,12 +481,17 @@ impl ValidatorAnnounce for DuskValidatorAnnounce {
                 .into()),
             };
             match locations {
-                Ok(locations) => {
+                Ok((locations, listed)) => {
                     if let Some(finalized) = finalized {
+                        // The log settles the read when it found every
+                        // listed location, or holds every final block.
+                        let hold = if complete || locations.len() == listed {
+                            CheckHold::FinalBlock(finalized)
+                        } else {
+                            CheckHold::unsettled(finalized, progress)
+                        };
                         let mut reads = self.reads();
-                        reads
-                            .locations
-                            .insert(address, (finalized, locations.clone()));
+                        reads.locations.insert(address, (hold, locations.clone()));
                         reads.bound();
                     }
                     all_locations.push(locations)

@@ -19,8 +19,8 @@ use hyperlane_dusk_types::merkle::{IncrementalMerkle as HookTree, TREE_DEPTH};
 use crate::final_records::FinalRecords;
 use crate::rues::{
     bounded_body, bounded_error, bounded_json, bounded_text, fits_one_aggregate, list_reply,
-    rkyv_deserialize, rkyv_serialize, BlockPair, LogLookup, Read, BOOL_REPLY, ID_REPLY, U32_REPLY,
-    U64_REPLY,
+    rkyv_deserialize, rkyv_serialize, BlockPair, CheckHold, LogLookup, Read, BOOL_REPLY, ID_REPLY,
+    U32_REPLY, U64_REPLY,
 };
 use crate::{ConnectionConf, DuskProvider, DuskSigner, HyperlaneDuskError, RuesClient};
 
@@ -65,39 +65,65 @@ enum Delivery {
     Final,
     /// Not delivered at the tip.
     Absent,
-    /// Delivered at the tip, but not shown final; why.
-    NotFinal(String),
+    /// Delivered at the tip in a block that is not final yet, which stays
+    /// so until the node finalizes another block; why.
+    Pending(String),
+    /// Delivered at the tip, but the check could not settle whether it is
+    /// final: the delivery log cannot be read or does not reach the last
+    /// final block, or the blocks above it cannot be read; why.
+    Unsettled(String),
 }
 
-/// The last delivery check of each message and the last final block it was
-/// made at. Until the node finalizes another block, a check finds the same:
+impl Delivery {
+    /// How long the check holds, made at last final block `finalized`
+    /// with the delivery log read up to `progress`.
+    fn hold(&self, finalized: u64, progress: impl FnOnce() -> Option<LogProgress>) -> CheckHold {
+        match self {
+            Self::Final => CheckHold::Forever,
+            Self::Absent | Self::Pending(_) => CheckHold::FinalBlock(finalized),
+            Self::Unsettled(_) => CheckHold::unsettled(finalized, progress()),
+        }
+    }
+}
+
+/// How far the delivery log reaches, as `RuesClient::event_log_progress`
+/// gives it.
+type LogProgress = crate::rues::LogState;
+
+/// The last delivery check of each message and how long it holds. Until
+/// the node finalizes another block, a check that settled finds the same:
 /// the relayer asks again every half second while it waits for signatures.
+/// One the delivery log could not settle holds only briefly, and only while
+/// the log has not read on: the next check tries the archive again, or
+/// reads on in it.
 #[derive(Debug, Default)]
 struct DeliveryChecks {
-    checks: HashMap<H256, (u64, Delivery)>,
+    checks: HashMap<H256, (CheckHold, Delivery)>,
 }
 
 impl DeliveryChecks {
-    /// The check of `id` that still holds at last final block `finalized`.
-    fn get(&self, id: H256, finalized: u64) -> Option<Delivery> {
-        match self.checks.get(&id)? {
-            (_, Delivery::Final) => Some(Delivery::Final),
-            (at, delivery) if *at == finalized => Some(delivery.clone()),
-            _ => None,
-        }
+    /// The check of `id` that still holds at last final block `finalized`,
+    /// the delivery log having read up to what `progress` returns.
+    fn get(
+        &self,
+        id: H256,
+        finalized: u64,
+        progress: impl FnOnce() -> Option<LogProgress>,
+    ) -> Option<Delivery> {
+        let (hold, delivery) = self.checks.get(&id)?;
+        hold.holds(finalized, progress).then(|| delivery.clone())
     }
 
-    fn insert(&mut self, id: H256, finalized: u64, delivery: Delivery) {
+    fn insert(&mut self, id: H256, finalized: u64, hold: CheckHold, delivery: Delivery) {
         if self.checks.len() >= MAX_DELIVERY_CHECKS && !self.checks.contains_key(&id) {
-            // Checks made at earlier final blocks no longer hold.
-            self.checks.retain(|_, (at, delivery)| {
-                *at == finalized && !matches!(delivery, Delivery::Final)
-            });
+            // Checks made at earlier final blocks no longer hold; a final
+            // delivery that goes is checked again.
+            self.checks.retain(|_, (hold, _)| hold.at(finalized));
             if self.checks.len() >= MAX_DELIVERY_CHECKS {
                 self.checks.clear();
             }
         }
-        self.checks.insert(id, (finalized, delivery));
+        self.checks.insert(id, (hold, delivery));
     }
 }
 
@@ -478,8 +504,9 @@ impl DuskMailbox {
 
     /// One delivery check of message `id`, whose state is read after
     /// `pair`, the node's tip and last final block. Fails only when the
-    /// `delivered` query does; everything the check cannot show is
-    /// `NotFinal`.
+    /// `delivered` query does; a delivery in a block that is not final yet
+    /// is `Pending`, and everything else the check cannot show is
+    /// `Unsettled`.
     async fn check_delivery(&self, id: H256, pair: &BlockPair) -> ChainResult<Delivery> {
         let id_bytes: [u8; 32] = id.into();
         // Read after `pair`'s last final block was final. When batching, it
@@ -508,14 +535,14 @@ impl DuskMailbox {
             Ok(LogLookup::Absent { final_block }) => final_block,
             Ok(LogLookup::Unknown(reason)) => {
                 debug!(message_id = ?id, %reason, "Dusk delivery log cannot show the delivery final yet");
-                return Ok(Delivery::NotFinal(format!(
+                return Ok(Delivery::Unsettled(format!(
                     "Message {id:?} is delivered at the Dusk tip, but the delivery log cannot show it final yet: {reason}"
                 )));
             }
             Err(error) => {
                 let error = bounded_error(&error);
                 debug!(message_id = ?id, %error, "Dusk delivery log cannot be read; the delivery does not count yet");
-                return Ok(Delivery::NotFinal(format!(
+                return Ok(Delivery::Unsettled(format!(
                     "Message {id:?} is delivered at the Dusk tip, but the delivery log that would show it final cannot be read: {error}"
                 )));
             }
@@ -527,7 +554,7 @@ impl DuskMailbox {
         {
             Ok(pending) => pending,
             Err(error) => {
-                return Ok(Delivery::NotFinal(format!(
+                return Ok(Delivery::Unsettled(format!(
                     "Message {id:?} is delivered at the Dusk tip, but its finality cannot be checked yet: {error}"
                 )))
             }
@@ -536,14 +563,14 @@ impl DuskMailbox {
             let processed = match rkyv_deserialize::<events::ProcessId>(&event.data) {
                 Ok(processed) => processed,
                 Err(error) => {
-                    return Ok(Delivery::NotFinal(format!(
+                    return Ok(Delivery::Unsettled(format!(
                         "Message {id:?} is delivered at the Dusk tip, but non-final block {} holds an undecodable ProcessId event: {error}",
                         event.block_height
                     )))
                 }
             };
             if processed.message_id == id_bytes {
-                return Ok(Delivery::NotFinal(format!(
+                return Ok(Delivery::Pending(format!(
                     "Message {id:?} is delivered in Dusk block {} ({:?}, transaction {}), which is not final yet",
                     event.block_height,
                     event.block_hash,
@@ -560,7 +587,7 @@ impl DuskMailbox {
             final_block,
             "Dusk Mailbox reports a delivery that neither the archive's finalized deliveries nor the blocks above the last final one hold"
         );
-        Ok(Delivery::NotFinal(format!(
+        Ok(Delivery::Unsettled(format!(
             "Message {id:?} is delivered at the Dusk tip, but no finalized block up to block {final_block}, the last final one, holds its delivery, and no block above it does either: the block that did was rolled back during this check, or the node's archive skipped it"
         )))
     }
@@ -1069,34 +1096,42 @@ impl Mailbox for DuskMailbox {
     /// block accepted and rolled back within its requests leaves no trace
     /// there.
     ///
-    /// A check holds until the node finalizes another block: asked again
-    /// before that, it is answered without a request. A final delivery is
-    /// answered without a request for good.
+    /// A check that settled holds until the node finalizes another block:
+    /// asked again before that, it is answered without a request. A final
+    /// delivery is answered without a request for good. A check the
+    /// delivery log could not settle, because the archive failed or the log
+    /// does not reach the last final block yet, holds for at most
+    /// `UNSETTLED_REUSE`, and only while the log has not read on: the next
+    /// one tries the archive again, or reads on in it.
     async fn delivered(&self, id: H256) -> ChainResult<bool> {
         // The chain first, then the state the check holds, so that no
         // rollback in between goes unnoticed.
         let pair = self.rues.block_pair().await?;
         let finalized = pair.finalized();
+        let log = crate::mailbox_indexer::delivery_log(self.mailbox_id);
         let known = self
             .delivery_checks
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(id, finalized);
+            .get(id, finalized, || self.rues.event_log_progress(&log));
         let delivery = match known {
             Some(delivery) => delivery,
             None => {
                 let delivery = self.check_delivery(id, &pair).await?;
+                let hold = delivery.hold(finalized, || self.rues.event_log_progress(&log));
                 self.delivery_checks
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .insert(id, finalized, delivery.clone());
+                    .insert(id, finalized, hold, delivery.clone());
                 delivery
             }
         };
         match delivery {
             Delivery::Final => Ok(true),
             Delivery::Absent => Ok(false),
-            Delivery::NotFinal(reason) => Err(HyperlaneDuskError::NotFinal(reason).into()),
+            Delivery::Pending(reason) | Delivery::Unsettled(reason) => {
+                Err(HyperlaneDuskError::NotFinal(reason).into())
+            }
         }
     }
 

@@ -43,7 +43,12 @@ how to run the local bridge.
   indexers' counts and tips, checkpoints, `delivered` and the announcement
   checks. Until the node finalizes another block they cost no request; the
   relayer's `delivered` checks every half second while it waits for
-  signatures are answered from the last one. When the node does, each
+  signatures are answered from the last one. A delivery or announcement
+  check that its event log could not settle, because the archive failed or
+  the log does not reach the last final block yet, is kept for at most 1 s,
+  and only while the log has not read on: the next check tries the archive
+  again, or reads on in it, also while the last final block stays. When the
+  node does, each
   record indexer reads its contract's count once, and the heights of only
   the records past the last final one it knows, from there (see
   `final_records.rs`); a validator's indexer and checkpoint reader share

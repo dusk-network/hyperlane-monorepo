@@ -32,7 +32,7 @@ pub(crate) use batch::{
 pub use endpoint::QueryRateLimit;
 use endpoint::{Endpoint, RequestClass};
 use event_log::EventLogLocks;
-pub(crate) use event_log::{EventLog, LogEntry, LogLookup, BLOCK_LIMITS};
+pub(crate) use event_log::{CheckHold, EventLog, LogEntry, LogLookup, LogState, BLOCK_LIMITS};
 
 const MAX_RUES_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// Rows per `finalizedEvents` page: the most Rusk 1.7.3 returns

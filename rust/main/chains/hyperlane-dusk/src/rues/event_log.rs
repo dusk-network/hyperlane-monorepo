@@ -125,6 +125,76 @@ pub(crate) struct LogState {
     pub published: u64,
 }
 
+/// How long a check that an event log could not settle stands, while the
+/// node's last final block stays and the log does not read on.
+pub(crate) const UNSETTLED_REUSE: Duration = Duration::from_secs(1);
+
+/// How long a check of a record, such as a delivery or an announcement,
+/// made against an event log at the node's last final block, holds.
+///
+/// Only what the check showed for that block holds until the node finalizes
+/// another: a record final for good, absent, or in a block not final yet.
+/// A check the log could not settle, because it cannot be read or does not
+/// reach the last final block yet, holds only briefly, and only while the
+/// log has not read on, so that the next check reads on or tries again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckHold {
+    /// For good: a record in a final block.
+    Forever,
+    /// Until the node finalizes another block than this one.
+    FinalBlock(u64),
+    /// Until the node finalizes another block than `final_block`, the log
+    /// reads on from `progress`, or `UNSETTLED_REUSE` has passed since
+    /// `checked`.
+    Unsettled {
+        final_block: u64,
+        progress: Option<LogState>,
+        checked: std::time::Instant,
+    },
+}
+
+impl CheckHold {
+    /// A check made at last final block `final_block` that the log could
+    /// not settle, the log having read up to `progress`.
+    pub(crate) fn unsettled(final_block: u64, progress: Option<LogState>) -> Self {
+        Self::Unsettled {
+            final_block,
+            progress,
+            checked: std::time::Instant::now(),
+        }
+    }
+
+    /// Whether the check still holds at last final block `final_block`,
+    /// the log having read up to what `progress` returns.
+    pub(crate) fn holds(
+        &self,
+        final_block: u64,
+        progress: impl FnOnce() -> Option<LogState>,
+    ) -> bool {
+        match *self {
+            Self::Forever => true,
+            Self::FinalBlock(at) => at == final_block,
+            Self::Unsettled {
+                final_block: at,
+                progress: seen,
+                checked,
+            } => at == final_block && checked.elapsed() < UNSETTLED_REUSE && progress() == seen,
+        }
+    }
+
+    /// Whether the check holds until the node finalizes another block than
+    /// `final_block`, or briefly at it.
+    pub(crate) fn at(&self, final_block: u64) -> bool {
+        match *self {
+            Self::Forever => false,
+            Self::FinalBlock(at)
+            | Self::Unsettled {
+                final_block: at, ..
+            } => at == final_block,
+        }
+    }
+}
+
 /// What a lookup of one key found among an event log's finalized rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LogLookup {
@@ -1299,6 +1369,13 @@ impl RuesClient {
                     log.topic
                 ))
             })
+    }
+
+    /// How far the log reaches, if the client keeps it and it can be read:
+    /// a check the log could not settle holds only while this stays.
+    pub(crate) fn event_log_progress(&self, log: &EventLog) -> Option<LogState> {
+        self.event_store.as_ref()?;
+        self.event_log_state(log).ok()
     }
 
     /// How far the log reaches.

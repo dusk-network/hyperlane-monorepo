@@ -1194,3 +1194,143 @@ async fn an_announcement_rolled_back_within_the_check_never_counts_without_a_com
         );
     }
 }
+
+/// Longer than a check the delivery or announcement log could not settle
+/// stands for the same final block.
+const UNSETTLED_EXPIRED: Duration = Duration::from_millis(1_200);
+
+/// `count` rows of `source` of a topic no log reads, in blocks of 200.
+fn history(node: &mut Node, source: [u8; 32], count: usize) {
+    for block in 0..count.div_ceil(200) {
+        let rows = (count - block * 200).min(200);
+        node.push(
+            (0..rows)
+                .map(|_| Event {
+                    source,
+                    topic: "history",
+                    data: vec![1],
+                    reverted: false,
+                })
+                .collect(),
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_delivery_check_recovers_with_its_archive_while_the_final_block_stays() {
+    let mut node = Node::new(100);
+    let block = node.push(vec![Event::processed(MESSAGE)]);
+    node.push(vec![]);
+    node.delivered.insert(MESSAGE);
+    node.finalized = block;
+    node.finalized_events_fail = true;
+    let fixture = Fixture::start(node);
+    // One adapter, as the relayer keeps it, throughout.
+    let mailbox = fixture.mailbox_with_log();
+    let error = mailbox
+        .delivered(message_id())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("cannot be read"), "{error}");
+    // The archive recovers; the node finalizes no other block.
+    fixture.node().finalized_events_fail = false;
+    tokio::time::sleep(UNSETTLED_EXPIRED).await;
+    assert_eq!(
+        mailbox
+            .delivered(message_id())
+            .await
+            .map_err(|error| error.to_string()),
+        Ok(true)
+    );
+}
+
+#[tokio::test]
+async fn a_delivery_log_behind_reads_on_while_the_final_block_stays() {
+    // 1,000 rows of the Mailbox before the delivery: a check reads 4 pages
+    // of 200.
+    let mut node = Node::new(100);
+    history(&mut node, MAILBOX, 1_000);
+    let block = node.push(vec![Event::processed(MESSAGE)]);
+    node.push(vec![]);
+    node.delivered.insert(MESSAGE);
+    node.finalized = block;
+    let fixture = Fixture::start(node);
+    let mailbox = fixture.mailbox_with_log();
+    let error = mailbox
+        .delivered(message_id())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("short of the last final block"), "{error}");
+    // The node finalizes no other block, and the checks read on.
+    let mut checked = Err(error);
+    for _ in 0..4 {
+        tokio::time::sleep(UNSETTLED_EXPIRED).await;
+        checked = mailbox
+            .delivered(message_id())
+            .await
+            .map_err(|error| error.to_string());
+        if checked.is_ok() {
+            break;
+        }
+    }
+    assert_eq!(checked, Ok(true));
+}
+
+#[tokio::test]
+async fn validator_startup_recovers_with_its_archive_while_the_final_block_stays() {
+    let mut node = Node::new(100);
+    let block = node.push(vec![Event::announced(VALIDATOR, LOCATION)]);
+    node.push(vec![]);
+    node.locations = vec![LOCATION.to_owned()];
+    node.finalized = block;
+    node.finalized_events_fail = true;
+    let fixture = Fixture::start(node);
+    let strict = fixture.announcements_with_log().with_own_location(LOCATION);
+    let error = strict
+        .get_announced_storage_locations(&[validator()])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("cannot be read"), "{error}");
+    fixture.node().finalized_events_fail = false;
+    tokio::time::sleep(UNSETTLED_EXPIRED).await;
+    assert_eq!(
+        strict
+            .get_announced_storage_locations(&[validator()])
+            .await
+            .map_err(|error| error.to_string()),
+        Ok(vec![vec![LOCATION.to_owned()]])
+    );
+}
+
+#[tokio::test]
+async fn relayer_location_reads_take_announcements_their_log_reads_later() {
+    // 3,400 rows of ValidatorAnnounce before the announcement: a read
+    // reads 16 pages of 200.
+    let mut node = Node::new(100);
+    history(&mut node, VALIDATOR_ANNOUNCE, 3_400);
+    let block = node.push(vec![Event::announced(VALIDATOR, LOCATION)]);
+    node.push(vec![]);
+    node.locations = vec![LOCATION.to_owned()];
+    node.finalized = block;
+    let fixture = Fixture::start(node);
+    let relayer = fixture.announcements_with_log();
+    // The log has not reached the announcement yet.
+    assert_eq!(
+        relayer
+            .get_announced_storage_locations(&[validator()])
+            .await
+            .unwrap(),
+        vec![Vec::<String>::new()]
+    );
+    // The next read, at the same final block, reads on and finds it.
+    assert_eq!(
+        relayer
+            .get_announced_storage_locations(&[validator()])
+            .await
+            .unwrap(),
+        vec![vec![LOCATION.to_owned()]]
+    );
+}
