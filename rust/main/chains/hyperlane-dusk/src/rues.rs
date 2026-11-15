@@ -1458,13 +1458,16 @@ impl RuesClient {
             ));
             // An archive that has passed the block holds every row of it it
             // ever will, so a missing record may never arrive.
-            return Err(match later_row {
-                Some(later) => self
-                    .diagnose_missing_rows(contract_id, topic, block_height, &missing, &later)
-                    .await
-                    .unwrap_or(not_archived),
-                None => not_archived,
-            });
+            return Err(self
+                .diagnose_missing_rows(
+                    contract_id,
+                    topic,
+                    block_height,
+                    &missing,
+                    later_row.as_ref(),
+                )
+                .await
+                .unwrap_or(not_archived));
         }
         let mut ordered = Vec::with_capacity(sequences.len());
         for sequence in sequences {
@@ -1476,41 +1479,70 @@ impl RuesClient {
     }
 
     /// Contract state holds records of finalized block `block_height`,
-    /// `missing`, that the archive has no matching rows for, although it has
-    /// finalized rows of a later block, `later`. Rusk archives a finalized
-    /// block's rows in one transaction, and blocks in height order, so a
-    /// lagging archive never shows a later row first. But its write of a
-    /// block can fail, after which it never holds that block's rows (a Rusk
-    /// node bug): the lookup would then fail for good with nothing saying
-    /// why.
+    /// `missing`, that the archive has no matching rows for. Rusk archives a
+    /// finalized block's rows in one transaction, and blocks in height
+    /// order, so an archive that has finalized a block at or above this one
+    /// holds every row of it it ever will. But its write of a block can fail,
+    /// after which it never holds that block's rows (a Rusk node bug): the
+    /// lookup would then fail for good with nothing saying why.
     ///
-    /// Returns an error naming the block and contract when `checkBlock`
-    /// confirms the archive finalized the later block, and says whether it
-    /// finalized this one, and reports it as a critical error, at most once
-    /// every `ARCHIVE_GAP_REPORT_INTERVAL` for a block. `None` when that
-    /// cannot be established; the lookup then reports the records as not
-    /// archived yet. Either way the lookup fails: no record is accepted
-    /// without its row.
+    /// The evidence that the archive has passed the block is `later`, a row
+    /// of the contract in a later block, when the scan read one, and
+    /// otherwise the node's last final block, at or above this one, once
+    /// `checkBlock(onlyFinalized)` accepts it: a contract that has emitted
+    /// nothing since its last record has no later row. Returns an error
+    /// naming the block and contract when `checkBlock` confirms the
+    /// evidence, and says whether the archive finalized this block, and
+    /// reports it as a critical error, at most once every
+    /// `ARCHIVE_GAP_REPORT_INTERVAL` for a block. `None` when there is no
+    /// such evidence; the lookup then reports the records as not archived
+    /// yet. Either way the lookup fails: no record is accepted without its
+    /// row.
     async fn diagnose_missing_rows(
         &self,
         contract_id: &[u8; 32],
         topic: &str,
         block_height: u64,
         missing: &[usize],
-        later: &FinalizedContractEvent,
+        later: Option<&FinalizedContractEvent>,
     ) -> Option<HyperlaneDuskError> {
-        let later_finalized = self
-            .check_finalized_block(later.block_height, strip_hex_prefix(&later.block_hash))
-            .await
-            .ok()?;
-        if !later_finalized {
-            return None;
-        }
-        let ledger_hash = self.ledger_block_hash(block_height).await.ok()??;
-        let finalized = self
-            .check_finalized_block(block_height, &hex::encode(ledger_hash))
-            .await
-            .ok()?;
+        // A block at or above this one that the archive has finalized, and
+        // this block's hash when that block is this one.
+        let (passed, own_hash) = match later {
+            Some(later) => (
+                self.check_finalized_block(later.block_height, strip_hex_prefix(&later.block_hash))
+                    .await
+                    .ok()?
+                    .then_some(later.block_height)?,
+                None,
+            ),
+            None => {
+                let pair = self.block_pair().await.ok()?;
+                if pair.finalized < block_height {
+                    return None;
+                }
+                let finalized = self
+                    .check_finalized_block(pair.finalized, &hex::encode(pair.finalized_hash))
+                    .await
+                    .ok()?;
+                (
+                    finalized.then_some(pair.finalized)?,
+                    (pair.finalized == block_height).then_some(pair.finalized_hash),
+                )
+            }
+        };
+        let (ledger_hash, finalized) = match own_hash {
+            // checkBlock has just accepted it.
+            Some(hash) => (hash, true),
+            None => {
+                let ledger_hash = self.ledger_block_hash(block_height).await.ok()??;
+                let finalized = self
+                    .check_finalized_block(block_height, &hex::encode(ledger_hash))
+                    .await
+                    .ok()?;
+                (ledger_hash, finalized)
+            }
+        };
         let contract = hex::encode(contract_id);
         let sequences = bounded_text(&format!("{missing:?}"));
         let detail = if finalized {
@@ -1519,8 +1551,7 @@ impl RuesClient {
             )
         } else {
             format!(
-                "Dusk archive skipped finalized block {block_height} ({ledger_hash:?}): it has finalized block {} but not this one, and holds none of the {topic} rows of contract {contract} that its finalized state records there for sequences {sequences}. The node failed to archive the block and will not add its rows; repair or rebuild its archive, or use another endpoint",
-                later.block_height
+                "Dusk archive skipped finalized block {block_height} ({ledger_hash:?}): it has finalized block {passed} but not this one, and holds none of the {topic} rows of contract {contract} that its finalized state records there for sequences {sequences}. The node failed to archive the block and will not add its rows; repair or rebuild its archive, or use another endpoint"
             )
         };
         if archive_gap_report_due(contract_id, topic, block_height) {
@@ -5529,7 +5560,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("not archived yet"), "{error}");
-        assert!(archive.checked_heights().is_empty());
+        // The archive has not finalized the node's last final block either.
+        assert_eq!(archive.checked_heights(), [1000]);
 
         // The archive failed to write block 7, as Rusk does when its archive
         // write fails, and has finalized blocks 8 and 9 since.
@@ -5555,7 +5587,7 @@ mod tests {
         );
         // checkBlock confirmed block 8 and found block 7, under the ledger's
         // hash, not finalized.
-        assert_eq!(archive.checked_heights(), [8, 7]);
+        assert_eq!(archive.checked_heights(), [1000, 8, 7]);
         // The critical report was made and is not due again yet; the lookup
         // keeps failing on every retry.
         assert!(!archive_gap_report_due(&contract_id, "dispatch", 7));
@@ -5575,6 +5607,58 @@ mod tests {
             archive_row(1, 7, 1, "dispatch", contract_id, &[70]),
             archive_row(2, 8, 2, "dispatch", contract_id, &[8]),
         ]);
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(archive.url.clone(), directory.path());
+        let error = client
+            .finalized_contract_event(&contract_id, "dispatch", 0, 7, &[7])
+            .await
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(
+            matches!(error, HyperlaneDuskError::ArchiveMissingRows(_))
+                && text.contains("finalized block 7")
+                && text.contains("without the dispatch rows"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_idle_contracts_records_in_a_block_the_archive_passed_are_reported_as_missing() {
+        let contract_id = [108u8; 32];
+        let other = [109u8; 32];
+        // The contract's last row is in block 6, and contract state records
+        // a dispatch at block 7, the contract's last: no later row of it can
+        // show that the archive has passed block 7. Another contract's row
+        // shows that the archive has finalized block 9, the node's last final
+        // block, so it skipped block 7.
+        let archive = Archive::start(vec![
+            archive_row(1, 6, 1, "dispatch", contract_id, &[6]),
+            archive_row(2, 9, 2, "transfer", other, &[9]),
+        ]);
+        *archive.ledger_tip.lock().unwrap() = 9;
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(archive.url.clone(), directory.path());
+        let error = client
+            .finalized_contract_event(&contract_id, "dispatch", 0, 7, &[7])
+            .await
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(
+            matches!(error, HyperlaneDuskError::ArchiveMissingRows(_))
+                && text.contains("skipped finalized block 7")
+                && text.contains("finalized block 9")
+                && text.contains(&hex::encode(contract_id)),
+            "{text}"
+        );
+
+        // The node's last final block is the record's own, which the archive
+        // finalized without the contract's rows.
+        let contract_id = [110u8; 32];
+        let archive = Archive::start(vec![
+            archive_row(1, 6, 1, "dispatch", contract_id, &[6]),
+            archive_row(2, 7, 2, "transfer", other, &[7]),
+        ]);
+        *archive.ledger_tip.lock().unwrap() = 7;
         let directory = tempfile::tempdir().unwrap();
         let client = test_client_with_event_store(archive.url.clone(), directory.path());
         let error = client
@@ -5746,8 +5830,10 @@ mod tests {
             .unwrap();
         assert_eq!(matched.block_height, 15);
         assert_eq!(archive.pages(), vec![None, Some(8), None, Some(23)]);
-        // Only the matched rows' blocks were checked.
-        assert_eq!(archive.checked_heights(), [14, 15]);
+        // Only the matched rows' blocks were checked, and, while block 15
+        // was missing, the node's last final block, which the archive had not
+        // finalized yet either.
+        assert_eq!(archive.checked_heights(), [14, 1000, 15]);
     }
 
     #[tokio::test]
