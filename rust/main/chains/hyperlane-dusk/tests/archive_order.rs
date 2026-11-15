@@ -622,3 +622,56 @@ async fn persisted_dispatch_that_no_longer_matches_the_stored_id_is_invalidated(
     let logs = read(Kind::Dispatch, rues, 0..=0, None).await.unwrap();
     assert_eq!(logs[0].transaction_id, h512([0xcc; 32]));
 }
+
+#[tokio::test]
+async fn a_transaction_whose_row_cannot_be_read_is_not_reported_empty() {
+    for kind in [Kind::Dispatch, Kind::Merkle, Kind::Igp] {
+        let fixture = Fixture::start(kind, false, 0);
+        let correct = fixture.archive_rows.lock().unwrap().clone();
+        // The archive serves transaction 0's row with data that is not hex.
+        fixture.archive_rows.lock().unwrap()[0]["data"] = json!("not hex");
+        let rues = fixture.client();
+        // Transaction 0 emitted a record that contract state holds, so its
+        // lookup fails until the archive serves the row, instead of finding
+        // nothing. The block's rows cannot be read whole, so the other
+        // transaction's lookup goes by contract state too, which needs every
+        // record of the block, and waits as well.
+        for transaction in [0, 1] {
+            let error = read(
+                kind,
+                rues.clone(),
+                0..=0,
+                Some(h512(tx_hash(transaction, false))),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains("not archived yet"), "{kind:?}: {error}");
+        }
+        *fixture.archive_rows.lock().unwrap() = correct;
+        for transaction in [0, 1] {
+            let logs = read(
+                kind,
+                rues.clone(),
+                0..=0,
+                Some(h512(tx_hash(transaction, false))),
+            )
+            .await
+            .unwrap();
+            assert_eq!(logs.len(), 1, "{kind:?}");
+            assert_eq!(logs[0].transaction_id, h512(tx_hash(transaction, false)));
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_transaction_with_no_rows_in_its_block_is_checked_against_contract_state() {
+    for kind in [Kind::Dispatch, Kind::Merkle, Kind::Igp] {
+        let fixture = Fixture::start(kind, false, 0);
+        let rues = fixture.client();
+        // A transaction of the block that emitted no row of the topic.
+        let logs = read(kind, rues, 0..=0, Some(h512([0x55; 32])))
+            .await
+            .unwrap();
+        assert!(logs.is_empty(), "{kind:?}");
+    }
+}

@@ -260,9 +260,9 @@ impl Indexer<InterchainGasPayment> for DuskInterchainGasPaymasterIndexer {
                 &crate::dusk_transaction_bytes(&tx_hash),
             )
             .await?;
-        if rows.as_ref().is_some_and(Vec::is_empty) {
-            return Ok(vec![]);
-        }
+        // Contract state decides whether the block holds any payment, also
+        // when the transaction's rows are empty: an empty selection is not
+        // evidence that it paid nothing.
         let count: u32 = self
             .rues
             .contract_query(&self.igp_id, "gas_payment_count", &())
@@ -271,7 +271,7 @@ impl Indexer<InterchainGasPayment> for DuskInterchainGasPaymasterIndexer {
             return Ok(vec![]);
         };
         crate::ensure_tx_hash_lookup_budget(&range, "IGP payment")?;
-        if let Some(rows) = rows {
+        if let Some(rows) = rows.filter(|rows| !rows.is_empty()) {
             // Only a record whose event bytes the transaction emitted can
             // have it as provenance, so only those are matched, against the
             // block's rows read once. The block is at or below the finalized

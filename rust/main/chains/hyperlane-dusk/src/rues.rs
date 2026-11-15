@@ -325,7 +325,7 @@ impl ScanAnchor {
 /// How a scan from an anchor, or from the contract's first row, ended.
 enum ScanOutcome {
     /// The scan ran: the rows it matched, and the scanned block's rows when
-    /// it read all of them within the cache bound.
+    /// it read all of them within the cache bound and each parsed.
     Done {
         found: ScannedRows,
         block: Option<CachedBlock>,
@@ -339,19 +339,36 @@ enum ScanOutcome {
 }
 
 /// A row of the scanned block that can be a sequence's record: not
-/// reverted, of the scan's topic, with hex event data, decoded here once.
-/// Any other row never matches.
+/// reverted, of the scan's topic, with its provenance and event data parsed
+/// here once. Any other row never matches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BlockRow {
-    block_hash: String,
-    origin: String,
+    block_hash: H256,
+    /// Hash of the transaction that emitted the row.
+    origin: [u8; 32],
     data: Vec<u8>,
 }
 
 impl BlockRow {
+    /// The row's provenance and data, or why they do not parse. A row
+    /// whose block hash or origin is not 32 bytes of hex, or whose data is
+    /// not hex, cannot be any sequence's record.
+    fn parse(event: &FinalizedContractEvent) -> Result<Self, HyperlaneDuskError> {
+        Ok(Self {
+            block_hash: parse_h256_hex(&event.block_hash, "archive row block hash")?,
+            origin: parse_h256_hex(&event.origin, "archive row origin")?.0,
+            data: hex::decode(strip_hex_prefix(&event.data)).map_err(|error| {
+                HyperlaneDuskError::Other(format!(
+                    "Archive row has invalid data: {}",
+                    bounded_error(error)
+                ))
+            })?,
+        })
+    }
+
     /// Memory the row takes, for the cache bound.
     fn bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.block_hash.len() + self.origin.len() + self.data.len()
+        std::mem::size_of::<Self>() + self.data.len()
     }
 
     /// The row as the record of `sequence`, which carries the sequence as
@@ -370,8 +387,8 @@ impl BlockRow {
                 )
             })?,
             block_height,
-            block_hash: self.block_hash.clone(),
-            origin: self.origin.clone(),
+            block_hash: hex::encode(self.block_hash),
+            origin: hex::encode(self.origin),
             topic: topic.to_owned(),
             source: hex::encode(contract_id),
             data: hex::encode(&self.data),
@@ -407,28 +424,24 @@ where
 }
 
 /// Every row of one finalized block, contract and topic that can be a
-/// record, in archive order. All carry the block hash that
+/// record, in archive order, all with the block hash that
 /// `checkBlock(onlyFinalized)` accepted when the block was cached.
 #[derive(Debug)]
 struct CachedBlock {
+    block_hash: H256,
     rows: Vec<BlockRow>,
     bytes: usize,
 }
 
-impl CachedBlock {
-    fn block_hash(&self) -> &str {
-        self.rows
-            .first()
-            .map_or("", |row| strip_hex_prefix(&row.block_hash))
-    }
-}
-
 /// The scanned block's rows that a scan collects for the block cache.
 struct BlockCapture {
-    /// `None` once the rows grew past the bound.
+    /// `None` once the rows grew past the bound, or once a row of the block
+    /// that could be a record did not parse.
     rows: Option<Vec<BlockRow>>,
     bytes: usize,
     max_bytes: usize,
+    /// Whether a row of the block that could be a record did not parse.
+    malformed: bool,
     /// Whether the scan read any row of the block, of any topic.
     seen: bool,
     /// Whether the scan read every row of the block. Rusk archives a
@@ -444,6 +457,7 @@ impl BlockCapture {
             rows: Some(Vec::new()),
             bytes: 0,
             max_bytes,
+            malformed: false,
             seen: false,
             complete: false,
         }
@@ -465,15 +479,25 @@ impl BlockCapture {
         }
     }
 
-    /// The block's rows, if the scan read all of them within the bound and
-    /// they name one block hash.
+    /// A row of the block that could be a record did not parse. The block's
+    /// readable rows are then not all of its records, so it is not cached,
+    /// and a lookup by transaction cannot rely on them.
+    fn reject_malformed(&mut self) {
+        self.malformed = true;
+        self.rows = None;
+    }
+
+    /// The block's rows, if the scan read all of them within the bound,
+    /// every one parsed, and they name one block hash.
     fn finish(self) -> Option<CachedBlock> {
         let rows = self.rows?;
-        let hash = &rows.first()?.block_hash;
-        (self.complete && rows.iter().all(|row| row.block_hash == *hash)).then_some(CachedBlock {
-            rows,
-            bytes: self.bytes,
-        })
+        let block_hash = rows.first()?.block_hash;
+        (self.complete && !self.malformed && rows.iter().all(|row| row.block_hash == block_hash))
+            .then_some(CachedBlock {
+                block_hash,
+                rows,
+                bytes: self.bytes,
+            })
     }
 }
 
@@ -1153,7 +1177,15 @@ impl RuesClient {
             let Some(event) = rows.get(&sequence) else {
                 continue;
             };
-            let block_hash = parse_h256_hex(&event.block_hash, "finalized event block hash")?;
+            let block_hash = match parse_h256_hex(&event.block_hash, "finalized event block hash") {
+                Ok(block_hash) => block_hash,
+                Err(error) => {
+                    // A row that does not parse never serves another lookup
+                    // from memory.
+                    self.block_cache().remove(&key);
+                    return Err(error);
+                }
+            };
             let block = (
                 event.block_height,
                 strip_hex_prefix(&event.block_hash).to_owned(),
@@ -1176,7 +1208,15 @@ impl RuesClient {
                 });
                 continue;
             }
-            matches.insert(sequence, finalized_event_match(event, block_hash)?);
+            match finalized_event_match(event, block_hash) {
+                Ok(matched) => {
+                    matches.insert(sequence, matched);
+                }
+                Err(error) => {
+                    self.block_cache().remove(&key);
+                    return Err(error);
+                }
+            }
         }
         if let Some(error) = first_unfinalized {
             self.invalidate_finalized_events(contract_id, topic, &unfinalized)?;
@@ -1195,7 +1235,7 @@ impl RuesClient {
         // A block's rows are cached only once checkBlock(onlyFinalized)
         // accepted the hash they all carry.
         if let Some(block) = scanned_block {
-            let check = (block_height, block.block_hash().to_owned());
+            let check = (block_height, hex::encode(block.block_hash));
             if block_checks.get(&check) == Some(&true) {
                 self.block_cache().insert(key, Arc::new(block));
             }
@@ -1216,16 +1256,21 @@ impl RuesClient {
 
     /// The event data of every row of `topic` in finalized block
     /// `block_height` that transaction `transaction` emitted and that can be
-    /// a record: not reverted, with hex data. Comes from the block's cached
-    /// rows, or from one pass over the block, which is then cached.
+    /// a record: not reverted, with well-formed provenance and data. Comes
+    /// from the block's cached rows, or from one pass over the block, which
+    /// is then cached. Either way `checkBlock(onlyFinalized)` must accept
+    /// the block's hash for this read.
     ///
     /// `None` when the block cannot be read whole: the archive holds no row
-    /// of it for this topic yet, its rows are over the cache bound or name
-    /// different block hashes, or `checkBlock(onlyFinalized)` rejects their
-    /// hash. Callers then look the transaction up by sequence range.
+    /// of it for this topic yet, its rows are over the cache bound, name
+    /// different block hashes or include one that does not parse, or
+    /// `checkBlock(onlyFinalized)` rejects their hash. Callers then look the
+    /// transaction up by sequence range.
     ///
     /// The rows only pick which sequences to look up. Every record still
-    /// comes from `finalized_contract_events_at_block`.
+    /// comes from `finalized_contract_events_at_block`, and an empty
+    /// selection does not show that the transaction has no record: callers
+    /// check that against contract state.
     pub(crate) async fn finalized_rows_of_transaction(
         &self,
         contract_id: &[u8; 32],
@@ -1235,8 +1280,8 @@ impl RuesClient {
     ) -> Result<Option<Vec<Vec<u8>>>, HyperlaneDuskError> {
         let key = BlockKey::new(contract_id, topic, block_height);
         let cached = self.block_cache().get(&key);
-        let block = match cached {
-            Some(block) => block,
+        let (block, read) = match cached {
+            Some(block) => (block, false),
             None => {
                 let (_, block) = self
                     .scan_block_rows(
@@ -1250,23 +1295,24 @@ impl RuesClient {
                 let Some(block) = block else {
                     return Ok(None);
                 };
-                if !self
-                    .check_finalized_block(block_height, block.block_hash())
-                    .await?
-                {
-                    return Ok(None);
-                }
-                let block = Arc::new(block);
-                self.block_cache().insert(key, block.clone());
-                block
+                (Arc::new(block), true)
             }
         };
-        let origin = hex::encode(transaction);
+        if !self
+            .check_finalized_block(block_height, &hex::encode(block.block_hash))
+            .await?
+        {
+            self.block_cache().remove(&key);
+            return Ok(None);
+        }
+        if read {
+            self.block_cache().insert(key, block.clone());
+        }
         Ok(Some(
             block
                 .rows
                 .iter()
-                .filter(|row| strip_hex_prefix(&row.origin).eq_ignore_ascii_case(&origin))
+                .filter(|row| row.origin == *transaction)
                 .map(|row| row.data.clone())
                 .collect(),
         ))
@@ -1433,22 +1479,35 @@ impl RuesClient {
                 if event.block_height == block_height {
                     capture.seen = true;
                     if !event.reverted && event.topic == topic {
-                        if let Ok(data) = hex::decode(strip_hex_prefix(&event.data)) {
-                            let row = BlockRow {
-                                block_hash: event.block_hash.clone(),
-                                origin: event.origin.clone(),
-                                data,
-                            };
-                            assign_row(
-                                &row,
-                                contract_id,
-                                topic,
-                                block_height,
-                                wanted,
-                                matching_sequences,
-                                &mut found,
-                            )?;
-                            capture.push(row);
+                        match BlockRow::parse(&event) {
+                            Ok(row) => {
+                                assign_row(
+                                    &row,
+                                    contract_id,
+                                    topic,
+                                    block_height,
+                                    wanted,
+                                    matching_sequences,
+                                    &mut found,
+                                )?;
+                                capture.push(row);
+                            }
+                            // Rusk writes well-formed rows. This one is no
+                            // record, and the block's other rows are not all
+                            // of its records: nothing of the block is cached.
+                            Err(error) => {
+                                if !capture.malformed {
+                                    warn!(
+                                        contract = %hex::encode(contract_id),
+                                        topic,
+                                        block_height,
+                                        row = event.id,
+                                        %error,
+                                        "Dusk archive row does not parse; its block is read again on each lookup"
+                                    );
+                                }
+                                capture.reject_malformed();
+                            }
                         }
                     }
                 }
@@ -4775,13 +4834,17 @@ mod tests {
     fn cached_block(height: u64, rows: usize, data_len: usize) -> Arc<CachedBlock> {
         let rows: Vec<BlockRow> = (0..rows)
             .map(|row| BlockRow {
-                block_hash: hex::encode([height as u8; 32]),
-                origin: hex::encode([row as u8; 32]),
+                block_hash: H256::from([height as u8; 32]),
+                origin: [row as u8; 32],
                 data: vec![row as u8; data_len],
             })
             .collect();
         let bytes = rows.iter().map(BlockRow::bytes).sum();
-        Arc::new(CachedBlock { rows, bytes })
+        Arc::new(CachedBlock {
+            block_hash: H256::from([height as u8; 32]),
+            rows,
+            bytes,
+        })
     }
 
     #[test]
@@ -4841,8 +4904,8 @@ mod tests {
         let client = test_client_with_event_store(archive.url.clone(), directory.path());
         // Room for 100 of block 6's rows.
         let row = BlockRow {
-            block_hash: hex::encode([6u8; 32]),
-            origin: hex::encode([2u8; 32]),
+            block_hash: H256::from([6u8; 32]),
+            origin: [2u8; 32],
             data: vec![0; 2],
         };
         *client.block_cache.lock().unwrap() = BlockCache::new(BlockCacheLimits {
@@ -4976,6 +5039,117 @@ mod tests {
             .finalized_contract_event(&contract_id, "dispatch", 1, 7, &[2])
             .await
             .unwrap();
+        assert_eq!(archive.pages(), [None, None]);
+    }
+
+    #[tokio::test]
+    async fn a_block_with_a_malformed_row_is_not_cached_and_recovers_once_repaired() {
+        let contract_id = [101u8; 32];
+        // A peer row of the block whose origin is one byte instead of a
+        // transaction hash.
+        let mut malformed = archive_row(2, 7, 2, "dispatch", contract_id, &[2]);
+        malformed["origin"] = serde_json::json!("ab");
+        let archive = Archive::start(vec![
+            archive_row(1, 7, 1, "dispatch", contract_id, &[1]),
+            malformed,
+        ]);
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(archive.url.clone(), directory.path());
+        client
+            .finalized_contract_event(&contract_id, "dispatch", 0, 7, &[1])
+            .await
+            .unwrap();
+        // The block cannot be served from memory: a lookup of the malformed
+        // row's record would fail on it forever.
+        assert!(client.block_cache().blocks.is_empty());
+        assert_eq!(
+            client
+                .finalized_rows_of_transaction(&contract_id, "dispatch", 7, &[1; 32])
+                .await
+                .unwrap(),
+            None
+        );
+        let error = client
+            .finalized_contract_event(&contract_id, "dispatch", 1, 7, &[2])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not archived yet"), "{error}");
+
+        // Once the endpoint serves the row correctly, the next lookup reads
+        // it from the archive.
+        archive.rows.lock().unwrap()[1] = archive_row(2, 7, 2, "dispatch", contract_id, &[2]);
+        let repaired = client
+            .finalized_contract_event(&contract_id, "dispatch", 1, 7, &[2])
+            .await
+            .unwrap();
+        assert_eq!(&repaired.transaction_id.as_bytes()[32..], &[2u8; 32]);
+        assert_eq!(client.block_cache().blocks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_block_with_undecodable_row_data_is_not_cached() {
+        let contract_id = [102u8; 32];
+        let mut undecodable = archive_row(2, 7, 2, "dispatch", contract_id, &[2]);
+        undecodable["data"] = serde_json::json!("not hex");
+        let archive = Archive::start(vec![
+            archive_row(1, 7, 1, "dispatch", contract_id, &[1]),
+            undecodable,
+        ]);
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(archive.url.clone(), directory.path());
+        client
+            .finalized_contract_event(&contract_id, "dispatch", 0, 7, &[1])
+            .await
+            .unwrap();
+        // The block's rows are not whole: transaction 2 emitted a row that
+        // cannot be read, so its lookup must not come back empty.
+        assert!(client.block_cache().blocks.is_empty());
+        assert_eq!(
+            client
+                .finalized_rows_of_transaction(&contract_id, "dispatch", 7, &[2; 32])
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cached_block_is_checked_again_before_a_transaction_lookup_uses_it() {
+        let contract_id = [103u8; 32];
+        let archive = Archive::start(vec![archive_row(1, 7, 1, "dispatch", contract_id, &[1])]);
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(archive.url.clone(), directory.path());
+        client
+            .finalized_contract_event(&contract_id, "dispatch", 0, 7, &[1])
+            .await
+            .unwrap();
+        assert_eq!(client.block_cache().blocks.len(), 1);
+        assert_eq!(archive.checked_heights(), [7]);
+
+        // The endpoint no longer reports the block final under that hash.
+        archive.unfinalized.lock().unwrap().insert(7);
+        assert_eq!(
+            client
+                .finalized_rows_of_transaction(&contract_id, "dispatch", 7, &[1; 32])
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(archive.checked_heights(), [7, 7]);
+        assert!(client.block_cache().blocks.is_empty());
+        // A miss reads the block again and checks it; the hit after it
+        // checks it too.
+        archive.unfinalized.lock().unwrap().clear();
+        for _ in 0..2 {
+            assert_eq!(
+                client
+                    .finalized_rows_of_transaction(&contract_id, "dispatch", 7, &[1; 32])
+                    .await
+                    .unwrap(),
+                Some(vec![vec![1]])
+            );
+        }
+        assert_eq!(archive.checked_heights(), [7, 7, 7, 7]);
         assert_eq!(archive.pages(), [None, None]);
     }
 

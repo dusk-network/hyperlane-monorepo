@@ -229,7 +229,9 @@ impl Indexer<HyperlaneMessage> for DuskMailboxIndexer {
             return Ok(vec![]);
         }
         // The transaction's own Dispatch rows name the nonces it used, so
-        // only those are looked up, from the block's rows read once.
+        // only those are looked up, from the block's rows read once. Rows
+        // that name no nonce are not evidence that it dispatched nothing:
+        // contract state decides that below.
         if let Some(rows) = self
             .rues
             .finalized_rows_of_transaction(
@@ -240,11 +242,14 @@ impl Indexer<HyperlaneMessage> for DuskMailboxIndexer {
             )
             .await?
         {
-            let nonces = rows
+            let nonces: std::collections::BTreeSet<u32> = rows
                 .iter()
                 .filter_map(|data| dispatch_nonce(data))
                 .collect();
-            return crate::transaction_logs(self, nonces, tx_hash, block_height, "dispatch").await;
+            if !nonces.is_empty() {
+                return crate::transaction_logs(self, nonces, tx_hash, block_height, "dispatch")
+                    .await;
+            }
         }
         let count: u32 = self
             .rues

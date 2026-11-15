@@ -172,7 +172,9 @@ impl Indexer<MerkleTreeInsertion> for DuskMerkleTreeHookIndexer {
             return Ok(vec![]);
         }
         // The transaction's own rows name the tree indices it inserted, so
-        // only those are looked up, from the block's rows read once.
+        // only those are looked up, from the block's rows read once. Rows
+        // that name no index are not evidence that it inserted nothing:
+        // contract state decides that below.
         if let Some(rows) = self
             .rues
             .finalized_rows_of_transaction(
@@ -183,19 +185,21 @@ impl Indexer<MerkleTreeInsertion> for DuskMerkleTreeHookIndexer {
             )
             .await?
         {
-            let indices = rows
+            let indices: std::collections::BTreeSet<u32> = rows
                 .iter()
                 .filter_map(|data| rkyv_deserialize::<events::InsertedIntoTree>(data).ok())
                 .map(|event| event.index)
                 .collect();
-            return crate::transaction_logs(
-                self,
-                indices,
-                tx_hash,
-                block_height,
-                "merkle insertion",
-            )
-            .await;
+            if !indices.is_empty() {
+                return crate::transaction_logs(
+                    self,
+                    indices,
+                    tx_hash,
+                    block_height,
+                    "merkle insertion",
+                )
+                .await;
+            }
         }
         let count: u32 = self
             .rues
