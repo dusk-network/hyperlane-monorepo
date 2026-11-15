@@ -984,10 +984,17 @@ async fn a_catch_up_stays_within_the_nodes_rate_limit() {
     assert!(refusals > 0);
 }
 
-/// A chain whose blocks come every `BLOCK_TIME`. Each block holds the
-/// transactions the mempool held when the block before it came, as Rusk
-/// builds a candidate block when its round starts: a transaction sent after
-/// that waits for the next block. Transactions are named by their nonce.
+/// A chain whose blocks come every `BLOCK_TIME`, of one account's
+/// transactions, as Rusk 1.7.3 takes them. The node admits a transaction to
+/// its mempool only with the account's next nonce or the one after a nonce
+/// the mempool holds, and ignores one whose nonce is used or held already,
+/// or that leaves a gap, although propagation succeeds. Each block holds the
+/// transactions of consecutive nonces, from the account's next one, that the
+/// mempool held when the block before it came, as Rusk builds a candidate
+/// block when its round starts: a transaction sent after that waits for the
+/// next block. A transaction that delivers a message an earlier one
+/// delivered fails, and the `process` simulation of a delivered message
+/// fails.
 struct TxChain {
     directory: TempDir,
     server: Server,
@@ -999,27 +1006,111 @@ struct TxChain {
 #[derive(Default)]
 struct TxState {
     height: u64,
-    /// Transactions by nonce, and the block each is in.
-    included: BTreeMap<u64, u64>,
-    /// The mempool when the last block came.
+    /// The account's nonce: that of its last transaction in a block.
+    committed: u64,
+    /// Lines of the helper's `inbox` read so far.
+    inbox_read: usize,
+    /// Every transaction propagated, in order: its ID, nonce and arguments.
+    propagated: Vec<(String, u64, String)>,
+    /// The transactions the mempool holds, by nonce.
+    mempool: BTreeMap<u64, String>,
+    /// The mempool's nonces when the last block came.
     candidate: Vec<u64>,
+    /// Transactions in blocks, by nonce: their ID, block and whether they
+    /// failed.
+    included: BTreeMap<u64, (String, u64, bool)>,
+    /// The arguments of deliveries in blocks.
+    delivered: HashSet<String>,
+    /// Blocks hold no transaction while set.
+    paused: bool,
+}
+
+impl TxState {
+    /// Take the transactions the helper propagated since the last call.
+    fn admit(&mut self, dir: &Path) {
+        let inbox = std::fs::read_to_string(dir.join("inbox")).unwrap_or_default();
+        let lines: Vec<&str> = inbox.lines().collect();
+        for line in &lines[self.inbox_read.min(lines.len())..] {
+            let mut fields = line.split(' ');
+            let (Some(tx), Some(nonce), Some(args)) = (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            let nonce: u64 = nonce.parse().unwrap();
+            self.propagated
+                .push((tx.to_owned(), nonce, args.to_owned()));
+            let next = nonce == self.committed + 1 || self.mempool.contains_key(&(nonce - 1));
+            if nonce > self.committed && !self.mempool.contains_key(&nonce) && next {
+                self.mempool.insert(nonce, tx.to_owned());
+            }
+        }
+        self.inbox_read = lines.len();
+    }
+
+    /// The account's next nonce, past those its mempool holds.
+    fn next_nonce(&self) -> u64 {
+        let mut next = self.committed + 1;
+        while self.mempool.contains_key(&next) {
+            next += 1;
+        }
+        next
+    }
+
+    fn arguments(&self, tx: &str) -> Option<&str> {
+        self.propagated
+            .iter()
+            .find(|(id, _, _)| id == tx)
+            .map(|(_, _, args)| args.as_str())
+    }
+
+    /// The next block: the candidate's consecutive nonces from the
+    /// account's next one, unless paused.
+    fn produce(&mut self, dir: &Path) {
+        self.admit(dir);
+        self.height += 1;
+        let height = self.height;
+        let candidate = std::mem::take(&mut self.candidate);
+        let mut lines = String::new();
+        if !self.paused {
+            for nonce in candidate {
+                if nonce != self.committed + 1 {
+                    continue;
+                }
+                let Some(tx) = self.mempool.remove(&nonce) else {
+                    continue;
+                };
+                let args = self.arguments(&tx).unwrap_or_default().to_owned();
+                let failed = !self.delivered.insert(args);
+                self.included.insert(nonce, (tx.clone(), height, failed));
+                self.committed = nonce;
+                lines.push_str(&format!("{tx}\n"));
+            }
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("included"))
+            .unwrap();
+        file.write_all(lines.as_bytes()).unwrap();
+        std::fs::write(dir.join("committed"), self.committed.to_string()).unwrap();
+        self.candidate = self.mempool.keys().copied().collect();
+    }
 }
 
 const BLOCK_TIME: Duration = Duration::from_millis(200);
 
 impl TxChain {
     /// `pipelines`: the helper takes `--nonce` and `--no-wait`. `refuse`:
-    /// the node refuses the transaction of this nonce before propagation.
+    /// the node refuses the first transaction of this nonce before
+    /// propagation.
     fn start(pipelines: bool, refuse: Option<u64>) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let dir = directory.path().to_path_buf();
-        std::fs::write(dir.join("mempool"), "").unwrap();
-        std::fs::write(dir.join("included"), "").unwrap();
+        for file in ["inbox", "included", "calls"] {
+            std::fs::write(dir.join(file), "").unwrap();
+        }
+        std::fs::write(dir.join("committed"), "0").unwrap();
         if pipelines {
             std::fs::write(dir.join("pipelines"), "").unwrap();
-        }
-        if let Some(nonce) = refuse {
-            std::fs::write(dir.join("refuse"), nonce.to_string()).unwrap();
         }
         let helper = dir.join("dusk-tx");
         std::fs::write(&helper, HELPER).unwrap();
@@ -1032,67 +1123,70 @@ impl TxChain {
             thread::spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
                     thread::sleep(BLOCK_TIME);
-                    let mempool = mempool(&dir);
-                    let mut state = state.lock().unwrap();
-                    state.height += 1;
-                    let height = state.height;
-                    let candidate = std::mem::take(&mut state.candidate);
-                    let mut lines = String::new();
-                    for nonce in candidate {
-                        state.included.insert(nonce, height);
-                        lines.push_str(&format!("{}\n", tx_id(nonce)));
-                    }
-                    let mut file = std::fs::OpenOptions::new()
-                        .append(true)
-                        .open(dir.join("included"))
-                        .unwrap();
-                    file.write_all(lines.as_bytes()).unwrap();
-                    state.candidate = mempool
-                        .into_iter()
-                        .filter(|nonce| !state.included.contains_key(nonce))
-                        .collect();
+                    state.lock().unwrap().produce(&dir);
                 }
             })
         };
         let server = {
             let (state, dir) = (state.clone(), dir.clone());
             Server::start(move |stream, path, body| {
-                let state = state.lock().unwrap();
+                let mut state = state.lock().unwrap();
+                state.admit(&dir);
                 if path.ends_with("/process") {
-                    // The simulation passes.
-                    reply(stream, "200 OK", "", &rkyv(&()));
-                } else if path.starts_with("/on/account:") {
-                    let committed = state.included.len() as u64;
-                    let pending: HashSet<u64> = mempool(&dir).into_iter().collect();
-                    let mut next = committed + 1;
-                    while pending.contains(&next) && !state.included.contains_key(&next) {
-                        next += 1;
+                    // The simulation fails once the message is delivered.
+                    if state.delivered.contains(&hex::encode(&body)) {
+                        reply(
+                            stream,
+                            "500 Internal Server Error",
+                            "",
+                            b"already delivered",
+                        );
+                    } else {
+                        reply(stream, "200 OK", "", &rkyv(&()));
                     }
-                    let value =
-                        json!({"balance": 1u64 << 40, "nonce": committed, "next_nonce": next});
+                } else if path.starts_with("/on/account:") {
+                    let value = json!({
+                        "balance": 1u64 << 40,
+                        "nonce": state.committed,
+                        "next_nonce": state.next_nonce(),
+                    });
                     reply(stream, "200 OK", "", value.to_string().as_bytes());
                 } else {
                     assert_eq!(path, "/on/graphql/query");
                     let query = String::from_utf8(body).unwrap();
-                    let tx = query
-                        .split_once("hash: \"")
-                        .and_then(|(_, rest)| rest.split('"').next())
-                        .unwrap();
-                    let nonce = u64::from_str_radix(tx, 16).unwrap();
-                    let included = state.included.get(&nonce).copied();
-                    let held = mempool(&dir).contains(&nonce);
-                    let value = if query.contains("mempoolTx") {
-                        json!({
-                            "mempoolTx": (held && included.is_none()).then(|| json!({"id": tx})),
-                            "tx": included.map(|height| json!({"blockHeight": height})),
-                        })
+                    let value = if query == "query { lastBlockPair { json } }" {
+                        let block = json!([state.height, hash_hex(state.height)]);
+                        json!({"lastBlockPair": {"json": {
+                            "last_block": block,
+                            "last_finalized_block": block,
+                        }}})
                     } else {
-                        json!({"tx": included.map(|_| json!({"gasSpent": 2_000_000, "err": null}))})
+                        let tx = query
+                            .split_once("hash: \"")
+                            .and_then(|(_, rest)| rest.split('"').next())
+                            .unwrap();
+                        let included = state.included.values().find(|(id, _, _)| id == tx).map(
+                            |(_, height, failed)| {
+                                json!({
+                                    "blockHeight": height,
+                                    "gasSpent": 2_000_000,
+                                    "err": failed.then_some("already delivered"),
+                                })
+                            },
+                        );
+                        let held = state.mempool.values().any(|id| id == tx);
+                        json!({
+                            "mempoolTx": held.then(|| json!({"id": tx})),
+                            "tx": included,
+                        })
                     };
                     reply(stream, "200 OK", "", value.to_string().as_bytes());
                 }
             })
         };
+        if let Some(nonce) = refuse {
+            std::fs::write(dir.join(format!("mode-{nonce}")), "refuse").unwrap();
+        }
         Self {
             directory,
             server,
@@ -1113,7 +1207,7 @@ impl TxChain {
     fn blocks_of(&self, nonces: impl Iterator<Item = u64>) -> HashSet<u64> {
         let state = self.state.lock().unwrap();
         nonces
-            .filter_map(|nonce| state.included.get(&nonce).copied())
+            .filter_map(|nonce| state.included.get(&nonce).map(|(_, height, _)| *height))
             .collect()
     }
 
@@ -1123,9 +1217,38 @@ impl TxChain {
         state
             .included
             .values()
-            .copied()
+            .map(|(_, height, _)| *height)
             .max()
             .unwrap_or(state.height)
+    }
+
+    /// The nonce of every transaction propagated, in order.
+    fn propagated(&self) -> Vec<u64> {
+        let mut state = self.state.lock().unwrap();
+        state.admit(self.directory.path());
+        state
+            .propagated
+            .iter()
+            .map(|(_, nonce, _)| *nonce)
+            .collect()
+    }
+
+    /// The ID of the transaction in a block with `nonce`.
+    fn included_tx(&self, nonce: u64) -> Option<String> {
+        let state = self.state.lock().unwrap();
+        state.included.get(&nonce).map(|(tx, _, _)| tx.clone())
+    }
+
+    /// Wait until the chain holds `count` transactions in blocks.
+    async fn wait_for_included(&self, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.state.lock().unwrap().included.len() < count {
+            assert!(
+                Instant::now() < deadline,
+                "{count} transactions not included"
+            );
+            tokio::time::sleep(BLOCK_TIME / 4).await;
+        }
     }
 
     fn mailbox(&self) -> DuskMailbox {
@@ -1143,22 +1266,13 @@ impl Drop for TxChain {
     }
 }
 
-fn tx_id(nonce: u64) -> String {
-    format!("{nonce:064x}")
-}
-
-fn mempool(dir: &Path) -> Vec<u64> {
-    std::fs::read_to_string(dir.join("mempool"))
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| u64::from_str_radix(line.trim(), 16).ok())
-        .collect()
-}
-
 /// A `dusk-tx` stand-in. Without `--nonce` it takes the account's next
-/// nonce and waits until its transaction is in a block, as the helper does;
-/// with `--nonce N --no-wait` (when the `pipelines` file exists) it signs
-/// with N and returns once the node holds the transaction.
+/// nonce and waits until its transaction is in a block, as the helper does,
+/// for 3 s; with `--nonce N --no-wait` (when the `pipelines` file exists) it
+/// signs with N and returns once it propagated the transaction. Each
+/// transaction it prepares has its own ID, of its nonce and the count of
+/// calls. A `mode-<nonce>` file changes the next submission of that nonce
+/// (see `TxChain::next_submission`).
 const HELPER: &str = r#"#!/bin/sh
 dir="$(dirname "$0")"
 if [ "$2" = "--help" ]; then
@@ -1169,29 +1283,86 @@ IFS= read -r url
 IFS= read -r key
 nonce=""
 wait=1
+args=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --nonce) nonce="$2"; shift ;;
     --no-wait) wait="" ;;
+    --args) args="$2"; shift ;;
   esac
   shift
 done
 if [ -z "$nonce" ]; then
-  nonce=$(( $(wc -l < "$dir/included") + 1 ))
+  nonce=$(( $(cat "$dir/committed") + 1 ))
 fi
 if [ -f "$dir/slow" ]; then sleep "$(cat "$dir/slow")"; fi
-tx=$(printf '%064x' "$nonce")
+echo x >> "$dir/calls"
+tx=$(printf '%032x%032x' "$nonce" "$(wc -l < "$dir/calls")")
 printf '  Prepared TX %s; reconcile this exact hash before retrying if submission is interrupted\n' "$tx" >&2
-if [ -f "$dir/refuse" ] && [ "$(cat "$dir/refuse")" = "$nonce" ]; then
+mode=""
+if [ -f "$dir/mode-$nonce" ]; then mode=$(cat "$dir/mode-$nonce"); rm -f "$dir/mode-$nonce"; fi
+if [ "$mode" = "refuse" ]; then
   printf '{"success":false,"error":"Transaction %s submission failed: Preverify rejected before propagation (400 Bad Request): refused; retain tx_id=%s"}\n' "$tx" "$tx"
   exit 1
 fi
-echo "$tx" >> "$dir/mempool"
+if [ "$mode" != "lose" ]; then echo "$tx $nonce $args" >> "$dir/inbox"; fi
+if [ -n "$mode" ]; then
+  printf '{"success":false,"error":"Transaction %s submission failed: Propagation outcome unknown: the connection closed"}\n' "$tx"
+  exit 1
+fi
 if [ -n "$wait" ]; then
-  while ! grep -q "^$tx" "$dir/included"; do sleep 0.02; done
+  tries=0
+  while ! grep -q "^$tx" "$dir/included"; do
+    sleep 0.02
+    tries=$((tries + 1))
+    if [ "$tries" -ge 150 ]; then
+      printf '{"success":false,"error":"Transaction %s confirmation outcome unknown: in no block yet"}\n' "$tx"
+      exit 1
+    fi
+  done
 fi
 printf '{"success":true,"tx_id":"%s"}\n' "$tx"
 "#;
+
+#[test]
+fn the_chain_takes_transactions_of_consecutive_nonces_only() {
+    let directory = tempfile::tempdir().unwrap();
+    let dir = directory.path();
+    for file in ["inbox", "included"] {
+        std::fs::write(dir.join(file), "").unwrap();
+    }
+    let mut state = TxState::default();
+    let propagate = |state: &mut TxState, tx: &str, nonce: u64| {
+        let mut inbox = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("inbox"))
+            .unwrap();
+        writeln!(inbox, "{tx} {nonce} {tx}").unwrap();
+        state.admit(dir);
+    };
+    // A gap before it: ignored, although propagated.
+    propagate(&mut state, "c", 3);
+    // The account's next nonce, then another transaction of it: the first
+    // stays.
+    propagate(&mut state, "a", 1);
+    propagate(&mut state, "a2", 1);
+    propagate(&mut state, "b", 2);
+    assert_eq!(state.next_nonce(), 3);
+    // A block holds what the mempool held when the block before it came.
+    state.produce(dir);
+    assert!(state.included.is_empty());
+    state.produce(dir);
+    let included: Vec<(u64, String)> = state
+        .included
+        .iter()
+        .map(|(nonce, (tx, _, _))| (*nonce, tx.clone()))
+        .collect();
+    assert_eq!(included, [(1, "a".to_owned()), (2, "b".to_owned())]);
+    // A used nonce is ignored too.
+    propagate(&mut state, "d", 2);
+    assert!(state.mempool.is_empty());
+    assert_eq!(state.next_nonce(), 3);
+}
 
 /// The process environment names the helper, so one test at a time uses it.
 static HELPER_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -1286,11 +1457,12 @@ async fn a_refused_delivery_ends_the_batch_and_the_rest_go_one_at_a_time() {
     assert_eq!(batch.failed_indexes, vec![2, 3, 4]);
     let outcome = batch.outcome.unwrap();
     assert_eq!(outcome.gas_used, U256::from(4_000_000u64));
+    chain.wait_for_included(2).await;
     assert_eq!(
         &outcome.transaction_id.as_bytes()[32..],
-        &hex::decode(tx_id(1)).unwrap()[..]
+        &hex::decode(chain.included_tx(1).unwrap()).unwrap()[..]
     );
-    assert_eq!(mempool(chain.directory.path()), vec![1, 2]);
+    assert_eq!(chain.propagated(), vec![1, 2]);
     std::env::remove_var("DUSK_TX_BIN");
 }
 
