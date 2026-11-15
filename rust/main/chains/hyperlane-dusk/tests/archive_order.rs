@@ -134,6 +134,8 @@ struct Fixture {
     archive_requests: Arc<Mutex<Vec<i64>>>,
     archive_rows: Arc<Mutex<Vec<Value>>>,
     dispatched_ids: Arc<Mutex<Vec<[u8; 32]>>>,
+    /// The contract-state methods the node answered, in order.
+    state_requests: Arc<Mutex<Vec<String>>>,
 }
 impl Fixture {
     fn start(kind: Kind, reversed: bool, prefix_rows: usize) -> Self {
@@ -179,6 +181,8 @@ impl Fixture {
                 .collect::<Vec<_>>(),
         ));
         let worker_ids = dispatched_ids.clone();
+        let state_requests = Arc::new(Mutex::new(Vec::new()));
+        let worker_state_requests = state_requests.clone();
         let worker = thread::spawn(move || {
             while !worker_stop.load(Ordering::SeqCst) {
                 let (mut stream, _) = match listener.accept() {
@@ -255,6 +259,10 @@ impl Fixture {
                 } else {
                     let prefix = format!("/on/contracts:{}/", hex::encode(CONTRACT));
                     let method = path.strip_prefix(&prefix).unwrap();
+                    worker_state_requests
+                        .lock()
+                        .unwrap()
+                        .push(method.to_owned());
                     let index = || u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
                     match method {
                         "nonce" | "count" | "gas_payment_count" => 2u32.to_le_bytes().to_vec(),
@@ -295,6 +303,7 @@ impl Fixture {
             archive_requests,
             archive_rows,
             dispatched_ids,
+            state_requests,
         }
     }
     fn client(&self) -> Arc<RuesClient> {
@@ -649,12 +658,39 @@ async fn a_transaction_whose_row_cannot_be_read_is_not_reported_empty() {
 #[tokio::test]
 async fn a_transaction_with_no_rows_in_its_block_is_checked_against_contract_state() {
     for kind in [Kind::Dispatch, Kind::Merkle, Kind::Igp] {
+        let count_method = match kind {
+            Kind::Dispatch => "nonce",
+            Kind::Merkle => "count",
+            Kind::Igp => "gas_payment_count",
+        };
+        // A transaction of the block that emitted no row of the topic. Its
+        // empty selection is no evidence by itself: contract state holds the
+        // block's records, and none of them is the transaction's.
         let fixture = Fixture::start(kind, false, 0);
-        let rues = fixture.client();
-        // A transaction of the block that emitted no row of the topic.
-        let logs = read(kind, rues, 0..=0, Some(h512([0x55; 32])))
+        let logs = read(kind, fixture.client(), 0..=0, Some(h512([0x55; 32])))
             .await
             .unwrap();
         assert!(logs.is_empty(), "{kind:?}");
+        let state = fixture.state_requests.lock().unwrap().clone();
+        assert!(
+            state.iter().any(|method| method == count_method),
+            "{kind:?}: contract state was not consulted: {state:?}"
+        );
+
+        // The archive lost transaction 0's row and serves only the other
+        // transaction's, so transaction 0's selection is empty as well. But
+        // contract state holds a record in the block that no row matches:
+        // the lookup fails instead of reporting that it emitted nothing.
+        let fixture = Fixture::start(kind, false, 0);
+        let lost = json!(hex::encode(tx_hash(0, false)));
+        fixture
+            .archive_rows
+            .lock()
+            .unwrap()
+            .retain(|row| row["origin"] != lost);
+        let error = read(kind, fixture.client(), 0..=0, Some(h512(tx_hash(0, false))))
+            .await
+            .unwrap_err();
+        assert!(error.contains("not archived yet"), "{kind:?}: {error}");
     }
 }
