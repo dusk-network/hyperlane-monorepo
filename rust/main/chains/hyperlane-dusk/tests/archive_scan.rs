@@ -268,12 +268,20 @@ impl Node {
     fn graphql(&mut self, query: &str) -> Value {
         if query == "query { lastBlockPair { json } }" {
             json!({"lastBlockPair":{"json":{
-                "last_block":[self.finalized + 5,"tip"],
-                "last_finalized_block":[self.finalized,"final"]
+                "last_block":[self.finalized + 5,"7777777777777777777777777777777777777777777777777777777777777777"],
+                "last_finalized_block":[self.finalized,"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"]
             }}})
         } else if query.contains("checkBlock(") {
             self.block_checks += 1;
-            json!({"checkBlock": true})
+            // Rusk records a block as finalized in its archive together with
+            // the block's rows.
+            let height: u64 = query
+                .split_once("height: ")
+                .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
+                .unwrap()
+                .parse()
+                .unwrap();
+            json!({"checkBlock": !self.unarchived.contains_key(&height)})
         } else if let Some((_, rest)) = query.split_once("tx(hash: \"") {
             let hash = rest.split('"').next().unwrap();
             match self.nonce_of_tx.get(hash).copied() {
@@ -350,6 +358,15 @@ impl Node {
             (HOOK, "count") => (self.insertions.len() as u32).to_le_bytes().to_vec(),
             (HOOK, "inserted_block_height") => self.insertions[index()].0.to_le_bytes().to_vec(),
             (HOOK, "message_id_at") => self.insertions[index()].1.to_vec(),
+            (HOOK, "message_ids") => {
+                let start = index();
+                let limit = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
+                let ids: Vec<[u8; 32]> = self.insertions[start..start + limit]
+                    .iter()
+                    .map(|(_, id)| *id)
+                    .collect();
+                rkyv::to_bytes::<_, 256>(&ids).unwrap().to_vec()
+            }
             (IGP, "gas_payment_count") => (self.payments.len() as u32).to_le_bytes().to_vec(),
             (IGP, "gas_payment_at") => rkyv::to_bytes::<_, 256>(&self.payments[index()])
                 .unwrap()
@@ -575,12 +592,13 @@ async fn an_archive_that_lags_finality_keeps_the_scan_position() {
     fixture.node().finalize_block(50, 2, 0, true);
     fixture.node().finalize_block(100, 3, 0, true);
     let rues = fixture.client();
-    let indexer = DuskMailboxIndexer::new(rues, H256::from(MAILBOX), ORIGIN);
+    let indexer = DuskMailboxIndexer::new(rues.clone(), H256::from(MAILBOX), ORIGIN);
     assert_eq!(indexer.fetch_logs_in_range(0..=4).await.unwrap().len(), 5);
 
     // The node finalizes block 200 before its archive inserts the rows, and
-    // the indexer polls in between.
+    // the indexer polls in between, a tick later.
     fixture.node().finalize_block(200, 3, 0, false);
+    rues.expire_block_pair().await;
     let error = indexer.fetch_logs_in_range(5..=7).await.unwrap_err();
     assert!(error.to_string().contains("not archived yet"), "{error}");
     let before_retry = fixture.node().pages_for(MAILBOX).len();

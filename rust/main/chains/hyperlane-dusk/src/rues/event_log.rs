@@ -306,11 +306,11 @@ impl RuesClient {
 
     /// The node's tip and last final block, from `lastBlockPair`.
     async fn frontier(&self) -> Result<Frontier, HyperlaneDuskError> {
-        let data = self
-            .graphql_query("query { lastBlockPair { json } }")
-            .await?;
-        let (latest, finalized) = parse_block_heights(&data)?;
-        Ok(Frontier { latest, finalized })
+        let pair = self.block_pair().await?;
+        Ok(Frontier {
+            latest: pair.latest,
+            finalized: pair.finalized,
+        })
     }
 
     /// Read the archive rows of `log`'s contract after the last block the log
@@ -362,6 +362,16 @@ impl RuesClient {
     ) -> Result<LogState, HyperlaneDuskError> {
         self.ensure_event_log_runs(log)?;
         let mut state = self.event_log_state(log)?;
+        // A log that holds every finalized row up to the node's last final
+        // block has nothing to read until the node finalizes another.
+        if let Some(pair) = finality {
+            if state
+                .complete_through
+                .is_some_and(|through| through >= pair.finalized)
+            {
+                return Ok(state);
+            }
+        }
         let frontier = match finality {
             Some(pair) => Frontier {
                 latest: pair.latest,

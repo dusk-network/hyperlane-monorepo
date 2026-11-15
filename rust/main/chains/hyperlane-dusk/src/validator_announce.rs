@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -22,6 +23,34 @@ const MAX_LOCATIONS_PER_VALIDATOR: usize = 16;
 /// Archive pages a read of announced locations reads to bring the
 /// announcement log up to date, on to the end of the block being read.
 const ANNOUNCEMENT_LOG_PAGES: usize = 16;
+/// Validators whose last read a ValidatorAnnounce keeps.
+const MAX_ANNOUNCEMENT_READS: usize = 1024;
+
+/// A validator's own startup check: its location, or why it is not final.
+type OwnCheck = Result<Vec<String>, String>;
+
+/// The last read of each validator's announced locations, and the last final
+/// block it was made at. Only final announcements are reported, so a read
+/// holds until the node finalizes another block.
+#[derive(Debug, Default)]
+struct AnnouncementReads {
+    /// The locations a relayer reads, by validator.
+    locations: HashMap<[u8; 20], (u64, Vec<String>)>,
+    /// A validator's own startup check, by validator: its location, or why
+    /// it is not final yet. A final location holds for good.
+    own: HashMap<[u8; 20], (u64, OwnCheck)>,
+}
+
+impl AnnouncementReads {
+    fn bound(&mut self) {
+        if self.locations.len() > MAX_ANNOUNCEMENT_READS {
+            self.locations.clear();
+        }
+        if self.own.len() > MAX_ANNOUNCEMENT_READS {
+            self.own.clear();
+        }
+    }
+}
 
 /// The finalized event log of a ValidatorAnnounce's announcements, keyed by
 /// validator and location hash.
@@ -82,6 +111,8 @@ pub struct DuskValidatorAnnounce {
     conn: ConnectionConf,
     /// The location a validator's own startup check looks for.
     own_location: Option<String>,
+    /// The last reads of announced locations, shared by every clone.
+    reads: Arc<StdMutex<AnnouncementReads>>,
 }
 
 impl DuskValidatorAnnounce {
@@ -102,7 +133,12 @@ impl DuskValidatorAnnounce {
             signer,
             conn,
             own_location: None,
+            reads: Arc::default(),
         }
+    }
+
+    fn reads(&self) -> std::sync::MutexGuard<'_, AnnouncementReads> {
+        self.reads.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The reader of a validator's startup check, which decides whether to
@@ -180,13 +216,53 @@ impl DuskValidatorAnnounce {
     /// (read before the list), cannot be read, or the client keeps none.
     /// That no block above the last final one holds the announcement never
     /// shows that it is final: a block accepted and rolled back within the
-    /// check's own requests leaves no trace there.
+    /// check's own requests leaves no trace there. A check holds until the
+    /// node finalizes another block, and a final announcement for good.
     async fn own_announcement(
         &self,
         log: &EventLog,
         validator: [u8; 20],
         location: &str,
     ) -> ChainResult<Vec<String>> {
+        // Read the chain before the list the check holds, so that no
+        // rollback in between goes unnoticed.
+        let pair = self.rues.block_pair().await?;
+        let finalized = pair.finalized();
+        let known = self.reads().own.get(&validator).and_then(|(at, check)| {
+            (*at == finalized || check.as_ref().is_ok_and(|found| !found.is_empty()))
+                .then(|| check.clone())
+        });
+        let check = match known {
+            Some(check) => check,
+            None => {
+                let check = self
+                    .check_own_announcement(log, validator, location, &pair)
+                    .await?;
+                let mut reads = self.reads();
+                reads.own.insert(validator, (finalized, check.clone()));
+                reads.bound();
+                check
+            }
+        };
+        check.map_err(|reason| {
+            HyperlaneDuskError::NotFinal(format!(
+                "Dusk validator 0x{} announced {} at the tip, but {reason}",
+                hex::encode(validator),
+                crate::rues::bounded_text(location)
+            ))
+            .into()
+        })
+    }
+
+    /// One check of `own_announcement`, whose list is read after `pair`.
+    /// Fails only when the list cannot be read.
+    async fn check_own_announcement(
+        &self,
+        log: &EventLog,
+        validator: [u8; 20],
+        location: &str,
+        pair: &crate::rues::BlockPair,
+    ) -> ChainResult<OwnCheck> {
         let location_hash = keccak256(location.as_bytes());
         // An unannounced location reads no blocks.
         if !self
@@ -194,46 +270,32 @@ impl DuskValidatorAnnounce {
             .await?
             .contains(&location_hash)
         {
-            return Ok(Vec::new());
+            return Ok(Ok(Vec::new()));
         }
-        // Read the chain before the list the check holds, so that no
-        // rollback in between goes unnoticed.
-        let pair = self.rues.block_pair().await?;
-        if !self
-            .location_hashes(validator)
-            .await?
-            .contains(&location_hash)
-        {
-            return Ok(Vec::new());
-        }
-        let not_final = |detail: String| {
-            HyperlaneDuskError::NotFinal(format!(
-                "Dusk validator 0x{} announced {} at the tip, but {detail}",
-                hex::encode(validator),
-                crate::rues::bounded_text(location)
-            ))
-        };
         let key = location_key(&validator, &location_hash);
-        let detail = match self
-            .rues
-            .finalized_event_log_lookup(log, &key, &pair, ANNOUNCEMENT_LOG_PAGES)
-            .await
-        {
-            Ok(LogLookup::Found(_)) => return Ok(vec![location.to_owned()]),
-            Ok(LogLookup::Absent { final_block }) => format!(
-                "no finalized block up to block {final_block}, the last final one, holds the announcement"
-            ),
-            Ok(LogLookup::Unknown(reason)) => {
-                debug!(%reason, "Dusk announcement log cannot show the announcement final yet");
-                format!("the announcement log cannot show it final yet: {reason}")
-            }
-            Err(error) => {
-                let error = crate::rues::bounded_error(&error);
-                debug!(%error, "Dusk announcement log cannot be read; the announcement does not count yet");
-                format!("the announcement log that would show it final cannot be read: {error}")
-            }
-        };
-        Err(not_final(detail).into())
+        Ok(Err(
+            match self
+                .rues
+                .finalized_event_log_lookup(log, &key, pair, ANNOUNCEMENT_LOG_PAGES)
+                .await
+            {
+                Ok(LogLookup::Found(_)) => return Ok(Ok(vec![location.to_owned()])),
+                Ok(LogLookup::Absent { final_block }) => format!(
+                    "no finalized block up to block {final_block}, the last final one, holds the announcement"
+                ),
+                Ok(LogLookup::Unknown(reason)) => {
+                    debug!(%reason, "Dusk announcement log cannot show the announcement final yet");
+                    format!("the announcement log cannot show it final yet: {reason}")
+                }
+                Err(error) => {
+                    let error = crate::rues::bounded_error(&error);
+                    debug!(%error, "Dusk announcement log cannot be read; the announcement does not count yet");
+                    format!(
+                        "the announcement log that would show it final cannot be read: {error}"
+                    )
+                }
+            },
+        ))
     }
 }
 
@@ -276,22 +338,53 @@ impl ValidatorAnnounce for DuskValidatorAnnounce {
             }
             return Ok(all_locations);
         }
-        if let Err(error) = self
-            .rues
-            .advance_event_log(&log, ANNOUNCEMENT_LOG_PAGES, None)
-            .await
-        {
-            warn!(%error, "Could not read new Dusk validator announcements; using those read before");
-        }
+        // Only final announcements are reported, so reads hold until the
+        // node finalizes another block.
+        let finalized = match self.rues.block_pair().await {
+            Ok(pair) => {
+                if let Err(error) = self
+                    .rues
+                    .advance_event_log(&log, ANNOUNCEMENT_LOG_PAGES, Some(&pair))
+                    .await
+                {
+                    warn!(%error, "Could not read new Dusk validator announcements; using those read before");
+                }
+                Some(pair.finalized())
+            }
+            Err(error) => {
+                warn!(%error, "Could not read the Dusk node's last final block; using the announcements read before");
+                None
+            }
+        };
         let mut all_locations = Vec::with_capacity(validators.len());
         for validator in validators {
             let address = eth_address(validator);
+            let known = finalized.and_then(|finalized| {
+                self.reads()
+                    .locations
+                    .get(&address)
+                    .filter(|(at, _)| *at == finalized)
+                    .map(|(_, locations)| locations.clone())
+            });
+            if let Some(locations) = known {
+                all_locations.push(locations);
+                continue;
+            }
             let locations = match self.location_hashes(address).await {
                 Ok(hashes) => self.announced_locations(&log, address, &hashes),
                 Err(error) => Err(error),
             };
             match locations {
-                Ok(locations) => all_locations.push(locations),
+                Ok(locations) => {
+                    if let Some(finalized) = finalized {
+                        let mut reads = self.reads();
+                        reads
+                            .locations
+                            .insert(address, (finalized, locations.clone()));
+                        reads.bound();
+                    }
+                    all_locations.push(locations)
+                }
                 Err(error) => {
                     warn!(
                         validator = ?validator,
@@ -568,6 +661,8 @@ mod tests {
         let (client, worker, _directory) = reader(
             vec![
                 (200, final_tip.into_bytes()),
+                // The archive has finalized the node's last final block.
+                (200, br#"{"checkBlock":true}"#.to_vec()),
                 (200, page.to_string().into_bytes()),
                 (200, br#"{"checkBlock":true}"#.to_vec()),
                 // Listed in order of announcement; one listed hash has no
@@ -619,9 +714,9 @@ mod tests {
         ] {
             let (client, worker, _directory) = reader(
                 vec![
-                    failure,
-                    (200, hashes(&[LOCATION])),
+                    // The chain, read once for both checks, then the list.
                     (200, final_tip.clone()),
+                    failure,
                     (200, hashes(&[LOCATION])),
                     // The announcement log: the archive has finalized the
                     // last final block, holds the announcement there, and
@@ -647,13 +742,31 @@ mod tests {
                 vec![vec![LOCATION.to_owned()]]
             );
             worker.join().unwrap();
+            // A final announcement holds for good: no request.
+            assert_eq!(
+                client
+                    .get_announced_storage_locations(&[validator(1)])
+                    .await
+                    .unwrap(),
+                vec![vec![LOCATION.to_owned()]]
+            );
         }
     }
 
     #[tokio::test]
     async fn a_validators_own_check_reads_its_location_and_no_other() {
         // Another location's hash is listed, not this one: not announced.
-        let (client, worker, _directory) = reader(vec![(200, hashes(&["s3://another"]))], false);
+        let final_tip = format!(
+            r#"{{"lastBlockPair":{{"json":{{"last_block":[9,"{hash}"],"last_finalized_block":[9,"{hash}"]}}}}}}"#,
+            hash = "ab".repeat(32)
+        );
+        let (client, worker, _directory) = reader(
+            vec![
+                (200, final_tip.into_bytes()),
+                (200, hashes(&["s3://another"])),
+            ],
+            false,
+        );
         assert_eq!(
             client
                 .with_own_location(LOCATION)

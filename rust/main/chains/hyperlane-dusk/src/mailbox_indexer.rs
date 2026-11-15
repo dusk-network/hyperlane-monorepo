@@ -11,6 +11,7 @@ use hyperlane_core::{
 };
 use hyperlane_dusk_types::{events, message};
 
+use crate::final_records::FinalRecords;
 use crate::rues::{rkyv_deserialize, rkyv_serialize, EventLog, LogEntry};
 use crate::tx_sender::{dusk_tx_id_to_h512, h512_to_dusk_tx_id};
 use crate::RuesClient;
@@ -29,6 +30,8 @@ pub struct DuskMailboxIndexer {
     mailbox_id: [u8; 32],
     mailbox_address: H256,
     local_domain: u32,
+    /// Where the dispatches last crossed a final height.
+    dispatches: Arc<FinalRecords>,
 }
 
 impl DuskMailboxIndexer {
@@ -39,10 +42,11 @@ impl DuskMailboxIndexer {
     /// `local_domain`.
     pub fn new(rues: Arc<RuesClient>, mailbox_id: H256, local_domain: u32) -> Self {
         Self {
-            rues,
             mailbox_id: mailbox_id.into(),
             mailbox_address: mailbox_id,
             local_domain,
+            dispatches: rues.final_records(mailbox_id.into(), "dispatched_block_height"),
+            rues,
         }
     }
 
@@ -53,39 +57,45 @@ impl DuskMailboxIndexer {
             .await?)
     }
 
-    async fn first_dispatch_at_or_after(&self, count: u32, block_height: u64) -> ChainResult<u32> {
-        let mut low = 0u32;
-        let mut high = count;
-        while low < high {
-            let middle = low + (high - low) / 2;
-            if self.dispatch_height(middle).await? < block_height {
-                low = middle + 1;
-            } else {
-                high = middle;
-            }
-        }
-        Ok(low)
+    async fn dispatch_count(&self) -> ChainResult<u32> {
+        Ok(self
+            .rues
+            .contract_query(&self.mailbox_id, "nonce", &())
+            .await?)
     }
 
+    /// How many dispatches are at or below final block `block_height`.
+    async fn dispatches_at_or_below(&self, block_height: u64) -> ChainResult<u32> {
+        self.dispatches
+            .count_at_or_below(
+                block_height,
+                || self.dispatch_count(),
+                |sequence| self.dispatch_height(sequence),
+            )
+            .await
+    }
+
+    /// The dispatches of final block `block_height`.
     async fn dispatch_range_at_block(
         &self,
-        count: u32,
         block_height: u64,
     ) -> ChainResult<Option<RangeInclusive<u32>>> {
-        let first = self.first_dispatch_at_or_after(count, block_height).await?;
-        if first == count || self.dispatch_height(first).await? != block_height {
+        let first = match block_height.checked_sub(1) {
+            Some(below) => self.dispatches_at_or_below(below).await?,
+            None => 0,
+        };
+        let after = self.dispatches_at_or_below(block_height).await?;
+        if after == first {
             return Ok(None);
         }
-        let after = self
-            .first_dispatch_at_or_after(count, block_height.saturating_add(1))
-            .await?;
         Ok(Some(crate::bounded_block_range(first, after, "dispatch")?))
     }
 
-    async fn finalized_dispatch_count(&self, current_count: u32) -> ChainResult<(u32, u32)> {
+    /// The final dispatches and the last final block.
+    async fn finalized_dispatch_count(&self) -> ChainResult<(u32, u32)> {
         let finalized_tip = self.rues.finalized_block_number().await?;
         let finalized_count = self
-            .first_dispatch_at_or_after(current_count, u64::from(finalized_tip) + 1)
+            .dispatches_at_or_below(u64::from(finalized_tip))
             .await?;
         Ok((finalized_count, finalized_tip))
     }
@@ -102,11 +112,7 @@ impl Indexer<HyperlaneMessage> for DuskMailboxIndexer {
         range: RangeInclusive<u32>,
     ) -> ChainResult<Vec<(Indexed<HyperlaneMessage>, LogMeta)>> {
         // Mailbox.nonce is the next dispatch nonce; messages exist for [0, nonce).
-        let current_nonce: u32 = self
-            .rues
-            .contract_query(&self.mailbox_id, "nonce", &())
-            .await?;
-        let (finalized_nonce, _) = self.finalized_dispatch_count(current_nonce).await?;
+        let (finalized_nonce, _) = self.finalized_dispatch_count().await?;
 
         // The Mailbox stores only each message's ID and block. The message
         // itself is in the finalized Dispatch event that hashes to that ID.
@@ -247,11 +253,7 @@ impl Indexer<HyperlaneMessage> for DuskMailboxIndexer {
                     .await;
             }
         }
-        let count: u32 = self
-            .rues
-            .contract_query(&self.mailbox_id, "nonce", &())
-            .await?;
-        let Some(range) = self.dispatch_range_at_block(count, block_height).await? else {
+        let Some(range) = self.dispatch_range_at_block(block_height).await? else {
             return Ok(vec![]);
         };
         crate::ensure_tx_hash_lookup_budget(&range, "dispatch")?;
@@ -274,12 +276,10 @@ impl Indexer<HyperlaneMessage> for DuskMailboxIndexer {
 
 #[async_trait]
 impl SequenceAwareIndexer<HyperlaneMessage> for DuskMailboxIndexer {
+    /// The final dispatches and the last final block. While the node has
+    /// finalized no new block, this reads only the shared `lastBlockPair`.
     async fn latest_sequence_count_and_tip(&self) -> ChainResult<(Option<u32>, u32)> {
-        let nonce: u32 = self
-            .rues
-            .contract_query(&self.mailbox_id, "nonce", &())
-            .await?;
-        let (finalized_nonce, finalized_tip) = self.finalized_dispatch_count(nonce).await?;
+        let (finalized_nonce, finalized_tip) = self.finalized_dispatch_count().await?;
         Ok((Some(finalized_nonce), finalized_tip))
     }
 }

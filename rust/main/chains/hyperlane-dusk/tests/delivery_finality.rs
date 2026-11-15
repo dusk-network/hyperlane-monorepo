@@ -433,6 +433,15 @@ impl Fixture {
         self.node.lock().unwrap()
     }
 
+    /// Let a tick pass: every client of the node reads its tip and last
+    /// final block again.
+    async fn next_tick(&self) {
+        RuesClient::new(self.url.clone())
+            .unwrap()
+            .expire_block_pair()
+            .await;
+    }
+
     fn parts(
         &self,
     ) -> (
@@ -580,6 +589,7 @@ async fn a_delivery_counts_only_once_its_block_is_final() {
 
     // Once that block is final, the delivery counts.
     fixture.node().finalized = block;
+    fixture.next_tick().await;
     assert_eq!(delivered_with_log(&fixture).await, Ok(true));
     // Only through the delivery log: a client that keeps none never counts
     // it, final or not.
@@ -617,6 +627,7 @@ async fn a_rolled_back_delivery_is_not_delivered_and_counts_again_once_final() {
     };
     assert!(delivered_with_log(&fixture).await.is_err());
     fixture.node().finalized = block + 1;
+    fixture.next_tick().await;
     assert_eq!(delivered_with_log(&fixture).await, Ok(true));
 }
 
@@ -630,7 +641,7 @@ async fn a_rollback_while_a_delivery_is_checked_is_noticed() {
         node.push(vec![Event::processed(MESSAGE)]);
         node.delivered.insert(MESSAGE);
         node.after_delivered_queries = Some((
-            2,
+            1,
             Box::new(move |node: &mut Node| {
                 node.roll_back_to(100);
                 if replaced {
@@ -655,7 +666,9 @@ async fn an_undelivered_message_reads_no_blocks() {
     node.push(vec![Event::processed([0x12; 32])]);
     let fixture = Fixture::start(node);
     assert_eq!(delivered(&fixture).await, Ok(false));
-    assert!(fixture.node().queries.is_empty());
+    // The check reads the node's last final block, which every client of
+    // the node shares for a tick, and no block.
+    assert_eq!(fixture.node().queries, ["query { lastBlockPair { json } }"]);
 }
 
 #[tokio::test]
@@ -708,6 +721,7 @@ async fn events_that_are_not_the_delivery_never_make_it_count() {
     // The delivery itself counts once its block is final.
     let block = fixture.node().push(vec![Event::processed(MESSAGE)]);
     fixture.node().finalized = block;
+    fixture.next_tick().await;
     assert!(mailbox.delivered(message_id()).await.unwrap());
 }
 
@@ -726,6 +740,7 @@ async fn a_block_the_archive_has_not_stored_keeps_the_delivery_unsettled() {
         node.chain[block as usize].archived = true;
         node.finalized = block;
     }
+    fixture.next_tick().await;
     assert_eq!(delivered_with_log(&fixture).await, Ok(true));
 }
 
@@ -765,12 +780,14 @@ async fn a_finality_stall_waits_instead_of_reading_every_block() {
 
     // At 64 blocks behind, the check reads them and names the delivery's.
     fixture.node().finalized = 101;
+    fixture.next_tick().await;
     let error = delivered_with_log(&fixture).await.unwrap_err();
     assert!(
         error.contains(&format!("delivered in Dusk block {block}")),
         "{error}"
     );
     fixture.node().finalized = block;
+    fixture.next_tick().await;
     assert_eq!(delivered_with_log(&fixture).await, Ok(true));
 }
 
@@ -804,6 +821,7 @@ async fn validator_startup_waits_until_its_announcement_is_final() {
     );
 
     fixture.node().finalized = block;
+    fixture.next_tick().await;
     assert_eq!(
         strict
             .get_announced_storage_locations(&[validator()])
@@ -847,6 +865,7 @@ async fn with_an_announcement_log_startup_counts_only_a_finalized_announcement()
         "{error}"
     );
     fixture.node().finalized = block;
+    fixture.next_tick().await;
     assert_eq!(
         strict
             .get_announced_storage_locations(&[validator()])
@@ -877,7 +896,9 @@ async fn a_validator_that_has_not_announced_reads_no_blocks() {
             .unwrap(),
         vec![Vec::<String>::new()]
     );
-    assert!(fixture.node().queries.is_empty());
+    // The check reads the node's last final block, which every client of
+    // the node shares for a tick, and no block.
+    assert_eq!(fixture.node().queries, ["query { lastBlockPair { json } }"]);
 }
 
 #[tokio::test]
@@ -892,13 +913,16 @@ async fn a_rolled_back_announcement_is_not_announced() {
         .await
         .is_err());
 
-    // The validator announces again once the location is gone from state.
+    // The validator announces again once the location is gone from state,
+    // which a check sees once the node has finalized another block.
     {
         let mut node = fixture.node();
         node.roll_back_to(100);
         node.push(vec![]);
         node.locations.clear();
+        node.finalized = 101;
     }
+    fixture.next_tick().await;
     assert_eq!(
         strict
             .get_announced_storage_locations(&[validator()])
@@ -966,7 +990,7 @@ async fn a_delivery_rolled_back_within_the_check_never_counts_with_a_delivery_lo
     node.unreported = 1;
     node.delivered.insert(MESSAGE);
     node.after_delivered_queries = Some((
-        2,
+        1,
         Box::new(|node: &mut Node| {
             node.roll_back_to(100);
             node.push(vec![]);
@@ -1026,6 +1050,7 @@ async fn with_a_delivery_log_a_delivery_in_a_block_that_is_not_final_waits_for_i
         "{error}"
     );
     fixture.node().finalized = block;
+    fixture.next_tick().await;
     assert_eq!(delivered_with_log(&fixture).await, Ok(true));
 }
 
@@ -1072,7 +1097,7 @@ async fn a_delivery_rolled_back_within_the_check_never_counts_without_a_complete
         node.unreported = 1;
         node.delivered.insert(MESSAGE);
         node.after_delivered_queries = Some((
-            2,
+            1,
             Box::new(|node: &mut Node| {
                 node.roll_back_to(100);
                 node.push(vec![]);
@@ -1095,7 +1120,14 @@ async fn a_delivery_rolled_back_within_the_check_never_counts_without_a_complete
             error.contains("delivered at the Dusk tip") && error.contains("final"),
             "{condition:?}: {error}"
         );
-        // The relayer checks again later and relays the message again.
+        // The relayer checks again once the node has finalized another
+        // block, and relays the message again.
+        {
+            let mut node = fixture.node();
+            node.push(vec![]);
+            node.finalized = 101;
+        }
+        fixture.next_tick().await;
         assert_eq!(
             mailbox
                 .delivered(message_id())
@@ -1111,14 +1143,14 @@ async fn a_delivery_rolled_back_within_the_check_never_counts_without_a_complete
 async fn an_announcement_rolled_back_within_the_check_never_counts_without_a_complete_log() {
     // The same race at validator startup: the location list holds the
     // announcement of block 101, which is replaced by a block without it
-    // after the check read the list twice.
+    // after the check read the list.
     for condition in LogCondition::ALL {
         let mut node = Node::new(100);
         node.push(vec![Event::announced(VALIDATOR, LOCATION)]);
         node.unreported = 1;
         node.locations = vec![LOCATION.to_owned()];
         node.after_location_queries = Some((
-            2,
+            1,
             Box::new(|node: &mut Node| {
                 node.roll_back_to(100);
                 node.push(vec![]);
@@ -1144,7 +1176,14 @@ async fn an_announcement_rolled_back_within_the_check_never_counts_without_a_com
             error.contains(LOCATION) && error.contains("final"),
             "{condition:?}: {error}"
         );
-        // The validator checks again and, the location gone, announces.
+        // The validator checks again once the node has finalized another
+        // block and, the location gone, announces.
+        {
+            let mut node = fixture.node();
+            node.push(vec![]);
+            node.finalized = 101;
+        }
+        fixture.next_tick().await;
         assert_eq!(
             strict
                 .get_announced_storage_locations(&[validator()])

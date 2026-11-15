@@ -217,11 +217,15 @@ impl Fixture {
                 let reply = if path == "/on/graphql/query" {
                     let query = std::str::from_utf8(&body).unwrap();
                     let value = if query == "query { lastBlockPair { json } }" {
-                        json!({"lastBlockPair":{"json":{"last_block":[100,"tip"],"last_finalized_block":[90,"final"]}}})
+                        json!({"lastBlockPair":{"json":{"last_block":[100,"7777777777777777777777777777777777777777777777777777777777777777"],"last_finalized_block":[90,"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"]}}})
                     } else if query.contains("checkBlock(") {
                         json!({"checkBlock":true})
                     } else if query.contains("tx(hash:") {
                         json!({"tx":{"blockHeight":HEIGHT}})
+                    } else if query.starts_with("query { block(height: ") {
+                        // The ledger holds no block, so a lookup that misses a
+                        // record reports it as not archived yet.
+                        json!({"block": null})
                     } else if query.contains("finalizedEvents(") {
                         assert!(
                             query.contains(&format!("contractId: \"{}\"", hex::encode(CONTRACT)))
@@ -271,6 +275,15 @@ impl Fixture {
                         }
                         "dispatched_id" => worker_ids.lock().unwrap()[index()].to_vec(),
                         "message_id_at" => id(index()).to_vec(),
+                        "message_ids" => {
+                            let start = index();
+                            let count = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
+                            rkyv::to_bytes::<_, 256>(
+                                &(start..start + count).map(id).collect::<Vec<_>>(),
+                            )
+                            .unwrap()
+                            .to_vec()
+                        }
                         "gas_payment_at" => rkyv::to_bytes::<_, 256>(&payment(index()))
                             .unwrap()
                             .to_vec(),

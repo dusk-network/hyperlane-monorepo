@@ -31,6 +31,23 @@ how to run the local bridge.
   with each refusal in a row, also at random within it, so that indexers do
   not come back together; after 4 refusals in a row (15 to 30 s) it fails.
   The node refuses a request before it runs it, so sending it again is safe.
+- **Finality is read once per tick.** Finalized data changes only when the
+  node's last final block does. Every client of an endpoint in a process
+  shares one `lastBlockPair` read per 5 s tick, and what the agent computes
+  from final data is kept for the last final block it was computed at: the
+  indexers' counts and tips, checkpoints, `delivered` and the announcement
+  checks. Until the node finalizes another block they cost no request; the
+  relayer's `delivered` checks every half second while it waits for
+  signatures are answered from the last one. When the node does, each
+  record indexer reads its contract's count once, and the heights of only
+  the records past the last final one it knows, from there (see
+  `final_records.rs`); a validator's indexer and checkpoint reader share
+  that read. The delivery log reads the archive again only then, from where
+  it stopped, and a checkpoint whose leaf count has not changed is not
+  checked against the hook again. An idle relayer sends one request a tick
+  plus about 6 per newly final block, and a validator one a tick plus one,
+  whatever the history (48 and 18 a minute on a 10 s chain). Finality is
+  seen up to one tick later than a fresh read would see it.
 - **Indexing** uses finalized contract events only. Each event is matched to
   its block and transaction, and stored in the agent's `eventCursorDir`, which
   every agent process needs its own copy of. The Mailbox stores only the ID of

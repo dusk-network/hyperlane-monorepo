@@ -277,6 +277,15 @@ impl Fixture {
         self.node.lock().unwrap()
     }
 
+    /// Let a tick pass: every client of the node reads its last final block
+    /// again.
+    async fn next_tick(&self) {
+        RuesClient::new(self.url.clone())
+            .unwrap()
+            .expire_block_pair()
+            .await;
+    }
+
     /// Restart the agent: drop `indexer` and the process's client of the
     /// event store, check that its RocksDB is closed by opening it alone,
     /// and open a new indexer over it.
@@ -418,12 +427,14 @@ async fn the_count_reaches_the_last_final_block_only_once_the_archive_has_finali
     fixture
         .node()
         .finalize(20, vec![Row::delivery(2, message(2))]);
+    fixture.next_tick().await;
     assert_eq!(
         indexer.latest_sequence_count_and_tip().await.unwrap(),
         (Some(2), 20)
     );
     // Later final blocks without deliveries move the tip on.
     fixture.node().finalize(30, vec![]);
+    fixture.next_tick().await;
     assert_eq!(
         indexer.latest_sequence_count_and_tip().await.unwrap(),
         (Some(2), 30)
@@ -568,6 +579,7 @@ async fn a_row_of_another_topic_above_the_nodes_tip_never_becomes_progress() {
         node.rows.pop();
         node.finalize(11, vec![Row::delivery(2, message(2))]);
     }
+    fixture.next_tick().await;
     assert_eq!(
         indexer.latest_sequence_count_and_tip().await.unwrap(),
         (Some(2), 11)
@@ -726,13 +738,16 @@ async fn rows_out_of_block_order_under_deliveries_already_read_halt_the_log() {
     // Contract sync reads both deliveries: sequence 1 is block 11's.
     assert_eq!(all_deliveries(&indexer).await.len(), 2);
 
-    // A faulty archive serves a row of block 10 after block 11's.
+    // A faulty archive serves a row of block 10 after block 11's, which the
+    // log reads once the node finalizes another block.
     {
         let mut node = fixture.node();
         let id = node.next_id;
         node.rows.push((id, 10, Row::delivery(3, message(3))));
         node.next_id += 1;
+        node.finalize(12, vec![]);
     }
+    fixture.next_tick().await;
     let error = indexer.latest_sequence_count_and_tip().await.unwrap_err();
     assert!(error.to_string().contains("below block 11"), "{error}");
 
@@ -757,7 +772,8 @@ async fn rows_out_of_block_order_under_deliveries_already_read_halt_the_log() {
     // Every read fails the same way until the operator resets the agent.
     fixture
         .node()
-        .finalize(12, vec![Row::delivery(4, message(4))]);
+        .finalize(13, vec![Row::delivery(4, message(4))]);
+    fixture.next_tick().await;
     assert_halted(
         &indexer
             .latest_sequence_count_and_tip()
@@ -810,11 +826,14 @@ async fn rows_restored_in_a_rebuilt_archive_are_read() {
     assert_eq!(logs.len(), 1);
     assert_eq!(logs[0].0.sequence, Some(0));
     rebuild_with_block_11(&mut fixture.node());
-    // The log reads its blocks again, finds block 11's delivery, and, no
-    // consumer having read sequence 1 or later, numbers them afresh.
+    // Once the node finalizes another block, the log reads its blocks again,
+    // finds block 11's delivery, and, no consumer having read sequence 1 or
+    // later, numbers them afresh.
+    fixture.node().finalize(13, vec![]);
+    fixture.next_tick().await;
     assert_eq!(
         indexer.latest_sequence_count_and_tip().await.unwrap(),
-        (Some(3), 12)
+        (Some(3), 13)
     );
     assert_eq!(
         all_deliveries(&indexer).await,
@@ -833,7 +852,10 @@ async fn rows_restored_under_deliveries_already_read_halt_the_log() {
     // Contract sync reads both deliveries: sequence 1 is block 12's.
     assert_eq!(all_deliveries(&indexer).await.len(), 2);
     rebuild_with_block_11(&mut fixture.node());
-    // Block 11's delivery would take sequence 1: the log stops instead.
+    // Block 11's delivery would take sequence 1: once the log reads the
+    // archive again, at the next final block, it stops instead.
+    fixture.node().finalize(13, vec![]);
+    fixture.next_tick().await;
     let error = indexer
         .latest_sequence_count_and_tip()
         .await

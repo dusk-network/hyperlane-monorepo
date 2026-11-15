@@ -83,8 +83,8 @@ impl Hook {
         if path == "/on/graphql/query" {
             assert_eq!(body, b"query { lastBlockPair { json } }");
             return serde_json::json!({"lastBlockPair": {"json": {
-                "last_block": [self.finalized + 5, "tip"],
-                "last_finalized_block": [self.finalized, "final"],
+                "last_block": [self.finalized + 5, "7777777777777777777777777777777777777777777777777777777777777777"],
+                "last_finalized_block": [self.finalized, "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"],
             }}})
             .to_string()
             .into_bytes();
@@ -192,6 +192,15 @@ impl Fixture {
         self.hook.lock().unwrap()
     }
 
+    /// Let a tick pass: every client of the node reads its last final block
+    /// again.
+    async fn next_tick(&self) {
+        RuesClient::new(self.url.clone())
+            .unwrap()
+            .expire_block_pair()
+            .await;
+    }
+
     fn adapter(&self) -> DuskMerkleTreeHook {
         let domain = HyperlaneDomain::from_config(
             4242,
@@ -281,7 +290,13 @@ async fn a_later_checkpoint_reads_only_the_new_ids() {
     let fixture = Fixture::start(hook_with(300, 10, 100));
     let hook = fixture.adapter();
     hook.latest_checkpoint(&ReorgPeriod::None).await.unwrap();
-    fixture.hook_state().push(100, 20);
+    // 100 more insertions in block 101, which the node then finalizes.
+    {
+        let mut state = fixture.hook_state();
+        state.push(100, 101);
+        state.finalized = 101;
+    }
+    fixture.next_tick().await;
     let checkpoint = hook.latest_checkpoint(&ReorgPeriod::None).await.unwrap();
     assert_eq!(checkpoint.checkpoint.index, 399);
     assert_eq!(
@@ -292,13 +307,26 @@ async fn a_later_checkpoint_reads_only_the_new_ids() {
         fixture.hook_state().pages(),
         [(0, 256), (256, 44), (300, 100)]
     );
-    // Clones of the adapter share the tree.
+    // Clones of the adapter share the tree, and until the node finalizes
+    // another block, its checkpoint: no contract query at all.
     fixture.hook_state().queries.clear();
     hook.clone()
         .latest_checkpoint(&ReorgPeriod::None)
         .await
         .unwrap();
-    assert!(fixture.hook_state().pages().is_empty());
+    assert!(fixture.hook_state().queries.is_empty());
+    // The next final block holds no insertion: one count, and no check of
+    // a tree already checked.
+    fixture.hook_state().finalized = 102;
+    fixture.next_tick().await;
+    hook.latest_checkpoint(&ReorgPeriod::None).await.unwrap();
+    let methods: Vec<String> = fixture
+        .hook_state()
+        .queries
+        .iter()
+        .map(|(method, _)| method.clone())
+        .collect();
+    assert_eq!(methods, ["count"]);
 }
 
 #[tokio::test]

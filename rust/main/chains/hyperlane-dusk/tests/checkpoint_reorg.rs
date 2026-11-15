@@ -79,7 +79,7 @@ impl ArchiveFixture {
                 reader.read_exact(&mut body).unwrap();
                 let reply = if path == "/on/graphql/query" {
                     assert_eq!(body, b"query { lastBlockPair { json } }");
-                    br#"{"lastBlockPair":{"json":{"last_block":[100,"tip"],"last_finalized_block":[90,"final"]}}}"#.to_vec()
+                    br#"{"lastBlockPair":{"json":{"last_block":[100,"7777777777777777777777777777777777777777777777777777777777777777"],"last_finalized_block":[90,"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"]}}}"#.to_vec()
                 } else {
                     let prefix = format!("/on/contracts:{}/", hex::encode([2u8; 32]));
                     match path
@@ -191,7 +191,10 @@ fn archive_fixture_reads_delayed_request_bytes() {
     let archive: serde_json::Value = serde_json::from_str(body).unwrap();
     assert_eq!(
         archive["lastBlockPair"]["json"]["last_finalized_block"],
-        serde_json::json!([90, "final"])
+        serde_json::json!([
+            90,
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        ])
     );
 }
 

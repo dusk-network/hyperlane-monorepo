@@ -26,6 +26,7 @@ pub use validator_announce::*;
 
 mod application;
 mod error;
+mod final_records;
 mod interchain_gas;
 mod interchain_security_module;
 mod mailbox;

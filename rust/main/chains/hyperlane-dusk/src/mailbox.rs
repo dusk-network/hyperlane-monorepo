@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -15,9 +16,10 @@ use hyperlane_core::{
 use hyperlane_dusk_types::events;
 use hyperlane_dusk_types::merkle::{IncrementalMerkle as HookTree, TREE_DEPTH};
 
+use crate::final_records::FinalRecords;
 use crate::rues::{
     bounded_body, bounded_error, bounded_json, bounded_text, rkyv_deserialize, rkyv_serialize,
-    LogLookup,
+    BlockPair, LogLookup,
 };
 use crate::{ConnectionConf, DuskProvider, DuskSigner, HyperlaneDuskError, RuesClient};
 
@@ -27,6 +29,51 @@ const MERKLE_HISTORY_PAGE_SIZE: u32 = 256;
 /// Archive pages a delivery check reads to bring the delivery log up to
 /// date, on to the end of the block being read.
 const DELIVERED_LOG_PAGES: usize = 4;
+/// Messages whose last delivery check a Mailbox keeps.
+const MAX_DELIVERY_CHECKS: usize = 4096;
+
+/// What a delivery check found.
+#[derive(Debug, Clone)]
+enum Delivery {
+    /// In a final block, for good.
+    Final,
+    /// Not delivered at the tip.
+    Absent,
+    /// Delivered at the tip, but not shown final; why.
+    NotFinal(String),
+}
+
+/// The last delivery check of each message and the last final block it was
+/// made at. Until the node finalizes another block, a check finds the same:
+/// the relayer asks again every half second while it waits for signatures.
+#[derive(Debug, Default)]
+struct DeliveryChecks {
+    checks: HashMap<H256, (u64, Delivery)>,
+}
+
+impl DeliveryChecks {
+    /// The check of `id` that still holds at last final block `finalized`.
+    fn get(&self, id: H256, finalized: u64) -> Option<Delivery> {
+        match self.checks.get(&id)? {
+            (_, Delivery::Final) => Some(Delivery::Final),
+            (at, delivery) if *at == finalized => Some(delivery.clone()),
+            _ => None,
+        }
+    }
+
+    fn insert(&mut self, id: H256, finalized: u64, delivery: Delivery) {
+        if self.checks.len() >= MAX_DELIVERY_CHECKS && !self.checks.contains_key(&id) {
+            // Checks made at earlier final blocks no longer hold.
+            self.checks.retain(|_, (at, delivery)| {
+                *at == finalized && !matches!(delivery, Delivery::Final)
+            });
+            if self.checks.len() >= MAX_DELIVERY_CHECKS {
+                self.checks.clear();
+            }
+        }
+        self.checks.insert(id, (finalized, delivery));
+    }
+}
 
 /// Dusk Mailbox contract adapter.
 #[derive(Debug, Clone)]
@@ -41,6 +88,10 @@ pub struct DuskMailbox {
     /// The hook's Merkle tree as far as checkpoints have read it, shared by
     /// every clone.
     merkle: Arc<tokio::sync::Mutex<MerkleCache>>,
+    /// Where the hook's insertions last crossed a final height.
+    insertions: Arc<FinalRecords>,
+    /// The last delivery check of each message, shared by every clone.
+    delivery_checks: Arc<StdMutex<DeliveryChecks>>,
 }
 
 /// The MerkleTreeHook keeps no root per insertion, so checkpoints compute
@@ -54,6 +105,9 @@ struct MerkleCache {
     tree: IncrementalMerkle,
     /// The last leaf ingested, `None` for an empty tree.
     last: Option<H256>,
+    /// The tree has passed `verify_tree` with this many leaves. Its leaves
+    /// are final, so the check would read the same answers again.
+    verified: Option<usize>,
 }
 
 impl DuskMailbox {
@@ -69,6 +123,7 @@ impl DuskMailbox {
     ) -> Self {
         Self {
             provider,
+            insertions: rues.final_records(merkle_tree_hook_id.into(), "inserted_block_height"),
             rues,
             mailbox_id: mailbox_id.into(),
             merkle_tree_hook_id: merkle_tree_hook_id.into(),
@@ -76,6 +131,7 @@ impl DuskMailbox {
             signer,
             conn,
             merkle: Arc::new(tokio::sync::Mutex::new(MerkleCache::default())),
+            delivery_checks: Arc::default(),
         }
     }
 
@@ -134,6 +190,91 @@ impl DuskMailbox {
         )))
     }
 
+    /// One delivery check of message `id`, whose state is read after
+    /// `pair`, the node's tip and last final block. Fails only when the
+    /// `delivered` query does; everything the check cannot show is
+    /// `NotFinal`.
+    async fn check_delivery(&self, id: H256, pair: &BlockPair) -> ChainResult<Delivery> {
+        let id_bytes: [u8; 32] = id.into();
+        if !self
+            .rues
+            .contract_query::<_, bool>(&self.mailbox_id, "delivered", &(id_bytes,))
+            .await?
+        {
+            return Ok(Delivery::Absent);
+        }
+        let lookup = self
+            .rues
+            .finalized_event_log_lookup(
+                &crate::mailbox_indexer::delivery_log(self.mailbox_id),
+                &id_bytes,
+                pair,
+                DELIVERED_LOG_PAGES,
+            )
+            .await;
+        // Only a finalized delivery counts.
+        let final_block = match lookup {
+            Ok(LogLookup::Found(_)) => return Ok(Delivery::Final),
+            Ok(LogLookup::Absent { final_block }) => final_block,
+            Ok(LogLookup::Unknown(reason)) => {
+                debug!(message_id = ?id, %reason, "Dusk delivery log cannot show the delivery final yet");
+                return Ok(Delivery::NotFinal(format!(
+                    "Message {id:?} is delivered at the Dusk tip, but the delivery log cannot show it final yet: {reason}"
+                )));
+            }
+            Err(error) => {
+                let error = bounded_error(&error);
+                debug!(message_id = ?id, %error, "Dusk delivery log cannot be read; the delivery does not count yet");
+                return Ok(Delivery::NotFinal(format!(
+                    "Message {id:?} is delivered at the Dusk tip, but the delivery log that would show it final cannot be read: {error}"
+                )));
+            }
+        };
+        let pending = match self
+            .rues
+            .non_final_events(pair, &self.mailbox_id, events::ProcessId::TOPIC)
+            .await
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                return Ok(Delivery::NotFinal(format!(
+                    "Message {id:?} is delivered at the Dusk tip, but its finality cannot be checked yet: {error}"
+                )))
+            }
+        };
+        for event in pending {
+            let processed = match rkyv_deserialize::<events::ProcessId>(&event.data) {
+                Ok(processed) => processed,
+                Err(error) => {
+                    return Ok(Delivery::NotFinal(format!(
+                        "Message {id:?} is delivered at the Dusk tip, but non-final block {} holds an undecodable ProcessId event: {error}",
+                        event.block_height
+                    )))
+                }
+            };
+            if processed.message_id == id_bytes {
+                return Ok(Delivery::NotFinal(format!(
+                    "Message {id:?} is delivered in Dusk block {} ({:?}, transaction {}), which is not final yet",
+                    event.block_height,
+                    event.block_hash,
+                    bounded_text(&event.origin)
+                )));
+            }
+        }
+        // In no final block and in no block above them: a block that held
+        // it was rolled back during this check, and the next one reads it
+        // as not delivered, or the archive skipped the final block that
+        // holds it and this stays so.
+        warn!(
+            message_id = ?id,
+            final_block,
+            "Dusk Mailbox reports a delivery that neither the archive's finalized deliveries nor the blocks above the last final one hold"
+        );
+        Ok(Delivery::NotFinal(format!(
+            "Message {id:?} is delivered at the Dusk tip, but no finalized block up to block {final_block}, the last final one, holds its delivery, and no block above it does either: the block that did was rolled back during this check, or the node's archive skipped it"
+        )))
+    }
+
     async fn merkle_tree_count(&self) -> ChainResult<u32> {
         Ok(self
             .rues
@@ -152,33 +293,23 @@ impl DuskMailbox {
             .await?)
     }
 
-    async fn first_merkle_insertion_at_or_after(
-        &self,
-        count: u32,
-        block_height: u64,
-    ) -> ChainResult<u32> {
-        let mut low = 0u32;
-        let mut high = count;
-        while low < high {
-            let middle = low + (high - low) / 2;
-            if self.merkle_insertion_height(middle).await? < block_height {
-                low = middle + 1;
-            } else {
-                high = middle;
-            }
-        }
-        Ok(low)
-    }
-
-    async fn merkle_count_at_height(&self, count: u32, block_height: u64) -> ChainResult<u32> {
-        self.first_merkle_insertion_at_or_after(count, block_height.saturating_add(1))
+    /// How many of the hook's insertions are at or below block
+    /// `block_height`, which is at or below the last final block. Shared
+    /// with the hook's indexer on the same endpoint, and free for a height
+    /// asked before.
+    async fn merkle_count_at_height(&self, block_height: u64) -> ChainResult<u32> {
+        self.insertions
+            .count_at_or_below(
+                block_height,
+                || self.merkle_tree_count(),
+                |index| self.merkle_insertion_height(index),
+            )
             .await
     }
 
     async fn finalized_merkle_view(&self, reorg_period: &ReorgPeriod) -> ChainResult<(u32, u64)> {
         let finalized_height = self.rues.checkpoint_block_height(reorg_period).await?;
-        let count = self.merkle_tree_count().await?;
-        let finalized_count = self.merkle_count_at_height(count, finalized_height).await?;
+        let finalized_count = self.merkle_count_at_height(finalized_height).await?;
         Ok((finalized_count, finalized_height))
     }
 
@@ -193,7 +324,11 @@ impl DuskMailbox {
     /// with the hook.
     async fn tree_at(&self, count: u32) -> ChainResult<IncrementalMerkle> {
         let mut shared = self.merkle.lock().await;
-        let (tree, last) = if shared.tree.count() <= count as usize {
+        if shared.verified == Some(count as usize) && shared.tree.count() == count as usize {
+            return Ok(shared.tree.clone());
+        }
+        let extends_shared = shared.tree.count() <= count as usize;
+        let (tree, last) = if extends_shared {
             self.extend_tree(&mut shared, count).await?;
             (shared.tree.clone(), shared.last)
         } else {
@@ -214,6 +349,9 @@ impl DuskMailbox {
                 tree.count()
             ))
             .into());
+        }
+        if extends_shared {
+            shared.verified = Some(tree.count());
         }
         Ok(tree)
     }
@@ -309,10 +447,7 @@ impl DuskMailbox {
     async fn checkpoint_at_height(&self, block_height: u64) -> ChainResult<CheckpointAtBlock> {
         let finalized_height = self.rues.finalized_block_height().await?;
         let effective_height = block_height.min(finalized_height);
-        let current_count = self.merkle_tree_count().await?;
-        let count = self
-            .merkle_count_at_height(current_count, effective_height)
-            .await?;
+        let count = self.merkle_count_at_height(effective_height).await?;
         if count == 0 {
             return Err(HyperlaneDuskError::Other(format!(
                 "MerkleTreeHook has no insertion at or before finalized block {effective_height}"
@@ -434,90 +569,36 @@ impl Mailbox for DuskMailbox {
     /// the chain up to a tip that is older than the state it read, so a
     /// block accepted and rolled back within its requests leaves no trace
     /// there.
+    ///
+    /// A check holds until the node finalizes another block: asked again
+    /// before that, it is answered without a request. A final delivery is
+    /// answered without a request for good.
     async fn delivered(&self, id: H256) -> ChainResult<bool> {
-        let id_bytes: [u8; 32] = id.into();
-        let delivered_at_tip = || async {
-            self.rues
-                .contract_query::<_, bool>(&self.mailbox_id, "delivered", &(id_bytes,))
-                .await
-        };
-        if !delivered_at_tip().await? {
-            return Ok(false);
-        }
-        // Read the chain before the state the check holds, so that no
+        // The chain first, then the state the check holds, so that no
         // rollback in between goes unnoticed.
         let pair = self.rues.block_pair().await?;
-        if !delivered_at_tip().await? {
-            return Ok(false);
-        }
-        let lookup = self
-            .rues
-            .finalized_event_log_lookup(
-                &crate::mailbox_indexer::delivery_log(self.mailbox_id),
-                &id_bytes,
-                &pair,
-                DELIVERED_LOG_PAGES,
-            )
-            .await;
-        // Only a finalized delivery counts.
-        let final_block = match lookup {
-            Ok(LogLookup::Found(_)) => return Ok(true),
-            Ok(LogLookup::Absent { final_block }) => final_block,
-            Ok(LogLookup::Unknown(reason)) => {
-                debug!(message_id = ?id, %reason, "Dusk delivery log cannot show the delivery final yet");
-                return Err(HyperlaneDuskError::NotFinal(format!(
-                    "Message {id:?} is delivered at the Dusk tip, but the delivery log cannot show it final yet: {reason}"
-                ))
-                .into());
-            }
-            Err(error) => {
-                let error = bounded_error(&error);
-                debug!(message_id = ?id, %error, "Dusk delivery log cannot be read; the delivery does not count yet");
-                return Err(HyperlaneDuskError::NotFinal(format!(
-                    "Message {id:?} is delivered at the Dusk tip, but the delivery log that would show it final cannot be read: {error}"
-                ))
-                .into());
+        let finalized = pair.finalized();
+        let known = self
+            .delivery_checks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(id, finalized);
+        let delivery = match known {
+            Some(delivery) => delivery,
+            None => {
+                let delivery = self.check_delivery(id, &pair).await?;
+                self.delivery_checks
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(id, finalized, delivery.clone());
+                delivery
             }
         };
-        let pending = self
-            .rues
-            .non_final_events(&pair, &self.mailbox_id, events::ProcessId::TOPIC)
-            .await
-            .map_err(|error| {
-                HyperlaneDuskError::NotFinal(format!(
-                    "Message {id:?} is delivered at the Dusk tip, but its finality cannot be checked yet: {error}"
-                ))
-            })?;
-        for event in pending {
-            let processed = rkyv_deserialize::<events::ProcessId>(&event.data).map_err(|error| {
-                HyperlaneDuskError::NotFinal(format!(
-                    "Message {id:?} is delivered at the Dusk tip, but non-final block {} holds an undecodable ProcessId event: {error}",
-                    event.block_height
-                ))
-            })?;
-            if processed.message_id == id_bytes {
-                return Err(HyperlaneDuskError::NotFinal(format!(
-                    "Message {id:?} is delivered in Dusk block {} ({:?}, transaction {}), which is not final yet",
-                    event.block_height,
-                    event.block_hash,
-                    bounded_text(&event.origin)
-                ))
-                .into());
-            }
+        match delivery {
+            Delivery::Final => Ok(true),
+            Delivery::Absent => Ok(false),
+            Delivery::NotFinal(reason) => Err(HyperlaneDuskError::NotFinal(reason).into()),
         }
-        // In no final block and in no block above them: a block that held
-        // it was rolled back during this check, and the next one reads it
-        // as not delivered, or the archive skipped the final block that
-        // holds it and this stays so.
-        warn!(
-            message_id = ?id,
-            final_block,
-            "Dusk Mailbox reports a delivery that neither the archive's finalized deliveries nor the blocks above the last final one hold"
-        );
-        Err(HyperlaneDuskError::NotFinal(format!(
-            "Message {id:?} is delivered at the Dusk tip, but no finalized block up to block {final_block}, the last final one, holds its delivery, and no block above it does either: the block that did was rolled back during this check, or the node's archive skipped it"
-        ))
-        .into())
     }
 
     async fn default_ism(&self) -> ChainResult<H256> {

@@ -1,6 +1,7 @@
 //! What one agent process shares about each Rusk endpoint it sends requests
-//! to: how fast it sends contract queries, and how it waits when the node
-//! refuses requests for its rate limit.
+//! to: how fast it sends contract queries, how it waits when the node
+//! refuses requests for its rate limit, the node's last final block, and
+//! where each contract's records cross final heights.
 //!
 //! Rusk 1.7.3's HTTP policy limits each class of request for all of a
 //! node's clients together. Contract queries get 180 a second, at most 360 in
@@ -11,6 +12,12 @@
 //! schedule here, so the agent's indexers cannot together run past the
 //! node's limit, and a refusal holds all of the process's requests of that
 //! class back, not only the one refused.
+//!
+//! Finalized data only changes when the node's last final block does. Every
+//! client of an endpoint reads that block from one `lastBlockPair` read per
+//! `FINALITY_TICK`, and what the agent computes from final data is kept for
+//! the final block it was computed at, so a tick at which the node finalized
+//! nothing new costs that one read.
 
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
@@ -22,6 +29,14 @@ use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 use url::Url;
+
+use super::BlockPair;
+use crate::final_records::FinalRecords;
+
+/// How long every client of an endpoint uses one read of its tip and last
+/// final block. The agents' indexers look every 5 s, and Rusk finalizes a
+/// block about every 10 s.
+pub(crate) const FINALITY_TICK: Duration = Duration::from_secs(5);
 
 /// How many contract queries one agent process sends one Rusk endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,9 +173,16 @@ pub(crate) struct Endpoint {
     refusals: AtomicU64,
     /// Refusals since the last warning, and when that was.
     unreported: StdMutex<(u64, Option<Instant>)>,
+    /// The node's tip and last final block, and when they were read. A
+    /// request for them while they are read waits for that read.
+    block_pair: tokio::sync::Mutex<Option<(BlockPair, Instant)>>,
+    /// Where each contract's records cross final heights, by contract and
+    /// the query that reads a record's height.
+    final_records: StdMutex<FinalRecordsByContract>,
 }
 
 type Endpoints = HashMap<String, Weak<Endpoint>>;
+type FinalRecordsByContract = HashMap<([u8; 32], &'static str), Arc<FinalRecords>>;
 static ENDPOINTS: OnceLock<StdMutex<Endpoints>> = OnceLock::new();
 
 impl Endpoint {
@@ -186,9 +208,51 @@ impl Endpoint {
             queries_in_flight: Arc::new(Semaphore::new(MAX_QUERIES_IN_FLIGHT)),
             refusals: AtomicU64::new(0),
             unreported: StdMutex::new((0, None)),
+            block_pair: tokio::sync::Mutex::new(None),
+            final_records: StdMutex::new(HashMap::new()),
         });
         endpoints.insert(key, Arc::downgrade(&endpoint));
         endpoint
+    }
+
+    /// The node's tip and last final block: the last read, while it is
+    /// younger than `FINALITY_TICK`, and otherwise `read`, whose result
+    /// every caller then shares.
+    pub(crate) async fn block_pair<F, Fut, E>(&self, read: F) -> Result<BlockPair, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<BlockPair, E>>,
+    {
+        let mut last = self.block_pair.lock().await;
+        if let Some((pair, read_at)) = *last {
+            if read_at.elapsed() < FINALITY_TICK {
+                return Ok(pair);
+            }
+        }
+        let pair = read().await?;
+        *last = Some((pair, Instant::now()));
+        Ok(pair)
+    }
+
+    /// Forget the last read of the tip and last final block, as if a tick
+    /// had passed.
+    pub(crate) async fn expire_block_pair(&self) {
+        *self.block_pair.lock().await = None;
+    }
+
+    /// Where `contract`'s records, whose heights `height_query` reads, cross
+    /// final heights, as every client of the endpoint shares it.
+    pub(crate) fn final_records(
+        &self,
+        contract: [u8; 32],
+        height_query: &'static str,
+    ) -> Arc<FinalRecords> {
+        self.final_records
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry((contract, height_query))
+            .or_default()
+            .clone()
     }
 
     /// Pace contract queries to this endpoint at `limit`, for every client

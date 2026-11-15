@@ -1,5 +1,6 @@
-//! What the Dusk clients cost a node, counted at a scripted one: a catch-up
-//! under Rusk 1.7.3's rate limit.
+//! What the Dusk clients cost a node, counted at a scripted one: requests
+//! at idle as the history grows, and a catch-up under Rusk 1.7.3's rate
+//! limit.
 //!
 //! Run with `--nocapture` to see the counts.
 #![cfg(unix)]
@@ -7,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -15,9 +17,14 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use hyperlane_core::{Indexer, H256};
+use hyperlane_core::{
+    config::OpSubmissionConfig, HyperlaneDomain, HyperlaneDomainProtocol,
+    HyperlaneDomainTechnicalStack, Indexer, Mailbox, MerkleTreeHook, NativeToken, ReorgPeriod,
+    SequenceAwareIndexer, H256,
+};
 use hyperlane_dusk::{
-    DuskInterchainGasPaymasterIndexer, DuskMailboxIndexer, DuskMerkleTreeHookIndexer,
+    ConnectionConf, DuskDeliveryIndexer, DuskInterchainGasPaymasterIndexer, DuskMailbox,
+    DuskMailboxIndexer, DuskMerkleTreeHook, DuskMerkleTreeHookIndexer, DuskProvider, DuskSigner,
     QueryRateLimit, RuesClient,
 };
 use hyperlane_dusk_types::{events, merkle::IncrementalMerkle, message, GasPaymentRecord};
@@ -397,6 +404,11 @@ impl Node {
         self.server.url.clone()
     }
 
+    /// The node finalizes one more block, without new records.
+    fn finalize_a_block(&self) {
+        self.chain.lock().unwrap().finalized += 1;
+    }
+
     /// The requests answered since the last call, by kind.
     fn take_requests(&self) -> BTreeMap<String, usize> {
         std::mem::take(&mut self.chain.lock().unwrap().requests)
@@ -407,8 +419,161 @@ impl Node {
     }
 }
 
+fn domain() -> HyperlaneDomain {
+    HyperlaneDomain::from_config(
+        ORIGIN,
+        "dusk-load",
+        HyperlaneDomainProtocol::Dusk,
+        HyperlaneDomainTechnicalStack::Other,
+    )
+    .unwrap()
+}
+
+fn connection(url: &Url, directory: &Path, gas_limit: u64) -> ConnectionConf {
+    ConnectionConf {
+        url: url.clone(),
+        chain_id: 0,
+        event_cursor_dir: directory.to_path_buf(),
+        gas_limit,
+        gas_price: 1,
+        native_token: NativeToken::default(),
+        op_submission_config: OpSubmissionConfig::default(),
+        query_rate_limit: QueryRateLimit::default(),
+    }
+}
+
+fn mailbox(rues: Arc<RuesClient>, url: &Url, directory: &Path, signer: bool) -> DuskMailbox {
+    let provider = Arc::new(DuskProvider::new(domain(), rues.clone()));
+    DuskMailbox::new(
+        provider,
+        rues,
+        H256::from(MAILBOX),
+        H256::from(HOOK),
+        domain(),
+        // A synthetic fixture key.
+        signer.then(|| DuskSigner::new(H256::repeat_byte(1)).unwrap()),
+        connection(url, directory, 5_000_000),
+    )
+}
+
 fn total(requests: &BTreeMap<String, usize>) -> usize {
     requests.values().sum()
+}
+
+/// The relayer's Dusk clients at idle for a minute, one tick every 5 s and
+/// a block finalized every 10 s with no new record: requests by kind.
+async fn relayer_idle_minute(records: u32) -> BTreeMap<String, usize> {
+    let node = Node::start(Chain::new(records, false, false));
+    let store = tempfile::tempdir().unwrap();
+    let rues = Arc::new(
+        RuesClient::new_with_event_cursor_dir(node.url(), store.path().to_path_buf()).unwrap(),
+    );
+    let dispatches = DuskMailboxIndexer::new(rues.clone(), H256::from(MAILBOX), ORIGIN);
+    let insertions = DuskMerkleTreeHookIndexer::new(rues.clone(), H256::from(HOOK));
+    let payments = DuskInterchainGasPaymasterIndexer::new(rues.clone(), H256::from(IGP));
+    let deliveries = DuskDeliveryIndexer::new(rues.clone(), H256::from(MAILBOX));
+    let destination = mailbox(rues.clone(), &node.url(), store.path(), false);
+    let waiting = H256::repeat_byte(0x55);
+    let tick = |first: bool| {
+        let (dispatches, insertions, payments, deliveries, destination) = (
+            &dispatches,
+            &insertions,
+            &payments,
+            &deliveries,
+            &destination,
+        );
+        async move {
+            let (count, _) = dispatches.latest_sequence_count_and_tip().await.unwrap();
+            assert_eq!(count, Some(records));
+            let (count, _) = insertions.latest_sequence_count_and_tip().await.unwrap();
+            assert_eq!(count, Some(records));
+            let (count, _) = payments.latest_sequence_count_and_tip().await.unwrap();
+            assert_eq!(count, Some(records));
+            deliveries.latest_sequence_count_and_tip().await.unwrap();
+            // A message waiting for its signatures is checked every 0.5 s.
+            for _ in 0..if first { 1 } else { 10 } {
+                assert!(!destination.delivered(waiting).await.unwrap());
+            }
+        }
+    };
+    // Startup.
+    tick(true).await;
+    node.take_requests();
+    for second in (0..60).step_by(5) {
+        if second % 10 == 0 {
+            node.finalize_a_block();
+        }
+        rues.expire_block_pair().await;
+        tick(false).await;
+    }
+    RuesClient::forget_shared_client(&node.url(), store.path());
+    node.take_requests()
+}
+
+/// A validator's Dusk clients at idle for a minute: its Merkle hook indexer
+/// and its checkpoint reader, which has its own client.
+async fn validator_idle_minute(records: u32) -> BTreeMap<String, usize> {
+    let node = Node::start(Chain::new(records, false, false));
+    let store = tempfile::tempdir().unwrap();
+    let rues = Arc::new(
+        RuesClient::new_with_event_cursor_dir(node.url(), store.path().to_path_buf()).unwrap(),
+    );
+    let insertions = DuskMerkleTreeHookIndexer::new(rues.clone(), H256::from(HOOK));
+    let reader = Arc::new(RuesClient::new(node.url()).unwrap());
+    let hook = DuskMerkleTreeHook::new(mailbox(reader, &node.url(), store.path(), false));
+    let tick = || async {
+        let (count, _) = insertions.latest_sequence_count_and_tip().await.unwrap();
+        assert_eq!(count, Some(records));
+        let checkpoint = hook.latest_checkpoint(&ReorgPeriod::None).await;
+        assert_eq!(checkpoint.is_ok(), records > 0);
+    };
+    tick().await;
+    node.take_requests();
+    for second in (0..60).step_by(5) {
+        if second % 10 == 0 {
+            node.finalize_a_block();
+        }
+        rues.expire_block_pair().await;
+        tick().await;
+    }
+    RuesClient::forget_shared_client(&node.url(), store.path());
+    node.take_requests()
+}
+
+#[tokio::test]
+async fn idle_requests_do_not_grow_with_history() {
+    let mut relayer = Vec::new();
+    let mut validator = Vec::new();
+    for records in [0, 100, 10_000] {
+        let requests = relayer_idle_minute(records).await;
+        eprintln!(
+            "relayer, {records} records: {} requests a minute: {requests:?}",
+            total(&requests)
+        );
+        relayer.push(requests);
+        let requests = validator_idle_minute(records).await;
+        eprintln!(
+            "validator, {records} records: {} requests a minute: {requests:?}",
+            total(&requests)
+        );
+        validator.push(requests);
+    }
+    // The same requests whatever the history.
+    assert_eq!(relayer[1], relayer[2]);
+    assert_eq!(validator[1], validator[2]);
+    // One lastBlockPair a tick; per newly finalized block, the relayer reads
+    // each contract's count, checks the block and reads the Mailbox's new
+    // rows once, and checks a waiting message once.
+    for requests in &relayer {
+        assert_eq!(requests.get("gql:lastBlockPair"), Some(&12));
+        assert!(total(requests) <= 12 + 6 * 6, "{requests:?}");
+    }
+    // Per newly finalized block a validator reads the hook's count once,
+    // for its indexer and its checkpoints together.
+    for requests in &validator {
+        assert_eq!(requests.get("gql:lastBlockPair"), Some(&12));
+        assert!(total(requests) <= 12 + 6, "{requests:?}");
+    }
 }
 
 /// The relayer's three record indexers read 120 new records at once, as

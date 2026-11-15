@@ -2388,11 +2388,8 @@ impl RuesClient {
                 )));
             }
         };
-        let data = self
-            .graphql_query("query { lastBlockPair { json } }")
-            .await?;
-        let (latest, finalized) = parse_block_heights(&data)?;
-        Ok(finalized.min(latest.saturating_sub(delay)))
+        let pair = self.block_pair().await?;
+        Ok(pair.finalized.min(pair.latest.saturating_sub(delay)))
     }
 
     /// Return the finalized height in Hyperlane's shared u32 cursor range.
@@ -2406,13 +2403,40 @@ impl RuesClient {
     }
 
     /// The node's tip and last finalized block. A finality check reads them
-    /// before the contract state it checks; see `non_final_events`.
+    /// before the contract state it checks; see `non_final_events`. Every
+    /// client of the endpoint in this process shares one read of them per
+    /// `FINALITY_TICK`: finalized data changes only when they do.
     pub(crate) async fn block_pair(&self) -> Result<BlockPair, HyperlaneDuskError> {
-        parse_block_pair(
-            &self
-                .graphql_query("query { lastBlockPair { json } }")
-                .await?,
-        )
+        // A pair another client read serves this one only once this one's
+        // deployment check has passed, as a request it sent would.
+        self.ensure_identity().await?;
+        self.endpoint
+            .block_pair(|| async {
+                parse_block_pair(
+                    &self
+                        .graphql_query("query { lastBlockPair { json } }")
+                        .await?,
+                )
+            })
+            .await
+    }
+
+    /// Read the node's tip and last final block again on the next request
+    /// for them, as once a tick has passed: for tests that step through
+    /// ticks without waiting for them.
+    #[doc(hidden)]
+    pub async fn expire_block_pair(&self) {
+        self.endpoint.expire_block_pair().await;
+    }
+
+    /// Where `contract`'s records, whose heights `height_query` reads, cross
+    /// final heights, shared by every client of the endpoint.
+    pub(crate) fn final_records(
+        &self,
+        contract: [u8; 32],
+        height_query: &'static str,
+    ) -> Arc<crate::final_records::FinalRecords> {
+        self.endpoint.final_records(contract, height_query)
     }
 
     /// The non-reverted `topic` events of `contract_id` in the blocks above
@@ -2882,6 +2906,13 @@ pub(crate) struct BlockPair {
     latest_hash: H256,
     finalized: u64,
     finalized_hash: H256,
+}
+
+impl BlockPair {
+    /// The height of the node's last final block.
+    pub(crate) fn finalized(&self) -> u64 {
+        self.finalized
+    }
 }
 
 fn parse_block_pair(data: &JsonValue) -> Result<BlockPair, HyperlaneDuskError> {

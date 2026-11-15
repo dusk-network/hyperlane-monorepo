@@ -14,6 +14,7 @@ use hyperlane_core::{
 
 use hyperlane_dusk_types::{events, GasPaymentRecord};
 
+use crate::final_records::FinalRecords;
 use crate::rues::{exact_event_data, rkyv_serialize};
 use crate::tx_sender::{dusk_tx_id_to_h512, h512_to_dusk_tx_id};
 use crate::{DuskProvider, RuesClient};
@@ -63,15 +64,18 @@ pub struct DuskInterchainGasPaymasterIndexer {
     rues: Arc<RuesClient>,
     igp_id: [u8; 32],
     igp_address: H256,
+    /// Where the payments last crossed a final height.
+    payments: Arc<FinalRecords>,
 }
 
 impl DuskInterchainGasPaymasterIndexer {
     /// Create a new indexer.
     pub fn new(rues: Arc<RuesClient>, igp_id: H256) -> Self {
         Self {
-            rues,
             igp_id: igp_id.into(),
             igp_address: igp_id,
+            payments: rues.final_records(igp_id.into(), "gas_payment_at"),
+            rues,
         }
     }
 
@@ -82,32 +86,37 @@ impl DuskInterchainGasPaymasterIndexer {
             .await?)
     }
 
-    async fn first_payment_at_or_after(&self, count: u32, block_height: u64) -> ChainResult<u32> {
-        let mut low = 0u32;
-        let mut high = count;
-        while low < high {
-            let middle = low + (high - low) / 2;
-            if self.payment_record(middle).await?.block_height < block_height {
-                low = middle + 1;
-            } else {
-                high = middle;
-            }
-        }
-        Ok(low)
+    async fn payment_count(&self) -> ChainResult<u32> {
+        Ok(self
+            .rues
+            .contract_query(&self.igp_id, "gas_payment_count", &())
+            .await?)
     }
 
+    /// How many payments are at or below final block `block_height`.
+    async fn payments_at_or_below(&self, block_height: u64) -> ChainResult<u32> {
+        self.payments
+            .count_at_or_below(
+                block_height,
+                || self.payment_count(),
+                |sequence| async move { Ok(self.payment_record(sequence).await?.block_height) },
+            )
+            .await
+    }
+
+    /// The payments of final block `block_height`.
     async fn payment_range_at_block(
         &self,
-        count: u32,
         block_height: u64,
     ) -> ChainResult<Option<RangeInclusive<u32>>> {
-        let first = self.first_payment_at_or_after(count, block_height).await?;
-        if first == count || self.payment_record(first).await?.block_height != block_height {
+        let first = match block_height.checked_sub(1) {
+            Some(below) => self.payments_at_or_below(below).await?,
+            None => 0,
+        };
+        let after = self.payments_at_or_below(block_height).await?;
+        if after == first {
             return Ok(None);
         }
-        let after = self
-            .first_payment_at_or_after(count, block_height.saturating_add(1))
-            .await?;
         Ok(Some(crate::bounded_block_range(
             first,
             after,
@@ -115,11 +124,10 @@ impl DuskInterchainGasPaymasterIndexer {
         )?))
     }
 
-    async fn finalized_payment_count(&self, current_count: u32) -> ChainResult<(u32, u32)> {
+    /// The final payments and the last final block.
+    async fn finalized_payment_count(&self) -> ChainResult<(u32, u32)> {
         let finalized_tip = self.rues.finalized_block_number().await?;
-        let finalized_count = self
-            .first_payment_at_or_after(current_count, u64::from(finalized_tip) + 1)
-            .await?;
+        let finalized_count = self.payments_at_or_below(u64::from(finalized_tip)).await?;
         Ok((finalized_count, finalized_tip))
     }
 
@@ -224,11 +232,7 @@ impl Indexer<InterchainGasPayment> for DuskInterchainGasPaymasterIndexer {
         &self,
         range: RangeInclusive<u32>,
     ) -> ChainResult<Vec<(Indexed<InterchainGasPayment>, LogMeta)>> {
-        let payment_count: u32 = self
-            .rues
-            .contract_query(&self.igp_id, "gas_payment_count", &())
-            .await?;
-        let (finalized_count, _) = self.finalized_payment_count(payment_count).await?;
+        let (finalized_count, _) = self.finalized_payment_count().await?;
         let stored = self.payment_records(range, finalized_count).await?;
         let results = self.payment_logs(&stored).await?;
         debug!(count = results.len(), "Fetched interchain gas payment logs");
@@ -263,11 +267,7 @@ impl Indexer<InterchainGasPayment> for DuskInterchainGasPaymasterIndexer {
         // Contract state decides whether the block holds any payment, also
         // when the transaction's rows are empty: an empty selection is not
         // evidence that it paid nothing.
-        let count: u32 = self
-            .rues
-            .contract_query(&self.igp_id, "gas_payment_count", &())
-            .await?;
-        let Some(range) = self.payment_range_at_block(count, block_height).await? else {
+        let Some(range) = self.payment_range_at_block(block_height).await? else {
             return Ok(vec![]);
         };
         crate::ensure_tx_hash_lookup_budget(&range, "IGP payment")?;
@@ -278,7 +278,8 @@ impl Indexer<InterchainGasPayment> for DuskInterchainGasPaymasterIndexer {
             // height, so all of its records are finalized.
             let emitted: HashSet<Vec<u8>> = rows.into_iter().collect();
             let mut candidates = Vec::new();
-            for (index, record) in self.payment_records(range, count).await? {
+            let after = range.end().saturating_add(1);
+            for (index, record) in self.payment_records(range, after).await? {
                 if emitted.contains(&payment_event(&record)?) {
                     candidates.push((index, record));
                 }
@@ -321,12 +322,10 @@ fn ensure_cursor_height(block_height: u64) -> ChainResult<()> {
 
 #[async_trait]
 impl SequenceAwareIndexer<InterchainGasPayment> for DuskInterchainGasPaymasterIndexer {
+    /// The final payments and the last final block. While the node has
+    /// finalized no new block, this reads only the shared `lastBlockPair`.
     async fn latest_sequence_count_and_tip(&self) -> ChainResult<(Option<u32>, u32)> {
-        let count: u32 = self
-            .rues
-            .contract_query(&self.igp_id, "gas_payment_count", &())
-            .await?;
-        let (finalized_count, finalized_tip) = self.finalized_payment_count(count).await?;
+        let (finalized_count, finalized_tip) = self.finalized_payment_count().await?;
         Ok((Some(finalized_count), finalized_tip))
     }
 }

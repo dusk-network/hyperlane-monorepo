@@ -10,9 +10,13 @@ use hyperlane_core::{
 };
 use hyperlane_dusk_types::events;
 
+use crate::final_records::FinalRecords;
 use crate::rues::{exact_event_data, rkyv_deserialize, rkyv_serialize};
 use crate::tx_sender::{dusk_tx_id_to_h512, h512_to_dusk_tx_id};
 use crate::RuesClient;
+
+/// Most message IDs one `message_ids` query returns.
+const MESSAGE_ID_PAGE_SIZE: u64 = 256;
 
 /// Dusk MerkleTreeHook indexer anchored to the hook's own state and events.
 #[derive(Debug, Clone)]
@@ -20,15 +24,18 @@ pub struct DuskMerkleTreeHookIndexer {
     rues: Arc<RuesClient>,
     hook_id: [u8; 32],
     hook_address: H256,
+    /// Where the insertions last crossed a final height.
+    insertions: Arc<FinalRecords>,
 }
 
 impl DuskMerkleTreeHookIndexer {
     /// Create an indexer for a deployed MerkleTreeHook contract.
     pub fn new(rues: Arc<RuesClient>, hook_id: H256) -> Self {
         Self {
-            rues,
             hook_id: hook_id.into(),
             hook_address: hook_id,
+            insertions: rues.final_records(hook_id.into(), "inserted_block_height"),
+            rues,
         }
     }
 
@@ -39,34 +46,37 @@ impl DuskMerkleTreeHookIndexer {
             .await?)
     }
 
-    async fn first_insertion_at_or_after(&self, count: u32, block_height: u64) -> ChainResult<u32> {
-        let mut low = 0u32;
-        let mut high = count;
-        while low < high {
-            let middle = low + (high - low) / 2;
-            if self.insertion_height(middle).await? < block_height {
-                low = middle + 1;
-            } else {
-                high = middle;
-            }
-        }
-        Ok(low)
+    async fn insertion_count(&self) -> ChainResult<u32> {
+        Ok(self
+            .rues
+            .contract_query(&self.hook_id, "count", &())
+            .await?)
     }
 
+    /// How many insertions are at or below final block `block_height`.
+    async fn insertions_at_or_below(&self, block_height: u64) -> ChainResult<u32> {
+        self.insertions
+            .count_at_or_below(
+                block_height,
+                || self.insertion_count(),
+                |sequence| self.insertion_height(sequence),
+            )
+            .await
+    }
+
+    /// The insertions of final block `block_height`.
     async fn insertion_range_at_block(
         &self,
-        count: u32,
         block_height: u64,
     ) -> ChainResult<Option<RangeInclusive<u32>>> {
-        let first = self
-            .first_insertion_at_or_after(count, block_height)
-            .await?;
-        if first == count || self.insertion_height(first).await? != block_height {
+        let first = match block_height.checked_sub(1) {
+            Some(below) => self.insertions_at_or_below(below).await?,
+            None => 0,
+        };
+        let after = self.insertions_at_or_below(block_height).await?;
+        if after == first {
             return Ok(None);
         }
-        let after = self
-            .first_insertion_at_or_after(count, block_height.saturating_add(1))
-            .await?;
         Ok(Some(crate::bounded_block_range(
             first,
             after,
@@ -74,12 +84,38 @@ impl DuskMerkleTreeHookIndexer {
         )?))
     }
 
-    async fn finalized_insertion_count(&self, current_count: u32) -> ChainResult<(u32, u32)> {
+    /// The final insertions and the last final block.
+    async fn finalized_insertion_count(&self) -> ChainResult<(u32, u32)> {
         let finalized_tip = self.rues.finalized_block_number().await?;
         let finalized_count = self
-            .first_insertion_at_or_after(current_count, u64::from(finalized_tip) + 1)
+            .insertions_at_or_below(u64::from(finalized_tip))
             .await?;
         Ok((finalized_count, finalized_tip))
+    }
+
+    /// The message IDs the hook stores at `range`, a page of at most
+    /// `MESSAGE_ID_PAGE_SIZE` per query, each page as long as asked.
+    async fn message_ids(&self, range: RangeInclusive<u32>) -> ChainResult<Vec<[u8; 32]>> {
+        let (start, end) = (u64::from(*range.start()), u64::from(*range.end()));
+        let mut ids = Vec::new();
+        let mut next = start;
+        while next <= end {
+            let limit = (end - next + 1).min(MESSAGE_ID_PAGE_SIZE);
+            let page: Vec<[u8; 32]> = self
+                .rues
+                .contract_query(&self.hook_id, "message_ids", &(next as u32, limit as u32))
+                .await?;
+            if page.len() as u64 != limit {
+                return Err(crate::HyperlaneDuskError::Other(format!(
+                    "MerkleTreeHook returned {} message IDs for page start={next} limit={limit}",
+                    page.len()
+                ))
+                .into());
+            }
+            ids.extend(page);
+            next += limit;
+        }
+        Ok(ids)
     }
 }
 
@@ -89,24 +125,19 @@ impl Indexer<MerkleTreeInsertion> for DuskMerkleTreeHookIndexer {
         &self,
         range: RangeInclusive<u32>,
     ) -> ChainResult<Vec<(Indexed<MerkleTreeInsertion>, LogMeta)>> {
-        let count: u32 = self
-            .rues
-            .contract_query(&self.hook_id, "count", &())
-            .await?;
-        let (finalized_count, _) = self.finalized_insertion_count(count).await?;
+        let (finalized_count, _) = self.finalized_insertion_count().await?;
 
+        // The final insertions in the range: their IDs a page at a time,
+        // and each one's block.
         let mut stored = Vec::new();
-        for index in range {
-            if index >= finalized_count {
-                break;
+        let start = *range.start();
+        let end = (*range.end()).min(finalized_count.saturating_sub(1));
+        if start < finalized_count {
+            for (index, message_id) in (start..=end).zip(self.message_ids(start..=end).await?) {
+                let block_number = self.insertion_height(index).await?;
+                ensure_cursor_height(block_number)?;
+                stored.push((index, block_number, message_id));
             }
-            let message_id: [u8; 32] = self
-                .rues
-                .contract_query(&self.hook_id, "message_id_at", &(index,))
-                .await?;
-            let block_number = self.insertion_height(index).await?;
-            ensure_cursor_height(block_number)?;
-            stored.push((index, block_number, message_id));
         }
 
         // One archive pass per block, however many insertions it holds. The
@@ -201,11 +232,7 @@ impl Indexer<MerkleTreeInsertion> for DuskMerkleTreeHookIndexer {
                 .await;
             }
         }
-        let count: u32 = self
-            .rues
-            .contract_query(&self.hook_id, "count", &())
-            .await?;
-        let Some(range) = self.insertion_range_at_block(count, block_height).await? else {
+        let Some(range) = self.insertion_range_at_block(block_height).await? else {
             return Ok(vec![]);
         };
         crate::ensure_tx_hash_lookup_budget(&range, "merkle insertion")?;
@@ -238,12 +265,10 @@ fn ensure_cursor_height(block_height: u64) -> ChainResult<()> {
 
 #[async_trait]
 impl SequenceAwareIndexer<MerkleTreeInsertion> for DuskMerkleTreeHookIndexer {
+    /// The final insertions and the last final block. While the node has
+    /// finalized no new block, this reads only the shared `lastBlockPair`.
     async fn latest_sequence_count_and_tip(&self) -> ChainResult<(Option<u32>, u32)> {
-        let count: u32 = self
-            .rues
-            .contract_query(&self.hook_id, "count", &())
-            .await?;
-        let (finalized_count, finalized_tip) = self.finalized_insertion_count(count).await?;
+        let (finalized_count, finalized_tip) = self.finalized_insertion_count().await?;
         Ok((Some(finalized_count), finalized_tip))
     }
 }

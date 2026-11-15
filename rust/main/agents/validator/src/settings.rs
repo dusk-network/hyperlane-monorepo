@@ -1186,9 +1186,14 @@ mod dusk_rpc_tests {
                     {
                         // An archive with no announcement yet.
                         (200, br#"{"finalizedEvents":{"json":{"events":[],"startCursor":null,"endCursor":null,"hasNextPage":false}}}"#.to_vec())
+                    } else if path == "/on/graphql/query"
+                        && String::from_utf8_lossy(&body).contains("checkBlock(")
+                    {
+                        // The archive has finalized the node's last final block.
+                        (200, br#"{"checkBlock":true}"#.to_vec())
                     } else if path == "/on/graphql/query" {
                         assert_eq!(body, b"query { lastBlockPair { json } }");
-                        (200, br#"{"lastBlockPair":{"json":{"last_block":[100,"tip"],"last_finalized_block":[90,"final"]}}}"#.to_vec())
+                        (200, format!(r#"{{"lastBlockPair":{{"json":{{"last_block":[100,"{}"],"last_finalized_block":[90,"{}"]}}}}}}"#, "77".repeat(32), "ff".repeat(32)).into_bytes())
                     } else if path.ends_with("/get_announced_storage_location_hashes") {
                         if current == Fault::AnnounceUnavailable as u8 {
                             (503, b"temporarily unavailable".to_vec())
@@ -1648,6 +1653,10 @@ mod dusk_rpc_tests {
                 assert_checkpoint(checkpoint);
             }
             nodes[2].set_fault(Fault::Unavailable);
+            // An endpoint's last answer stands until its clients read the
+            // node's last final block again, 5 s later; then the unavailable
+            // endpoint has no vote.
+            tokio::time::sleep(Duration::from_millis(5_100)).await;
             assert!(
                 tokio::time::timeout(READ_DEADLINE, reader.checkpoints(&ReorgPeriod::None))
                     .await
