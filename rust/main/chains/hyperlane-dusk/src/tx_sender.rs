@@ -17,7 +17,7 @@ use tracing::{debug, info, warn};
 
 use hyperlane_core::H512;
 
-use crate::rues::rkyv_serialize;
+use crate::rues::{bounded_error, bounded_text, rkyv_serialize};
 use crate::{ConnectionConf, DuskSigner, HyperlaneDuskError};
 
 const DUSK_TX_HELPER_TIMEOUT: Duration = Duration::from_secs(120);
@@ -106,86 +106,7 @@ pub async fn dusk_tx_call(
 
     let (output, prepared_tx_id) =
         wait_for_child_output(child, fn_name, DUSK_TX_HELPER_TIMEOUT).await?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    if !stderr.is_empty() {
-        debug!(stderr = %stderr, "dusk-tx stderr");
-    }
-
-    if !output.status.success() {
-        let code = output.status.code().unwrap_or(-1);
-        warn!(
-            code = code,
-            stderr = %stderr,
-            stdout = %stdout,
-            "dusk-tx call failed"
-        );
-        // Try to parse error from JSON output
-        if let Ok(json) = serde_json::from_str::<Value>(&stdout) {
-            if let Some(err) = json.get("error").and_then(|e| e.as_str()) {
-                // Diagnostic bodies are opaque. Only the helper's anchored
-                // transaction prefix can report an identity, and it cannot
-                // replace the locally prepared hash captured from stderr.
-                if let Some(prepared) = prepared_tx_id.as_deref() {
-                    if transaction_error_parts(err)
-                        .is_some_and(|(reported, _)| !prepared.eq_ignore_ascii_case(reported))
-                    {
-                        return Err(helper_failure(
-                            Some(prepared),
-                            "dusk-tx error transaction ID disagrees with the prepared transaction"
-                                .into(),
-                        ));
-                    }
-                }
-                if let Some(tx_id) = included_failure_tx_id(err) {
-                    return Err(HyperlaneDuskError::TransactionExecutionFailed {
-                        tx_id,
-                        detail: err.to_owned(),
-                    });
-                }
-                if let Some(tx_id) = outcome_unknown_tx_id(err) {
-                    return Err(HyperlaneDuskError::SubmissionOutcomeUnknown {
-                        tx_id,
-                        detail: err.to_owned(),
-                    });
-                }
-                let detail = format!("dusk-tx call {fn_name} failed: {err}");
-                // A complete preverify diagnostic proves propagation never ran.
-                if before_propagation_error(err) {
-                    return Err(HyperlaneDuskError::Other(detail));
-                }
-                return Err(helper_failure(prepared_tx_id.as_deref(), detail));
-            }
-        }
-        return Err(helper_failure(
-            prepared_tx_id.as_deref(),
-            format!("dusk-tx call {fn_name} failed (exit code {code}): {stderr}"),
-        ));
-    }
-
-    let json: Value = serde_json::from_str(&stdout).map_err(|e| {
-        helper_failure(
-            prepared_tx_id.as_deref(),
-            format!("Failed to parse dusk-tx output as JSON: {e}. Output: {stdout}"),
-        )
-    })?;
-    let returned_id = json
-        .get("tx_id")
-        .and_then(Value::as_str)
-        .and_then(|tx_id| dusk_tx_id_to_h512(tx_id).ok());
-    if json.get("success").and_then(Value::as_bool) != Some(true)
-        || returned_id.is_none()
-        || prepared_tx_id
-            .as_deref()
-            .is_some_and(|prepared| dusk_tx_id_to_h512(prepared).ok() != returned_id)
-    {
-        return Err(helper_failure(
-            prepared_tx_id.as_deref(),
-            "dusk-tx output is missing a successful result with the prepared transaction ID".into(),
-        ));
-    }
+    let json = helper_result(fn_name, &output, prepared_tx_id.as_deref())?;
 
     let tx_id = json
         .get("tx_id")
@@ -198,6 +119,97 @@ pub async fn dusk_tx_call(
         "dusk-tx call succeeded"
     );
 
+    Ok(json)
+}
+
+/// The result of a finished helper call: its JSON output, or the error its
+/// exit status and output describe. Stdout and stderr can each be up to
+/// `MAX_DUSK_TX_STREAM_BYTES`, so only a bounded part of either goes into an
+/// error or a log line. The helper's error text is classified whole.
+fn helper_result(
+    fn_name: &str,
+    output: &std::process::Output,
+    prepared_tx_id: Option<&str>,
+) -> Result<Value, HyperlaneDuskError> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !stderr.is_empty() {
+        debug!(stderr = %bounded_text(&stderr), "dusk-tx stderr");
+    }
+
+    if !output.status.success() {
+        let code = output.status.code().unwrap_or(-1);
+        warn!(
+            code = code,
+            stderr = %bounded_text(&stderr),
+            stdout = %bounded_text(&stdout),
+            "dusk-tx call failed"
+        );
+        // Try to parse error from JSON output
+        if let Ok(json) = serde_json::from_str::<Value>(&stdout) {
+            if let Some(err) = json.get("error").and_then(|e| e.as_str()) {
+                // Diagnostic bodies are opaque. Only the helper's anchored
+                // transaction prefix can report an identity, and it cannot
+                // replace the locally prepared hash captured from stderr.
+                if let Some(prepared) = prepared_tx_id {
+                    if transaction_error_parts(err)
+                        .is_some_and(|(reported, _)| !prepared.eq_ignore_ascii_case(reported))
+                    {
+                        return Err(helper_failure(
+                            Some(prepared),
+                            "dusk-tx error transaction ID disagrees with the prepared transaction"
+                                .into(),
+                        ));
+                    }
+                }
+                let detail = bounded_text(err);
+                if let Some(tx_id) = included_failure_tx_id(err) {
+                    return Err(HyperlaneDuskError::TransactionExecutionFailed { tx_id, detail });
+                }
+                if let Some(tx_id) = outcome_unknown_tx_id(err) {
+                    return Err(HyperlaneDuskError::SubmissionOutcomeUnknown { tx_id, detail });
+                }
+                let detail = format!("dusk-tx call {fn_name} failed: {detail}");
+                // A complete preverify diagnostic proves propagation never ran.
+                if before_propagation_error(err) {
+                    return Err(HyperlaneDuskError::Other(detail));
+                }
+                return Err(helper_failure(prepared_tx_id, detail));
+            }
+        }
+        return Err(helper_failure(
+            prepared_tx_id,
+            format!(
+                "dusk-tx call {fn_name} failed (exit code {code}): {}",
+                bounded_text(&stderr)
+            ),
+        ));
+    }
+
+    let json: Value = serde_json::from_str(&stdout).map_err(|e| {
+        helper_failure(
+            prepared_tx_id,
+            format!(
+                "Failed to parse dusk-tx output as JSON: {}. Output: {}",
+                bounded_error(e),
+                bounded_text(&stdout)
+            ),
+        )
+    })?;
+    let returned_id = json
+        .get("tx_id")
+        .and_then(Value::as_str)
+        .and_then(|tx_id| dusk_tx_id_to_h512(tx_id).ok());
+    if json.get("success").and_then(Value::as_bool) != Some(true)
+        || returned_id.is_none()
+        || prepared_tx_id.is_some_and(|prepared| dusk_tx_id_to_h512(prepared).ok() != returned_id)
+    {
+        return Err(helper_failure(
+            prepared_tx_id,
+            "dusk-tx output is missing a successful result with the prepared transaction ID".into(),
+        ));
+    }
     Ok(json)
 }
 
@@ -367,7 +379,11 @@ pub fn dusk_tx_id_to_h512(tx_id_hex: &str) -> Result<H512, HyperlaneDuskError> {
         .or_else(|| tx_id_hex.strip_prefix("0X"))
         .unwrap_or(tx_id_hex);
     let bytes = hex::decode(tx_id_hex).map_err(|e| {
-        HyperlaneDuskError::Other(format!("Invalid dusk tx_id hex '{tx_id_hex}': {e}"))
+        HyperlaneDuskError::Other(format!(
+            "Invalid dusk tx_id hex '{}': {}",
+            bounded_text(tx_id_hex),
+            bounded_error(e)
+        ))
     })?;
     if bytes.len() != 32 {
         return Err(HyperlaneDuskError::Other(format!(
@@ -612,6 +628,90 @@ mod tests {
         let mut stderr = tokio::spawn(read_bounded_stream(reader, "stderr", Some(sender)));
         drain_timed_out_readers(&mut stdout, &mut stderr).await;
         assert_eq!(receiver.try_recv().unwrap(), tx_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn large_helper_output_is_cut_before_it_reaches_errors() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let huge = "x".repeat(MAX_DUSK_TX_STREAM_BYTES);
+        let tx_id = "ab".repeat(32);
+        let output = |code: i32, stdout: String, stderr: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.into_bytes(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        let error_json = |error: String| serde_json::json!({ "error": error }).to_string();
+        for (output, prepared) in [
+            // A failure without a JSON error reports stderr.
+            (output(1, String::new(), &huge), None),
+            // The helper's own error text: unclassified, an included
+            // failure, and an unknown propagation outcome.
+            (output(1, error_json(huge.clone()), ""), None),
+            (
+                output(
+                    1,
+                    error_json(format!("Transaction {tx_id} failed: {huge}")),
+                    "",
+                ),
+                None,
+            ),
+            (
+                output(
+                    1,
+                    error_json(format!(
+                        "Transaction {tx_id} submission failed: Propagation outcome unknown: {huge}"
+                    )),
+                    "",
+                ),
+                Some(tx_id.as_str()),
+            ),
+            // A successful exit whose output is not JSON.
+            (output(0, huge.clone(), ""), Some(tx_id.as_str())),
+        ] {
+            let error = helper_result("process", &output, prepared)
+                .unwrap_err()
+                .to_string();
+            assert!(error.len() < 3 * 1024, "{} bytes", error.len());
+            assert!(error.contains("[truncated, "), "{error}");
+        }
+        // Classification still reads the whole error text.
+        assert!(matches!(
+            helper_result(
+                "process",
+                &output(1, error_json(format!("Transaction {tx_id} failed: {huge}")), ""),
+                None
+            ),
+            Err(HyperlaneDuskError::TransactionExecutionFailed { tx_id: failed, .. }) if failed == tx_id
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_noisy_failing_helper_yields_a_short_error() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("head -c 900000 /dev/zero | tr '\\0' x >&2; exit 3")
+            .kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = command.spawn().unwrap();
+        let (output, prepared) = wait_for_child_output(child, "process", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(output.stderr.len(), 900_000);
+        let error = helper_result("process", &output, prepared.as_deref())
+            .unwrap_err()
+            .to_string();
+        assert!(error.len() < 2 * 1024, "{} bytes", error.len());
+        assert!(error.contains("exit code 3"), "{error}");
+        assert!(
+            error.ends_with("[truncated, 900000 bytes]"),
+            "{}",
+            &error[error.len().saturating_sub(64)..]
+        );
     }
 
     #[cfg(unix)]

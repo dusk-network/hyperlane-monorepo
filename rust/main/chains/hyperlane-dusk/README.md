@@ -16,8 +16,9 @@ how to run the local bridge.
 - **Reads** go to Rusk contract queries (`POST /on/contracts:<id>/<method>`)
   with rkyv-encoded arguments, and to Rusk's GraphQL endpoint for blocks,
   transactions and finalized events. Events come from the archive, so the
-  node must be built with the `archive` feature. Response bodies are cut to
-  1 KiB before they appear in errors or logs.
+  node must be built with the `archive` feature. Response bodies, the parse
+  errors that quote them and the `dusk-tx` helper's output are cut to 1 KiB
+  before they appear in errors or logs.
 - **Indexing** uses finalized contract events only. Each event is matched to
   its block and transaction, and stored in the agent's `eventCursorDir`, which
   every agent process needs its own copy of. The Mailbox stores only the ID of

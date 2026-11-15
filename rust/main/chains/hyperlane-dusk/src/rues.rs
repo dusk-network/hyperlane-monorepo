@@ -576,7 +576,8 @@ impl RuesClient {
 
         serde_json::from_slice::<ContractMetadata>(&response_body).map_err(|error| {
             HyperlaneDuskError::Other(format!(
-                "Failed to parse contract metadata JSON: {error}. Body: {}",
+                "Failed to parse contract metadata JSON: {}. Body: {}",
+                bounded_error(error),
                 bounded_body(&response_body)
             ))
         })
@@ -663,7 +664,8 @@ impl RuesClient {
 
         let payload = serde_json::from_slice::<JsonValue>(&body).map_err(|e| {
             HyperlaneDuskError::Other(format!(
-                "Failed to parse GraphQL JSON response: {e}. Body: {}",
+                "Failed to parse GraphQL JSON response: {}. Body: {}",
+                bounded_error(e),
                 bounded_body(&body)
             ))
         })?;
@@ -1117,7 +1119,8 @@ impl RuesClient {
         let mut event: FinalizedContractEvent =
             serde_json::from_slice(&bytes).map_err(|error| {
                 HyperlaneDuskError::Other(format!(
-                    "Failed to decode persisted Dusk finalized event: {error}"
+                    "Failed to decode persisted Dusk finalized event: {}",
+                    bounded_error(error)
                 ))
             })?;
         // Archive row IDs are pagination hints, not durable provenance. Use
@@ -1288,7 +1291,8 @@ impl RuesClient {
             })?;
         let page = serde_json::from_value(page.clone()).map_err(|error| {
             HyperlaneDuskError::Other(format!(
-                "Failed to decode Rusk finalizedEvents page: {error}"
+                "Failed to decode Rusk finalizedEvents page: {}",
+                bounded_error(error)
             ))
         })?;
         Ok(PageReply::Page(page, bytes))
@@ -1462,7 +1466,8 @@ impl RuesClient {
 
         serde_json::from_slice::<AccountStatus>(&body).map_err(|e| {
             HyperlaneDuskError::Other(format!(
-                "Failed to parse account status JSON: {e}. Body: {}",
+                "Failed to parse account status JSON: {}. Body: {}",
+                bounded_error(e),
                 bounded_body(&body)
             ))
         })
@@ -1475,7 +1480,9 @@ impl RuesClient {
     ) -> Result<ContractStatus, HyperlaneDuskError> {
         let bytes = hex::decode(contract_id_hex).map_err(|error| {
             HyperlaneDuskError::Other(format!(
-                "Invalid contract ID hex '{contract_id_hex}': {error}"
+                "Invalid contract ID hex '{}': {}",
+                bounded_text(contract_id_hex),
+                bounded_error(error)
             ))
         })?;
         let contract_id: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
@@ -1515,7 +1522,8 @@ impl RuesClient {
 
         serde_json::from_slice::<GasPriceStats>(&body).map_err(|e| {
             HyperlaneDuskError::Other(format!(
-                "Failed to parse gas price stats JSON: {e}. Body: {}",
+                "Failed to parse gas price stats JSON: {}. Body: {}",
+                bounded_error(e),
                 bounded_body(&body)
             ))
         })
@@ -1704,11 +1712,15 @@ fn canonical_event_cursor(id: i64) -> String {
 fn decode_event_cursor(cursor: &str) -> Result<i64, HyperlaneDuskError> {
     let decoded = BASE64_STANDARD.decode(cursor).map_err(|error| {
         HyperlaneDuskError::Other(format!(
-            "Invalid Dusk finalized-event cursor encoding: {error}"
+            "Invalid Dusk finalized-event cursor encoding: {}",
+            bounded_error(error)
         ))
     })?;
     let decoded = std::str::from_utf8(&decoded).map_err(|error| {
-        HyperlaneDuskError::Other(format!("Invalid Dusk finalized-event cursor text: {error}"))
+        HyperlaneDuskError::Other(format!(
+            "Invalid Dusk finalized-event cursor text: {}",
+            bounded_error(error)
+        ))
     })?;
     let id = decoded
         .strip_prefix("v1:")
@@ -1717,7 +1729,10 @@ fn decode_event_cursor(cursor: &str) -> Result<i64, HyperlaneDuskError> {
         })?
         .parse::<i64>()
         .map_err(|error| {
-            HyperlaneDuskError::Other(format!("Invalid Dusk finalized-event cursor ID: {error}"))
+            HyperlaneDuskError::Other(format!(
+                "Invalid Dusk finalized-event cursor ID: {}",
+                bounded_error(error)
+            ))
         })?;
     if id < 0 || canonical_event_cursor(id) != cursor {
         return Err(HyperlaneDuskError::Other(
@@ -1746,7 +1761,8 @@ fn validate_persisted_event(
     parse_h256_hex(&event.origin, "persisted finalized event origin")?;
     hex::decode(strip_hex_prefix(&event.data)).map_err(|error| {
         HyperlaneDuskError::Other(format!(
-            "Persisted Dusk finalized event contains invalid data: {error}"
+            "Persisted Dusk finalized event contains invalid data: {}",
+            bounded_error(error)
         ))
     })?;
     Ok(())
@@ -1835,8 +1851,9 @@ where
     }
     let data = hex::decode(strip_hex_prefix(&event.data)).map_err(|error| {
         HyperlaneDuskError::FinalizedEventMismatch(format!(
-            "Finalized Dusk event {}/{topic} sequence {sequence} has invalid data: {error}",
-            hex::encode(contract_id)
+            "Finalized Dusk event {}/{topic} sequence {sequence} has invalid data: {}",
+            hex::encode(contract_id),
+            bounded_error(error)
         ))
     })?;
     if !matching_sequences(data.as_slice()).contains(&sequence) {
@@ -1854,7 +1871,10 @@ fn finalized_event_match(
     block_hash: H256,
 ) -> Result<FinalizedEventMatch, HyperlaneDuskError> {
     let data = hex::decode(strip_hex_prefix(&event.data)).map_err(|error| {
-        HyperlaneDuskError::Other(format!("Finalized Dusk event has invalid data: {error}"))
+        HyperlaneDuskError::Other(format!(
+            "Finalized Dusk event has invalid data: {}",
+            bounded_error(error)
+        ))
     })?;
     let origin = parse_h256_hex(&event.origin, "finalized event origin")?;
     let mut transaction_id = [0u8; 64];
@@ -1892,6 +1912,13 @@ pub(crate) fn bounded_text(text: &str) -> String {
 /// At most `MAX_ERROR_BODY_BYTES` of an endpoint-supplied JSON value.
 pub(crate) fn bounded_json(value: &JsonValue) -> String {
     bounded_text(&value.to_string())
+}
+
+/// At most `MAX_ERROR_BODY_BYTES` of an error's text. Parse errors quote the
+/// input they fail on, such as a string where a number belongs, and an
+/// endpoint or a helper process chooses that input.
+pub(crate) fn bounded_error(error: impl fmt::Display) -> String {
+    bounded_text(&error.to_string())
 }
 
 /// Cut `text` to `MAX_ERROR_BODY_BYTES` on a character boundary, and say how
@@ -1987,8 +2014,9 @@ fn tx_confirmation_timeout_error(
 fn parse_h256_hex(value: &str, field: &str) -> Result<H256, HyperlaneDuskError> {
     let bytes = hex::decode(strip_hex_prefix(value)).map_err(|error| {
         HyperlaneDuskError::Other(format!(
-            "Invalid {field} hex '{}': {error}",
-            bounded_text(value)
+            "Invalid {field} hex '{}': {}",
+            bounded_text(value),
+            bounded_error(error)
         ))
     })?;
     if bytes.len() != 32 {
@@ -2056,10 +2084,10 @@ where
     T::Archived: Deserialize<T, Infallible> + for<'b> rkyv::CheckBytes<DefaultValidator<'b>>,
 {
     let archived = check_archived_root::<T>(bytes)
-        .map_err(|e| HyperlaneDuskError::RkyvDeserialize(format!("{e}")))?;
+        .map_err(|e| HyperlaneDuskError::RkyvDeserialize(bounded_error(e)))?;
     archived
         .deserialize(&mut Infallible)
-        .map_err(|e| HyperlaneDuskError::RkyvDeserialize(format!("{e:?}")))
+        .map_err(|e| HyperlaneDuskError::RkyvDeserialize(bounded_text(&format!("{e:?}"))))
 }
 
 #[cfg(test)]
@@ -3327,6 +3355,71 @@ mod tests {
             );
             assert!(error.contains("[truncated, "), "{error}");
         }
+    }
+
+    #[tokio::test]
+    async fn oversized_strings_in_typed_replies_stay_out_of_errors() {
+        // A string where a number belongs: parse errors quote it.
+        let huge = "x".repeat(1024 * 1024);
+        let contract_id = [7u8; 32];
+        let page = serde_json::json!({"finalizedEvents": {"json": {
+            "events": [{
+                "id": huge, "block_height": 7, "block_hash": hex::encode([8u8; 32]),
+                "origin": hex::encode([9u8; 32]), "topic": "dispatch",
+                "source": hex::encode(contract_id), "data": "01", "reverted": false
+            }],
+            "startCursor": canonical_event_cursor(11),
+            "endCursor": canonical_event_cursor(11),
+            "hasNextPage": false
+        }}})
+        .to_string();
+        let account = serde_json::json!({"balance": huge, "nonce": 1, "next_nonce": 2}).to_string();
+        let gas = serde_json::json!({"average": huge, "max": 2, "median": 1, "min": 0}).to_string();
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(
+            test_server(vec![(200, page), (200, account), (200, gas)]),
+            directory.path(),
+        );
+        let errors = [
+            client
+                .finalized_contract_event(&contract_id, "dispatch", 0, 7, &[1])
+                .await
+                .unwrap_err(),
+            client.account_status("11111").await.unwrap_err(),
+            client.gas_price_stats(1).await.unwrap_err(),
+        ];
+        for error in errors {
+            let error = error.to_string();
+            // The parse error and, for account and gas replies, the body,
+            // each cut to the limit.
+            assert!(
+                error.len() < 3 * MAX_ERROR_BODY_BYTES,
+                "{} bytes",
+                error.len()
+            );
+            assert!(error.contains("invalid type: string"), "{error}");
+            assert!(error.contains("[truncated, "), "{error}");
+        }
+
+        // A damaged row in the local event store is reported the same way.
+        client
+            .event_store()
+            .unwrap()
+            .put(
+                finalized_event_row_key(&contract_id, "dispatch", 3).unwrap(),
+                serde_json::json!({ "id": huge }).to_string(),
+            )
+            .unwrap();
+        let error = client
+            .load_finalized_event(&contract_id, "dispatch", 3)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.len() < 2 * MAX_ERROR_BODY_BYTES,
+            "{} bytes",
+            error.len()
+        );
+        assert!(error.contains("[truncated, "), "{error}");
     }
 
     #[test]

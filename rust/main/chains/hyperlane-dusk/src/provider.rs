@@ -8,7 +8,7 @@ use hyperlane_core::{
     HyperlaneProvider, HyperlaneProviderError, TxnInfo, H256, H512, U256,
 };
 
-use crate::rues::{bounded_json, bounded_text};
+use crate::rues::{bounded_error, bounded_json, bounded_text};
 use crate::tx_sender::h512_to_dusk_tx_id;
 use crate::{HyperlaneDuskError, RuesClient};
 
@@ -80,8 +80,9 @@ impl HyperlaneProvider for DuskProvider {
         })?;
         let hash_bytes = hex::decode(hash_hex).map_err(|e| {
             HyperlaneDuskError::Other(format!(
-                "Invalid hex block hash '{}': {e}",
-                bounded_text(hash_hex)
+                "Invalid hex block hash '{}': {}",
+                bounded_text(hash_hex),
+                bounded_error(e)
             ))
         })?;
         if hash_bytes.len() != 32 {
@@ -252,8 +253,9 @@ impl HyperlaneProvider for DuskProvider {
         })?;
         let hash_bytes = hex::decode(hash_hex).map_err(|error| {
             HyperlaneDuskError::Other(format!(
-                "Invalid latest block hash '{}': {error}",
-                bounded_text(hash_hex)
+                "Invalid latest block hash '{}': {}",
+                bounded_text(hash_hex),
+                bounded_error(error)
             ))
         })?;
         if hash_bytes.len() != 32 {
@@ -273,7 +275,10 @@ impl HyperlaneProvider for DuskProvider {
 
 fn moonlight_identity_from_json(value: &str) -> Result<(H256, u64), HyperlaneDuskError> {
     let transaction: serde_json::Value = serde_json::from_str(value).map_err(|error| {
-        HyperlaneDuskError::Other(format!("Invalid ledger transaction JSON: {error}"))
+        HyperlaneDuskError::Other(format!(
+            "Invalid ledger transaction JSON: {}",
+            bounded_error(error)
+        ))
     })?;
     if transaction.get("type").and_then(serde_json::Value::as_str) != Some("moonlight") {
         return Err(HyperlaneDuskError::Other(
@@ -299,7 +304,10 @@ fn moonlight_identity_from_json(value: &str) -> Result<(H256, u64), HyperlaneDus
             ))
         })?;
     let sender_bytes = bs58::decode(sender_bs58).into_vec().map_err(|error| {
-        HyperlaneDuskError::Other(format!("Invalid Moonlight sender encoding: {error}"))
+        HyperlaneDuskError::Other(format!(
+            "Invalid Moonlight sender encoding: {}",
+            bounded_error(error)
+        ))
     })?;
     if sender_bytes.len() != 96 {
         return Err(HyperlaneDuskError::Other(format!(
