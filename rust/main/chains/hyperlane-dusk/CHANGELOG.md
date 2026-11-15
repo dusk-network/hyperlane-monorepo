@@ -4,6 +4,8 @@
 
 ### Changed
 
+- Contract queries were paced per endpoint, for every client of it in an agent process: 100 a second, in bursts of up to 20 and at most 8 at once by default (`contractQueriesPerSecond`, `contractQueryBurst`), inside the 180 a second, 360 in 2 s and 12 at once that Rusk 1.7.3 allows all of a node's clients together. A relayer restarted against a deployment with history sent 887 contract queries in its first 10 s, and the node refused 48, 9 of them the validators'.
+- A request the node refused for its rate limit (`429`) was sent again after the refusal's `Retry-After` plus up to as long again at random, doubling with each refusal in a row, up to 4 times, while every request of its class from the process waited out the refusal too. It used to fail at once, and the relayer's three indexers then backed off 5, 10, 20, ... 300 s in step and came back together.
 - The backward sequence cursor in `hyperlane-base` started a range above the logs its store already holds below the gap it fills. A relayer restarted after 40 of 99 Dusk messages arrived read all 99 again, at about 46 requests each, because the chunk of 1,999 sequences below the first missing one reached back to sequence 0.
 - The default Dusk `gasLimit` was 5,000,000 instead of 500,000,000. A failed transaction pays its whole limit, and a relayed `process` costs about 1.95M gas plus 0.22M per ISM signature; the deploy scripts already set 5,000,000 for the relayer.
 - Dispatch indexing read each message from its finalized `Dispatch` event, matched by the message ID the Mailbox stores (`dispatched_id`), because Mailbox state version 4 no longer stores dispatched messages.

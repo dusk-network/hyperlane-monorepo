@@ -4,6 +4,8 @@ use hyperlane_core::config::OpSubmissionConfig;
 use hyperlane_core::NativeToken;
 use url::Url;
 
+use crate::QueryRateLimit;
+
 /// Configuration for connecting to a Dusk node via RUES.
 #[derive(Clone)]
 pub struct ConnectionConf {
@@ -24,6 +26,9 @@ pub struct ConnectionConf {
     pub native_token: NativeToken,
     /// Operation submission configuration.
     pub op_submission_config: OpSubmissionConfig,
+    /// How many contract queries the agent sends the endpoint
+    /// (`contractQueriesPerSecond`, `contractQueryBurst`).
+    pub query_rate_limit: QueryRateLimit,
 }
 
 impl fmt::Debug for ConnectionConf {
@@ -37,6 +42,7 @@ impl fmt::Debug for ConnectionConf {
             .field("gas_price", &self.gas_price)
             .field("native_token", &self.native_token)
             .field("op_submission_config", &self.op_submission_config)
+            .field("query_rate_limit", &self.query_rate_limit)
             .finish()
     }
 }
@@ -58,6 +64,7 @@ mod tests {
             gas_price: 2_000,
             native_token: NativeToken::default(),
             op_submission_config: OpSubmissionConfig::default(),
+            query_rate_limit: QueryRateLimit::default(),
         };
         let rendered = format!("{connection:?}");
 

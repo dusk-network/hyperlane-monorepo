@@ -1980,6 +1980,7 @@ fn build_dusk_provider(
         connection_conf.url.clone(),
         connection_conf.event_cursor_dir.clone(),
     )?
+    .with_query_rate_limit(connection_conf.query_rate_limit)
     .with_identity(dusk_identity(chain_conf, connection_conf));
     Ok(h_dusk::DuskProvider::new(
         chain_conf.domain.clone(),
@@ -1996,6 +1997,7 @@ fn build_dusk_state_provider(
     // The client checks identity before its first read, inside the quorum's
     // deadline, so one unavailable endpoint does not veto the pool.
     let rues = h_dusk::RuesClient::new(connection_conf.url.clone())?
+        .with_query_rate_limit(connection_conf.query_rate_limit)
         .with_identity(dusk_identity(chain_conf, connection_conf));
     Ok(h_dusk::DuskProvider::new(
         chain_conf.domain.clone(),

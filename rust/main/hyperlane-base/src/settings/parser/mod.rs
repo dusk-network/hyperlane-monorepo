@@ -1333,6 +1333,55 @@ mod test {
     }
 
     #[test]
+    fn dusk_contract_queries_are_paced_at_a_configurable_rate() {
+        let mut value = json!({
+            "domainid": 1337, "chainid": 7, "name": "test", "protocol": "dusk",
+            "rpcurls": [{"http": "http://localhost:8080"}],
+            "eventcursordir": "/tmp/dusk-parser-events",
+            "mailbox": "0x0000000000000000000000000000000000000001",
+            "interchaingaspaymaster": "0x0000000000000000000000000000000000000002",
+            "validatorannounce": "0x0000000000000000000000000000000000000003",
+            "merkletreehook": "0x0000000000000000000000000000000000000004"
+        });
+        let limit = |value: &serde_json::Value| {
+            parse_chain(
+                ValueParser::new(Default::default(), value),
+                "test",
+                "fallback",
+            )
+            .map(|chain| {
+                let crate::settings::ChainConnectionConf::Dusk(connection) = chain.connection
+                else {
+                    panic!("expected Dusk transport");
+                };
+                connection.query_rate_limit
+            })
+        };
+        assert_eq!(
+            limit(&value).unwrap(),
+            hyperlane_dusk::QueryRateLimit {
+                per_second: 100,
+                burst: 20
+            }
+        );
+        value["contractqueriespersecond"] = json!(150);
+        value["contractqueryburst"] = json!(40);
+        assert_eq!(
+            limit(&value).unwrap(),
+            hyperlane_dusk::QueryRateLimit {
+                per_second: 150,
+                burst: 40
+            }
+        );
+        for key in ["contractqueriespersecond", "contractqueryburst"] {
+            let mut zero = value.clone();
+            zero[key] = json!(0);
+            let error = limit(&zero).expect_err("zero must be rejected").to_string();
+            assert!(error.contains("greater than zero"), "{key}: {error}");
+        }
+    }
+
+    #[test]
     fn rejects_zero_max_batch_size() {
         let value = serde_json::json!({
             "domainid": 1,

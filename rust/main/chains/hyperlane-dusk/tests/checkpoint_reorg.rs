@@ -148,6 +148,7 @@ impl ArchiveFixture {
                 gas_price: 1,
                 native_token: NativeToken::default(),
                 op_submission_config: OpSubmissionConfig::default(),
+                query_rate_limit: hyperlane_dusk::QueryRateLimit::default(),
             },
         ))
     }

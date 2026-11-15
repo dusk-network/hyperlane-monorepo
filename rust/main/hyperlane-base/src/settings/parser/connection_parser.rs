@@ -1100,6 +1100,28 @@ pub fn build_dusk_connection_conf(
         .parse_u64()
         .unwrap_or(1);
 
+    // Rusk's HTTP policy limits contract queries for all of a node's
+    // clients together (180 a second, 360 in 2 s, in Rusk 1.7.3).
+    let default_limit = hyperlane_dusk::QueryRateLimit::DEFAULT;
+    let mut positive = |key: &str, default: u32| {
+        let value = chain
+            .chain(err)
+            .get_opt_key(key)
+            .parse_u32()
+            .unwrap_or(default);
+        if value == 0 {
+            err.push(
+                (&chain.cwp).add(key.to_ascii_lowercase()),
+                eyre!("Dusk {key} must be greater than zero"),
+            );
+        }
+        value
+    };
+    let query_rate_limit = hyperlane_dusk::QueryRateLimit {
+        per_second: positive("contractQueriesPerSecond", default_limit.per_second),
+        burst: positive("contractQueryBurst", default_limit.burst),
+    };
+
     Some(ChainConnectionConf::Dusk(hyperlane_dusk::ConnectionConf {
         url,
         chain_id,
@@ -1108,6 +1130,7 @@ pub fn build_dusk_connection_conf(
         gas_price,
         native_token,
         op_submission_config: operation_batch,
+        query_rate_limit,
     }))
 }
 

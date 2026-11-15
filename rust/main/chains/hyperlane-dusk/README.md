@@ -19,6 +19,18 @@ how to run the local bridge.
   node must be built with the `archive` feature. Response bodies, the parse
   errors that quote them and the `dusk-tx` helper's output are cut to 1 KiB
   before they appear in errors or logs.
+- **Pacing.** Rusk 1.7.3 allows all of a node's clients together 180
+  contract queries a second, 360 in any 2 s and 12 at once, and answers the
+  rest `429 too_many_requests` with `Retry-After: 1`. Every client of one
+  endpoint in an agent process shares one pace for contract queries:
+  `contractQueriesPerSecond` (100 by default) and `contractQueryBurst` (20),
+  with at most 8 in flight, which leaves room for the node's other clients.
+  A request the node refuses for its rate limit, on any route, holds back
+  every request of its class from that process for the `Retry-After` plus up
+  to as long again at random, and is sent again after a wait that doubles
+  with each refusal in a row, also at random within it, so that indexers do
+  not come back together; after 4 refusals in a row (15 to 30 s) it fails.
+  The node refuses a request before it runs it, so sending it again is safe.
 - **Indexing** uses finalized contract events only. Each event is matched to
   its block and transaction, and stored in the agent's `eventCursorDir`, which
   every agent process needs its own copy of. The Mailbox stores only the ID of
@@ -210,6 +222,8 @@ how to run the local bridge.
   "eventCursorDir": "/var/lib/hyperlane/dusk-events",
   "gasLimit": 5000000,
   "gasPrice": 2000,
+  "contractQueriesPerSecond": 100,
+  "contractQueryBurst": 20,
   "mailbox": "0x<contract id>",
   "interchainGasPaymaster": "0x<contract id>",
   "validatorAnnounce": "0x<contract id>",
@@ -223,6 +237,11 @@ defaults to 5,000,000. A failed Dusk transaction pays its whole limit, so
 keep it close to what the agent needs: a relayed `process` costs about 1.95M
 gas plus 0.22M per signature the Dusk ISM checks, and a validator
 announcement about 2.1M.
+
+`contractQueriesPerSecond` and `contractQueryBurst` pace the agent's
+contract queries to its endpoint (see Pacing above); an operator of a node
+that serves only its own agents can raise them together with the node's
+`[http.policy.global_limits.classes.contract_query]`.
 
 The `duskKey` signer takes exactly one of `keyFile` (a regular file with no
 group or world permissions), `keyEnv` (an environment variable name) or `key`

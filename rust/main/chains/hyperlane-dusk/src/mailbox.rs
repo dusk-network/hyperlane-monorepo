@@ -789,6 +789,7 @@ mod tests {
                 gas_price: 1,
                 native_token: NativeToken::default(),
                 op_submission_config: OpSubmissionConfig::default(),
+                query_rate_limit: crate::QueryRateLimit::default(),
             },
         );
         let hook = DuskMerkleTreeHook::new(mailbox.clone());

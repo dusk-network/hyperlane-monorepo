@@ -19,6 +19,16 @@ pub enum HyperlaneDuskError {
         /// Response body.
         body: String,
     },
+    /// The endpoint refused a request for its rate limit each time the agent
+    /// sent it, waiting longer before each try. The endpoint ran none of
+    /// them; the caller tries again later.
+    #[error("Dusk endpoint refused a {class} request {refusals} times for its rate limit")]
+    RateLimited {
+        /// The class of request, as the endpoint limits it.
+        class: &'static str,
+        /// How many times it was refused.
+        refusals: u32,
+    },
     /// A response body over the agent's transport limit, refused from its
     /// declared length or once reading it passed the limit.
     #[error("{context} response exceeds {limit} bytes")]

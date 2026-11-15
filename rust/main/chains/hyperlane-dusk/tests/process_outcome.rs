@@ -275,6 +275,7 @@ impl Fixture {
                 gas_price: 2,
                 native_token: NativeToken::default(),
                 op_submission_config: OpSubmissionConfig::default(),
+                query_rate_limit: hyperlane_dusk::QueryRateLimit::default(),
             },
         )
     }

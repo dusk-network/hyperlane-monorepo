@@ -23,7 +23,10 @@ use hyperlane_core::{ReorgPeriod, H256, H512};
 
 use crate::HyperlaneDuskError;
 
+mod endpoint;
 mod event_log;
+pub use endpoint::QueryRateLimit;
+use endpoint::{Endpoint, RequestClass};
 use event_log::EventLogLocks;
 pub(crate) use event_log::{EventLog, LogEntry, LogLookup, BLOCK_LIMITS};
 
@@ -46,6 +49,9 @@ const MERKLE_TREE_HOOK_STATE_VERSION: u32 = 2;
 /// with the locations in `ValidatorAnnouncement` events.
 const VALIDATOR_ANNOUNCE_STATE_VERSION: u32 = 2;
 const TX_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// How many times a request the endpoint refuses for its rate limit is sent
+/// again before it fails. The waits in between add up to 15 to 30 s.
+const MAX_RATE_LIMIT_RETRIES: u32 = 4;
 /// Most non-final blocks a finality check reads. Rusk finalizes a block a
 /// few blocks after accepting it; a longer non-final chain means finality
 /// has stalled, and checks wait for it to catch up instead.
@@ -131,6 +137,9 @@ type IdentityGates = HashMap<DeploymentIdentity, Arc<IdentityGate>>;
 pub struct RuesClient {
     client: reqwest::Client,
     base_url: Url,
+    /// The endpoint's pace and refusals, shared by every client of it in
+    /// this process.
+    endpoint: Arc<Endpoint>,
     event_store: Option<Arc<DB>>,
     /// Serializes read-modify-write updates of the persisted scan anchors.
     scan_anchors: Arc<StdMutex<()>>,
@@ -792,6 +801,7 @@ impl RuesClient {
         let base_url = url;
         Ok(Self {
             client,
+            endpoint: Endpoint::of(&base_url),
             base_url,
             event_store: None,
             scan_anchors: Arc::new(StdMutex::new(())),
@@ -801,6 +811,13 @@ impl RuesClient {
             identity: None,
             identity_gates: Arc::new(StdMutex::new(HashMap::new())),
         })
+    }
+
+    /// This client, with every client of its endpoint in this process
+    /// pacing contract queries at `limit`.
+    pub fn with_query_rate_limit(self, limit: QueryRateLimit) -> Self {
+        self.endpoint.set_query_rate_limit(limit);
+        self
     }
 
     /// This client, but every request it sends first checks, once, that the
@@ -926,6 +943,52 @@ impl RuesClient {
         url.set_path(&format!("{}{path}", url.path().trim_end_matches('/')));
         url.set_fragment(None);
         url
+    }
+
+    /// POST `body` to `url`, a route of `class`. A contract query waits for
+    /// its slot in the endpoint's pace first. A request the endpoint refuses
+    /// for its rate limit (`429`) is sent again once the wait the refusal
+    /// asks for has passed, longer after each refusal in a row and at random
+    /// within it, up to `MAX_RATE_LIMIT_RETRIES` times; Rusk's policy
+    /// refuses a request before running it, so sending it again is safe.
+    async fn send(
+        &self,
+        class: RequestClass,
+        url: Url,
+        body: Vec<u8>,
+    ) -> Result<reqwest::Response, HyperlaneDuskError> {
+        let mut refusals = 0u32;
+        loop {
+            let in_flight = self.endpoint.admit(class).await;
+            let response = self
+                .client
+                .post(url.clone())
+                .headers(self.default_headers())
+                .body(body.clone())
+                .send()
+                .await?;
+            drop(in_flight);
+            if response.status() != StatusCode::TOO_MANY_REQUESTS {
+                return Ok(response);
+            }
+            refusals += 1;
+            let delay =
+                self.endpoint
+                    .refused(class, endpoint::retry_after(response.headers()), refusals);
+            if refusals > MAX_RATE_LIMIT_RETRIES {
+                return Err(HyperlaneDuskError::RateLimited {
+                    class: class.name(),
+                    refusals,
+                });
+            }
+            debug!(
+                class = class.name(),
+                refusals,
+                ?delay,
+                "Dusk endpoint refused a request for its rate limit; sending it again later"
+            );
+            tokio::time::sleep(delay).await;
+        }
     }
 
     /// Query the native Dusk chain ID from the transfer contract.
@@ -1122,11 +1185,7 @@ impl RuesClient {
         let url = self.endpoint(&format!("/on/contracts:{contract_hex}/{method}"));
 
         let response = self
-            .client
-            .post(url)
-            .headers(self.default_headers())
-            .body(body.to_vec())
-            .send()
+            .send(RequestClass::ContractQuery, url, body.to_vec())
             .await?;
 
         let status = response.status();
@@ -1147,13 +1206,7 @@ impl RuesClient {
         let contract_hex = hex::encode(contract_id);
         let url = self.endpoint(&format!("/on/contract:{contract_hex}/metadata"));
 
-        let response = self
-            .client
-            .post(url)
-            .headers(self.default_headers())
-            .body(Vec::new())
-            .send()
-            .await?;
+        let response = self.send(RequestClass::Other, url, Vec::new()).await?;
 
         let status = response.status();
         let response_body = read_bounded_body(response, "contract metadata query").await?;
@@ -1211,11 +1264,7 @@ impl RuesClient {
         // Preverify first
         let preverify_url = self.endpoint("/on/transactions/preverify");
         let response = self
-            .client
-            .post(preverify_url)
-            .headers(self.default_headers())
-            .body(tx_bytes.to_vec())
-            .send()
+            .send(RequestClass::Other, preverify_url, tx_bytes.to_vec())
             .await?;
 
         let status = response.status();
@@ -1227,11 +1276,7 @@ impl RuesClient {
         let url = self.endpoint("/on/transactions/propagate");
 
         let response = self
-            .client
-            .post(url)
-            .headers(self.default_headers())
-            .body(tx_bytes.to_vec())
-            .send()
+            .send(RequestClass::Other, url, tx_bytes.to_vec())
             .await?;
 
         let status = response.status();
@@ -1256,11 +1301,7 @@ impl RuesClient {
         let url = self.endpoint("/on/graphql/query");
 
         let response = self
-            .client
-            .post(url)
-            .headers(self.default_headers())
-            .body(query.as_bytes().to_vec())
-            .send()
+            .send(RequestClass::Graphql, url, query.as_bytes().to_vec())
             .await?;
 
         let status = response.status();
@@ -2659,13 +2700,7 @@ impl RuesClient {
         self.ensure_identity().await?;
         let url = self.endpoint(&format!("/on/account:{bs58_pk}/status"));
 
-        let response = self
-            .client
-            .post(url)
-            .headers(self.default_headers())
-            .body(Vec::new())
-            .send()
-            .await?;
+        let response = self.send(RequestClass::Other, url, Vec::new()).await?;
 
         let status = response.status();
         let body = read_bounded_body(response, "account status query").await?;
@@ -2717,11 +2752,11 @@ impl RuesClient {
         let url = self.endpoint("/on/blocks/gas-price");
 
         let response = self
-            .client
-            .post(url)
-            .headers(self.default_headers())
-            .body(max_transactions.to_string())
-            .send()
+            .send(
+                RequestClass::Other,
+                url,
+                max_transactions.to_string().into_bytes(),
+            )
             .await?;
 
         let status = response.status();
