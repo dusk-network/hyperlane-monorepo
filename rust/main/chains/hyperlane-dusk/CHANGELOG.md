@@ -4,6 +4,7 @@
 
 ### Changed
 
+- The backward sequence cursor in `hyperlane-base` started a range above the logs its store already holds below the gap it fills. A relayer restarted after 40 of 99 Dusk messages arrived read all 99 again, at about 46 requests each, because the chunk of 1,999 sequences below the first missing one reached back to sequence 0.
 - The default Dusk `gasLimit` was 5,000,000 instead of 500,000,000. A failed transaction pays its whole limit, and a relayed `process` costs about 1.95M gas plus 0.22M per ISM signature; the deploy scripts already set 5,000,000 for the relayer.
 - Dispatch indexing read each message from its finalized `Dispatch` event, matched by the message ID the Mailbox stores (`dispatched_id`), because Mailbox state version 4 no longer stores dispatched messages.
 

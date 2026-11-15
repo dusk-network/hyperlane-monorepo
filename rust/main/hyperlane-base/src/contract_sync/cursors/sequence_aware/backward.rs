@@ -413,7 +413,34 @@ impl<T: Debug + Clone + Sync + Send + Indexable + 'static> BackwardSequenceAware
             // Use the lowest sequence as the low bound of the range
             // if the calculated low is less than the lowest sequence.
             .max(lowest_block_height_or_sequence);
+        // Logs the store already holds below the gap are skipped next anyway,
+        // so the range starts above them instead of reading them again.
+        let low = self
+            .gap_start(low, current_indexing_snapshot.sequence)
+            .await;
         Some(low..=current_indexing_snapshot.sequence)
+    }
+
+    /// The lowest sequence, from `low` up, of the run of sequences ending at
+    /// `sequence` whose logs the store does not hold. If the store cannot be
+    /// read, the run starts at `low`.
+    async fn gap_start(&self, low: u32, sequence: u32) -> u32 {
+        let mut start = sequence;
+        while start > low {
+            match self.get_sequence_log_block_number(start - 1).await {
+                Ok(None) => start -= 1,
+                Ok(Some(_)) => break,
+                Err(error) => {
+                    warn!(
+                        ?error,
+                        "Failed to read indexed logs below a sequence gap, querying the whole chunk"
+                    );
+                    return low;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+        start
     }
 
     /// Get the lowest block height or sequence.
@@ -1838,6 +1865,76 @@ mod test {
         async fn get_cursor() -> BackwardSequenceAwareSyncCursor<MockSequencedData> {
             get_test_backward_sequence_aware_sync_cursor(INDEX_MODE, CHUNK_SIZE, LOWEST_SEQUENCE)
                 .await
+        }
+
+        /// The mock store, holding `sequences` at block `900 + sequence`.
+        fn store_holding(
+            sequences: impl Iterator<Item = u32>,
+        ) -> Arc<MockHyperlaneSequenceAwareIndexerStore<MockSequencedData>> {
+            Arc::new(MockHyperlaneSequenceAwareIndexerStore {
+                logs: sequences
+                    .map(|sequence| {
+                        (
+                            MockSequencedData::new(sequence),
+                            log_meta_with_block(900 + u64::from(sequence)),
+                        )
+                    })
+                    .collect(),
+            })
+        }
+
+        #[tracing_test::traced_test]
+        #[tokio::test]
+        async fn test_range_starts_above_the_logs_the_store_holds() {
+            let mut cursor = get_cursor().await;
+            cursor.chunk_size = 100;
+            // As after a restart: the store holds the history up to 40, and
+            // the logs from 41 to 99 arrived while the agent was stopped.
+            cursor.store = store_holding((0..=40).chain(100..=102));
+
+            // The chunk reaches down to 0, but 0 to 40 are not read again.
+            let range = cursor.get_next_range().await.unwrap().unwrap();
+            assert_eq!(range, 41..=99);
+            cursor
+                .update(
+                    range
+                        .clone()
+                        .map(|i| {
+                            (
+                                MockSequencedData::new(i).into(),
+                                log_meta_with_block(900 + u64::from(i)),
+                            )
+                        })
+                        .collect(),
+                    range,
+                )
+                .await
+                .unwrap();
+
+            // The cursor passes the logs the store holds and is done.
+            assert_eq!(cursor.get_next_range().await.unwrap(), None);
+            assert_eq!(cursor.current_indexing_snapshot, None);
+            assert_eq!(
+                cursor.last_indexed_snapshot,
+                LastIndexedSnapshot {
+                    sequence: Some(0),
+                    at_block: 900,
+                }
+            );
+        }
+
+        #[tracing_test::traced_test]
+        #[tokio::test]
+        async fn test_range_below_a_gap_of_held_logs_starts_at_the_gap() {
+            let mut cursor = get_cursor().await;
+            cursor.chunk_size = 100;
+            // Held logs inside the chunk, with gaps above and below them:
+            // only the gap that ends at the current sequence is read.
+            cursor.store = store_holding((10..=20).chain(50..=60).chain(100..=102));
+            assert_eq!(cursor.get_next_range().await.unwrap(), Some(61..=99));
+            // A chunk that ends below the held logs is unchanged.
+            cursor.chunk_size = 5;
+            assert_eq!(cursor.get_next_range().await.unwrap(), Some(94..=99));
         }
 
         #[tracing_test::traced_test]

@@ -81,6 +81,7 @@ jobs:
               rust/main/chains/hyperlane-dusk/*|\
               rust/main/hyperlane-base/Cargo.toml|\
               rust/main/hyperlane-base/src/contract_sync/cursors/mod.rs|\
+              rust/main/hyperlane-base/src/contract_sync/cursors/sequence_aware/backward.rs|\
               rust/main/hyperlane-base/src/settings/chains.rs|\
               rust/main/hyperlane-base/src/settings/checkpoint_syncer.rs|\
               rust/main/hyperlane-base/src/settings/parser/connection_parser.rs|\

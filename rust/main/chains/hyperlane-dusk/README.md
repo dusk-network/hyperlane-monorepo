@@ -283,7 +283,10 @@ directory.
 
 The integration also touches shared code: Dusk connection and signer parsing
 in `hyperlane-base`, the `Dusk` protocol in `hyperlane-core`, and validator
-startup, checkpoint consensus and reorg reporting. It also carries a fix for
+startup, checkpoint consensus and reorg reporting. The backward
+sequence-aware cursor starts a range above the logs its store already holds
+below the gap it fills, so a restart reads only the logs that arrived while
+the agent was stopped, instead of the whole chunk below them. It also carries a fix for
 upstream checkpoint quorums, which counted signatures over different message
 IDs together (`hyperlane-base`'s multisig syncer, `hyperlane-core`'s
 checkpoint types and the relayer's message-ID multisig metadata). The
