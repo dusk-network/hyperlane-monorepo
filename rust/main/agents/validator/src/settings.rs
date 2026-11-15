@@ -1028,7 +1028,8 @@ mod dusk_rpc_tests {
         WrongMerkleMailbox,
         WrongRequiredHook,
         AnnounceUnavailable,
-        /// A Mailbox from before `dispatched_id` (state version 3).
+        /// A Mailbox that still stores the processed-message log (state
+        /// version 4).
         OldMailbox,
     }
 
@@ -1159,11 +1160,14 @@ mod dusk_rpc_tests {
                         (200, vec![3])
                     } else if path.ends_with(&format!("{:064x}/state_version", 1)) {
                         let version: u32 = if current == Fault::OldMailbox as u8 {
-                            3
-                        } else {
                             4
+                        } else {
+                            5
                         };
                         (200, version.to_le_bytes().to_vec())
+                    } else if path.ends_with("/state_version") {
+                        // ValidatorAnnounce and MerkleTreeHook.
+                        (200, 2u32.to_le_bytes().to_vec())
                     } else if path.ends_with("/mailbox") {
                         let wrong = (path.ends_with(&format!("{:064x}/mailbox", 3))
                             && current == Fault::WrongAnnounceMailbox as u8)
@@ -1689,8 +1693,8 @@ mod dusk_rpc_tests {
         for checkpoint in votes.iter().flatten() {
             assert_checkpoint(checkpoint);
         }
-        assert_eq!(nodes[0].identity_reads.load(Ordering::SeqCst), 8);
-        assert_eq!(nodes[2].identity_reads.load(Ordering::SeqCst), 8);
+        assert_eq!(nodes[0].identity_reads.load(Ordering::SeqCst), 10);
+        assert_eq!(nodes[2].identity_reads.load(Ordering::SeqCst), 10);
     }
 
     async fn identity_failure_blocks_every_read_and_can_recover(fault: Fault) {
@@ -1777,7 +1781,7 @@ mod dusk_rpc_tests {
         );
         assert_eq!(count.expect("healthy hook returns count"), 1);
         assert_checkpoint(&checkpoint.expect("healthy hook returns checkpoint"));
-        assert_eq!(node.identity_reads.load(Ordering::SeqCst), 8);
+        assert_eq!(node.identity_reads.load(Ordering::SeqCst), 10);
     }
 
     #[tokio::test]

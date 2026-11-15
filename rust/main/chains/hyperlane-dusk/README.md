@@ -79,17 +79,22 @@ how to run the local bridge.
   falls more than 64 blocks behind the tip, the checks wait for it to catch
   up instead of reading every block.
 - **Identity checks.** On startup the agent checks that the node's chain ID
-  and the configured contracts agree with each other: the Mailbox domain and
-  `state_version`, and the ValidatorAnnounce and Merkle hook bindings to that
-  Mailbox. A Mailbox below `state_version` 4 is refused with an explicit
-  error. Startup waits for the node instead of failing when it is unreachable.
+  and the configured contracts agree with each other: the Mailbox and
+  ValidatorAnnounce domains, each contract's `state_version`, and the
+  ValidatorAnnounce and Merkle hook bindings to that Mailbox. The agent
+  accepts only the state versions it reads (Mailbox 5, MerkleTreeHook 2,
+  ValidatorAnnounce 2) and refuses any other with an explicit error, since
+  another version lacks queries the agent uses. Startup waits for the node
+  instead of failing when it is unreachable.
 - **Checkpoints** are read at consensus finality, adjusted by the configured
   reorg period.
 
 ## Supported
 
 - `index.mode: sequence` only.
-- A Mailbox that stores dispatched message IDs (`state_version` 4 or later).
+- Mailbox `state_version` 5, MerkleTreeHook 2 and ValidatorAnnounce 2: the
+  contracts whose growing state is chunked, which keep deliveries, Merkle
+  roots and announced locations out of contract state.
 - Security modules: `MessageIdMultisig`, plus the companion repository's
   test-only null ISM. Routing, Aggregation and CCIP-read ISMs return an
   explicit unsupported error.

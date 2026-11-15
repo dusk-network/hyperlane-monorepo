@@ -10,6 +10,7 @@
 - Finalized-event indexing matched every record of a block in one pass over that block's archive rows, 200 rows per `finalizedEvents` page (Rusk's maximum), instead of rescanning the block from its first row for each record. A block of 256 dispatches took 3 pages instead of 4,224.
 - Archive scan positions were kept in `eventCursorDir`, about one per 200 rows, so a restart resumed near the block it needed instead of at the contract's first row. A position was reused only after the archive returned the row it was taken from, unchanged.
 - Startup refused a Mailbox below `state_version` 4 with an explicit error, instead of every dispatch fetch failing later with an unexplained HTTP 500.
+- Startup required Mailbox `state_version` 5, MerkleTreeHook 2 and ValidatorAnnounce 2, the versions this agent reads, and refused any other, newer ones included. It used to accept any Mailbox from version 4 on, so an agent started against the redesigned contracts and then failed on queries they no longer have.
 
 ### Fixed
 

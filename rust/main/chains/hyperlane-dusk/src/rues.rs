@@ -31,9 +31,15 @@ const MAX_EVENT_TOPIC_BYTES: usize = 256;
 const SCAN_ANCHOR_SPACING: u64 = FINALIZED_EVENT_PAGE_SIZE as u64;
 /// Most bytes of a response body that go into an error or a log line.
 const MAX_ERROR_BODY_BYTES: usize = 1024;
-/// First Mailbox state version that stores only dispatched message IDs
-/// (`dispatched_id`), which dispatch indexing reads.
-const MIN_MAILBOX_STATE_VERSION: u32 = 4;
+/// The Mailbox state version this agent reads: dispatched message IDs
+/// (`dispatched_id`), and deliveries from `ProcessId` events only.
+const MAILBOX_STATE_VERSION: u32 = 5;
+/// The MerkleTreeHook state version this agent reads: stored message IDs,
+/// from which checkpoints compute their roots (no `root_at`).
+const MERKLE_TREE_HOOK_STATE_VERSION: u32 = 2;
+/// The ValidatorAnnounce state version this agent reads: location hashes,
+/// with the locations in `ValidatorAnnouncement` events.
+const VALIDATOR_ANNOUNCE_STATE_VERSION: u32 = 2;
 const TX_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Most non-final blocks a finality check reads. Rusk finalizes a block a
 /// few blocks after accepting it; a longer non-final chain means finality
@@ -772,7 +778,20 @@ impl RuesClient {
                 )));
             }
         }
-        self.validate_mailbox_state_version(mailbox_id).await?;
+        self.validate_state_version(
+            mailbox_id,
+            "Mailbox",
+            MAILBOX_STATE_VERSION,
+            "stores dispatched message IDs (dispatched_id) and leaves deliveries to ProcessId events",
+        )
+        .await?;
+        self.validate_state_version(
+            validator_announce_id,
+            "ValidatorAnnounce",
+            VALIDATOR_ANNOUNCE_STATE_VERSION,
+            "stores location hashes (get_announced_storage_location_hashes) and leaves the locations to ValidatorAnnouncement events",
+        )
+        .await?;
         self.validate_mailbox_binding(validator_announce_id, mailbox_id, "ValidatorAnnounce")
             .await?;
 
@@ -790,6 +809,13 @@ impl RuesClient {
                 "Configured Dusk MerkleTreeHook does not have MerkleTree hook_type 3".into(),
             ));
         }
+        self.validate_state_version(
+            merkle_tree_hook_id,
+            "MerkleTreeHook",
+            MERKLE_TREE_HOOK_STATE_VERSION,
+            "stores the inserted message IDs (message_ids) that checkpoint roots are computed from",
+        )
+        .await?;
         if required == *merkle_tree_hook_id {
             self.validate_mailbox_binding(merkle_tree_hook_id, mailbox_id, "MerkleTreeHook")
                 .await?;
@@ -834,23 +860,28 @@ impl RuesClient {
         Ok(())
     }
 
-    /// Dispatch indexing reads `dispatched_id`, which older Mailboxes lack:
-    /// every dispatch fetch would fail with an unexplained node error.
-    async fn validate_mailbox_state_version(
+    /// Each state version names the queries and events a contract offers,
+    /// and contracts cannot be upgraded. An agent reading another version
+    /// fails later on a query that is gone, with an unexplained node error,
+    /// so only the version this agent reads is accepted.
+    async fn validate_state_version(
         &self,
-        mailbox_id: &[u8; 32],
+        contract: &[u8; 32],
+        label: &str,
+        expected: u32,
+        what: &str,
     ) -> Result<(), HyperlaneDuskError> {
         let state_version: u32 = self
-            .contract_query(mailbox_id, "state_version", &())
+            .contract_query(contract, "state_version", &())
             .await
             .map_err(|error| {
                 HyperlaneDuskError::Other(format!(
-                    "Failed to query Dusk Mailbox state_version (this agent needs state_version {MIN_MAILBOX_STATE_VERSION} or later): {error}"
+                    "Failed to query Dusk {label} state_version (this agent needs state_version {expected}): {error}"
                 ))
             })?;
-        if state_version < MIN_MAILBOX_STATE_VERSION {
+        if state_version != expected {
             return Err(HyperlaneDuskError::Other(format!(
-                "Dusk Mailbox state_version {state_version} is not supported: this agent needs state_version {MIN_MAILBOX_STATE_VERSION} or later, which stores dispatched message IDs (dispatched_id). Deploy a Mailbox that matches this agent's hyperlane-dusk-types pin"
+                "Dusk {label} state_version {state_version} is not supported: this agent needs state_version {expected}, which {what}. Deploy contracts that match this agent's hyperlane-dusk-types pin"
             )));
         }
         Ok(())
@@ -4327,7 +4358,11 @@ mod tests {
                 (200, vec![1]),
                 (200, rkyv_serialize(&4242u32).unwrap()),
                 (200, rkyv_serialize(&4242u32).unwrap()),
-                (200, rkyv_serialize(&MIN_MAILBOX_STATE_VERSION).unwrap()),
+                (200, rkyv_serialize(&MAILBOX_STATE_VERSION).unwrap()),
+                (
+                    200,
+                    rkyv_serialize(&VALIDATOR_ANNOUNCE_STATE_VERSION).unwrap(),
+                ),
                 (200, rkyv_serialize(&mailbox).unwrap()),
             ]
         };
@@ -4335,6 +4370,10 @@ mod tests {
         direct.extend([
             (200, rkyv_serialize(&merkle).unwrap()),
             (200, vec![3]),
+            (
+                200,
+                rkyv_serialize(&MERKLE_TREE_HOOK_STATE_VERSION).unwrap(),
+            ),
             (200, rkyv_serialize(&mailbox).unwrap()),
         ]);
         RuesClient::new(test_server(direct))
@@ -4347,6 +4386,10 @@ mod tests {
             responses.extend([
                 (200, rkyv_serialize(&aggregate).unwrap()),
                 (200, vec![3]),
+                (
+                    200,
+                    rkyv_serialize(&MERKLE_TREE_HOOK_STATE_VERSION).unwrap(),
+                ),
                 (200, vec![2]),
                 (200, rkyv_serialize(&mailbox).unwrap()),
                 (200, rkyv_serialize(&vec![merkle, foreign]).unwrap()),
@@ -4362,29 +4405,44 @@ mod tests {
         for (position, bytes, diagnostic) in [
             (
                 3,
-                rkyv_serialize(&(MIN_MAILBOX_STATE_VERSION - 1)).unwrap(),
-                "Dusk Mailbox state_version 3 is not supported",
+                rkyv_serialize(&4u32).unwrap(),
+                "Dusk Mailbox state_version 4 is not supported: this agent needs state_version 5",
+            ),
+            (
+                3,
+                rkyv_serialize(&6u32).unwrap(),
+                "Dusk Mailbox state_version 6 is not supported",
             ),
             (
                 4,
+                rkyv_serialize(&1u32).unwrap(),
+                "Dusk ValidatorAnnounce state_version 1 is not supported: this agent needs state_version 2",
+            ),
+            (
+                5,
                 rkyv_serialize(&foreign).unwrap(),
                 "ValidatorAnnounce mailbox",
             ),
-            (6, vec![2], "MerkleTree hook_type"),
-            (7, vec![1], "required_hook"),
+            (7, vec![2], "MerkleTree hook_type"),
             (
                 8,
+                rkyv_serialize(&1u32).unwrap(),
+                "Dusk MerkleTreeHook state_version 1 is not supported: this agent needs state_version 2",
+            ),
+            (9, vec![1], "required_hook"),
+            (
+                10,
                 rkyv_serialize(&foreign).unwrap(),
                 "required aggregation hook mailbox",
             ),
-            (9, rkyv_serialize(&vec![foreign]).unwrap(), "exactly once"),
+            (11, rkyv_serialize(&vec![foreign]).unwrap(), "exactly once"),
             (
-                9,
+                11,
                 rkyv_serialize(&vec![merkle, merkle]).unwrap(),
                 "exactly once",
             ),
             (
-                10,
+                12,
                 rkyv_serialize(&mailbox).unwrap(),
                 "MerkleTreeHook mailbox",
             ),
@@ -4402,7 +4460,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mailboxes_older_than_state_version_4_are_refused() {
+    async fn contracts_of_another_state_version_are_refused() {
         let mailbox = [3u8; 32];
         let identity = |state_version: (u16, Vec<u8>)| {
             RuesClient::new(test_server(vec![
@@ -4413,7 +4471,9 @@ mod tests {
             ]))
             .unwrap()
         };
-        for version in [0u32, 1, 3] {
+        // Version 4 stored the processed-message log and root_at that this
+        // agent no longer reads, and the Mailbox dropped them in version 5.
+        for version in [0u32, 1, 3, 4, 6] {
             let error = identity((200, rkyv_serialize(&version).unwrap()))
                 .validate_chain_identity(1, 4242, &mailbox, &[4u8; 32], &[5u8; 32])
                 .await
@@ -4421,7 +4481,7 @@ mod tests {
                 .to_string();
             assert!(
                 error.contains(&format!("state_version {version} is not supported"))
-                    && error.contains("state_version 4 or later"),
+                    && error.contains("needs state_version 5"),
                 "{error}"
             );
         }
@@ -4433,7 +4493,7 @@ mod tests {
             .to_string();
         assert!(
             error.contains("Failed to query Dusk Mailbox state_version")
-                && error.contains("state_version 4 or later"),
+                && error.contains("needs state_version 5"),
             "{error}"
         );
     }
