@@ -505,7 +505,8 @@ async fn a_block_the_endpoint_no_longer_reports_final_drops_the_log() {
     fixture.node().rejected.push(10);
     let error = indexer.fetch_logs_in_range(0..=0).await.unwrap_err();
     assert!(error.to_string().contains("no longer accepts"), "{error}");
-    // The log was dropped; once the endpoint agrees again it is rebuilt.
+    // The log dropped its entries; once the endpoint agrees again, it reads
+    // them again under the same sequences.
     fixture.node().rejected.clear();
     assert_eq!(all_deliveries(&indexer).await, [(0, message(1), 1, 10)]);
 }
