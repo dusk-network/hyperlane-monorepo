@@ -24,8 +24,9 @@ const DUSK_TX_HELPER_TIMEOUT: Duration = Duration::from_secs(120);
 const DUSK_TX_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_RUES_URL_STDIN_BYTES: usize = 8 * 1024;
 const MAX_DUSK_TX_STREAM_BYTES: usize = 1024 * 1024;
+/// The most bytes of serialized call arguments the `dusk-tx` helper accepts
+/// (`MAX_CALL_ARGS_BYTES` in the companion repository's `dusk-tx`).
 const MAX_DUSK_TX_ARGS_BYTES: usize = 60 * 1024;
-const MAX_PROCESS_PAYLOAD_BYTES: usize = MAX_DUSK_TX_ARGS_BYTES - 1024;
 
 /// Send a contract call via the `dusk-tx` CLI binary.
 ///
@@ -408,6 +409,11 @@ pub fn h512_to_dusk_tx_id(transaction_id: &H512) -> Result<String, HyperlaneDusk
 }
 
 /// Build rkyv-serialized args for mailbox.process(metadata, encoded_message).
+///
+/// The `dusk-tx` helper limits the serialized arguments, not the payload, so
+/// this refuses exactly what the helper would refuse. Serialized arguments
+/// are never shorter than the bytes they carry, so a payload over the limit
+/// is refused before it is copied.
 pub fn process_args(
     metadata: &[u8],
     encoded_message: &[u8],
@@ -416,15 +422,16 @@ pub fn process_args(
         .len()
         .checked_add(encoded_message.len())
         .ok_or_else(|| HyperlaneDuskError::Other("Dusk process payload length overflow".into()))?;
-    if payload_len > MAX_PROCESS_PAYLOAD_BYTES {
+    if payload_len > MAX_DUSK_TX_ARGS_BYTES {
         return Err(HyperlaneDuskError::Other(format!(
-            "Dusk process metadata and message exceed the {MAX_PROCESS_PAYLOAD_BYTES}-byte payload limit"
+            "Dusk process metadata and message ({payload_len} bytes) exceed the {MAX_DUSK_TX_ARGS_BYTES}-byte argument limit of the dusk-tx helper"
         )));
     }
     let args = rkyv_serialize(&(metadata.to_vec(), encoded_message.to_vec()))?;
     if args.len() > MAX_DUSK_TX_ARGS_BYTES {
         return Err(HyperlaneDuskError::Other(format!(
-            "Serialized Dusk process arguments exceed the {MAX_DUSK_TX_ARGS_BYTES}-byte helper transport limit"
+            "Serialized Dusk process arguments ({} bytes) exceed the {MAX_DUSK_TX_ARGS_BYTES}-byte argument limit of the dusk-tx helper",
+            args.len()
         )));
     }
     Ok(args)
@@ -468,9 +475,39 @@ mod tests {
 
     #[test]
     fn process_payload_is_bounded_before_helper_transport() {
-        let oversized = vec![0u8; MAX_PROCESS_PAYLOAD_BYTES + 1];
+        let oversized = vec![0u8; MAX_DUSK_TX_ARGS_BYTES + 1];
         let error = process_args(&oversized, &[]).unwrap_err();
-        assert!(error.to_string().contains("payload limit"));
+        assert!(error.to_string().contains("dusk-tx helper"), "{error}");
+    }
+
+    /// The helper refuses serialized arguments over `MAX_DUSK_TX_ARGS_BYTES`
+    /// and nothing else, so the adapter accepts every message whose
+    /// serialized arguments fit and refuses every one that does not.
+    #[test]
+    fn process_arguments_are_limited_exactly_as_the_helper_limits_them() {
+        let metadata = vec![7u8; 1_000];
+        let serialized_len = |message_len: usize| {
+            rkyv_serialize(&(metadata.clone(), vec![0u8; message_len]))
+                .unwrap()
+                .len()
+        };
+        // The longest message whose serialized arguments fit the helper.
+        let fitting = (0..MAX_DUSK_TX_ARGS_BYTES)
+            .rev()
+            .find(|len| serialized_len(*len) <= MAX_DUSK_TX_ARGS_BYTES)
+            .unwrap();
+        // Well past the old 60,416-byte payload reserve.
+        assert!(metadata.len() + fitting > MAX_DUSK_TX_ARGS_BYTES - 1024);
+        let args = process_args(&metadata, &vec![0u8; fitting]).unwrap();
+        assert_eq!(args.len(), serialized_len(fitting));
+        assert!(args.len() <= MAX_DUSK_TX_ARGS_BYTES);
+        let error = process_args(&metadata, &vec![0u8; fitting + 1]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Serialized Dusk process arguments"),
+            "{error}"
+        );
     }
 
     #[test]

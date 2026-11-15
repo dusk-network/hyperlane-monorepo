@@ -558,6 +558,11 @@ async fn oversized_process_payload_fails_before_simulation() {
         .process_estimate_costs(&message(), &Metadata::new(vec![0; 60 * 1024]))
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("payload limit"), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("argument limit of the dusk-tx helper"),
+        "{error}"
+    );
     assert_eq!(fixture.simulations(), 0);
 }

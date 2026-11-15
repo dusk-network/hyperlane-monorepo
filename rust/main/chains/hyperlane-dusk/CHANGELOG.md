@@ -13,6 +13,7 @@
 
 ### Fixed
 
+- A relayed `process` was refused once its metadata and message passed 60,416 bytes, 1 KiB short of the 61,440 bytes of serialized arguments the `dusk-tx` helper accepts. The arguments are now serialized first and refused exactly when the helper would refuse them.
 - A Dusk delivery counted only once its block was final, whoever delivered the message. The relayer used to mark a message processed as soon as the node's tip held its delivery, and never retried it: if finality stalled past the relayer's confirmation delay and a rollback dropped the delivery, the message was lost. While no final block held the delivery, `delivered` failed and the relayer checked again later; a rolled-back delivery read as not delivered, and the message was relayed again.
 - A validator's startup waited until its announcement's block was final, instead of ending as soon as the node's tip held an announcement that a rollback could still drop.
 - Checkpoint quorums counted only signatures over the same checkpoint, and message-ID multisig metadata only signatures over the message's own ID. A validator that signed the right root and index with another message ID used to join the honest signatures' group, which then failed to form one quorum and aborted the whole fetch: a validator that answered first could hold back delivery for good.
