@@ -51,6 +51,8 @@ pub struct RuesClient {
     event_store: Option<Arc<DB>>,
     /// Serializes read-modify-write updates of the persisted scan anchors.
     scan_anchors: Arc<StdMutex<()>>,
+    /// Finalized blocks' archive rows, shared by every clone of the client.
+    block_cache: Arc<StdMutex<BlockCache>>,
 }
 
 impl fmt::Debug for RuesClient {
@@ -300,14 +302,270 @@ impl ScanAnchor {
 
 /// How a scan from an anchor, or from the contract's first row, ended.
 enum ScanOutcome {
-    /// The scan ran; the rows it matched.
-    Done(ScannedRows),
+    /// The scan ran: the rows it matched, and the scanned block's rows when
+    /// it read all of them within the cache bound.
+    Done {
+        found: ScannedRows,
+        block: Option<CachedBlock>,
+    },
     /// The archive returned another row where the anchor's fence row was,
     /// or has finalized the fence row's block without that row, so the
     /// anchor does not belong to this archive.
     WrongAnchor,
     /// The archive has not reached the anchor's fence row yet.
     ArchiveBehind(ScanAnchor),
+}
+
+/// A row of the scanned block that can be a sequence's record: not
+/// reverted, of the scan's topic, with hex event data, decoded here once.
+/// Any other row never matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlockRow {
+    block_hash: String,
+    origin: String,
+    data: Vec<u8>,
+}
+
+impl BlockRow {
+    /// Memory the row takes, for the cache bound.
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.block_hash.len() + self.origin.len() + self.data.len()
+    }
+
+    /// The row as the record of `sequence`, which carries the sequence as
+    /// its ID.
+    fn record(
+        &self,
+        contract_id: &[u8; 32],
+        topic: &str,
+        block_height: u64,
+        sequence: usize,
+    ) -> Result<FinalizedContractEvent, HyperlaneDuskError> {
+        Ok(FinalizedContractEvent {
+            id: i64::try_from(sequence).map_err(|_| {
+                HyperlaneDuskError::Other(
+                    "Dusk finalized-event sequence exceeds i64 provenance range".into(),
+                )
+            })?,
+            block_height,
+            block_hash: self.block_hash.clone(),
+            origin: self.origin.clone(),
+            topic: topic.to_owned(),
+            source: hex::encode(contract_id),
+            data: hex::encode(&self.data),
+            reverted: false,
+        })
+    }
+}
+
+/// Give each wanted sequence that has no row yet the first row, in archive
+/// order, whose data `matching_sequences` assigns to it. A scan and the
+/// block cache match rows only through this.
+fn assign_row<F>(
+    row: &BlockRow,
+    contract_id: &[u8; 32],
+    topic: &str,
+    block_height: u64,
+    wanted: &HashSet<usize>,
+    matching_sequences: &F,
+    found: &mut ScannedRows,
+) -> Result<(), HyperlaneDuskError>
+where
+    F: Fn(&[u8]) -> Vec<usize>,
+{
+    for sequence in matching_sequences(&row.data) {
+        if wanted.contains(&sequence) && !found.contains_key(&sequence) {
+            found.insert(
+                sequence,
+                row.record(contract_id, topic, block_height, sequence)?,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Every row of one finalized block, contract and topic that can be a
+/// record, in archive order. All carry the block hash that
+/// `checkBlock(onlyFinalized)` accepted when the block was cached.
+#[derive(Debug)]
+struct CachedBlock {
+    rows: Vec<BlockRow>,
+    bytes: usize,
+}
+
+impl CachedBlock {
+    fn block_hash(&self) -> &str {
+        self.rows
+            .first()
+            .map_or("", |row| strip_hex_prefix(&row.block_hash))
+    }
+}
+
+/// The scanned block's rows that a scan collects for the block cache.
+struct BlockCapture {
+    /// `None` once the rows grew past the bound.
+    rows: Option<Vec<BlockRow>>,
+    bytes: usize,
+    max_bytes: usize,
+    /// Whether the scan read any row of the block, of any topic.
+    seen: bool,
+    /// Whether the scan read every row of the block. Rusk archives a
+    /// finalized block's rows in one transaction, and blocks in height
+    /// order, so the block's rows end at a row of a later block or at the
+    /// end of an archive that holds one of them.
+    complete: bool,
+}
+
+impl BlockCapture {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            rows: Some(Vec::new()),
+            bytes: 0,
+            max_bytes,
+            seen: false,
+            complete: false,
+        }
+    }
+
+    fn collecting(&self) -> bool {
+        self.rows.is_some()
+    }
+
+    fn push(&mut self, row: BlockRow) {
+        let Some(rows) = &mut self.rows else {
+            return;
+        };
+        self.bytes = self.bytes.saturating_add(row.bytes());
+        if self.bytes > self.max_bytes {
+            self.rows = None;
+        } else {
+            rows.push(row);
+        }
+    }
+
+    /// The block's rows, if the scan read all of them within the bound and
+    /// they name one block hash.
+    fn finish(self) -> Option<CachedBlock> {
+        let rows = self.rows?;
+        let hash = &rows.first()?.block_hash;
+        (self.complete && rows.iter().all(|row| row.block_hash == *hash)).then_some(CachedBlock {
+            rows,
+            bytes: self.bytes,
+        })
+    }
+}
+
+/// Bounds of a client's cache of finalized blocks' rows.
+#[derive(Debug, Clone, Copy)]
+struct BlockCacheLimits {
+    /// Most blocks held at once.
+    blocks: usize,
+    /// Most bytes held at once.
+    bytes: usize,
+    /// Most bytes of one block; a larger block is scanned per lookup.
+    block_bytes: usize,
+}
+
+/// The cache holds the blocks that indexing is working through: a forward
+/// and a backward cursor and the transaction lookups of each indexed
+/// contract and topic. 32 MiB fits about 500 dispatches of 64 KiB, the
+/// largest event Rusk emits, or 100,000 Merkle insertions.
+const BLOCK_CACHE_LIMITS: BlockCacheLimits = BlockCacheLimits {
+    blocks: 64,
+    bytes: 64 * 1024 * 1024,
+    block_bytes: 32 * 1024 * 1024,
+};
+
+/// One block of one contract and topic.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct BlockKey {
+    contract_id: [u8; 32],
+    topic: String,
+    block_height: u64,
+}
+
+impl BlockKey {
+    fn new(contract_id: &[u8; 32], topic: &str, block_height: u64) -> Self {
+        Self {
+            contract_id: *contract_id,
+            topic: topic.to_owned(),
+            block_height,
+        }
+    }
+}
+
+/// Finalized blocks' rows that one scan read whole, so that other lookups
+/// in the same blocks, such as a cursor that asks for one sequence at a
+/// time or a lookup per transaction, match against them instead of reading
+/// the archive again. Rows are matched exactly as a scan matches them, and
+/// every lookup still checks contract state and `checkBlock` itself.
+/// Bounded by blocks and bytes; the least recently used block goes first.
+#[derive(Debug)]
+struct BlockCache {
+    limits: BlockCacheLimits,
+    /// Each block, and when it was last used.
+    blocks: HashMap<BlockKey, (Arc<CachedBlock>, u64)>,
+    bytes: usize,
+    clock: u64,
+}
+
+impl BlockCache {
+    fn new(limits: BlockCacheLimits) -> Self {
+        Self {
+            limits,
+            blocks: HashMap::new(),
+            bytes: 0,
+            clock: 0,
+        }
+    }
+
+    fn get(&mut self, key: &BlockKey) -> Option<Arc<CachedBlock>> {
+        self.clock += 1;
+        let (block, used) = self.blocks.get_mut(key)?;
+        *used = self.clock;
+        Some(block.clone())
+    }
+
+    fn insert(&mut self, key: BlockKey, block: Arc<CachedBlock>) {
+        self.remove(&key);
+        if block.bytes > self.limits.block_bytes || self.limits.blocks == 0 {
+            return;
+        }
+        while self.blocks.len() >= self.limits.blocks
+            || self.bytes.saturating_add(block.bytes) > self.limits.bytes
+        {
+            let Some(oldest) = self
+                .blocks
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.remove(&oldest);
+        }
+        self.clock += 1;
+        self.bytes += block.bytes;
+        self.blocks.insert(key, (block, self.clock));
+    }
+
+    fn remove(&mut self, key: &BlockKey) {
+        if let Some((block, _)) = self.blocks.remove(key) {
+            self.bytes -= block.bytes;
+        }
+    }
+
+    fn forget_contract(&mut self, contract_id: &[u8; 32]) {
+        let keys: Vec<BlockKey> = self
+            .blocks
+            .keys()
+            .filter(|key| key.contract_id == *contract_id)
+            .cloned()
+            .collect();
+        for key in keys {
+            self.remove(&key);
+        }
+    }
 }
 
 /// The rows of one block that a scan matched, keyed by sequence.
@@ -347,6 +605,7 @@ impl RuesClient {
             base_url,
             event_store: None,
             scan_anchors: Arc::new(StdMutex::new(())),
+            block_cache: Arc::new(StdMutex::new(BlockCache::new(BLOCK_CACHE_LIMITS))),
         })
     }
 
@@ -732,16 +991,48 @@ impl RuesClient {
             .filter(|sequence| !rows.contains_key(sequence))
             .collect();
         let mut scanned = HashSet::new();
+        let key = BlockKey::new(contract_id, topic, block_height);
+        let mut scanned_block = None;
         if !wanted.is_empty() {
-            let found = self
-                .scan_block_rows(
-                    contract_id,
-                    topic,
-                    block_height,
-                    &wanted,
-                    &matching_sequences,
-                )
-                .await?;
+            let cached = self.block_cache().get(&key);
+            let found = match cached {
+                Some(block) => {
+                    let mut found = ScannedRows::new();
+                    for row in &block.rows {
+                        assign_row(
+                            row,
+                            contract_id,
+                            topic,
+                            block_height,
+                            &wanted,
+                            &matching_sequences,
+                            &mut found,
+                        )?;
+                        if found.len() == wanted.len() {
+                            break;
+                        }
+                    }
+                    if found.len() < wanted.len() {
+                        // The block lacks a record that contract state
+                        // implies, so the next lookup reads the archive.
+                        self.block_cache().remove(&key);
+                    }
+                    found
+                }
+                None => {
+                    let (found, block) = self
+                        .scan_block_rows(
+                            contract_id,
+                            topic,
+                            block_height,
+                            &wanted,
+                            &matching_sequences,
+                        )
+                        .await?;
+                    scanned_block = block;
+                    found
+                }
+            };
             scanned.extend(found.keys().copied());
             rows.extend(found);
         }
@@ -795,6 +1086,15 @@ impl RuesClient {
             .collect();
         self.persist_finalized_events(contract_id, topic, &fresh)?;
 
+        // A block's rows are cached only once checkBlock(onlyFinalized)
+        // accepted the hash they all carry.
+        if let Some(block) = scanned_block {
+            let check = (block_height, block.block_hash().to_owned());
+            if block_checks.get(&check) == Some(&true) {
+                self.block_cache().insert(key, Arc::new(block));
+            }
+        }
+
         let mut ordered = Vec::with_capacity(sequences.len());
         for sequence in sequences {
             let Some(matched) = matches.remove(sequence) else {
@@ -808,9 +1108,68 @@ impl RuesClient {
         Ok(ordered)
     }
 
+    /// The event data of every row of `topic` in finalized block
+    /// `block_height` that transaction `transaction` emitted and that can be
+    /// a record: not reverted, with hex data. Comes from the block's cached
+    /// rows, or from one pass over the block, which is then cached.
+    ///
+    /// `None` when the block cannot be read whole: the archive holds no row
+    /// of it for this topic yet, its rows are over the cache bound or name
+    /// different block hashes, or `checkBlock(onlyFinalized)` rejects their
+    /// hash. Callers then look the transaction up by sequence range.
+    ///
+    /// The rows only pick which sequences to look up. Every record still
+    /// comes from `finalized_contract_events_at_block`.
+    pub(crate) async fn finalized_rows_of_transaction(
+        &self,
+        contract_id: &[u8; 32],
+        topic: &str,
+        block_height: u64,
+        transaction: &[u8; 32],
+    ) -> Result<Option<Vec<Vec<u8>>>, HyperlaneDuskError> {
+        let key = BlockKey::new(contract_id, topic, block_height);
+        let cached = self.block_cache().get(&key);
+        let block = match cached {
+            Some(block) => block,
+            None => {
+                let (_, block) = self
+                    .scan_block_rows(
+                        contract_id,
+                        topic,
+                        block_height,
+                        &HashSet::new(),
+                        &|_: &[u8]| Vec::new(),
+                    )
+                    .await?;
+                let Some(block) = block else {
+                    return Ok(None);
+                };
+                if !self
+                    .check_finalized_block(block_height, block.block_hash())
+                    .await?
+                {
+                    return Ok(None);
+                }
+                let block = Arc::new(block);
+                self.block_cache().insert(key, block.clone());
+                block
+            }
+        };
+        let origin = hex::encode(transaction);
+        Ok(Some(
+            block
+                .rows
+                .iter()
+                .filter(|row| strip_hex_prefix(&row.origin).eq_ignore_ascii_case(&origin))
+                .map(|row| row.data.clone())
+                .collect(),
+        ))
+    }
+
     /// Scan the contract's archive rows once for the rows of `block_height`
     /// that `matching_sequences` assigns to the `wanted` sequences, starting
-    /// at the closest persisted anchor below the block.
+    /// at the closest persisted anchor below the block. Also returns the
+    /// block's rows when the scan read all of them within the cache bound.
     async fn scan_block_rows<F>(
         &self,
         contract_id: &[u8; 32],
@@ -818,7 +1177,7 @@ impl RuesClient {
         block_height: u64,
         wanted: &HashSet<usize>,
         matching_sequences: &F,
-    ) -> Result<ScannedRows, HyperlaneDuskError>
+    ) -> Result<(ScannedRows, Option<CachedBlock>), HyperlaneDuskError>
     where
         F: Fn(&[u8]) -> Vec<usize> + Sync,
     {
@@ -834,7 +1193,7 @@ impl RuesClient {
             )
             .await?
         {
-            ScanOutcome::Done(rows) => return Ok(rows),
+            ScanOutcome::Done { found, block } => return Ok((found, block)),
             // The anchors stay: the archive reaches them once it catches up.
             ScanOutcome::ArchiveBehind(anchor) => {
                 return Err(HyperlaneDuskError::Other(format!(
@@ -863,7 +1222,7 @@ impl RuesClient {
             )
             .await?
         {
-            ScanOutcome::Done(rows) => Ok(rows),
+            ScanOutcome::Done { found, block } => Ok((found, block)),
             ScanOutcome::WrongAnchor | ScanOutcome::ArchiveBehind(_) => {
                 Err(HyperlaneDuskError::Other(
                     "Dusk archive scan without an anchor found a stale anchor".into(),
@@ -873,9 +1232,13 @@ impl RuesClient {
     }
 
     /// One pass over the contract's archive rows from `start`, or from its
-    /// first row. Stops once every wanted sequence has a row, or at the end
-    /// of the archive. A resumed scan first checks `start`'s fence row, as
-    /// `ScanAnchor` describes.
+    /// first row, for the rows of `block_height`. Reads to the end of that
+    /// block, so the block's rows can be cached, and stops before the first
+    /// row of a later block once every wanted sequence has a row. A block
+    /// over the cache bound is read only until every wanted sequence has a
+    /// row. Without a row for every wanted sequence the scan reads to the
+    /// end of the archive. A resumed scan first checks `start`'s fence row,
+    /// as `ScanAnchor` describes.
     ///
     /// A row the archive has not inserted yet is not an error here: the
     /// caller reports it, and the next lookup resumes from the anchors this
@@ -903,6 +1266,7 @@ impl RuesClient {
             start.and_then(|anchor| anchor.fence_id.checked_sub(1).filter(|id| *id >= 0));
         let mut fence = start;
         let mut size = PageSize::largest();
+        let mut capture = BlockCapture::new(self.block_cache().limits.block_bytes);
         loop {
             let cursor = previous_id.map(canonical_event_cursor);
             let (page, bytes) = self
@@ -944,8 +1308,19 @@ impl RuesClient {
                 }
             }
 
-            let mut complete = false;
+            let mut stop = false;
             for event in events {
+                if event.block_height > block_height {
+                    // The scanned block's rows all come before this one.
+                    capture.complete = true;
+                    if found.len() == wanted.len() {
+                        // Stop before it: the position recorded below then
+                        // ends the scanned block, where a lookup of a later
+                        // block can start.
+                        stop = true;
+                        break;
+                    }
+                }
                 previous_id = Some(event.id);
                 rank = rank.saturating_add(1);
                 let highest = highest_block.map_or(event.block_height, |height: u64| {
@@ -958,37 +1333,52 @@ impl RuesClient {
                         self.offer_scan_anchor(contract_id, anchor)?;
                     }
                 }
-                if !event.reverted && event.topic == topic && event.block_height == block_height {
-                    if let Ok(data) = hex::decode(strip_hex_prefix(&event.data)) {
-                        for sequence in matching_sequences(&data) {
-                            if wanted.contains(&sequence) && !found.contains_key(&sequence) {
-                                let mut row = event.clone();
-                                row.id = i64::try_from(sequence).map_err(|_| {
-                                    HyperlaneDuskError::Other(
-                                        "Dusk finalized-event sequence exceeds i64 provenance range"
-                                            .into(),
-                                    )
-                                })?;
-                                found.insert(sequence, row);
-                            }
+                if event.block_height == block_height {
+                    capture.seen = true;
+                    if !event.reverted && event.topic == topic {
+                        if let Ok(data) = hex::decode(strip_hex_prefix(&event.data)) {
+                            let row = BlockRow {
+                                block_hash: event.block_hash.clone(),
+                                origin: event.origin.clone(),
+                                data,
+                            };
+                            assign_row(
+                                &row,
+                                contract_id,
+                                topic,
+                                block_height,
+                                wanted,
+                                matching_sequences,
+                                &mut found,
+                            )?;
+                            capture.push(row);
                         }
                     }
                 }
                 last_row = Some(event);
-                if found.len() == wanted.len() {
-                    complete = true;
+                // A block too large to cache is read only as far as the
+                // lookup needs.
+                if found.len() == wanted.len() && !capture.collecting() {
+                    stop = true;
                     break;
                 }
             }
 
-            if complete || !has_next_page {
+            if stop || !has_next_page {
+                if !has_next_page && capture.seen {
+                    // Rusk archives a finalized block's rows together.
+                    capture.complete = true;
+                }
                 if let (Some(event), Some(highest)) = (last_row, highest_block) {
                     let before_block = start_before.max(highest.saturating_add(1));
                     if let Some(anchor) = ScanAnchor::after_row(&event, before_block, rank)? {
                         self.offer_scan_anchor(contract_id, anchor)?;
                     }
                 }
-                return Ok(ScanOutcome::Done(found));
+                return Ok(ScanOutcome::Done {
+                    found,
+                    block: capture.finish(),
+                });
             }
         }
     }
@@ -1060,9 +1450,10 @@ impl RuesClient {
         })
     }
 
-    /// Drop every scan anchor of a contract. The next scan starts from the
-    /// contract's first archive row.
+    /// Drop every scan anchor and cached block of a contract. The next scan
+    /// starts from the contract's first archive row.
     fn forget_scan_anchors(&self, contract_id: &[u8; 32]) -> Result<(), HyperlaneDuskError> {
+        self.block_cache().forget_contract(contract_id);
         let _guard = self
             .scan_anchors
             .lock()
@@ -1084,6 +1475,12 @@ impl RuesClient {
         store.write(batch).map_err(|error| {
             HyperlaneDuskError::Other(format!("Failed to drop Dusk archive scan anchors: {error}"))
         })
+    }
+
+    fn block_cache(&self) -> std::sync::MutexGuard<'_, BlockCache> {
+        self.block_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn event_store(&self) -> Result<&DB, HyperlaneDuskError> {
@@ -1172,8 +1569,9 @@ impl RuesClient {
     }
 
     /// Drop rows that no longer match contract state or finality, together
-    /// with the contract's scan anchors: an endpoint that served them may
-    /// also have served the rows the anchors were taken from.
+    /// with the contract's scan anchors and cached blocks: an endpoint that
+    /// served them may also have served the rows the anchors and blocks were
+    /// taken from.
     fn invalidate_finalized_events(
         &self,
         contract_id: &[u8; 32],
@@ -2467,11 +2865,12 @@ mod tests {
         let page: &'static str = Box::leak(page.into_boxed_str());
         let directory = tempfile::tempdir().unwrap();
         let store = directory.path().join("event-store");
+        // The second lookup matches the block's rows that the first one
+        // read, so it only checks the block.
         let client = test_client_with_event_store(
             test_server(vec![
                 (200, page),
                 (200, r#"{"checkBlock":true}"#),
-                (200, page),
                 (200, r#"{"checkBlock":true}"#),
             ]),
             &store,
@@ -2600,8 +2999,10 @@ mod tests {
         /// or proxy that refuses large replies.
         refusal: Arc<StdMutex<Option<(usize, u16, String)>>>,
         /// The block of each `checkBlock` request. The archive has finalized
-        /// a block when it holds a row of it.
+        /// a block when it holds a row of it and its height is not listed in
+        /// `unfinalized`.
         block_checks: Arc<StdMutex<Vec<(u64, String)>>>,
+        unfinalized: Arc<StdMutex<HashSet<u64>>>,
         stop: Arc<std::sync::atomic::AtomicBool>,
         worker: Option<thread::JoinHandle<()>>,
     }
@@ -2617,12 +3018,14 @@ mod tests {
             let limits = Arc::new(StdMutex::new(Vec::new()));
             let refusal = Arc::new(StdMutex::new(None));
             let block_checks = Arc::new(StdMutex::new(Vec::new()));
+            let unfinalized = Arc::new(StdMutex::new(HashSet::new()));
             let stop = Arc::new(AtomicBool::new(false));
             let worker_rows = rows.clone();
             let worker_pages = pages.clone();
             let worker_limits = limits.clone();
             let worker_refusal = refusal.clone();
             let worker_block_checks = block_checks.clone();
+            let worker_unfinalized = unfinalized.clone();
             let worker_stop = stop.clone();
             let worker = thread::spawn(move || {
                 while !worker_stop.load(Ordering::SeqCst) {
@@ -2659,9 +3062,10 @@ mod tests {
                             .and_then(|(_, rest)| rest.split('"').next())
                             .unwrap()
                             .to_owned();
-                        let finalized = worker_rows.lock().unwrap().iter().any(|row| {
-                            row["block_height"] == height && row["block_hash"] == hash.as_str()
-                        });
+                        let finalized = !worker_unfinalized.lock().unwrap().contains(&height)
+                            && worker_rows.lock().unwrap().iter().any(|row| {
+                                row["block_height"] == height && row["block_hash"] == hash.as_str()
+                            });
                         worker_block_checks.lock().unwrap().push((height, hash));
                         (
                             200,
@@ -2688,6 +3092,7 @@ mod tests {
                 limits,
                 refusal,
                 block_checks,
+                unfinalized,
                 stop,
                 worker: Some(worker),
             }
@@ -2973,7 +3378,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(later.event_id, 1);
-        assert_eq!(archive.pages(), vec![None, Some(10), None]);
+        // The first scan read all of block 7, so its position is row 12.
+        assert_eq!(archive.pages(), vec![None, Some(11), None]);
     }
 
     #[tokio::test]
@@ -3731,6 +4137,213 @@ mod tests {
             archive.limits(),
             [200, 100, 50, 25, 12, 12, 12, 12, 24, 48, 96, 192, 200]
         );
+    }
+
+    fn cached_block(height: u64, rows: usize, data_len: usize) -> Arc<CachedBlock> {
+        let rows: Vec<BlockRow> = (0..rows)
+            .map(|row| BlockRow {
+                block_hash: hex::encode([height as u8; 32]),
+                origin: hex::encode([row as u8; 32]),
+                data: vec![row as u8; data_len],
+            })
+            .collect();
+        let bytes = rows.iter().map(BlockRow::bytes).sum();
+        Arc::new(CachedBlock { rows, bytes })
+    }
+
+    #[test]
+    fn block_cache_keeps_its_bounds_and_drops_the_least_recently_used_block() {
+        let one_row = cached_block(1, 1, 1000).bytes;
+        let mut cache = BlockCache::new(BlockCacheLimits {
+            blocks: 3,
+            bytes: 4 * one_row,
+            block_bytes: 2 * one_row,
+        });
+        let key = |height| BlockKey::new(&[1; 32], "dispatch", height);
+        for height in 1..=3 {
+            cache.insert(key(height), cached_block(height, 1, 1000));
+        }
+        // Using block 1 leaves block 2 the least recently used.
+        assert!(cache.get(&key(1)).is_some());
+        cache.insert(key(4), cached_block(4, 1, 1000));
+        assert!(cache.get(&key(2)).is_none());
+        for height in [1, 3, 4] {
+            assert!(cache.get(&key(height)).is_some(), "block {height}");
+        }
+        // A two-row block needs room for two: block 1, now the least
+        // recently used, goes.
+        cache.insert(key(5), cached_block(5, 2, 1000));
+        assert!(cache.get(&key(1)).is_none());
+        assert_eq!((cache.blocks.len(), cache.bytes), (3, 4 * one_row));
+        // A block over the per-block bound is not cached.
+        cache.insert(key(6), cached_block(6, 3, 1000));
+        assert!(cache.get(&key(6)).is_none());
+        // Forgetting a contract keeps other contracts' blocks.
+        let other = BlockKey::new(&[2; 32], "dispatch", 1);
+        cache.insert(other.clone(), cached_block(1, 1, 1000));
+        cache.forget_contract(&[1; 32]);
+        assert!(cache.get(&other).is_some());
+        assert_eq!((cache.blocks.len(), cache.bytes), (1, one_row));
+    }
+
+    #[tokio::test]
+    async fn a_block_over_the_cache_bound_is_read_per_lookup() {
+        let contract_id = [97u8; 32];
+        // 200 rows of block 5, then 400 dispatch rows of block 6.
+        let mut rows: Vec<JsonValue> = (0..200)
+            .map(|id| archive_row(id, 5, 1, "other", contract_id, &[0]))
+            .collect();
+        rows.extend((0..400u16).map(|n| {
+            archive_row(
+                200 + i64::from(n),
+                6,
+                2,
+                "dispatch",
+                contract_id,
+                &n.to_be_bytes(),
+            )
+        }));
+        let archive = Archive::start(rows);
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(archive.url.clone(), directory.path());
+        // Room for 100 of block 6's rows.
+        let row = BlockRow {
+            block_hash: hex::encode([6u8; 32]),
+            origin: hex::encode([2u8; 32]),
+            data: vec![0; 2],
+        };
+        *client.block_cache.lock().unwrap() = BlockCache::new(BlockCacheLimits {
+            blocks: 4,
+            bytes: 1 << 20,
+            block_bytes: 100 * row.bytes(),
+        });
+        for n in [0u16, 1, 399] {
+            let matched = client
+                .finalized_contract_event(
+                    &contract_id,
+                    "dispatch",
+                    usize::from(n),
+                    6,
+                    &n.to_be_bytes(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(matched.block_height, 6);
+        }
+        // Each lookup read the block only as far as its row, or 100 rows
+        // further, and the next one started at the position before the
+        // block, as without the cache.
+        assert_eq!(
+            archive.pages(),
+            [None, Some(199), Some(198), Some(198), Some(398), Some(598)]
+        );
+        assert!(client.block_cache().blocks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_blocks_that_checkblock_accepts_are_cached() {
+        let contract_id = [98u8; 32];
+        let archive = Archive::start(vec![
+            archive_row(1, 7, 1, "dispatch", contract_id, &[1]),
+            archive_row(2, 7, 2, "dispatch", contract_id, &[2]),
+        ]);
+        archive.unfinalized.lock().unwrap().insert(7);
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(archive.url.clone(), directory.path());
+        let error = client
+            .finalized_contract_event(&contract_id, "dispatch", 0, 7, &[1])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            HyperlaneDuskError::FinalizedEventMismatch(_)
+        ));
+        assert_eq!(
+            client
+                .finalized_rows_of_transaction(&contract_id, "dispatch", 7, &[1; 32])
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(client.block_cache().blocks.is_empty());
+
+        // Once the archive has finalized the block, the next lookup reads it
+        // again and caches it; the block's other record and the
+        // transaction's rows then need no page.
+        archive.unfinalized.lock().unwrap().clear();
+        client
+            .finalized_contract_event(&contract_id, "dispatch", 0, 7, &[1])
+            .await
+            .unwrap();
+        let other = client
+            .finalized_contract_event(&contract_id, "dispatch", 1, 7, &[2])
+            .await
+            .unwrap();
+        assert_eq!(&other.transaction_id.as_bytes()[32..], &[2u8; 32]);
+        assert_eq!(
+            client
+                .finalized_rows_of_transaction(&contract_id, "dispatch", 7, &[2; 32])
+                .await
+                .unwrap(),
+            Some(vec![vec![2]])
+        );
+        assert_eq!(archive.pages(), [None, None, None]);
+    }
+
+    #[tokio::test]
+    async fn a_block_whose_rows_name_two_hashes_is_not_cached() {
+        let contract_id = [99u8; 32];
+        let mut forked = archive_row(2, 7, 2, "dispatch", contract_id, &[2]);
+        forked["block_hash"] = serde_json::json!(hex::encode([0xaa; 32]));
+        let archive = Archive::start(vec![
+            archive_row(1, 7, 1, "dispatch", contract_id, &[1]),
+            forked,
+        ]);
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(archive.url.clone(), directory.path());
+        client
+            .finalized_contract_event(&contract_id, "dispatch", 0, 7, &[1])
+            .await
+            .unwrap();
+        assert!(client.block_cache().blocks.is_empty());
+        client
+            .finalized_contract_event(&contract_id, "dispatch", 1, 7, &[2])
+            .await
+            .unwrap();
+        assert_eq!(archive.pages(), [None, None]);
+    }
+
+    #[tokio::test]
+    async fn a_cached_block_that_lacks_a_record_is_read_again() {
+        let contract_id = [100u8; 32];
+        let archive = Archive::start(vec![archive_row(1, 7, 1, "dispatch", contract_id, &[1])]);
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(archive.url.clone(), directory.path());
+        client
+            .finalized_contract_event(&contract_id, "dispatch", 0, 7, &[1])
+            .await
+            .unwrap();
+        assert_eq!(client.block_cache().blocks.len(), 1);
+        // Contract state names a second record the cached rows lack: the
+        // lookup fails without a page and drops the block.
+        let error = client
+            .finalized_contract_event(&contract_id, "dispatch", 1, 7, &[2])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not archived yet"), "{error}");
+        assert!(client.block_cache().blocks.is_empty());
+        assert_eq!(archive.pages(), [None]);
+        // A repaired archive serves the row, and the retry reads it.
+        archive
+            .rows
+            .lock()
+            .unwrap()
+            .push(archive_row(2, 7, 2, "dispatch", contract_id, &[2]));
+        client
+            .finalized_contract_event(&contract_id, "dispatch", 1, 7, &[2])
+            .await
+            .unwrap();
+        assert_eq!(archive.pages(), [None, None]);
     }
 
     /// Ten dispatch rows, one per block from 5 to 14, with IDs 0 to 9.

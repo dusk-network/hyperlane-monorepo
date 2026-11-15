@@ -494,12 +494,12 @@ async fn same_block_replay_reuses_the_cursor_after_older_blocks() {
             h512(tx_hash(sequence as usize, true))
         );
     }
-    // The second lookup resumes at the last older-block row (ID 399), which
-    // it checks is unchanged, so it sees every row of the block again.
+    // The first lookup read the whole block, and the second one matches
+    // those rows without reading the archive again.
     assert_eq!(
         *fixture.archive_requests.lock().unwrap(),
-        vec![-1, 199, 399, 398],
-        "same-block lookup must retain earlier peers without replaying older-block history"
+        vec![-1, 199, 399],
+        "same-block lookup must reuse the block's rows without replaying older-block history"
     );
 }
 
@@ -527,7 +527,7 @@ async fn a_missing_row_cannot_pin_a_cursor_past_repaired_archive_rows() {
 }
 
 #[tokio::test]
-async fn a_successful_lookup_hint_is_discarded_when_archive_ids_are_rebuilt() {
+async fn a_block_read_before_its_archive_ids_are_rebuilt_still_resolves() {
     for kind in [Kind::Dispatch, Kind::Process, Kind::Merkle, Kind::Igp] {
         let fixture = Fixture::start_with_prefix_height(kind, true, OLDER_HISTORY_ROWS, HEIGHT - 1);
         let rues = fixture.client();
@@ -542,15 +542,19 @@ async fn a_successful_lookup_hint_is_discarded_when_archive_ids_are_rebuilt() {
                 row["id"] = json!(index);
             }
         }
-        // The saved position names row 399, which the rebuilt archive does
-        // not have: the same lookup starts over and finds the renumbered row.
+        // The first lookup read the whole block. Its rows, the same in the
+        // rebuilt archive, still resolve the block's other record, so the
+        // saved position (row 399, which the rebuilt archive lacks) is not
+        // needed. A lookup that does need it starts over, as
+        // `a_missing_row_cannot_pin_a_cursor_past_repaired_archive_rows`
+        // shows.
         let logs = read(kind, rues, 1..=1, None)
             .await
             .unwrap_or_else(|e| panic!("{kind:?} stale successful hint must not pin retries: {e}"));
         assert_eq!(logs[0].transaction_id, h512(tx_hash(1, true)));
         assert_eq!(
             *fixture.archive_requests.lock().unwrap(),
-            vec![-1, 199, 399, 398, -1]
+            vec![-1, 199, 399]
         );
     }
 }

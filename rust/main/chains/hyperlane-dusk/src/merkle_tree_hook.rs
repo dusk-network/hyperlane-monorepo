@@ -10,7 +10,7 @@ use hyperlane_core::{
 };
 use hyperlane_dusk_types::events;
 
-use crate::rues::{exact_event_data, rkyv_serialize};
+use crate::rues::{exact_event_data, rkyv_deserialize, rkyv_serialize};
 use crate::tx_sender::{dusk_tx_id_to_h512, h512_to_dusk_tx_id};
 use crate::RuesClient;
 
@@ -170,6 +170,32 @@ impl Indexer<MerkleTreeInsertion> for DuskMerkleTreeHookIndexer {
         ensure_cursor_height(block_height)?;
         if block_height > self.rues.finalized_block_height().await? {
             return Ok(vec![]);
+        }
+        // The transaction's own rows name the tree indices it inserted, so
+        // only those are looked up, from the block's rows read once.
+        if let Some(rows) = self
+            .rues
+            .finalized_rows_of_transaction(
+                &self.hook_id,
+                events::InsertedIntoTree::TOPIC,
+                block_height,
+                &crate::dusk_transaction_bytes(&tx_hash),
+            )
+            .await?
+        {
+            let indices = rows
+                .iter()
+                .filter_map(|data| rkyv_deserialize::<events::InsertedIntoTree>(data).ok())
+                .map(|event| event.index)
+                .collect();
+            return crate::transaction_logs(
+                self,
+                indices,
+                tx_hash,
+                block_height,
+                "merkle insertion",
+            )
+            .await;
         }
         let count: u32 = self
             .rues

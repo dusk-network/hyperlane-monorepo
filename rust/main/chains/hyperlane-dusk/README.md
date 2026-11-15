@@ -42,6 +42,15 @@ how to run the local bridge.
   block's rows. If it has, its rows are numbered differently and the scan
   starts over; if not, the archive is behind, and the lookup fails until it
   catches up, keeping the positions.
+- **Block cache.** A scan reads the whole block it is looking in, and the
+  block's rows stay in memory, so other lookups in the same block (a cursor
+  with a small `index.chunk`, or one lookup per transaction) match against
+  them instead of reading the archive again. Every lookup still checks
+  contract state and `checkBlock` itself. Only blocks whose rows carry the
+  hash `checkBlock(onlyFinalized)` accepted are kept, at most 64 blocks and
+  64 MiB, and 32 MiB for one block; a larger block is read per lookup. The
+  Merkle hook, dispatch and IGP indexers look a transaction up by the
+  records its own rows name, instead of every record of its block.
 - **Writes** are Moonlight transactions built and signed by the `dusk-tx`
   helper from the companion repository. The agent runs it as a subprocess
   (`DUSK_TX_BIN`, or `dusk-tx` on `PATH`) and passes the RPC URL and signing

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -121,25 +122,19 @@ impl DuskInterchainGasPaymasterIndexer {
             .await?;
         Ok((finalized_count, finalized_tip))
     }
-}
 
-#[async_trait]
-impl Indexer<InterchainGasPayment> for DuskInterchainGasPaymasterIndexer {
-    async fn fetch_logs_in_range(
+    /// The stored payment records in `range` below `count`, read a page of
+    /// records at a time.
+    async fn payment_records(
         &self,
         range: RangeInclusive<u32>,
-    ) -> ChainResult<Vec<(Indexed<InterchainGasPayment>, LogMeta)>> {
-        let payment_count: u32 = self
-            .rues
-            .contract_query(&self.igp_id, "gas_payment_count", &())
-            .await?;
-        let (finalized_count, _) = self.finalized_payment_count(payment_count).await?;
-
+        count: u32,
+    ) -> ChainResult<Vec<(u32, GasPaymentRecord)>> {
         let mut stored = Vec::new();
         let mut next = *range.start();
         let requested_end = *range.end();
-        while next < finalized_count && next <= requested_end {
-            let limit = (finalized_count - next)
+        while next < count && next <= requested_end {
+            let limit = (count - next)
                 .min(requested_end.saturating_sub(next).saturating_add(1))
                 .min(GAS_PAYMENT_PAGE_SIZE);
             let records: Vec<GasPaymentRecord> = self
@@ -159,9 +154,16 @@ impl Indexer<InterchainGasPayment> for DuskInterchainGasPaymasterIndexer {
             }
             next += limit;
         }
+        Ok(stored)
+    }
 
-        // One archive pass per block, however many payments it holds.
-        // Identical payments in one block share the first matching row.
+    /// Match finalized stored payment records to their archive rows, one
+    /// archive pass per block, however many payments it holds. Identical
+    /// payments in one block share the first matching row.
+    async fn payment_logs(
+        &self,
+        stored: &[(u32, GasPaymentRecord)],
+    ) -> ChainResult<Vec<(Indexed<InterchainGasPayment>, LogMeta)>> {
         let mut results = Vec::with_capacity(stored.len());
         for block in stored.chunk_by(|a, b| a.1.block_height == b.1.block_height) {
             let Some((_, first)) = block.first() else {
@@ -169,14 +171,7 @@ impl Indexer<InterchainGasPayment> for DuskInterchainGasPaymasterIndexer {
             };
             let mut expected = Vec::with_capacity(block.len());
             for (index, record) in block {
-                expected.push((
-                    *index as usize,
-                    rkyv_serialize(&events::GasPayment {
-                        message_id: record.message_id,
-                        gas_limit: record.gas_limit,
-                        payment: record.payment,
-                    })?,
-                ));
+                expected.push((*index as usize, payment_event(record)?));
             }
             let sequences: Vec<usize> = expected.iter().map(|(index, _)| *index).collect();
             let matches = self
@@ -207,11 +202,35 @@ impl Indexer<InterchainGasPayment> for DuskInterchainGasPaymasterIndexer {
                     transaction_index: 0,
                     log_index: U256::from(*index),
                 };
-
                 results.push((indexed, meta));
             }
         }
+        Ok(results)
+    }
+}
 
+/// The `GasPayment` event the IGP emits for a stored record.
+fn payment_event(record: &GasPaymentRecord) -> ChainResult<Vec<u8>> {
+    Ok(rkyv_serialize(&events::GasPayment {
+        message_id: record.message_id,
+        gas_limit: record.gas_limit,
+        payment: record.payment,
+    })?)
+}
+
+#[async_trait]
+impl Indexer<InterchainGasPayment> for DuskInterchainGasPaymasterIndexer {
+    async fn fetch_logs_in_range(
+        &self,
+        range: RangeInclusive<u32>,
+    ) -> ChainResult<Vec<(Indexed<InterchainGasPayment>, LogMeta)>> {
+        let payment_count: u32 = self
+            .rues
+            .contract_query(&self.igp_id, "gas_payment_count", &())
+            .await?;
+        let (finalized_count, _) = self.finalized_payment_count(payment_count).await?;
+        let stored = self.payment_records(range, finalized_count).await?;
+        let results = self.payment_logs(&stored).await?;
         debug!(count = results.len(), "Fetched interchain gas payment logs");
         Ok(results)
     }
@@ -232,6 +251,18 @@ impl Indexer<InterchainGasPayment> for DuskInterchainGasPaymasterIndexer {
         if block_height > self.rues.finalized_block_height().await? {
             return Ok(vec![]);
         }
+        let rows = self
+            .rues
+            .finalized_rows_of_transaction(
+                &self.igp_id,
+                events::GasPayment::TOPIC,
+                block_height,
+                &crate::dusk_transaction_bytes(&tx_hash),
+            )
+            .await?;
+        if rows.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(vec![]);
+        }
         let count: u32 = self
             .rues
             .contract_query(&self.igp_id, "gas_payment_count", &())
@@ -240,6 +271,27 @@ impl Indexer<InterchainGasPayment> for DuskInterchainGasPaymasterIndexer {
             return Ok(vec![]);
         };
         crate::ensure_tx_hash_lookup_budget(&range, "IGP payment")?;
+        if let Some(rows) = rows {
+            // Only a record whose event bytes the transaction emitted can
+            // have it as provenance, so only those are matched, against the
+            // block's rows read once. The block is at or below the finalized
+            // height, so all of its records are finalized.
+            let emitted: HashSet<Vec<u8>> = rows.into_iter().collect();
+            let mut candidates = Vec::new();
+            for (index, record) in self.payment_records(range, count).await? {
+                if emitted.contains(&payment_event(&record)?) {
+                    candidates.push((index, record));
+                }
+            }
+            return Ok(self
+                .payment_logs(&candidates)
+                .await?
+                .into_iter()
+                .filter(|(_, meta)| {
+                    meta.transaction_id == tx_hash && meta.block_number == block_height
+                })
+                .collect());
+        }
         let mut logs = Vec::new();
         for chunk in crate::block_range_chunks(range) {
             logs.extend(

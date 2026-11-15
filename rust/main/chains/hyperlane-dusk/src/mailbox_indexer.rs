@@ -228,6 +228,24 @@ impl Indexer<HyperlaneMessage> for DuskMailboxIndexer {
         if block_height > self.rues.finalized_block_height().await? {
             return Ok(vec![]);
         }
+        // The transaction's own Dispatch rows name the nonces it used, so
+        // only those are looked up, from the block's rows read once.
+        if let Some(rows) = self
+            .rues
+            .finalized_rows_of_transaction(
+                &self.mailbox_id,
+                events::Dispatch::TOPIC,
+                block_height,
+                &crate::dusk_transaction_bytes(&tx_hash),
+            )
+            .await?
+        {
+            let nonces = rows
+                .iter()
+                .filter_map(|data| dispatch_nonce(data))
+                .collect();
+            return crate::transaction_logs(self, nonces, tx_hash, block_height, "dispatch").await;
+        }
         let count: u32 = self
             .rues
             .contract_query(&self.mailbox_id, "nonce", &())

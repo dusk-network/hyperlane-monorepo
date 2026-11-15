@@ -1,5 +1,7 @@
 //! Archive work per block: the indexers read each block's archive rows once,
-//! however many sequences the block holds, and keep their scan position when
+//! however many sequences the block holds and however they are asked for
+//! (a whole range, one sequence at a time, or one transaction at a time),
+//! split pages that are too large to read, and keep their scan position when
 //! the archive lags behind finality.
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -12,15 +14,18 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use hyperlane_core::{Indexer, H256, H512};
-use hyperlane_dusk::{DuskMailboxIndexer, DuskMerkleTreeHookIndexer, RuesClient};
-use hyperlane_dusk_types::{events, message};
+use hyperlane_core::{Indexer, H256, H512, U256};
+use hyperlane_dusk::{
+    DuskInterchainGasPaymasterIndexer, DuskMailboxIndexer, DuskMerkleTreeHookIndexer, RuesClient,
+};
+use hyperlane_dusk_types::{events, message, GasPaymentRecord};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use url::Url;
 
 const MAILBOX: [u8; 32] = [2; 32];
 const HOOK: [u8; 32] = [5; 32];
+const IGP: [u8; 32] = [6; 32];
 const ORIGIN: u32 = 4242;
 /// Rusk 1.7.3 clamps `finalizedEvents(limit)` to this many rows
 /// (`rusk/src/lib/http/chain/graphql/archive/events.rs`, `MAX_LIMIT`).
@@ -40,10 +45,10 @@ struct PageRequest {
     reply_len: usize,
 }
 
-/// The node: Mailbox and MerkleTreeHook state plus an archive that behaves
-/// like Rusk 1.7.3. Row IDs are global across contracts. A finalized block's
-/// rows are inserted together, grouped by transaction hash, so archive order
-/// within a block is not dispatch order.
+/// The node: Mailbox, MerkleTreeHook and IGP state plus an archive that
+/// behaves like Rusk 1.7.3. Row IDs are global across contracts. A finalized
+/// block's rows are inserted together, grouped by transaction hash, so
+/// archive order within a block is not dispatch order.
 #[derive(Default)]
 struct Node {
     rows: Vec<Value>,
@@ -51,8 +56,18 @@ struct Node {
     dispatches: Vec<(u64, [u8; 32])>,
     /// Per tree index: insertion height and message ID.
     insertions: Vec<(u64, [u8; 32])>,
+    /// Per payment index: what the IGP stored. Every dispatch pays once, so
+    /// the payment index is the nonce.
+    payments: Vec<GasPaymentRecord>,
     /// Per nonce: the transaction that dispatched it.
     dispatch_tx: Vec<[u8; 32]>,
+    /// Each dispatch transaction's nonce, by hex hash.
+    nonce_of_tx: std::collections::HashMap<String, usize>,
+    /// Give later nonces lower transaction hashes, so each contract's rows of
+    /// a block run from its last sequence to its first.
+    reverse_tx_order: bool,
+    /// Contract state queries answered.
+    contract_queries: usize,
     /// Blocks whose rows the archive has not inserted yet.
     unarchived: BTreeMap<u64, Vec<Value>>,
     finalized: u64,
@@ -77,7 +92,17 @@ impl Node {
             let body = vec![nonce as u8; self.body_len.max(1)];
             let message = message::encode(3, nonce, ORIGIN, [7; 32], 42, [8; 32], &body);
             let id = message::id(&message);
-            let tx = message::keccak256(&[b"tx".as_slice(), &nonce.to_be_bytes()].concat());
+            let mut tx = message::keccak256(&[b"tx".as_slice(), &nonce.to_be_bytes()].concat());
+            if self.reverse_tx_order {
+                tx[..4].copy_from_slice(&(u32::MAX - nonce).to_be_bytes());
+            }
+            let payment = GasPaymentRecord {
+                message_id: id,
+                destination: 42,
+                gas_limit: 100 + u64::from(nonce),
+                payment: 1000 + u64::from(nonce),
+                block_height: height,
+            };
             by_origin.insert(
                 tx,
                 vec![
@@ -99,10 +124,25 @@ impl Node {
                         .to_vec(),
                         false,
                     ),
+                    (
+                        IGP,
+                        events::GasPayment::TOPIC,
+                        rkyv::to_bytes::<_, 256>(&events::GasPayment {
+                            message_id: id,
+                            gas_limit: payment.gas_limit,
+                            payment: payment.payment,
+                        })
+                        .unwrap()
+                        .to_vec(),
+                        false,
+                    ),
                 ],
             );
             self.dispatches.push((height, id));
             self.insertions.push((height, id));
+            self.payments.push(payment);
+            self.nonce_of_tx
+                .insert(hex::encode(tx), self.dispatch_tx.len());
             self.dispatch_tx.push(tx);
         }
         for attempt in 0..reverted {
@@ -234,6 +274,12 @@ impl Node {
         } else if query.contains("checkBlock(") {
             self.block_checks += 1;
             json!({"checkBlock": true})
+        } else if let Some((_, rest)) = query.split_once("tx(hash: \"") {
+            let hash = rest.split('"').next().unwrap();
+            match self.nonce_of_tx.get(hash).copied() {
+                Some(nonce) => json!({"tx": {"blockHeight": self.dispatches[nonce].0}}),
+                None => json!({ "tx": null }),
+            }
         } else {
             panic!("unexpected GraphQL query: {query}")
         }
@@ -292,7 +338,8 @@ impl Node {
         (page, requested)
     }
 
-    fn contract_query(&self, contract: [u8; 32], method: &str, body: &[u8]) -> Vec<u8> {
+    fn contract_query(&mut self, contract: [u8; 32], method: &str, body: &[u8]) -> Vec<u8> {
+        self.contract_queries += 1;
         let index = || u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
         match (contract, method) {
             (MAILBOX, "nonce") => (self.dispatches.len() as u32).to_le_bytes().to_vec(),
@@ -303,6 +350,17 @@ impl Node {
             (HOOK, "count") => (self.insertions.len() as u32).to_le_bytes().to_vec(),
             (HOOK, "inserted_block_height") => self.insertions[index()].0.to_le_bytes().to_vec(),
             (HOOK, "message_id_at") => self.insertions[index()].1.to_vec(),
+            (IGP, "gas_payment_count") => (self.payments.len() as u32).to_le_bytes().to_vec(),
+            (IGP, "gas_payment_at") => rkyv::to_bytes::<_, 256>(&self.payments[index()])
+                .unwrap()
+                .to_vec(),
+            (IGP, "gas_payments") => {
+                let start = index();
+                let limit = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
+                rkyv::to_bytes::<_, 256>(&self.payments[start..start + limit].to_vec())
+                    .unwrap()
+                    .to_vec()
+            }
             _ => panic!(
                 "unexpected contract query {}/{method}",
                 hex::encode(contract)
@@ -337,6 +395,7 @@ fn h512(hash: [u8; 32]) -> H512 {
 
 struct Fixture {
     url: Url,
+    address: std::net::SocketAddr,
     store: TempDir,
     node: Arc<Mutex<Node>>,
     stop: Arc<AtomicBool>,
@@ -346,22 +405,20 @@ struct Fixture {
 impl Fixture {
     fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let url = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = Url::parse(&format!("http://{address}")).unwrap();
         let node = Arc::new(Mutex::new(Node::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let (worker_node, worker_stop) = (node.clone(), stop.clone());
         let worker = thread::spawn(move || {
-            while !worker_stop.load(Ordering::SeqCst) {
-                let (mut stream, _) = match listener.accept() {
-                    Ok(connection) => connection,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(1));
-                        continue;
-                    }
-                    Err(error) => panic!("fixture accept failed: {error}"),
-                };
-                stream.set_nonblocking(false).unwrap();
+            // Dropping the fixture sets `stop` and connects once to end the
+            // wait for a connection.
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                if worker_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                stream.set_nodelay(true).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(3)))
                     .unwrap();
@@ -389,19 +446,21 @@ impl Fixture {
                 let mut body = vec![0; length];
                 reader.read_exact(&mut body).unwrap();
                 let reply = worker_node.lock().unwrap().reply(&path, &body);
+                let mut response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    reply.len()
+                )
+                .into_bytes();
+                response.extend_from_slice(&reply);
                 // The agent hangs up on a reply whose Content-Length is over
                 // its limit without reading the body, so a failed write is
                 // expected here.
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    reply.len()
-                );
-                let _ = stream.write_all(&reply);
+                let _ = stream.write_all(&response);
             }
         });
         Self {
             url,
+            address,
             store: tempfile::tempdir().unwrap(),
             node,
             stop,
@@ -427,6 +486,7 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(self.address);
         if let Err(panic) = self.worker.take().unwrap().join() {
             if !thread::panicking() {
                 std::panic::resume_unwind(panic);
@@ -687,5 +747,135 @@ async fn a_row_larger_than_the_limit_fails_with_a_short_error() {
                 .collect::<Vec<_>>(),
             [200, 100, 50, 25, 12, 6, 3, 1].repeat(attempt)
         );
+    }
+}
+
+/// Finalize block 100 with `dispatches` dispatches whose transaction hashes
+/// sort in reverse nonce order: each contract's rows of the block run from
+/// its last sequence to its first.
+fn reversed_block(fixture: &Fixture, dispatches: usize) {
+    let mut node = fixture.node();
+    node.reverse_tx_order = true;
+    node.finalize_block(100, dispatches, 0, true);
+}
+
+/// Archive pages and rows of `contract`, logged and checked against one pass
+/// over its rows.
+fn assert_one_pass(node: &Node, contract: [u8; 32], label: &str) -> usize {
+    let pages = node.pages_for(contract).len();
+    let rows = node.contract_rows(contract);
+    eprintln!("{label}: rows={rows} pages={pages}");
+    assert!(
+        pages <= rows.div_ceil(RUSK_MAX_PAGE) + 1,
+        "{label}: {pages} pages for {rows} rows"
+    );
+    pages
+}
+
+#[tokio::test]
+async fn one_sequence_at_a_time_reads_a_block_of_1000_once() {
+    const DISPATCHES: u32 = 1000;
+    let fixture = Fixture::start();
+    reversed_block(&fixture, DISPATCHES as usize);
+    let rues = fixture.client();
+    let hook = DuskMerkleTreeHookIndexer::new(rues.clone(), H256::from(HOOK));
+    let mailbox = DuskMailboxIndexer::new(rues.clone(), H256::from(MAILBOX), ORIGIN);
+    let igp = DuskInterchainGasPaymasterIndexer::new(rues, H256::from(IGP));
+    let txs = fixture.node().dispatch_tx.clone();
+
+    // `index.chunk: 1`: a forward cursor asks for one sequence per call...
+    for index in 0..DISPATCHES {
+        let logs = hook.fetch_logs_in_range(index..=index).await.unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].0.inner().index(), index);
+        assert_eq!(logs[0].1.transaction_id, h512(txs[index as usize]));
+    }
+    // ...and so does a backward cursor, from the last sequence down. Every
+    // tenth sequence keeps the test short; the first lookup reads the whole
+    // block either way.
+    for nonce in (0..DISPATCHES).rev().step_by(10) {
+        let messages = mailbox.fetch_logs_in_range(nonce..=nonce).await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].0.inner().nonce, nonce);
+        assert_eq!(messages[0].1.transaction_id, h512(txs[nonce as usize]));
+        let payments = igp.fetch_logs_in_range(nonce..=nonce).await.unwrap();
+        assert_eq!(payments.len(), 1);
+        assert_eq!(payments[0].0.inner().payment, U256::from(1000 + nonce));
+        assert_eq!(payments[0].1.transaction_id, h512(txs[nonce as usize]));
+    }
+
+    let node = fixture.node();
+    assert_one_pass(&node, HOOK, "hook, forward");
+    assert_one_pass(&node, MAILBOX, "mailbox, backward");
+    assert_one_pass(&node, IGP, "igp, backward");
+}
+
+#[tokio::test]
+async fn transaction_lookups_in_a_block_of_1000_read_it_once() {
+    const DISPATCHES: usize = 1000;
+    let fixture = Fixture::start();
+    reversed_block(&fixture, DISPATCHES);
+    let rues = fixture.client();
+    let hook = DuskMerkleTreeHookIndexer::new(rues.clone(), H256::from(HOOK));
+    let mailbox = DuskMailboxIndexer::new(rues.clone(), H256::from(MAILBOX), ORIGIN);
+    let igp = DuskInterchainGasPaymasterIndexer::new(rues, H256::from(IGP));
+    let txs: Vec<H512> = fixture
+        .node()
+        .dispatch_tx
+        .iter()
+        .map(|tx| h512(*tx))
+        .collect();
+    let queries = || fixture.node().contract_queries;
+
+    // Contract sync hands each dispatch's transaction to the hook and IGP
+    // indexers, which look up what that transaction did. The Mailbox's
+    // lookup works the same way.
+    let mut per_indexer = Vec::new();
+    let before = queries();
+    for (nonce, tx) in txs.iter().enumerate() {
+        let insertions = hook.fetch_logs_by_tx_hash(*tx).await.unwrap();
+        assert_eq!(insertions.len(), 1);
+        assert_eq!(insertions[0].0.inner().index(), nonce as u32);
+        assert_eq!(insertions[0].1.transaction_id, *tx);
+    }
+    per_indexer.push(("hook", queries() - before, txs.len()));
+    // Every tenth transaction for the IGP and the Mailbox keeps the test
+    // short; the first lookup reads the whole block either way.
+    let sampled: Vec<(usize, H512)> = txs.iter().copied().enumerate().step_by(10).collect();
+    let before = queries();
+    for &(nonce, ref tx) in &sampled {
+        let payments = igp.fetch_logs_by_tx_hash(*tx).await.unwrap();
+        assert_eq!(payments.len(), 1);
+        assert_eq!(payments[0].0.sequence, Some(nonce as u32));
+        assert_eq!(payments[0].1.transaction_id, *tx);
+    }
+    per_indexer.push(("igp", queries() - before, sampled.len()));
+    let before = queries();
+    for &(nonce, ref tx) in &sampled {
+        let messages = mailbox.fetch_logs_by_tx_hash(*tx).await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].0.inner().nonce, nonce as u32);
+        assert_eq!(messages[0].1.transaction_id, *tx);
+    }
+    per_indexer.push(("mailbox", queries() - before, sampled.len()));
+    // A transaction that emitted nothing in the contract has no logs.
+    assert!(hook
+        .fetch_logs_by_tx_hash(h512([0xee; 32]))
+        .await
+        .unwrap()
+        .is_empty());
+
+    let node = fixture.node();
+    assert_one_pass(&node, HOOK, "hook, by transaction");
+    assert_one_pass(&node, MAILBOX, "mailbox, by transaction");
+    assert_one_pass(&node, IGP, "igp, by transaction");
+    // State reads grow with the lookups, not with lookups times the block's
+    // records: a lookup of the whole block took 2,000 for the hook alone.
+    for (label, count, lookups) in per_indexer {
+        eprintln!(
+            "{label}: {count} contract queries for {lookups} lookups, {} per lookup",
+            count / lookups
+        );
+        assert!(count <= 50 * lookups, "{label}: {count} contract queries");
     }
 }
