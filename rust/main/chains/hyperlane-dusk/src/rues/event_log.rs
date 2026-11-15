@@ -28,18 +28,21 @@
 //! order, and a rebuilt archive can hold rows of a block that the old one
 //! skipped, or lack rows it had. Every block a pass reads again that the log
 //! holds must match the log's rows of it exactly, and every block the log
-//! holds rows of must come again before a later block does. A row below a
-//! block read before it, or a block that differs, drops the log's rows from
-//! that block on, and the log reads them again. Consumers that index a log
+//! holds rows of must come again before a later block does, or before the
+//! archive's end when the archive had finalized the block before the pass.
+//! A row below a block read before it, or a block that differs, drops the
+//! log's rows from that block on, and the log reads them again. Consumers that index a log
 //! by its sequences (the delivery indexer's contract sync) mark the
 //! sequences they are told of or read as published: every sequence below a
 //! count they get, and every row they read. The previous version recorded
 //! none, so every row of such a log it wrote counts as published. Dropped
 //! rows of published sequences are kept, unseen, as evidence: the rows the
-//! log takes again under those sequences must be the same, and where one is
-//! not, the log stops with a critical error instead of numbering them
-//! differently, until the operator resets the agent's database and event
-//! store.
+//! log takes again under those sequences must be the same, and the log must
+//! take one under each of them by the time it holds every finalized row of
+//! its block. Where it does not, the log stops with a critical error
+//! instead of numbering them differently or reporting fewer rows than
+//! consumers hold, until the operator resets the agent's database and
+//! event store.
 
 use super::*;
 
@@ -161,6 +164,10 @@ enum PassStart {
 struct Frontier {
     latest: u64,
     finalized: u64,
+    /// The node's last final block, if the archive had finalized it before
+    /// the log read on: the archive then holds every row of the blocks up to
+    /// it that it will ever hold.
+    archived_final: Option<u64>,
 }
 
 /// A row of the log's topic in a block the log takes.
@@ -315,6 +322,7 @@ impl RuesClient {
         Ok(Frontier {
             latest: pair.latest,
             finalized: pair.finalized,
+            archived_final: None,
         })
     }
 
@@ -358,7 +366,8 @@ impl RuesClient {
         Ok(state)
     }
 
-    /// `advance_event_log`, with the log's lock held.
+    /// `advance_event_log`, with the log's lock held. Halts the log when a
+    /// row consumers read is gone (`ensure_published_rows_remain`).
     async fn advance_locked_event_log(
         &self,
         log: &EventLog,
@@ -366,6 +375,65 @@ impl RuesClient {
         finality: Option<&BlockPair>,
     ) -> Result<LogState, HyperlaneDuskError> {
         self.ensure_event_log_runs(log)?;
+        let state = self.read_on_event_log(log, max_pages, finality).await?;
+        self.ensure_published_rows_remain(log, &state)?;
+        Ok(state)
+    }
+
+    /// Fail, halting the log, when it lacks a row consumers read although it
+    /// holds every finalized row of that row's block: the first published
+    /// sequence it has not taken again since it dropped the row. A rebuilt
+    /// archive that lacks a published row, without another row to take its
+    /// sequence, leaves the log short of what consumers hold, for good.
+    fn ensure_published_rows_remain(
+        &self,
+        log: &EventLog,
+        state: &LogState,
+    ) -> Result<(), HyperlaneDuskError> {
+        if state.count >= state.published {
+            return Ok(());
+        }
+        let sequence = state.count;
+        let (height, read) = match self.event_log_entry(log, sequence)? {
+            Some(read) => {
+                if state
+                    .complete_through
+                    .is_none_or(|through| through < read.block_height)
+                {
+                    // The log may still take the row again.
+                    return Ok(());
+                }
+                let detail = format!(
+                    "the row of transaction {} in block {}",
+                    hex::encode(read.origin),
+                    read.block_height
+                );
+                (read.block_height, detail)
+            }
+            None => (
+                state.last_block.unwrap_or_default(),
+                "a row the event store no longer holds".to_owned(),
+            ),
+        };
+        Err(self.halt_event_log(
+            log,
+            height,
+            format!(
+                "CRITICAL: the Dusk {} event log of contract {} no longer has a row consumers have read: sequence {sequence}, read as {read}, is in no finalized block the endpoint's archive serves, although the log holds every finalized row up to block {}, so the endpoint's finalized archive history changed under it. The log stops instead of reporting fewer rows than consumers hold. Check the endpoint's archive, then stop the agent, reset its database and its eventCursorDir, and start it again so that both index the archive afresh",
+                log.topic,
+                hex::encode(log.contract_id),
+                state.complete_through.unwrap_or_default()
+            ),
+        )?)
+    }
+
+    /// `advance_locked_event_log`'s reading on.
+    async fn read_on_event_log(
+        &self,
+        log: &EventLog,
+        max_pages: usize,
+        finality: Option<&BlockPair>,
+    ) -> Result<LogState, HyperlaneDuskError> {
         let mut state = self.event_log_state(log)?;
         // A log that holds every finalized row up to the node's last final
         // block has nothing to read until the node finalizes another.
@@ -377,13 +445,6 @@ impl RuesClient {
                 return Ok(state);
             }
         }
-        let frontier = match finality {
-            Some(pair) => Frontier {
-                latest: pair.latest,
-                finalized: pair.finalized,
-            },
-            None => self.frontier().await?,
-        };
         let archived_final = match finality {
             Some(pair)
                 if state
@@ -395,6 +456,14 @@ impl RuesClient {
                     .then_some(pair.finalized)
             }
             _ => None,
+        };
+        let frontier = match finality {
+            Some(pair) => Frontier {
+                latest: pair.latest,
+                finalized: pair.finalized,
+                archived_final,
+            },
+            None => self.frontier().await?,
         };
         let target = |state: &LogState| state.last_block.map_or(0, |block| block.saturating_add(1));
         let mut start = match self.staged_block(log, &state)? {
@@ -710,6 +779,19 @@ impl RuesClient {
                             self.write_event_log(log, state, batch)?;
                             return Err(error);
                         }
+                    }
+                }
+                // Blocks the log holds rows of that did not come again by
+                // the archive's end are gone, once the archive had
+                // finalized them before this pass: it holds every row of
+                // them it ever will. Otherwise it may only lag behind.
+                if next_sequence < state.count {
+                    let height = self.entry_height(log, next_sequence)?;
+                    if frontier
+                        .archived_final
+                        .is_some_and(|archived| height <= archived)
+                    {
+                        return self.event_log_diverged(log, state, batch, height);
                     }
                 }
             }

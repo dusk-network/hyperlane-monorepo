@@ -874,6 +874,86 @@ async fn rows_restored_under_deliveries_already_read_halt_the_log() {
 }
 
 #[tokio::test]
+async fn deliveries_already_read_that_a_rebuilt_archive_lacks_halt_the_log() {
+    // Block 13 holds a row of another topic, or none at all: either way the
+    // archive has finalized it, and nothing comes to take sequence 2.
+    for later_rows in [vec![Row::other(4, events::Dispatch::TOPIC)], vec![]] {
+        let mut node = Node::default();
+        node.finalize(10, vec![Row::delivery(1, message(1))]);
+        node.finalize(11, vec![Row::delivery(2, message(2))]);
+        node.finalize(12, vec![Row::delivery(3, message(3))]);
+        let fixture = Fixture::start(node);
+        let indexer = fixture.indexer();
+        // Contract sync reads all three: sequence 2 is block 12's.
+        assert_eq!(all_deliveries(&indexer).await.len(), 3);
+
+        // The operator rebuilds the archive without block 12's delivery,
+        // numbering its rows afresh, and the node finalizes block 13.
+        {
+            let mut node = fixture.node();
+            node.rows = vec![
+                (100, 10, Row::delivery(1, message(1))),
+                (101, 11, Row::delivery(2, message(2))),
+            ];
+            node.next_id = 102;
+            node.finalize(13, later_rows.clone());
+        }
+        fixture.next_tick().await;
+        // Once the log holds every finalized delivery past block 12, the
+        // delivery consumers read as sequence 2 is gone for good: the log
+        // halts instead of reporting fewer deliveries than they hold.
+        for _ in 0..2 {
+            let error = indexer
+                .latest_sequence_count_and_tip()
+                .await
+                .unwrap_err()
+                .to_string();
+            assert_halted(&error, 12, 2);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_delivery_already_read_waits_for_an_archive_that_lags_behind_its_block() {
+    let mut node = Node::default();
+    node.finalize(10, vec![Row::delivery(1, message(1))]);
+    node.finalize(11, vec![Row::delivery(2, message(2))]);
+    let fixture = Fixture::start(node);
+    let indexer = fixture.indexer();
+    assert_eq!(all_deliveries(&indexer).await.len(), 2);
+
+    // An archive rebuilt from scratch has reached block 10 so far, and the
+    // node has finalized block 12.
+    {
+        let mut node = fixture.node();
+        node.rows = vec![(100, 10, Row::delivery(1, message(1)))];
+        node.next_id = 101;
+        node.archived.remove(&11);
+        node.finalized = 12;
+    }
+    fixture.next_tick().await;
+    // Block 11 may still come: the log keeps its rows and waits, and does
+    // not halt.
+    assert_eq!(
+        indexer.latest_sequence_count_and_tip().await.unwrap(),
+        (Some(2), 11)
+    );
+    // It comes, as it was.
+    {
+        let mut node = fixture.node();
+        node.rows.push((101, 11, Row::delivery(2, message(2))));
+        node.next_id = 102;
+        node.archived.insert(11, block_hash(11));
+        node.finalize(12, vec![]);
+    }
+    fixture.next_tick().await;
+    assert_eq!(
+        indexer.latest_sequence_count_and_tip().await.unwrap(),
+        (Some(2), 12)
+    );
+}
+
+#[tokio::test]
 async fn a_crash_between_an_entry_batch_and_the_completeness_update_loses_nothing() {
     let mut node = Node::default();
     for height in 10..14u64 {

@@ -128,7 +128,9 @@ how to run the local bridge.
   pass reads again from its first row, as it does from the contract's first
   row once the archive numbers its rows differently, must match the log's
   rows of it, and every block the log holds rows of must come again before a
-  later block does. A row below a block read before it, or a block that
+  later block does, or before the archive's end when the archive had
+  finalized the node's last final block before the read. A row below a
+  block read before it, or a block that
   differs, drops the log's rows from that block on, and the log reads them
   again; a block that `checkBlock` no longer accepts when a delivery is
   served drops them all. The delivery indexer marks as published every
@@ -137,7 +139,9 @@ how to run the local bridge.
   counts every delivery it holds as published. The log keeps the dropped
   rows of published deliveries, and where
   the rows it reads again would give one of those sequences another
-  delivery, it halts (see [Event log halts](#event-log-halts)). The delivery
+  delivery, it halts (see [Event log halts](#event-log-halts)), as it does
+  once it holds every finalized delivery up to the block of one of them
+  without having taken it again. The delivery
   indexer's tip is the height up to which the log holds every finalized
   delivery.
 - **Announced locations.** ValidatorAnnounce keeps only the keccak256 of
@@ -376,8 +380,9 @@ group or world permissions), `keyEnv` (an environment variable name) or `key`
 Contract sync indexes deliveries by their sequence in the delivery log, so
 the log never numbers a delivery it has published differently. When the
 endpoint's archive changes its finalized history under published
-deliveries (an archive rebuilt or repaired with rows it lacked, or another
-node's archive with a different history behind the same URL), every read
+deliveries (an archive rebuilt or repaired with rows it lacked, or without
+rows it had, or another node's archive with a different history behind the
+same URL), every read
 of the delivery log fails with an error that starts with `CRITICAL` and
 names the contract, the topic, the block, the sequence and the rows, and
 the agent logs it as a critical error at most every 10 minutes. The
