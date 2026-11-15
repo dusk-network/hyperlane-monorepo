@@ -13,8 +13,7 @@ use std::time::Duration;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use hyperlane_core::{Indexer, LogMeta, H256, H512};
 use hyperlane_dusk::{
-    DuskDeliveryIndexer, DuskInterchainGasPaymasterIndexer, DuskMailboxIndexer,
-    DuskMerkleTreeHookIndexer, RuesClient,
+    DuskInterchainGasPaymasterIndexer, DuskMailboxIndexer, DuskMerkleTreeHookIndexer, RuesClient,
 };
 use hyperlane_dusk_types::{events, message, GasPaymentRecord};
 use serde_json::{json, Value};
@@ -32,10 +31,11 @@ const PAGE_BOUNDARY_PREFIX: usize = RUSK_MAX_PAGE - 1;
 /// them.
 const OLDER_HISTORY_ROWS: usize = 2 * RUSK_MAX_PAGE;
 
+/// The indexers whose records contract state numbers. Deliveries are
+/// numbered by the delivery log instead (`tests/delivery_log.rs`).
 #[derive(Clone, Copy, Debug)]
 enum Kind {
     Dispatch,
-    Process,
     Merkle,
     Igp,
 }
@@ -44,7 +44,6 @@ impl Kind {
     fn topic(self) -> &'static str {
         match self {
             Self::Dispatch => events::Dispatch::TOPIC,
-            Self::Process => events::ProcessId::TOPIC,
             Self::Merkle => events::InsertedIntoTree::TOPIC,
             Self::Igp => events::GasPayment::TOPIC,
         }
@@ -52,11 +51,6 @@ impl Kind {
     fn event(self, index: usize) -> Vec<u8> {
         match self {
             Self::Dispatch => dispatch_event(encoded(index)),
-            Self::Process => rkyv::to_bytes::<_, 256>(&events::ProcessId {
-                message_id: id(index),
-            })
-            .unwrap()
-            .to_vec(),
             Self::Merkle => rkyv::to_bytes::<_, 256>(&events::InsertedIntoTree {
                 message_id: id(index),
                 index: index as u32,
@@ -263,14 +257,12 @@ impl Fixture {
                     let method = path.strip_prefix(&prefix).unwrap();
                     let index = || u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
                     match method {
-                        "nonce" | "processed_count" | "count" | "gas_payment_count" => {
-                            2u32.to_le_bytes().to_vec()
+                        "nonce" | "count" | "gas_payment_count" => 2u32.to_le_bytes().to_vec(),
+                        "dispatched_block_height" | "inserted_block_height" => {
+                            HEIGHT.to_le_bytes().to_vec()
                         }
-                        "dispatched_block_height"
-                        | "processed_block_height_at_index"
-                        | "inserted_block_height" => HEIGHT.to_le_bytes().to_vec(),
                         "dispatched_id" => worker_ids.lock().unwrap()[index()].to_vec(),
-                        "processed_at_index" | "message_id_at" => id(index()).to_vec(),
+                        "message_id_at" => id(index()).to_vec(),
                         "gas_payment_at" => rkyv::to_bytes::<_, 256>(&payment(index()))
                             .unwrap()
                             .to_vec(),
@@ -347,7 +339,6 @@ async fn read(
     }
     match kind {
         Kind::Dispatch => read_indexer!(DuskMailboxIndexer::new(rues, address, ORIGIN)),
-        Kind::Process => read_indexer!(DuskDeliveryIndexer::new(rues, address)),
         Kind::Merkle => read_indexer!(DuskMerkleTreeHookIndexer::new(rues, address)),
         Kind::Igp => read_indexer!(DuskInterchainGasPaymasterIndexer::new(rues, address)),
     }
@@ -406,10 +397,6 @@ async fn dispatch_hash_order_matches_execution_control() {
     must_read(Kind::Dispatch, false, 0, 0..=1, false).await;
 }
 #[tokio::test]
-async fn process_hash_order_matches_execution_control() {
-    must_read(Kind::Process, false, 0, 0..=1, false).await;
-}
-#[tokio::test]
 async fn merkle_hash_order_matches_execution_control() {
     must_read(Kind::Merkle, false, 0, 0..=1, false).await;
 }
@@ -420,10 +407,6 @@ async fn igp_hash_order_matches_execution_control() {
 #[tokio::test]
 async fn dispatch_same_block_reverse_hash_order() {
     must_read(Kind::Dispatch, true, 0, 0..=1, false).await;
-}
-#[tokio::test]
-async fn process_same_block_reverse_hash_order() {
-    must_read(Kind::Process, true, 0, 0..=1, false).await;
 }
 #[tokio::test]
 async fn merkle_same_block_reverse_hash_order() {
@@ -505,7 +488,7 @@ async fn same_block_replay_reuses_the_cursor_after_older_blocks() {
 
 #[tokio::test]
 async fn a_missing_row_cannot_pin_a_cursor_past_repaired_archive_rows() {
-    for kind in [Kind::Dispatch, Kind::Process, Kind::Merkle, Kind::Igp] {
+    for kind in [Kind::Dispatch, Kind::Merkle, Kind::Igp] {
         let fixture = Fixture::start(kind, true, 0);
         let correct = fixture.archive_rows.lock().unwrap().clone();
         *fixture.archive_rows.lock().unwrap() = vec![json!({
@@ -528,7 +511,7 @@ async fn a_missing_row_cannot_pin_a_cursor_past_repaired_archive_rows() {
 
 #[tokio::test]
 async fn a_block_read_before_its_archive_ids_are_rebuilt_still_resolves() {
-    for kind in [Kind::Dispatch, Kind::Process, Kind::Merkle, Kind::Igp] {
+    for kind in [Kind::Dispatch, Kind::Merkle, Kind::Igp] {
         let fixture = Fixture::start_with_prefix_height(kind, true, OLDER_HISTORY_ROWS, HEIGHT - 1);
         let rues = fixture.client();
         assert_eq!(

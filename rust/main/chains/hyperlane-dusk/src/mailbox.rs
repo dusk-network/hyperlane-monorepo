@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use hyperlane_core::{
     accumulator::incremental::IncrementalMerkle, BatchResult, ChainResult, Checkpoint,
@@ -15,12 +15,17 @@ use hyperlane_core::{
 use hyperlane_dusk_types::events;
 use hyperlane_dusk_types::merkle::{IncrementalMerkle as HookTree, TREE_DEPTH};
 
-use crate::rues::{bounded_body, bounded_json, bounded_text, rkyv_deserialize, rkyv_serialize};
+use crate::rues::{
+    bounded_body, bounded_json, bounded_text, rkyv_deserialize, rkyv_serialize, LogLookup,
+};
 use crate::{ConnectionConf, DuskProvider, DuskSigner, HyperlaneDuskError, RuesClient};
 
 const TX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(120);
 /// Most message IDs one `message_ids` query returns.
 const MERKLE_HISTORY_PAGE_SIZE: u32 = 256;
+/// Archive pages a delivery check reads to bring the delivery log up to
+/// date, on to the end of the block being read.
+const DELIVERED_LOG_PAGES: usize = 4;
 
 /// Dusk Mailbox contract adapter.
 #[derive(Debug, Clone)]
@@ -451,10 +456,15 @@ impl Mailbox for DuskMailbox {
     ///
     /// The relayer stops retrying a message once this returns `true`, but
     /// the `delivered` query reads the node's tip, which Rusk can still roll
-    /// back. So a delivery the tip holds counts only once no non-final block
-    /// emitted its `ProcessId` event, whoever delivered it. Until then this
-    /// fails and the relayer checks again later; a delivery that is rolled
-    /// back reads as not delivered, and the message is relayed again.
+    /// back. So a delivery the tip holds counts only once its block is final.
+    /// Where the agent's delivery log holds the archive's finalized
+    /// deliveries up to the last final block, that takes the delivery's
+    /// `ProcessId` row in a finalized block: no rollback can undo it. Where
+    /// the log does not reach that far yet, or there is none, the delivery
+    /// counts once no non-final block emitted its `ProcessId` event, whoever
+    /// delivered it. Until then this fails and the relayer checks again
+    /// later; a delivery that is rolled back reads as not delivered, and the
+    /// message is relayed again.
     async fn delivered(&self, id: H256) -> ChainResult<bool> {
         let id_bytes: [u8; 32] = id.into();
         let delivered_at_tip = || async {
@@ -470,6 +480,30 @@ impl Mailbox for DuskMailbox {
         let pair = self.rues.block_pair().await?;
         if !delivered_at_tip().await? {
             return Ok(false);
+        }
+        let lookup = self
+            .rues
+            .finalized_event_log_lookup(
+                &crate::mailbox_indexer::delivery_log(self.mailbox_id),
+                &id_bytes,
+                &pair,
+                DELIVERED_LOG_PAGES,
+            )
+            .await;
+        match lookup {
+            Ok(LogLookup::Found(_)) => return Ok(true),
+            Ok(LogLookup::Absent { final_block }) => {
+                return Err(HyperlaneDuskError::NotFinal(format!(
+                    "Message {id:?} is delivered at the Dusk tip, but no finalized block up to block {final_block}, the last final one, holds its delivery"
+                ))
+                .into())
+            }
+            Ok(LogLookup::Unknown(reason)) => {
+                debug!(message_id = ?id, %reason, "Dusk delivery log cannot show finality; checking the blocks that are not final");
+            }
+            Err(error) => {
+                debug!(message_id = ?id, %error, "Dusk delivery log is unavailable; checking the blocks that are not final");
+            }
         }
         let pending = self
             .rues

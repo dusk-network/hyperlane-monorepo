@@ -11,6 +11,7 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use base64::Engine;
 use hyperlane_core::{
     config::OpSubmissionConfig, HyperlaneDomain, HyperlaneDomainProtocol,
     HyperlaneDomainTechnicalStack, Mailbox, NativeToken, ValidatorAnnounce, H256,
@@ -193,7 +194,94 @@ impl Node {
         panic!("unexpected request {path}");
     }
 
+    /// Every event of the final blocks the archive has stored, numbered
+    /// in chain order as the archive numbers its rows.
+    fn finalized_rows(&self) -> Vec<(i64, &Block, &Event)> {
+        self.chain
+            .iter()
+            .filter(|block| block.height <= self.finalized && block.archived)
+            .flat_map(|block| block.events.iter().map(move |event| (block, event)))
+            .enumerate()
+            .map(|(id, (block, event))| (id as i64, block, event))
+            .collect()
+    }
+
     fn graphql(&self, query: &str) -> serde_json::Value {
+        if query.contains("finalizedEvents(") {
+            let source = query
+                .split_once("contractId: \"")
+                .and_then(|(_, rest)| rest.split('"').next())
+                .unwrap();
+            let limit: usize = query
+                .split_once("limit: ")
+                .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
+                .unwrap()
+                .parse()
+                .unwrap();
+            let after = query.split_once("cursor: \"").map(|(_, rest)| {
+                let cursor = rest.split('"').next().unwrap();
+                let text = String::from_utf8(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(cursor)
+                        .unwrap(),
+                )
+                .unwrap();
+                text.strip_prefix("v1:").unwrap().parse::<i64>().unwrap()
+            });
+            let mut page: Vec<_> = self
+                .finalized_rows()
+                .into_iter()
+                .filter(|(id, _, event)| {
+                    hex::encode(event.source) == source && *id > after.unwrap_or(-1)
+                })
+                .take(limit + 1)
+                .map(|(id, block, event)| {
+                    serde_json::json!({
+                        "id": id, "block_height": block.height,
+                        "block_hash": hex::encode(block.hash), "origin": "33".repeat(32),
+                        "topic": event.topic, "source": hex::encode(event.source),
+                        "data": hex::encode(&event.data), "reverted": event.reverted,
+                    })
+                })
+                .collect();
+            let has_next = page.len() > limit;
+            page.truncate(limit);
+            let cursor = |row: Option<&serde_json::Value>| {
+                row.map(|row| {
+                    base64::engine::general_purpose::STANDARD.encode(format!("v1:{}", row["id"]))
+                })
+            };
+            return serde_json::json!({"finalizedEvents": {"json": {
+                "events": page,
+                "startCursor": cursor(page.first()),
+                "endCursor": cursor(page.last()),
+                "hasNextPage": has_next,
+            }}});
+        }
+        if query.contains("checkBlock(") {
+            let height: u64 = query
+                .split_once("height: ")
+                .and_then(|(_, rest)| rest.split(',').next())
+                .unwrap()
+                .parse()
+                .unwrap();
+            let hash = query
+                .split_once("hash: \"")
+                .and_then(|(_, rest)| rest.split('"').next())
+                .unwrap();
+            let finalized = height <= self.finalized
+                && self
+                    .chain
+                    .get(height as usize)
+                    .is_some_and(|block| block.archived && hex::encode(block.hash) == hash);
+            return serde_json::json!({ "checkBlock": finalized });
+        }
+        if let Some(rest) = query.strip_prefix("query { block(height: ") {
+            let height: usize = rest.split(')').next().unwrap().parse().unwrap();
+            return serde_json::json!({"block": self.chain.get(height).map(|block| {
+                serde_json::json!({"header": {"hash": hex::encode(block.hash)}})
+            })});
+        }
         if query == "query { lastBlockPair { json } }" {
             let tip = self.block(self.tip() - self.unreported);
             let finalized = self.block(self.finalized);
@@ -346,6 +434,29 @@ impl Fixture {
             op_submission_config: OpSubmissionConfig::default(),
         };
         (domain, rues, provider, conf)
+    }
+
+    /// A Mailbox adapter whose client keeps a delivery log in the
+    /// fixture's event store.
+    fn mailbox_with_log(&self) -> DuskMailbox {
+        let (domain, _, _, conf) = self.parts();
+        let rues = Arc::new(
+            RuesClient::new_with_event_cursor_dir(
+                self.url.clone(),
+                self._directory.path().join("events"),
+            )
+            .unwrap(),
+        );
+        let provider = Arc::new(DuskProvider::new(domain.clone(), rues.clone()));
+        DuskMailbox::new(
+            provider,
+            rues,
+            H256::from(MAILBOX),
+            H256::repeat_byte(3),
+            domain,
+            None,
+            conf,
+        )
     }
 
     fn mailbox(&self) -> DuskMailbox {
@@ -672,4 +783,81 @@ async fn another_validators_pending_announcement_does_not_hold_startup() {
             .unwrap(),
         vec![vec![LOCATION.to_owned()]]
     );
+}
+
+async fn delivered_with_log(fixture: &Fixture) -> Result<bool, String> {
+    fixture
+        .mailbox_with_log()
+        .delivered(message_id())
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tokio::test]
+async fn a_delivery_the_delivery_log_finds_final_reads_no_non_final_block() {
+    let mut node = Node::new(100);
+    let block = node.push(vec![Event::processed(MESSAGE)]);
+    node.push(vec![]);
+    node.delivered.insert(MESSAGE);
+    node.finalized = block;
+    let fixture = Fixture::start(node);
+    assert_eq!(delivered_with_log(&fixture).await, Ok(true));
+    let queries = fixture.node().queries.clone();
+    assert!(
+        queries
+            .iter()
+            .all(|query| !query.contains("blocks(range") && !query.contains("contractEvents")),
+        "{queries:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_delivery_rolled_back_within_the_check_never_counts_with_a_delivery_log() {
+    // The state holds a delivery in block 101, which the ledger stores only
+    // after `lastBlockPair` has answered. Between the check's state reads
+    // and its read of the blocks that are not final, block 101 is rolled
+    // back and replaced by a block without the delivery: those blocks then
+    // hold no event of it, and the chain still extends the tip the check
+    // read. Only the finalized deliveries can show that it is not final.
+    let mut node = Node::new(100);
+    node.push(vec![Event::processed(MESSAGE)]);
+    node.unreported = 1;
+    node.delivered.insert(MESSAGE);
+    node.after_delivered_queries = Some((
+        2,
+        Box::new(|node: &mut Node| {
+            node.roll_back_to(100);
+            node.push(vec![]);
+            node.unreported = 0;
+            node.delivered.clear();
+        }),
+    ));
+    let fixture = Fixture::start(node);
+    let error = delivered_with_log(&fixture).await.unwrap_err();
+    assert!(
+        error.contains("no finalized block up to block 100"),
+        "{error}"
+    );
+    // The relayer checks again later and relays the message again.
+    assert_eq!(delivered_with_log(&fixture).await, Ok(false));
+}
+
+#[tokio::test]
+async fn a_delivery_log_short_of_the_last_final_block_falls_back_to_non_final_blocks() {
+    let mut node = Node::new(100);
+    let block = node.push(vec![Event::processed(MESSAGE)]);
+    node.push(vec![]);
+    node.delivered.insert(MESSAGE);
+    node.finalized = block;
+    // The archive has not stored the last final block yet, so the log
+    // cannot hold every final delivery: the check reads the blocks above
+    // the last final one, which hold no event of it.
+    node.chain[block as usize].archived = false;
+    let fixture = Fixture::start(node);
+    assert_eq!(delivered_with_log(&fixture).await, Ok(true));
+    assert!(fixture
+        .node()
+        .queries
+        .iter()
+        .any(|query| query.contains("blocks(range")));
 }

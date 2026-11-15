@@ -22,6 +22,10 @@ use hyperlane_core::{ReorgPeriod, H256, H512};
 
 use crate::HyperlaneDuskError;
 
+mod event_log;
+use event_log::EventLogLocks;
+pub(crate) use event_log::{EventLog, LogEntry, LogLookup};
+
 const MAX_RUES_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// Rows per `finalizedEvents` page: the most Rusk 1.7.3 returns
 /// (`MAX_LIMIT` in its GraphQL archive module).
@@ -101,6 +105,8 @@ pub struct RuesClient {
     block_cache: Arc<StdMutex<BlockCache>>,
     /// Archived events of blocks that finality checks read.
     non_final_cache: Arc<StdMutex<NonFinalEventCache>>,
+    /// Serializes the advances of each finalized event log.
+    event_logs: Arc<StdMutex<EventLogLocks>>,
 }
 
 impl fmt::Debug for RuesClient {
@@ -752,6 +758,7 @@ impl RuesClient {
             scan_anchors: Arc::new(StdMutex::new(())),
             block_cache: Arc::new(StdMutex::new(BlockCache::new(BLOCK_CACHE_LIMITS))),
             non_final_cache: Arc::new(StdMutex::new(NonFinalEventCache::default())),
+            event_logs: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
 
@@ -2081,6 +2088,16 @@ impl RuesClient {
             ))
         })?;
         Ok(PageReply::Page(page, bytes))
+    }
+
+    /// `checkBlock(onlyFinalized: true)` for a block by its parsed hash.
+    pub(crate) async fn check_finalized_block_hash(
+        &self,
+        block_height: u64,
+        block_hash: H256,
+    ) -> Result<bool, HyperlaneDuskError> {
+        self.check_finalized_block(block_height, &hex::encode(block_hash))
+            .await
     }
 
     /// `checkBlock(onlyFinalized: true)` for one block.

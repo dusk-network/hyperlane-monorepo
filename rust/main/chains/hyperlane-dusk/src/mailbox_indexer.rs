@@ -11,7 +11,7 @@ use hyperlane_core::{
 };
 use hyperlane_dusk_types::{events, message};
 
-use crate::rues::{exact_event_data, rkyv_deserialize, rkyv_serialize};
+use crate::rues::{rkyv_deserialize, rkyv_serialize, EventLog, LogEntry};
 use crate::tx_sender::{dusk_tx_id_to_h512, h512_to_dusk_tx_id};
 use crate::RuesClient;
 
@@ -22,11 +22,7 @@ struct StoredDispatch {
     message_id: [u8; 32],
 }
 
-/// Dusk mailbox indexer for dispatch and delivery events.
-///
-/// Uses sequence-based indexing, keyed on:
-/// - Dispatch nonce for `Indexer<HyperlaneMessage>`
-/// - Process index for `Indexer<H256>` (delivery)
+/// Dusk mailbox indexer for dispatch events, by dispatch nonce.
 #[derive(Debug, Clone)]
 pub struct DuskMailboxIndexer {
     rues: Arc<RuesClient>,
@@ -289,14 +285,43 @@ impl SequenceAwareIndexer<HyperlaneMessage> for DuskMailboxIndexer {
 }
 
 // =============================================================================
-// Delivery indexing: Indexer<H256> (processed message IDs)
+// Delivery indexing: Indexer<H256> (delivered message IDs)
 // =============================================================================
 
-/// Dusk delivery indexer — indexes processed (delivered) message IDs.
+/// Archive pages a delivery indexer reads per call to catch up, on to the
+/// end of the block being read.
+const DELIVERY_LOG_PAGES: usize = 16;
+
+/// The finalized event log of a Mailbox's deliveries: its `ProcessId` rows,
+/// keyed by message ID.
+pub(crate) fn delivery_log(mailbox_id: [u8; 32]) -> EventLog {
+    EventLog {
+        contract_id: mailbox_id,
+        topic: events::ProcessId::TOPIC,
+        key_of: delivery_key,
+    }
+}
+
+/// The message ID a `ProcessId` event names, if its data is exactly the
+/// event's encoding.
+fn delivery_key(data: &[u8]) -> Option<Vec<u8>> {
+    let event: events::ProcessId = rkyv_deserialize(data).ok()?;
+    (rkyv_serialize(&event).ok()? == data).then(|| event.message_id.to_vec())
+}
+
+/// Dusk delivery indexer: the message IDs the Mailbox delivered.
+///
+/// The Mailbox keeps no list of deliveries, only a set of delivered IDs, so
+/// deliveries come from its finalized `ProcessId` events. Their sequence is
+/// their number in the delivery log (`delivery_log`): every non-reverted
+/// `ProcessId` row the archive has finalized, in block order and, within a
+/// block, in archive order (by transaction hash, then by emission). It is
+/// the same for every agent and endpoint whose archive holds the same
+/// blocks, but it is not the order of execution within a block.
 #[derive(Debug, Clone)]
 pub struct DuskDeliveryIndexer {
     rues: Arc<RuesClient>,
-    mailbox_id: [u8; 32],
+    log: EventLog,
     mailbox_address: H256,
 }
 
@@ -305,140 +330,93 @@ impl DuskDeliveryIndexer {
     pub fn new(rues: Arc<RuesClient>, mailbox_id: H256) -> Self {
         Self {
             rues,
-            mailbox_id: mailbox_id.into(),
+            log: delivery_log(mailbox_id.into()),
             mailbox_address: mailbox_id,
         }
     }
 
-    async fn process_height(&self, sequence: u32) -> ChainResult<u64> {
-        Ok(self
-            .rues
-            .contract_query(
-                &self.mailbox_id,
-                "processed_block_height_at_index",
-                &(sequence,),
-            )
-            .await?)
-    }
-
-    async fn first_process_at_or_after(&self, count: u32, block_height: u64) -> ChainResult<u32> {
-        let mut low = 0u32;
-        let mut high = count;
-        while low < high {
-            let middle = low + (high - low) / 2;
-            if self.process_height(middle).await? < block_height {
-                low = middle + 1;
-            } else {
-                high = middle;
-            }
-        }
-        Ok(low)
-    }
-
-    async fn process_range_at_block(
+    /// The deliveries of `entries`, each in a block that
+    /// `checkBlock(onlyFinalized)` still accepts. A block it no longer
+    /// accepts means the endpoint does not agree with the log, which is
+    /// dropped and rebuilt.
+    async fn deliveries(
         &self,
-        count: u32,
-        block_height: u64,
-    ) -> ChainResult<Option<RangeInclusive<u32>>> {
-        let first = self.first_process_at_or_after(count, block_height).await?;
-        if first == count || self.process_height(first).await? != block_height {
-            return Ok(None);
+        entries: Vec<LogEntry>,
+    ) -> ChainResult<Vec<(Indexed<H256>, LogMeta)>> {
+        let mut checked: HashMap<(u64, H256), bool> = HashMap::new();
+        let mut logs = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let block = (entry.block_height, entry.block_hash);
+            let finalized = match checked.get(&block) {
+                Some(finalized) => *finalized,
+                None => {
+                    let finalized = self
+                        .rues
+                        .check_finalized_block_hash(entry.block_height, entry.block_hash)
+                        .await?;
+                    checked.insert(block, finalized);
+                    finalized
+                }
+            };
+            if !finalized {
+                self.rues.reset_event_log(&self.log).await?;
+                return Err(crate::HyperlaneDuskError::FinalizedEventMismatch(format!(
+                    "Dusk delivery {} is in block {} ({:?}), which checkBlock(onlyFinalized) no longer accepts; the delivery log is rebuilt",
+                    entry.sequence, entry.block_height, entry.block_hash
+                ))
+                .into());
+            }
+            ensure_cursor_height(entry.block_height)?;
+            let message_id = delivery_key(&entry.data)
+                .and_then(|id| <[u8; 32]>::try_from(id).ok())
+                .ok_or_else(|| {
+                    crate::HyperlaneDuskError::Other(format!(
+                        "Dusk delivery log row {} is not a ProcessId event",
+                        entry.sequence
+                    ))
+                })?;
+            let sequence = u32::try_from(entry.sequence).map_err(|_| {
+                crate::HyperlaneDuskError::Other(format!(
+                    "Dusk delivery sequence {} exceeds the shared u32 cursor range",
+                    entry.sequence
+                ))
+            })?;
+            let mut transaction_id = [0u8; 64];
+            transaction_id[32..].copy_from_slice(&entry.origin);
+            let log_meta = LogMeta {
+                address: self.mailbox_address,
+                block_number: entry.block_height,
+                block_hash: entry.block_hash,
+                transaction_id: H512::from(transaction_id),
+                transaction_index: 0,
+                log_index: U256::from(sequence),
+            };
+            logs.push((
+                Indexed::from(H256::from(message_id)).with_sequence(sequence),
+                log_meta,
+            ));
         }
-        let after = self
-            .first_process_at_or_after(count, block_height.saturating_add(1))
-            .await?;
-        Ok(Some(crate::bounded_block_range(first, after, "delivery")?))
-    }
-
-    async fn finalized_process_count(&self, current_count: u32) -> ChainResult<(u32, u32)> {
-        let finalized_tip = self.rues.finalized_block_number().await?;
-        let finalized_count = self
-            .first_process_at_or_after(current_count, u64::from(finalized_tip) + 1)
-            .await?;
-        Ok((finalized_count, finalized_tip))
+        Ok(logs)
     }
 }
 
 #[async_trait]
 impl Indexer<H256> for DuskDeliveryIndexer {
+    /// The deliveries numbered `range` that the log holds. Contract sync
+    /// asks only for sequences below the count `latest_sequence_count_and_tip`
+    /// reported.
     async fn fetch_logs_in_range(
         &self,
         range: RangeInclusive<u32>,
     ) -> ChainResult<Vec<(Indexed<H256>, LogMeta)>> {
-        // Messages exist for [0, processed_count).
-        let processed_count: u32 = self
-            .rues
-            .contract_query(&self.mailbox_id, "processed_count", &())
-            .await?;
-        let (finalized_count, _) = self.finalized_process_count(processed_count).await?;
-
-        let mut stored = Vec::new();
-        for index in range {
-            if index >= finalized_count {
-                break;
-            }
-            let message_id: [u8; 32] = self
-                .rues
-                .contract_query(&self.mailbox_id, "processed_at_index", &(index,))
-                .await?;
-
-            let block_number: u64 = self
-                .rues
-                .contract_query(
-                    &self.mailbox_id,
-                    "processed_block_height_at_index",
-                    &(index,),
-                )
-                .await?;
-            ensure_cursor_height(block_number)?;
-            stored.push((index, block_number, message_id));
-        }
-
-        // One archive pass per block, however many deliveries it holds.
-        let mut results = Vec::with_capacity(stored.len());
-        for block in stored.chunk_by(|a, b| a.1 == b.1) {
-            let Some(&(_, block_number, _)) = block.first() else {
-                continue;
-            };
-            let mut expected = Vec::with_capacity(block.len());
-            for (index, _, message_id) in block {
-                let message_id = *message_id;
-                expected.push((
-                    *index as usize,
-                    rkyv_serialize(&events::ProcessId { message_id })?,
-                ));
-            }
-            let sequences: Vec<usize> = expected.iter().map(|(index, _)| *index).collect();
-            let matches = self
-                .rues
-                .finalized_contract_events_at_block(
-                    &self.mailbox_id,
-                    events::ProcessId::TOPIC,
-                    block_number,
-                    &sequences,
-                    exact_event_data(expected),
-                )
-                .await?;
-
-            for (&(index, _, message_id), matched) in block.iter().zip(matches) {
-                let provenance = matched.provenance;
-                let log_meta = LogMeta {
-                    address: self.mailbox_address,
-                    block_number: provenance.block_height,
-                    block_hash: provenance.block_hash,
-                    transaction_id: provenance.transaction_id,
-                    transaction_index: 0,
-                    log_index: U256::from(index),
-                };
-
-                let h256_id = H256::from_slice(&message_id);
-                let indexed = Indexed::from(h256_id).with_sequence(index);
-                results.push((indexed, log_meta));
-            }
-        }
-
-        debug!(count = results.len(), "Fetched delivery logs");
-        Ok(results)
+        let entries = self.rues.event_log_entries(
+            &self.log,
+            u64::from(*range.start()),
+            u64::from(*range.end()),
+        )?;
+        let logs = self.deliveries(entries).await?;
+        debug!(count = logs.len(), "Fetched delivery logs");
+        Ok(logs)
     }
 
     async fn get_finalized_block_number(&self) -> ChainResult<u32> {
@@ -457,24 +435,29 @@ impl Indexer<H256> for DuskDeliveryIndexer {
         if block_height > self.rues.finalized_block_height().await? {
             return Ok(vec![]);
         }
-        let count: u32 = self
+        let pair = self.rues.block_pair().await?;
+        let state = self
             .rues
-            .contract_query(&self.mailbox_id, "processed_count", &())
+            .advance_event_log(&self.log, DELIVERY_LOG_PAGES, Some(&pair))
             .await?;
-        let Some(range) = self.process_range_at_block(count, block_height).await? else {
-            return Ok(vec![]);
-        };
-        crate::ensure_tx_hash_lookup_budget(&range, "delivery")?;
-        let mut logs = Vec::new();
-        for chunk in crate::block_range_chunks(range) {
-            logs.extend(
-                self.fetch_logs_in_range(chunk)
-                    .await?
-                    .into_iter()
-                    .filter(|(_, meta)| meta.transaction_id == tx_hash),
-            );
+        if state
+            .complete_through
+            .is_none_or(|through| through < block_height)
+        {
+            return Err(crate::HyperlaneDuskError::Other(format!(
+                "Dusk delivery log holds the archive's finalized deliveries up to block {:?}, short of block {block_height}; retrying later",
+                state.complete_through
+            ))
+            .into());
         }
-        Ok(logs)
+        let transaction = crate::dusk_transaction_bytes(&tx_hash);
+        let entries = self
+            .rues
+            .event_log_block(&self.log, block_height)?
+            .into_iter()
+            .filter(|entry| entry.origin == transaction)
+            .collect();
+        self.deliveries(entries).await
     }
 
     fn parse_tx_hash(&self, tx_hash: &str) -> ChainResult<H512> {
@@ -537,13 +520,23 @@ fn dispatch_nonce(event_data: &[u8]) -> Option<u32> {
 
 #[async_trait]
 impl SequenceAwareIndexer<H256> for DuskDeliveryIndexer {
+    /// The deliveries the log holds after reading on in the archive, and
+    /// the height up to which it holds every finalized delivery.
     async fn latest_sequence_count_and_tip(&self) -> ChainResult<(Option<u32>, u32)> {
-        let count: u32 = self
+        let pair = self.rues.block_pair().await?;
+        let state = self
             .rues
-            .contract_query(&self.mailbox_id, "processed_count", &())
+            .advance_event_log(&self.log, DELIVERY_LOG_PAGES, Some(&pair))
             .await?;
-        let (finalized_count, finalized_tip) = self.finalized_process_count(count).await?;
-        Ok((Some(finalized_count), finalized_tip))
+        let count = u32::try_from(state.count).map_err(|_| {
+            crate::HyperlaneDuskError::Other(format!(
+                "Dusk delivery count {} exceeds the shared u32 cursor range",
+                state.count
+            ))
+        })?;
+        let tip = state.complete_through.unwrap_or_default();
+        ensure_cursor_height(tip)?;
+        Ok((Some(count), tip as u32))
     }
 }
 

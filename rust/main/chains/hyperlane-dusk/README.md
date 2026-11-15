@@ -24,6 +24,21 @@ how to run the local bridge.
   every agent process needs its own copy of. The Mailbox stores only the ID of
   each dispatched message (`dispatched_id`); the message itself comes from the
   finalized `Dispatch` event whose message hashes to that ID.
+- **Event logs.** The Mailbox keeps no list of deliveries, so they come from
+  its finalized `ProcessId` events alone: the agent keeps a log of them in
+  `eventCursorDir`, every non-reverted row the archive has finalized, in
+  block order and within a block in archive order (by transaction hash),
+  numbered from zero. A delivery's sequence is its number there, the same for
+  any endpoint whose archive holds the same blocks, but not its order of
+  execution within a block. The log takes a block's rows once it has read all
+  of them and `checkBlock(onlyFinalized)` accepted the block; a row that does
+  not parse stops it before its block. It reads on from the closest saved
+  scan position below the first block it lacks, at most 16 pages per indexer
+  call and 4 per delivery check, and never takes rows of a block it already
+  holds, so its numbering survives restarts and renumbered archives. A block
+  that `checkBlock` no longer accepts when a delivery is served drops the log,
+  which is then rebuilt. The delivery indexer's tip is the height up to which
+  the log holds every finalized delivery.
 - **Archive scans** read a contract's `finalizedEvents` 200 rows at a time
   (Rusk's maximum) and match every record of a block in one pass over that
   block's rows. The agent reads at most 4 MiB of a reply, and 200 rows of
@@ -83,11 +98,17 @@ how to run the local bridge.
   tip, which Rusk can roll back until a block is final, and Rusk 1.7.3 has
   no query of contract state at the last finalized block. The relayer stops
   retrying a message once the Mailbox reports it delivered, so `delivered`
-  reports a delivery the tip holds only once no block above the last
-  finalized one emitted its `ProcessId` event, whoever delivered it. The
-  check reads `lastBlockPair` before the state and then the blocks above the
-  last finalized one (`blocks`), which must still hold that tip, so a
-  rollback in between is noticed; each block's events come from the archive
+  reports a delivery the tip holds only once its block is final. Where the
+  delivery log holds every finalized delivery up to the last final block,
+  read with `lastBlockPair` before the state, the delivery counts only once
+  its `ProcessId` row is in a block `checkBlock(onlyFinalized)` accepts,
+  which no rollback can undo. Where the log does not reach that far yet, or
+  the client has no `eventCursorDir`, the delivery counts once no block
+  above the last finalized one emitted its `ProcessId` event, whoever
+  delivered it: the check reads the blocks above the last finalized one
+  (`blocks`), which must still hold the tip it read, so a rollback in
+  between is noticed, though not a block accepted and rolled back entirely
+  within the check's own requests; each block's events come from the archive
   (`contractEvents`). Until the delivery is final, the check fails and the
   relayer tries again later with its usual backoff; a rolled-back delivery
   reads as not delivered, and the message is relayed again. A validator's
