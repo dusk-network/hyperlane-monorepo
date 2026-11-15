@@ -1,14 +1,15 @@
 //! What the Dusk clients cost a node, counted at a scripted one: requests
-//! at idle as the history grows, and a catch-up under Rusk 1.7.3's rate
-//! limit.
+//! at idle as the history grows, a catch-up under Rusk 1.7.3's rate limit,
+//! and how many blocks queued deliveries take.
 //!
 //! Run with `--nocapture` to see the counts.
 #![cfg(unix)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -19,8 +20,8 @@ use std::time::{Duration, Instant};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use hyperlane_core::{
     config::OpSubmissionConfig, HyperlaneDomain, HyperlaneDomainProtocol,
-    HyperlaneDomainTechnicalStack, Indexer, Mailbox, MerkleTreeHook, NativeToken, ReorgPeriod,
-    SequenceAwareIndexer, H256,
+    HyperlaneDomainTechnicalStack, HyperlaneMessage, Indexer, Mailbox, MerkleTreeHook, Metadata,
+    NativeToken, ReorgPeriod, SequenceAwareIndexer, H256, U256,
 };
 use hyperlane_dusk::{
     ConnectionConf, DuskDeliveryIndexer, DuskInterchainGasPaymasterIndexer, DuskMailbox,
@@ -29,6 +30,7 @@ use hyperlane_dusk::{
 };
 use hyperlane_dusk_types::{events, merkle::IncrementalMerkle, message, GasPaymentRecord};
 use serde_json::{json, Value};
+use tempfile::TempDir;
 use url::Url;
 
 const MAILBOX: [u8; 32] = [2; 32];
@@ -628,4 +630,313 @@ async fn a_catch_up_stays_within_the_nodes_rate_limit() {
         total(&requests)
     );
     assert!(refusals > 0);
+}
+
+/// A chain whose blocks come every `BLOCK_TIME`. Each block holds the
+/// transactions the mempool held when the block before it came, as Rusk
+/// builds a candidate block when its round starts: a transaction sent after
+/// that waits for the next block. Transactions are named by their nonce.
+struct TxChain {
+    directory: TempDir,
+    server: Server,
+    state: Arc<Mutex<TxState>>,
+    stop: Arc<AtomicBool>,
+    producer: Option<JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct TxState {
+    height: u64,
+    /// Transactions by nonce, and the block each is in.
+    included: BTreeMap<u64, u64>,
+    /// The mempool when the last block came.
+    candidate: Vec<u64>,
+}
+
+const BLOCK_TIME: Duration = Duration::from_millis(200);
+
+impl TxChain {
+    /// `pipelines`: the helper takes `--nonce` and `--no-wait`. `refuse`:
+    /// the node refuses the transaction of this nonce before propagation.
+    fn start(pipelines: bool, refuse: Option<u64>) -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let dir = directory.path().to_path_buf();
+        std::fs::write(dir.join("mempool"), "").unwrap();
+        std::fs::write(dir.join("included"), "").unwrap();
+        if pipelines {
+            std::fs::write(dir.join("pipelines"), "").unwrap();
+        }
+        if let Some(nonce) = refuse {
+            std::fs::write(dir.join("refuse"), nonce.to_string()).unwrap();
+        }
+        let helper = dir.join("dusk-tx");
+        std::fs::write(&helper, HELPER).unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let state = Arc::new(Mutex::new(TxState::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let producer = {
+            let (state, stop, dir) = (state.clone(), stop.clone(), dir.clone());
+            thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    thread::sleep(BLOCK_TIME);
+                    let mempool = mempool(&dir);
+                    let mut state = state.lock().unwrap();
+                    state.height += 1;
+                    let height = state.height;
+                    let candidate = std::mem::take(&mut state.candidate);
+                    let mut lines = String::new();
+                    for nonce in candidate {
+                        state.included.insert(nonce, height);
+                        lines.push_str(&format!("{}\n", tx_id(nonce)));
+                    }
+                    let mut file = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(dir.join("included"))
+                        .unwrap();
+                    file.write_all(lines.as_bytes()).unwrap();
+                    state.candidate = mempool
+                        .into_iter()
+                        .filter(|nonce| !state.included.contains_key(nonce))
+                        .collect();
+                }
+            })
+        };
+        let server = {
+            let (state, dir) = (state.clone(), dir.clone());
+            Server::start(move |stream, path, body| {
+                let state = state.lock().unwrap();
+                if path.ends_with("/process") {
+                    // The simulation passes.
+                    reply(stream, "200 OK", "", &rkyv(&()));
+                } else if path.starts_with("/on/account:") {
+                    let committed = state.included.len() as u64;
+                    let pending: HashSet<u64> = mempool(&dir).into_iter().collect();
+                    let mut next = committed + 1;
+                    while pending.contains(&next) && !state.included.contains_key(&next) {
+                        next += 1;
+                    }
+                    let value =
+                        json!({"balance": 1u64 << 40, "nonce": committed, "next_nonce": next});
+                    reply(stream, "200 OK", "", value.to_string().as_bytes());
+                } else {
+                    assert_eq!(path, "/on/graphql/query");
+                    let query = String::from_utf8(body).unwrap();
+                    let tx = query
+                        .split_once("hash: \"")
+                        .and_then(|(_, rest)| rest.split('"').next())
+                        .unwrap();
+                    let nonce = u64::from_str_radix(tx, 16).unwrap();
+                    let included = state.included.get(&nonce).copied();
+                    let held = mempool(&dir).contains(&nonce);
+                    let value = if query.contains("mempoolTx") {
+                        json!({
+                            "mempoolTx": (held && included.is_none()).then(|| json!({"id": tx})),
+                            "tx": included.map(|height| json!({"blockHeight": height})),
+                        })
+                    } else {
+                        json!({"tx": included.map(|_| json!({"gasSpent": 2_000_000, "err": null}))})
+                    };
+                    reply(stream, "200 OK", "", value.to_string().as_bytes());
+                }
+            })
+        };
+        Self {
+            directory,
+            server,
+            state,
+            stop,
+            producer: Some(producer),
+        }
+    }
+
+    fn helper(&self) -> PathBuf {
+        self.directory.path().join("dusk-tx")
+    }
+
+    fn height(&self) -> u64 {
+        self.state.lock().unwrap().height
+    }
+
+    fn blocks_of(&self, nonces: impl Iterator<Item = u64>) -> HashSet<u64> {
+        let state = self.state.lock().unwrap();
+        nonces
+            .filter_map(|nonce| state.included.get(&nonce).copied())
+            .collect()
+    }
+
+    /// The block of the last transaction.
+    fn last_block(&self) -> u64 {
+        let state = self.state.lock().unwrap();
+        state
+            .included
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(state.height)
+    }
+
+    fn mailbox(&self) -> DuskMailbox {
+        let rues = Arc::new(RuesClient::new(self.server.url.clone()).unwrap());
+        mailbox(rues, &self.server.url, self.directory.path(), true)
+    }
+}
+
+impl Drop for TxChain {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(producer) = self.producer.take() {
+            let _ = producer.join();
+        }
+    }
+}
+
+fn tx_id(nonce: u64) -> String {
+    format!("{nonce:064x}")
+}
+
+fn mempool(dir: &Path) -> Vec<u64> {
+    std::fs::read_to_string(dir.join("mempool"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| u64::from_str_radix(line.trim(), 16).ok())
+        .collect()
+}
+
+/// A `dusk-tx` stand-in. Without `--nonce` it takes the account's next
+/// nonce and waits until its transaction is in a block, as the helper does;
+/// with `--nonce N --no-wait` (when the `pipelines` file exists) it signs
+/// with N and returns once the node holds the transaction.
+const HELPER: &str = r#"#!/bin/sh
+dir="$(dirname "$0")"
+if [ "$2" = "--help" ]; then
+  if [ -f "$dir/pipelines" ]; then echo "--nonce <NONCE>  --no-wait"; fi
+  exit 0
+fi
+IFS= read -r url
+IFS= read -r key
+nonce=""
+wait=1
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --nonce) nonce="$2"; shift ;;
+    --no-wait) wait="" ;;
+  esac
+  shift
+done
+if [ -z "$nonce" ]; then
+  nonce=$(( $(wc -l < "$dir/included") + 1 ))
+fi
+tx=$(printf '%064x' "$nonce")
+printf '  Prepared TX %s; reconcile this exact hash before retrying if submission is interrupted\n' "$tx" >&2
+if [ -f "$dir/refuse" ] && [ "$(cat "$dir/refuse")" = "$nonce" ]; then
+  printf '{"success":false,"error":"Transaction %s submission failed: Preverify rejected before propagation (400 Bad Request): refused; retain tx_id=%s"}\n' "$tx" "$tx"
+  exit 1
+fi
+echo "$tx" >> "$dir/mempool"
+if [ -n "$wait" ]; then
+  while ! grep -q "^$tx" "$dir/included"; do sleep 0.02; done
+fi
+printf '{"success":true,"tx_id":"%s"}\n' "$tx"
+"#;
+
+/// The process environment names the helper, so one test at a time uses it.
+static HELPER_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn delivery(nonce: u32) -> (HyperlaneMessage, Metadata, Option<U256>) {
+    let message = HyperlaneMessage {
+        version: 3,
+        nonce,
+        origin: 7,
+        sender: H256::repeat_byte(4),
+        destination: ORIGIN,
+        recipient: H256::repeat_byte(5),
+        body: vec![nonce as u8],
+    };
+    (message, Metadata::new(vec![]), Some(U256::from(5_000_000)))
+}
+
+#[tokio::test]
+async fn queued_deliveries_share_blocks_when_the_helper_takes_a_nonce() {
+    const QUEUED: u32 = 12;
+    let _env = HELPER_ENV.lock().await;
+
+    // One at a time: each transaction is sent once the one before is in a
+    // block, after the next block's round started, so it waits a block.
+    let chain = TxChain::start(false, None);
+    std::env::set_var("DUSK_TX_BIN", chain.helper());
+    let mailbox = chain.mailbox();
+    let start = chain.height();
+    for nonce in 0..QUEUED {
+        let (message, metadata, gas_limit) = delivery(nonce);
+        let outcome = mailbox
+            .process(&message, &metadata, gas_limit)
+            .await
+            .unwrap();
+        assert!(outcome.executed);
+    }
+    let serial_blocks = chain.last_block() - start;
+    // A batch from this helper is left to be sent one at a time.
+    let batch = mailbox
+        .process_deliveries(&(0..3).map(delivery).collect::<Vec<_>>())
+        .await
+        .unwrap();
+    assert!(batch.outcome.is_none());
+    assert_eq!(batch.failed_indexes, vec![0, 1, 2]);
+    drop(chain);
+
+    // Pipelined: consecutive nonces, each sent once the node holds the one
+    // before, all in the next blocks.
+    let chain = TxChain::start(true, None);
+    std::env::set_var("DUSK_TX_BIN", chain.helper());
+    let mailbox = chain.mailbox();
+    let start = chain.height();
+    let batch = mailbox
+        .process_deliveries(&(0..QUEUED).map(delivery).collect::<Vec<_>>())
+        .await
+        .unwrap();
+    let pipelined_blocks = chain.last_block() - start;
+    let outcome = batch.outcome.unwrap();
+    assert!(batch.failed_indexes.is_empty());
+    assert!(outcome.executed);
+    assert_eq!(
+        outcome.gas_used,
+        U256::from(2_000_000u64 * u64::from(QUEUED))
+    );
+    let blocks = chain.blocks_of(1..=u64::from(QUEUED));
+    eprintln!(
+        "{QUEUED} deliveries: one at a time {serial_blocks} blocks, pipelined {pipelined_blocks} blocks, in {} distinct blocks",
+        blocks.len()
+    );
+    assert!(
+        serial_blocks >= u64::from(QUEUED) * 2 - 1,
+        "{serial_blocks}"
+    );
+    assert!(pipelined_blocks * 4 <= serial_blocks, "{pipelined_blocks}");
+    assert!(blocks.len() <= 3, "{blocks:?}");
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+#[tokio::test]
+async fn a_refused_delivery_ends_the_batch_and_the_rest_go_one_at_a_time() {
+    let _env = HELPER_ENV.lock().await;
+    // The node refuses the third transaction, nonce 3.
+    let chain = TxChain::start(true, Some(3));
+    std::env::set_var("DUSK_TX_BIN", chain.helper());
+    let batch = chain
+        .mailbox()
+        .process_deliveries(&(0..5).map(delivery).collect::<Vec<_>>())
+        .await
+        .unwrap();
+    // The first two are sent; the refused one and every later one are left
+    // out, so no later nonce waits behind the one the node refused.
+    assert_eq!(batch.failed_indexes, vec![2, 3, 4]);
+    let outcome = batch.outcome.unwrap();
+    assert_eq!(outcome.gas_used, U256::from(4_000_000u64));
+    assert_eq!(
+        &outcome.transaction_id.as_bytes()[32..],
+        &hex::decode(tx_id(1)).unwrap()[..]
+    );
+    assert_eq!(mempool(chain.directory.path()), vec![1, 2]);
+    std::env::remove_var("DUSK_TX_BIN");
 }

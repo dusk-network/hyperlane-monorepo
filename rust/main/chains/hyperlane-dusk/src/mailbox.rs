@@ -43,6 +43,12 @@ const MAX_REMEMBERED_SIMULATIONS: usize = 1024;
 /// Rusk 1.7.3's block gas limit (`DEFAULT_BLOCK_GAS_LIMIT`). The mempool
 /// admits a transaction with a higher limit, but no block can hold it.
 pub const RUSK_BLOCK_GAS_LIMIT: u64 = 3_000_000_000;
+/// How long a batch waits for the node to hold one delivery before it sends
+/// the next.
+const HELD_TIMEOUT: Duration = Duration::from_secs(5);
+/// Rusk 1.7.3 queues at most this many transactions of one account whose
+/// earlier nonces it has not seen yet (`max_moonlight_future_nonce_per_account`).
+const MAX_PIPELINED_DELIVERIES: usize = 64;
 
 /// What a delivery check found.
 #[derive(Debug, Clone)]
@@ -107,6 +113,9 @@ pub struct DuskMailbox {
     /// When `process` last passed its simulation, by the keccak256 of its
     /// arguments, shared by every clone.
     simulations: Arc<StdMutex<HashMap<[u8; 32], std::time::Instant>>>,
+    /// Held while a delivery or a batch of them uses the signer's nonces,
+    /// shared by every clone.
+    submissions: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// The MerkleTreeHook keeps no root per insertion, so checkpoints compute
@@ -148,6 +157,7 @@ impl DuskMailbox {
             merkle: Arc::new(tokio::sync::Mutex::new(MerkleCache::default())),
             delivery_checks: Arc::default(),
             simulations: Arc::default(),
+            submissions: Arc::default(),
         }
     }
 
@@ -229,6 +239,188 @@ impl DuskMailbox {
             "Dusk Mailbox process query failed for message {:?}: {failure}",
             message.id()
         )))
+    }
+
+    /// Submit `deliveries`, each a message, its metadata and the relayer's
+    /// gas limit, as consecutive transactions of the signer's account, so
+    /// that several share a block.
+    ///
+    /// Each delivery is simulated first (`simulate_process`), and one that
+    /// fails is left out. The others are signed with the account's next
+    /// nonces, from the node's `next_nonce`, which counts the account's
+    /// transactions in its mempool, and sent in nonce order, each once the
+    /// node holds the one before: Rusk checks a transaction's nonce against
+    /// its mempool. A delivery the node refuses ends the batch there, and so
+    /// does one whose submission outcome is unknown, so that no later nonce
+    /// waits behind a gap. Then the batch follows every transaction it sent
+    /// to its block, under one deadline.
+    ///
+    /// Returns the deliveries it left out, which the relayer submits one at
+    /// a time through `process`, and, when it sent any, one outcome for all
+    /// of them, as the relayer's batches have: the first transaction's ID,
+    /// the gas they spent together, which the relayer shares out among them,
+    /// and whether every one executed. A delivery whose transaction is in no
+    /// block by the deadline still counts as sent: the relayer checks that
+    /// it was delivered before it gives up on it, and relays it again if
+    /// not. Once one transaction is sent this never fails, so the relayer
+    /// never sends the batch again.
+    ///
+    /// With a helper that cannot sign with a given nonce
+    /// (`tx_sender::helper_pipelines`), every delivery is left out.
+    pub async fn process_deliveries(
+        &self,
+        deliveries: &[(HyperlaneMessage, Metadata, Option<U256>)],
+    ) -> ChainResult<BatchResult> {
+        let signer = self
+            .signer
+            .as_ref()
+            .ok_or(HyperlaneDuskError::SignerUnavailable)?;
+        if !crate::tx_sender::helper_pipelines().await {
+            return Ok(BatchResult::failed(deliveries.len()));
+        }
+        let mut left_out = Vec::new();
+        let mut ready = Vec::new();
+        for (index, (message, metadata, gas_limit)) in deliveries.iter().enumerate() {
+            if ready.len() == MAX_PIPELINED_DELIVERIES {
+                left_out.push(index);
+                continue;
+            }
+            let encoded = Self::encode_message(message);
+            let args = match crate::tx_sender::process_args(metadata, &encoded) {
+                Ok(args) => args,
+                Err(error) => {
+                    warn!(message_id = ?message.id(), %error, "Dusk delivery cannot be sent");
+                    left_out.push(index);
+                    continue;
+                }
+            };
+            if self.simulate_process(message, &args).await.is_err() {
+                left_out.push(index);
+                continue;
+            }
+            let gas_limit = self.submission_gas_limit(message, *gas_limit);
+            ready.push((index, message.id(), args, gas_limit));
+        }
+        if ready.is_empty() {
+            return Ok(BatchResult {
+                outcome: None,
+                failed_indexes: left_out,
+            });
+        }
+
+        let _submission = self.submissions.lock().await;
+        // Nothing is sent before the account's next nonce is known.
+        self.rues.ensure_identity().await?;
+        let mut nonce = self
+            .rues
+            .account_status(&signer.address_string())
+            .await?
+            .next_nonce;
+        let mut sent = Vec::new();
+        let mut stopped = false;
+        for (index, message_id, args, gas_limit) in ready {
+            if stopped {
+                left_out.push(index);
+                continue;
+            }
+            let result = crate::tx_sender::dusk_tx_send_with_nonce(
+                &self.conn,
+                signer,
+                &self.mailbox_id,
+                "process",
+                &args,
+                gas_limit,
+                nonce,
+            )
+            .await;
+            let tx_id = match result {
+                // The helper's result names the transaction it prepared.
+                Ok(response) => response
+                    .get("tx_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+                Err(HyperlaneDuskError::SubmissionOutcomeUnknown { tx_id, detail })
+                | Err(HyperlaneDuskError::TransactionExecutionFailed { tx_id, detail }) => {
+                    warn!(
+                        ?message_id,
+                        %tx_id,
+                        nonce,
+                        %detail,
+                        "Dusk delivery submission outcome is unknown; reconciling its exact hash and sending no later nonce"
+                    );
+                    stopped = true;
+                    tx_id
+                }
+                Err(error) => {
+                    warn!(
+                        ?message_id,
+                        nonce,
+                        %error,
+                        "Dusk node refused a pipelined delivery; the batch's later deliveries are sent one at a time"
+                    );
+                    left_out.push(index);
+                    stopped = true;
+                    continue;
+                }
+            };
+            info!(?message_id, %tx_id, nonce, "Dusk delivery sent");
+            nonce = nonce.saturating_add(1);
+            if !stopped {
+                let held = self.rues.wait_until_held(&tx_id, HELD_TIMEOUT).await;
+                if !matches!(held, Ok(true)) {
+                    warn!(
+                        %tx_id,
+                        ?held,
+                        "Dusk node does not hold a pipelined delivery yet; sending no later nonce"
+                    );
+                    stopped = true;
+                }
+            }
+            sent.push(tx_id);
+        }
+        left_out.sort_unstable();
+        let Some(first) = sent.first() else {
+            return Ok(BatchResult {
+                outcome: None,
+                failed_indexes: left_out,
+            });
+        };
+
+        // Follow every sent transaction to its block.
+        let deadline = tokio::time::Instant::now() + TX_CONFIRMATION_TIMEOUT;
+        let mut gas_spent = 0u64;
+        let mut executed = true;
+        for tx_id in &sent {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match self.rues.wait_for_tx(tx_id, remaining).await {
+                Ok(receipt) => {
+                    gas_spent = gas_spent.saturating_add(receipt.gas_spent);
+                    if let Some(error) = &receipt.error {
+                        executed = false;
+                        let error = bounded_text(error);
+                        warn!(tx_id, %error, "Dusk delivery transaction execution failed");
+                    }
+                }
+                Err(error) => {
+                    executed = false;
+                    warn!(
+                        tx_id,
+                        %error,
+                        "Dusk delivery transaction is in no block yet; the relayer checks the delivery before it relays it again"
+                    );
+                }
+            }
+        }
+        Ok(BatchResult {
+            outcome: Some(TxOutcome {
+                transaction_id: crate::tx_sender::dusk_tx_id_to_h512(first).unwrap_or_default(),
+                executed,
+                gas_used: U256::from(gas_spent),
+                gas_price: FixedPointNumber::from(self.conn.gas_price),
+            }),
+            failed_indexes: left_out,
+        })
     }
 
     /// One delivery check of message `id`, whose state is read after
@@ -708,6 +900,9 @@ impl Mailbox for DuskMailbox {
             "Processing message on Dusk via dusk-tx"
         );
 
+        // The helper signs with the account's next nonce: no batch may be
+        // using the account's nonces meanwhile.
+        let _submission = self.submissions.lock().await;
         let call_result = crate::tx_sender::dusk_tx_call(
             &self.conn,
             signer,
@@ -755,12 +950,25 @@ impl Mailbox for DuskMailbox {
         })
     }
 
+    /// Batches are sent as consecutive transactions of the signer's
+    /// account (`process_deliveries`), with a helper that can do so.
     fn supports_batching(&self) -> bool {
-        false
+        self.signer.is_some()
     }
 
-    async fn process_batch<'a>(&self, _ops: Vec<&'a QueueOperation>) -> ChainResult<BatchResult> {
-        Err(ChainCommunicationError::BatchingFailed)
+    async fn process_batch<'a>(&self, ops: Vec<&'a QueueOperation>) -> ChainResult<BatchResult> {
+        let deliveries = ops
+            .iter()
+            .map(|op| {
+                let item = op.try_batch()?;
+                Ok((
+                    item.data,
+                    item.submission_data.metadata,
+                    Some(item.submission_data.gas_limit),
+                ))
+            })
+            .collect::<ChainResult<Vec<_>>>()?;
+        self.process_deliveries(&deliveries).await
     }
 
     async fn process_estimate_costs(

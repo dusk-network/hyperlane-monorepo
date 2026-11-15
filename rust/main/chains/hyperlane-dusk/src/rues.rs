@@ -49,6 +49,8 @@ const MERKLE_TREE_HOOK_STATE_VERSION: u32 = 2;
 /// with the locations in `ValidatorAnnouncement` events.
 const VALIDATOR_ANNOUNCE_STATE_VERSION: u32 = 2;
 const TX_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// How often `wait_until_held` asks whether the node holds a transaction.
+const HELD_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// How many times a request the endpoint refuses for its rate limit is sent
 /// again before it fails. The waits in between add up to 15 to 30 s.
 const MAX_RATE_LIMIT_RETRIES: u32 = 4;
@@ -2640,6 +2642,34 @@ impl RuesClient {
                 ))
             })?;
         Ok(Some(height))
+    }
+
+    /// Whether the node holds transaction `tx_id`, in its mempool or in a
+    /// block, within `timeout`. The node accepts a propagated transaction
+    /// before its mempool stores it, and checks a transaction with a later
+    /// nonce of the same account against the mempool.
+    pub(crate) async fn wait_until_held(
+        &self,
+        tx_id: &str,
+        timeout: Duration,
+    ) -> Result<bool, HyperlaneDuskError> {
+        validate_transaction_id(tx_id)?;
+        let query = format!(
+            r#"query {{ mempoolTx(hash: "{tx_id}") {{ id }} tx(hash: "{tx_id}") {{ blockHeight }} }}"#
+        );
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let data = self.graphql_query(&query).await?;
+            let held = |field: &str| data.get(field).is_some_and(|value| !value.is_null());
+            if held("mempoolTx") || held("tx") {
+                return Ok(true);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep(HELD_POLL_INTERVAL.min(deadline - tokio::time::Instant::now()))
+                .await;
+        }
     }
 
     /// Wait for a propagated transaction to be included in the ledger.

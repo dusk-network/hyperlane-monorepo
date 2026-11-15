@@ -28,7 +28,8 @@ const MAX_DUSK_TX_STREAM_BYTES: usize = 1024 * 1024;
 /// (`MAX_CALL_ARGS_BYTES` in the companion repository's `dusk-tx`).
 const MAX_DUSK_TX_ARGS_BYTES: usize = 60 * 1024;
 
-/// Send a contract call via the `dusk-tx` CLI binary.
+/// Send a contract call via the `dusk-tx` CLI binary, which signs it with
+/// the account's next nonce and returns once the transaction is in a block.
 ///
 /// Returns the parsed JSON output on success.
 pub async fn dusk_tx_call(
@@ -38,6 +39,101 @@ pub async fn dusk_tx_call(
     fn_name: &str,
     args_bytes: &[u8],
     gas_limit: Option<u64>,
+) -> Result<Value, HyperlaneDuskError> {
+    run_dusk_tx(
+        conn,
+        signer,
+        contract_id,
+        fn_name,
+        args_bytes,
+        gas_limit,
+        &[],
+    )
+    .await
+}
+
+/// Send a contract call signed with Moonlight nonce `nonce`, and return once
+/// the node has accepted the transaction, without waiting for its block.
+/// Needs a `dusk-tx` with `--nonce` and `--no-wait` (`helper_pipelines`).
+pub(crate) async fn dusk_tx_send_with_nonce(
+    conn: &ConnectionConf,
+    signer: &DuskSigner,
+    contract_id: &[u8; 32],
+    fn_name: &str,
+    args_bytes: &[u8],
+    gas_limit: u64,
+    nonce: u64,
+) -> Result<Value, HyperlaneDuskError> {
+    let extra = [
+        "--nonce".to_owned(),
+        nonce.to_string(),
+        "--no-wait".to_owned(),
+    ];
+    run_dusk_tx(
+        conn,
+        signer,
+        contract_id,
+        fn_name,
+        args_bytes,
+        Some(gas_limit),
+        &extra,
+    )
+    .await
+}
+
+/// How long the `call --help` probe of a helper may take.
+const HELPER_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Whether the configured `dusk-tx` can sign with a given nonce and return
+/// once the node has accepted the transaction (`call --nonce --no-wait`),
+/// which pipelined deliveries need. Asked once per helper path, from its
+/// `call --help`, which reads no key and sends nothing; a helper that fails
+/// the probe is taken not to.
+pub(crate) async fn helper_pipelines() -> bool {
+    static PROBES: std::sync::OnceLock<
+        tokio::sync::Mutex<std::collections::HashMap<String, bool>>,
+    > = std::sync::OnceLock::new();
+    let bin = std::env::var("DUSK_TX_BIN").unwrap_or_else(|_| "dusk-tx".into());
+    let mut probes = PROBES
+        .get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .await;
+    if let Some(known) = probes.get(&bin) {
+        return *known;
+    }
+    let mut command = Command::new(&bin);
+    command
+        .kill_on_drop(true)
+        .arg("call")
+        .arg("--help")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let help = match tokio::time::timeout(HELPER_PROBE_TIMEOUT, command.output()).await {
+        Ok(Ok(output)) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+        _ => String::new(),
+    };
+    let pipelines = help.contains("--nonce") && help.contains("--no-wait");
+    if !pipelines {
+        info!(
+            bin = %bin,
+            "The dusk-tx helper cannot sign with a given nonce (call --nonce --no-wait); Dusk deliveries are submitted one at a time"
+        );
+    }
+    probes.insert(bin, pipelines);
+    pipelines
+}
+
+async fn run_dusk_tx(
+    conn: &ConnectionConf,
+    signer: &DuskSigner,
+    contract_id: &[u8; 32],
+    fn_name: &str,
+    args_bytes: &[u8],
+    gas_limit: Option<u64>,
+    extra_args: &[String],
 ) -> Result<Value, HyperlaneDuskError> {
     if args_bytes.len() > MAX_DUSK_TX_ARGS_BYTES {
         return Err(HyperlaneDuskError::Other(format!(
@@ -80,6 +176,7 @@ pub async fn dusk_tx_call(
         .arg(gas_limit.unwrap_or(conn.gas_limit).to_string())
         .arg("--gas-price")
         .arg(conn.gas_price.to_string())
+        .args(extra_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

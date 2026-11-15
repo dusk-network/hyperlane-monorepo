@@ -156,6 +156,21 @@ how to run the local bridge.
   sender paid for, but at most `gasLimit` and Rusk's block gas limit of
   3,000,000,000: the mempool keeps a transaction over the block gas limit
   without any block taking it, and a failed transaction pays its whole limit.
+- **Pipelined deliveries.** The helper signs with the account's next nonce
+  and returns once the transaction is in a block, so deliveries sent one at
+  a time land one every two blocks: the next one reaches the node after the
+  next block's round has started. With `maxBatchSize` above 1 in the chain's
+  config and a helper that takes `call --nonce <N> --no-wait` (found from
+  its `call --help`, once per process), the relayer submits a batch of
+  deliveries as consecutive transactions of its account, from the node's
+  `next_nonce`, each once the node holds the one before, and they share a
+  block. A delivery the node refuses, or whose submission outcome is
+  unknown, ends the batch: the deliveries after it are submitted one at a
+  time. The batch then follows each transaction to its block; one that is
+  in none by then still counts as sent, and the relayer checks that its
+  message was delivered before it relays it again. At most 64 go in a batch,
+  Rusk's queue of an account's future nonces. With another helper, every
+  delivery is submitted one at a time.
 - **Delivery simulation.** Dusk charges a failed transaction its whole gas
   limit. Before submitting `process`, the relayer runs it as an unsigned
   contract query, which Rusk executes in a throwaway session. If the query
@@ -253,6 +268,7 @@ how to run the local bridge.
   "gasPrice": 2000,
   "contractQueriesPerSecond": 100,
   "contractQueryBurst": 20,
+  "maxBatchSize": 16,
   "mailbox": "0x<contract id>",
   "interchainGasPaymaster": "0x<contract id>",
   "validatorAnnounce": "0x<contract id>",
@@ -273,6 +289,11 @@ with, since Rusk reports no gas for a simulation.
 contract queries to its endpoint (see Pacing above); an operator of a node
 that serves only its own agents can raise them together with the node's
 `[http.policy.global_limits.classes.contract_query]`.
+
+`maxBatchSize` (1 by default) is how many prepared deliveries the relayer
+submits together; above 1, with a helper that takes `--nonce` and
+`--no-wait`, they go as consecutive transactions (see Pipelined
+deliveries).
 
 The `duskKey` signer takes exactly one of `keyFile` (a regular file with no
 group or world permissions), `keyEnv` (an environment variable name) or `key`
