@@ -317,6 +317,8 @@ pub(crate) fn delivery_log(mailbox_id: [u8; 32]) -> EventLog {
         topic: events::ProcessId::TOPIC,
         key_of: delivery_key,
         limits: crate::rues::BLOCK_LIMITS,
+        // Contract sync indexes deliveries by their sequence.
+        consumed_by_sequence: true,
     }
 }
 

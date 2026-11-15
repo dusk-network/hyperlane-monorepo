@@ -133,7 +133,9 @@ how to run the local bridge.
   again; a block that `checkBlock` no longer accepts when a delivery is
   served drops them all. The delivery indexer marks as published every
   delivery below a count it reports to contract sync, and every delivery it
-  serves. The log keeps the dropped rows of published deliveries, and where
+  serves; a delivery log the previous version wrote, which records none,
+  counts every delivery it holds as published. The log keeps the dropped
+  rows of published deliveries, and where
   the rows it reads again would give one of those sequences another
   delivery, it halts (see [Event log halts](#event-log-halts)). The delivery
   indexer's tip is the height up to which the log holds every finalized

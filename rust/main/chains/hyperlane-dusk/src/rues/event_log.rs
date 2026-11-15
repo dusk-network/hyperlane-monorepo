@@ -33,13 +33,13 @@
 //! that block on, and the log reads them again. Consumers that index a log
 //! by its sequences (the delivery indexer's contract sync) mark the
 //! sequences they are told of or read as published: every sequence below a
-//! count they get, and every row they read. A log the previous version
-//! wrote has none published until then. Dropped rows of published sequences
-//! are kept, unseen, as evidence: the rows the log takes again under those
-//! sequences must be the
-//! same, and where one is not, the log stops with a critical error instead
-//! of numbering them differently, until the operator resets the agent's
-//! database and event store.
+//! count they get, and every row they read. The previous version recorded
+//! none, so every row of such a log it wrote counts as published. Dropped
+//! rows of published sequences are kept, unseen, as evidence: the rows the
+//! log takes again under those sequences must be the same, and where one is
+//! not, the log stops with a critical error instead of numbering them
+//! differently, until the operator resets the agent's database and event
+//! store.
 
 use super::*;
 
@@ -85,6 +85,11 @@ pub(crate) struct EventLog {
     pub topic: &'static str,
     pub key_of: fn(&[u8]) -> Option<Vec<u8>>,
     pub limits: BlockLimits,
+    /// Whether consumers index the log by its sequences, as contract sync
+    /// indexes deliveries. Every row of such a log that the previous
+    /// version wrote, which recorded no published sequences, counts as
+    /// published.
+    pub consumed_by_sequence: bool,
 }
 
 /// One row of an event log.
@@ -1223,7 +1228,7 @@ impl RuesClient {
         else {
             return Ok(LogState::default());
         };
-        decode_state(&bytes).ok_or_else(|| {
+        decode_state(&bytes, log.consumed_by_sequence).ok_or_else(|| {
             HyperlaneDuskError::Other(format!(
                 "The Dusk {} event log's state in eventCursorDir is corrupt",
                 log.topic
@@ -1578,7 +1583,11 @@ fn encode_state(state: &LogState) -> Vec<u8> {
 }
 
 /// A state the previous version wrote records no published sequences.
-fn decode_state(bytes: &[u8]) -> Option<LogState> {
+/// Contract sync may have indexed any row of such a log that consumers
+/// index by sequence (`all_published`), so every row it holds counts as
+/// published, before any read of the archive could number them again;
+/// another log has none.
+fn decode_state(bytes: &[u8], all_published: bool) -> Option<LogState> {
     if bytes.len() != STATE_BYTES && bytes.len() != STATE_V1_BYTES {
         return None;
     }
@@ -1595,13 +1604,16 @@ fn decode_state(bytes: &[u8]) -> Option<LogState> {
             _ => None,
         }
     };
+    let count = number(0)?;
     let published = if bytes.len() == STATE_BYTES {
         number(STATE_V1_BYTES)?
+    } else if all_published {
+        count
     } else {
         0
     };
     Some(LogState {
-        count: number(0)?,
+        count,
         last_block: height(8)?,
         complete_through: height(17)?,
         published,
@@ -1620,6 +1632,7 @@ mod tests {
             topic: "deliver",
             key_of: |data| Some(data.to_vec()),
             limits,
+            consumed_by_sequence: true,
         }
     }
 
@@ -1778,6 +1791,70 @@ mod tests {
         assert_eq!(data(&client), [vec![0xa1], vec![0xc]]);
     }
 
+    /// A log the previous version wrote holds blocks 5 and 6, and a rebuilt
+    /// archive restores a row of block 5 that would take sequence 1 from
+    /// block 6's row. Returns what the next advance that publishes its
+    /// count does, and the rows the event store then holds under the log's
+    /// first sequences, evidence included.
+    async fn upgrade_then_restore_a_row(
+        consumed_by_sequence: bool,
+    ) -> (Result<LogState, HyperlaneDuskError>, Vec<Vec<u8>>) {
+        let contract_id = [126u8 + u8::from(consumed_by_sequence); 32];
+        let deliver = |id: i64, height: u64, data: u8| {
+            archive_row(id, height, data, "deliver", contract_id, &[data])
+        };
+        let rows = vec![deliver(0, 5, 0xa), deliver(1, 6, 0xb)];
+        let archive = Archive::start(rows.clone());
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(archive.url.clone(), directory.path());
+        let log = EventLog {
+            consumed_by_sequence,
+            ..test_log(contract_id, BLOCK_LIMITS)
+        };
+        let state = client.advance_event_log(&log, 16, None).await.unwrap();
+        assert_eq!(state.count, 2);
+        // The previous version wrote its state without published
+        // sequences, and contract sync may have indexed both rows.
+        client
+            .event_store()
+            .unwrap()
+            .put(
+                event_log_state_key(&log),
+                &encode_state(&state)[..STATE_V1_BYTES],
+            )
+            .unwrap();
+        *archive.rows.lock().unwrap() =
+            renumbered(vec![rows[0].clone(), deliver(0, 5, 0xc), rows[1].clone()]);
+        let advanced = client.advance_and_publish_event_log(&log, 16, None).await;
+        let data = (0..4)
+            .filter_map(|sequence| client.event_log_entry(&log, sequence).unwrap())
+            .map(|entry| entry.data)
+            .collect();
+        (advanced, data)
+    }
+
+    #[tokio::test]
+    async fn an_upgraded_log_counts_every_row_it_holds_as_published() {
+        let (advanced, data) = upgrade_then_restore_a_row(true).await;
+        let error = advanced.unwrap_err();
+        assert!(
+            matches!(error, HyperlaneDuskError::EventLogHalted(_)),
+            "{error}"
+        );
+        let error = error.to_string();
+        assert!(
+            error.contains("CRITICAL") && error.contains("sequence 1"),
+            "{error}"
+        );
+        // Nothing was numbered again: the rows consumers read stay.
+        assert_eq!(data, [vec![0xa], vec![0xb]]);
+        // A log no consumer reads by sequence, such as the announcement
+        // log, reads the restored row and numbers its rows again.
+        let (advanced, data) = upgrade_then_restore_a_row(false).await;
+        assert_eq!(advanced.unwrap().count, 3);
+        assert_eq!(data, [vec![0xa], vec![0xc], vec![0xb]]);
+    }
+
     #[tokio::test]
     async fn a_staged_block_whose_rows_are_lost_is_read_again() {
         let contract_id = [124u8; 32];
@@ -1863,22 +1940,33 @@ mod tests {
                 published: 0,
             },
         ] {
-            assert_eq!(decode_state(&encode_state(&state)), Some(state));
+            for all_published in [false, true] {
+                assert_eq!(
+                    decode_state(&encode_state(&state), all_published),
+                    Some(state)
+                );
+            }
         }
         let mut corrupt = encode_state(&LogState::default());
         corrupt[8] = 2;
-        assert!(decode_state(&corrupt).is_none());
-        assert!(decode_state(&corrupt[1..]).is_none());
-        // A state the previous version wrote records no published sequences.
+        assert!(decode_state(&corrupt, true).is_none());
+        assert!(decode_state(&corrupt[1..], true).is_none());
+        // A state the previous version wrote records no published sequences:
+        // a log consumers index by sequence counts every row as published.
         let state = LogState {
             count: 7,
             last_block: Some(11),
             complete_through: Some(12),
             published: 0,
         };
+        let legacy = &encode_state(&state)[..STATE_V1_BYTES];
+        assert_eq!(decode_state(legacy, false), Some(state));
         assert_eq!(
-            decode_state(&encode_state(&state)[..STATE_V1_BYTES]),
-            Some(state)
+            decode_state(legacy, true),
+            Some(LogState {
+                published: 7,
+                ..state
+            })
         );
     }
 
@@ -1889,6 +1977,7 @@ mod tests {
             topic: "topic",
             key_of: |_| None,
             limits: BLOCK_LIMITS,
+            consumed_by_sequence: true,
         };
         let short = event_log_lookup_prefix(&log, &[1, 2]);
         let long = event_log_lookup_key(&log, &[1, 2, 3], 0);

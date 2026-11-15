@@ -60,6 +60,8 @@ fn announcement_log(va_id: [u8; 32]) -> EventLog {
         topic: events::ValidatorAnnouncement::TOPIC,
         key_of: announcement_key,
         limits: crate::rues::BLOCK_LIMITS,
+        // Announced locations are looked up by validator, never by sequence.
+        consumed_by_sequence: false,
     }
 }
 
