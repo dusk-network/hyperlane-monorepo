@@ -30,18 +30,18 @@ how to run the local bridge.
   large dispatches are more than that, so a page over the limit is asked for
   again at the same position with half the rows, down to one. A Rusk event
   carries at most 64 KiB of data, so a single row always fits; one that does
-  not is reported as an endpoint fault. Each scan starts from a saved position just before the block,
-  kept in `eventCursorDir` (about one per 200 rows), so a restart or an archive
-  that lags behind finality does not send the scan back to the contract's
-  first row. Before reusing a position, the scan checks that the archive still
-  has the row it was taken from, unchanged and below the block the position
-  names. If the archive returns another row there, it was rebuilt: the
-  contract's positions are dropped and the scan starts over. If the row is
-  missing, the scan asks the archive (`checkBlock(onlyFinalized)`) whether it
-  has finalized that row's block, which Rusk records together with the
-  block's rows. If it has, its rows are numbered differently and the scan
-  starts over; if not, the archive is behind, and the lookup fails until it
-  catches up, keeping the positions.
+  not is reported as an endpoint fault. Each scan starts from a saved
+  position just before the block, kept in `eventCursorDir` (about one per
+  200 rows), so a restart or an archive that lags behind finality does not
+  send the scan back to the contract's first row. Before reusing a position,
+  the scan checks that the archive still has the row it was taken from,
+  unchanged and below the block the position names. If the archive returns
+  another row there, it was rebuilt: the contract's positions are dropped
+  and the scan starts over. If the row is missing, the scan asks the archive
+  (`checkBlock(onlyFinalized)`) whether it has finalized that row's block,
+  which Rusk records together with the block's rows. If it has, its rows are
+  numbered differently and the scan starts over; if not, the archive is
+  behind, and the lookup fails until it catches up, keeping the positions.
 - **Block cache.** A scan reads the whole block it is looking in, and the
   block's rows stay in memory, so other lookups in the same block (a cursor
   with a small `index.chunk`, or one lookup per transaction) match against
