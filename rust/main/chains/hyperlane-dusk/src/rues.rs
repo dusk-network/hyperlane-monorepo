@@ -126,8 +126,6 @@ struct IdentityGate {
     attempt: tokio::sync::Mutex<Option<String>>,
 }
 
-type IdentityGates = HashMap<DeploymentIdentity, Arc<IdentityGate>>;
-
 /// RUES (Rusk Unified Event System) HTTP client.
 ///
 /// Communicates with Dusk nodes using the RUES protocol:
@@ -150,11 +148,10 @@ pub struct RuesClient {
     /// Serializes the advances of each finalized event log.
     event_logs: Arc<StdMutex<EventLogLocks>>,
     /// The deployment every request first checks the endpoint serves, if
-    /// any (`with_identity`).
+    /// any (`with_identity`). Every client of the endpoint in this process
+    /// that requires the same deployment shares it, so the endpoint is
+    /// checked once.
     identity: Option<Arc<IdentityGate>>,
-    /// The gates of the deployments this client's clones require, so they
-    /// verify each deployment once.
-    identity_gates: Arc<StdMutex<IdentityGates>>,
 }
 
 impl fmt::Debug for RuesClient {
@@ -809,7 +806,6 @@ impl RuesClient {
             non_final_cache: Arc::new(StdMutex::new(NonFinalEventCache::default())),
             event_logs: Arc::new(StdMutex::new(HashMap::new())),
             identity: None,
-            identity_gates: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
 
@@ -824,22 +820,11 @@ impl RuesClient {
     /// endpoint serves `identity` (`validate_chain_identity`): building it
     /// makes no request. Until a check succeeds, every request fails without
     /// being sent and the next one checks again; callers that wait while a
-    /// check runs share its result. Clones share the outcome.
+    /// check runs share its result. Every client of the endpoint in this
+    /// process that requires `identity`, clones and clients built apart
+    /// alike, shares the outcome.
     pub fn with_identity(&self, identity: DeploymentIdentity) -> Self {
-        let gate = self
-            .identity_gates
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(identity)
-            .or_insert_with(|| {
-                Arc::new(IdentityGate {
-                    identity,
-                    verified: AtomicBool::new(false),
-                    finished: AtomicU64::new(0),
-                    attempt: tokio::sync::Mutex::new(None),
-                })
-            })
-            .clone();
+        let gate = self.endpoint.identity_gate(identity);
         Self {
             identity: Some(gate),
             ..self.clone()

@@ -10,6 +10,7 @@
 - The delivery log read the archive only once the node had finalized a block past the ones it holds, and a checkpoint whose leaf count had not changed was not checked against the hook again: their leaves and rows are final.
 - MerkleTreeHook insertion indexing read the stored IDs a page of 256 at a time (`message_ids`), instead of one `message_id_at` per insertion.
 - The backward sequence cursor in `hyperlane-base` started a range above the logs its store already holds below the gap it fills. A relayer restarted after 40 of 99 Dusk messages arrived read all 99 again, at about 46 requests each, because the chunk of 1,999 sequences below the first missing one reached back to sequence 0.
+- An endpoint's deployment was checked once per process for every client of it that requires the same deployment. A validator's checkpoint reader, which has its own client, ran the 13-query check a second time.
 - The default Dusk `gasLimit` was 5,000,000 instead of 500,000,000. A failed transaction pays its whole limit, and a relayed `process` costs about 1.95M gas plus 0.22M per ISM signature; the deploy scripts already set 5,000,000 for the relayer.
 - Dispatch indexing read each message from its finalized `Dispatch` event, matched by the message ID the Mailbox stores (`dispatched_id`), because Mailbox state version 4 no longer stores dispatched messages.
 

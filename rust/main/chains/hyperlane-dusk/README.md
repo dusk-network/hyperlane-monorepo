@@ -190,9 +190,12 @@ how to run the local bridge.
   request. Before its first request, each client checks, once, that the
   endpoint serves the configured deployment: the node's chain ID, the
   Mailbox and ValidatorAnnounce domains, each contract's `state_version`,
-  and the ValidatorAnnounce and Merkle hook bindings to that Mailbox. Until a
-  check succeeds, every request fails without being sent and the next one
-  checks again; requests that wait while a check runs share its result. A
+  and the ValidatorAnnounce and Merkle hook bindings to that Mailbox. Every
+  client of one endpoint in a process that requires the same deployment,
+  such as a validator's indexer and its checkpoint reader, shares the check.
+  Until a check succeeds, every request fails without being sent and the
+  next one checks again; requests that wait while a check runs share its
+  result. A
   node that is unreachable, or serves another deployment, when an agent
   starts therefore delays its reads, and the relayer keeps the chain instead
   of dropping it. Submissions through the `dusk-tx` helper are checked the

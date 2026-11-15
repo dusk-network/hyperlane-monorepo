@@ -30,7 +30,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 use url::Url;
 
-use super::BlockPair;
+use super::{BlockPair, DeploymentIdentity, IdentityGate};
 use crate::final_records::FinalRecords;
 
 /// How long every client of an endpoint uses one read of its tip and last
@@ -179,6 +179,9 @@ pub(crate) struct Endpoint {
     /// Where each contract's records cross final heights, by contract and
     /// the query that reads a record's height.
     final_records: StdMutex<FinalRecordsByContract>,
+    /// Whether the endpoint has been shown to serve a deployment, by
+    /// deployment.
+    identity_gates: StdMutex<HashMap<DeploymentIdentity, Arc<IdentityGate>>>,
 }
 
 type Endpoints = HashMap<String, Weak<Endpoint>>;
@@ -210,6 +213,7 @@ impl Endpoint {
             unreported: StdMutex::new((0, None)),
             block_pair: tokio::sync::Mutex::new(None),
             final_records: StdMutex::new(HashMap::new()),
+            identity_gates: StdMutex::new(HashMap::new()),
         });
         endpoints.insert(key, Arc::downgrade(&endpoint));
         endpoint
@@ -232,6 +236,23 @@ impl Endpoint {
         let pair = read().await?;
         *last = Some((pair, Instant::now()));
         Ok(pair)
+    }
+
+    /// The gate of every client of the endpoint that requires `identity`.
+    pub(crate) fn identity_gate(&self, identity: DeploymentIdentity) -> Arc<IdentityGate> {
+        self.identity_gates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(identity)
+            .or_insert_with(|| {
+                Arc::new(IdentityGate {
+                    identity,
+                    verified: std::sync::atomic::AtomicBool::new(false),
+                    finished: AtomicU64::new(0),
+                    attempt: tokio::sync::Mutex::new(None),
+                })
+            })
+            .clone()
     }
 
     /// Forget the last read of the tip and last final block, as if a tick
