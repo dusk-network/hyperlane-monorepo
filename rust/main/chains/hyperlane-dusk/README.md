@@ -127,6 +127,8 @@ From `rust/main`:
 ```bash
 cargo test -p hyperlane-dusk
 cargo test -p hyperlane-base dusk_
+cargo test -p hyperlane-base types::multisig
+cargo test -p relayer msg::metadata::multisig
 cargo test -p validator dusk
 cargo test -p validator reorg
 cargo clippy -p hyperlane-dusk --all-targets -- -D warnings
@@ -140,6 +142,9 @@ directory.
 
 The integration also touches shared code: Dusk connection and signer parsing
 in `hyperlane-base`, the `Dusk` protocol in `hyperlane-core`, and validator
-startup, checkpoint consensus and reorg reporting. The
+startup, checkpoint consensus and reorg reporting. It also carries a fix for
+upstream checkpoint quorums, which counted signatures over different message
+IDs together (`hyperlane-base`'s multisig syncer, `hyperlane-core`'s
+checkpoint types and the relayer's message-ID multisig metadata). The
 `dusk-proposal-validation.yml` workflow lists every file the fork may change
 relative to upstream.
