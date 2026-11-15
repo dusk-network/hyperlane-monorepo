@@ -1246,6 +1246,34 @@ mod test {
     }
 
     #[test]
+    fn dusk_gas_limit_defaults_to_five_million() {
+        let mut value = json!({
+            "domainid": 1337, "chainid": 7, "name": "test", "protocol": "dusk",
+            "rpcurls": [{"http": "http://localhost:8080"}],
+            "eventcursordir": "/tmp/dusk-parser-events",
+            "mailbox": "0x0000000000000000000000000000000000000001",
+            "interchaingaspaymaster": "0x0000000000000000000000000000000000000002",
+            "validatorannounce": "0x0000000000000000000000000000000000000003",
+            "merkletreehook": "0x0000000000000000000000000000000000000004"
+        });
+        let gas_limit = |value: &serde_json::Value| {
+            let chain = parse_chain(
+                ValueParser::new(Default::default(), value),
+                "test",
+                "fallback",
+            )
+            .unwrap();
+            let crate::settings::ChainConnectionConf::Dusk(connection) = chain.connection else {
+                panic!("expected Dusk transport");
+            };
+            connection.gas_limit
+        };
+        assert_eq!(gas_limit(&value), 5_000_000);
+        value["gaslimit"] = json!(30_000_000);
+        assert_eq!(gas_limit(&value), 30_000_000);
+    }
+
+    #[test]
     fn rejects_zero_max_batch_size() {
         let value = serde_json::json!({
             "domainid": 1,

@@ -83,7 +83,7 @@ how to run the local bridge.
   "chainId": <chain id reported by the node>,
   "rpcUrls": [{ "http": "https://<rusk-node>" }],
   "eventCursorDir": "/var/lib/hyperlane/dusk-events",
-  "gasLimit": 30000000,
+  "gasLimit": 5000000,
   "gasPrice": 2000,
   "mailbox": "0x<contract id>",
   "interchainGasPaymaster": "0x<contract id>",
@@ -92,6 +92,12 @@ how to run the local bridge.
   "signer": { "type": "duskKey", "keyFile": "/run/secrets/dusk-signer.key" }
 }
 ```
+
+`gasLimit` is the gas ceiling of every transaction the agent sends, and
+defaults to 5,000,000. A failed Dusk transaction pays its whole limit, so
+keep it close to what the agent needs: a relayed `process` costs about 1.95M
+gas plus 0.22M per signature the Dusk ISM checks, and a validator
+announcement about 2.1M.
 
 The `duskKey` signer takes exactly one of `keyFile` (a regular file with no
 group or world permissions), `keyEnv` (an environment variable name) or `key`

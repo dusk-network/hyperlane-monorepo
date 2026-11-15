@@ -1086,11 +1086,13 @@ pub fn build_dusk_connection_conf(
         return None;
     }
 
+    // A failed Dusk transaction pays its whole gas limit. A relayed
+    // `process` costs about 1.95M gas plus 0.22M per ISM signature.
     let gas_limit = chain
         .chain(err)
         .get_opt_key("gasLimit")
         .parse_u64()
-        .unwrap_or(500_000_000);
+        .unwrap_or(5_000_000);
 
     let gas_price = chain
         .chain(err)

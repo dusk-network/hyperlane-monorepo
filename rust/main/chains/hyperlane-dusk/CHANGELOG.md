@@ -4,6 +4,7 @@
 
 ### Changed
 
+- The default Dusk `gasLimit` was 5,000,000 instead of 500,000,000. A failed transaction pays its whole limit, and a relayed `process` costs about 1.95M gas plus 0.22M per ISM signature; the deploy scripts already set 5,000,000 for the relayer.
 - Dispatch indexing read each message from its finalized `Dispatch` event, matched by the message ID the Mailbox stores (`dispatched_id`), because Mailbox state version 4 no longer stores dispatched messages.
 
 - Finalized-event indexing matched every record of a block in one pass over that block's archive rows, 200 rows per `finalizedEvents` page (Rusk's maximum), instead of rescanning the block from its first row for each record. A block of 256 dispatches took 3 pages instead of 4,224.
