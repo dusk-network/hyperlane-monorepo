@@ -208,9 +208,13 @@ impl PageSize {
 /// Archive IDs belong to the endpoint's archive: a rebuilt or replaced archive
 /// may number its rows differently. A scan that resumes from an anchor must
 /// therefore see the fence row first, unchanged and below `before_block`.
-/// When the archive returns another row there, the anchor is wrong for this
-/// archive, the contract's anchors are dropped and the scan starts over. When
-/// the fence row is missing, the archive may only be behind: the scan asks
+///
+/// Rusk numbers rows in insertion order and never deletes one, so an archive
+/// that only lags behind the one an anchor came from returns the fence row
+/// first whenever it returns any row from the fence's ID on. When the archive
+/// returns another row first, it numbers its rows differently: the
+/// contract's anchors are dropped and the scan starts over. When it returns
+/// no row from the fence's ID on, it may only be behind, so the scan asks
 /// whether the archive has finalized the fence row's block, which Rusk does
 /// in the same transaction that inserts the block's rows. If it has, its rows
 /// are numbered differently and the scan starts over; if not, the lookup
@@ -308,9 +312,9 @@ enum ScanOutcome {
         found: ScannedRows,
         block: Option<CachedBlock>,
     },
-    /// The archive returned another row where the anchor's fence row was,
-    /// or has finalized the fence row's block without that row, so the
-    /// anchor does not belong to this archive.
+    /// The archive's first row from the anchor's fence ID on is not the
+    /// fence row, or the archive has finalized the fence row's block without
+    /// that row, so the anchor does not belong to this archive.
     WrongAnchor,
     /// The archive has not reached the anchor's fence row yet.
     ArchiveBehind(ScanAnchor),
@@ -1290,9 +1294,12 @@ impl RuesClient {
                         }
                         previous_id = Some(first.id);
                     }
-                    // The fence row is missing: the page is empty or starts
-                    // after it.
-                    _ => {
+                    // Later rows without the fence row: an archive that only
+                    // lagged would return the fence row first.
+                    Some(_) => return Ok(ScanOutcome::WrongAnchor),
+                    // No row from the fence's ID on: the archive is behind,
+                    // unless it has finalized the fence row's block.
+                    None => {
                         let fence_block_hash = hex::encode(anchor.fence_block_hash);
                         return Ok(
                             if self
@@ -3344,8 +3351,10 @@ mod tests {
             .unwrap();
         assert_eq!(later.event_id, 1);
         // The persisted position names a row the repaired archive does not
-        // have, so the scan starts over instead of skipping its rows.
+        // have, and the archive has finalized that row's block 7, so the
+        // scan starts over instead of skipping its rows.
         assert_eq!(archive.pages(), vec![None, Some(i64::MAX - 1), None]);
+        assert_eq!(archive.checked_heights(), [7, 7, 8]);
     }
 
     #[tokio::test]
@@ -4445,7 +4454,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_missing_fence_row_is_waited_for_until_its_block_is_finalized() {
+    async fn a_page_that_skips_the_fence_row_starts_the_scan_over() {
         let contract_id = [89u8; 32];
         let archive = Archive::start(one_row_per_block(contract_id));
         let directory = tempfile::tempdir().unwrap();
@@ -4456,7 +4465,12 @@ mod tests {
             .unwrap();
 
         // The endpoint now serves another node's archive. It numbers the same
-        // rows from 20 and has archived blocks 5 to 9 so far.
+        // rows from 20 and has archived blocks 5 to 9 so far, so it has rows
+        // after the saved position (row 9) but not row 9. A copy of the old
+        // archive that only lagged would return row 9 first, so this one
+        // numbers its rows differently, even though it has not finalized
+        // block 14 yet: the scan starts over instead of waiting for a row it
+        // may never have.
         let renumbered =
             |n: i64| archive_row(20 + n, 5 + n as u64, 1, "dispatch", contract_id, &[n as u8]);
         *archive.rows.lock().unwrap() = (0..5).map(renumbered).collect();
@@ -4464,24 +4478,26 @@ mod tests {
             .finalized_contract_event(&contract_id, "dispatch", 1, 15, &[10])
             .await
             .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("has not reached the saved scan position"),
-            "{error}"
+        assert!(error.to_string().contains("not archived yet"), "{error}");
+        assert_eq!(archive.pages(), vec![None, Some(8), None]);
+        assert_eq!(
+            client
+                .scan_anchors_of(&contract_id)
+                .iter()
+                .map(|anchor| (anchor.fence_id, anchor.before_block))
+                .collect::<Vec<_>>(),
+            vec![(24, 10)]
         );
-        assert_eq!(client.scan_anchors_of(&contract_id).len(), 1);
 
-        // It catches up. It has now finalized block 14 but still has no row
-        // 9, which proves it numbers its rows differently: the scan starts
-        // over from the first row.
+        // Once it catches up, the scan resumes at its own position.
         archive.rows.lock().unwrap().extend((5..11).map(renumbered));
         let matched = client
             .finalized_contract_event(&contract_id, "dispatch", 1, 15, &[10])
             .await
             .unwrap();
         assert_eq!(matched.block_height, 15);
-        assert_eq!(archive.pages(), vec![None, Some(8), Some(8), None]);
-        assert_eq!(archive.checked_heights(), [14, 14, 14, 15]);
+        assert_eq!(archive.pages(), vec![None, Some(8), None, Some(23)]);
+        // Only the matched rows' blocks were checked.
+        assert_eq!(archive.checked_heights(), [14, 15]);
     }
 }
