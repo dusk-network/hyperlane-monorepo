@@ -1,8 +1,11 @@
 //! What the Dusk clients cost a node, counted at a scripted one: requests
 //! at idle as the history grows, a catch-up under Rusk 1.7.3's rate limit,
-//! and how many blocks queued deliveries take.
+//! a restart's catch-up with and without a multicall, and how many blocks
+//! queued deliveries take.
 //!
-//! Run with `--nocapture` to see the counts.
+//! Run with `--nocapture` to see the counts, and
+//! `restart_catch_up_requests_for_ten_thousand_records` with `--ignored`
+//! for the long measurement.
 #![cfg(unix)]
 
 use std::collections::{BTreeMap, HashSet};
@@ -23,10 +26,11 @@ use hyperlane_core::{
     HyperlaneDomainTechnicalStack, HyperlaneMessage, Indexer, Mailbox, MerkleTreeHook, Metadata,
     NativeToken, ReorgPeriod, SequenceAwareIndexer, H256, U256,
 };
+use hyperlane_dusk::multicall::{Aggregate, Call};
 use hyperlane_dusk::{
-    ConnectionConf, DuskDeliveryIndexer, DuskInterchainGasPaymasterIndexer, DuskMailbox,
-    DuskMailboxIndexer, DuskMerkleTreeHook, DuskMerkleTreeHookIndexer, DuskProvider, DuskSigner,
-    QueryRateLimit, RuesClient,
+    ConnectionConf, DeploymentIdentity, DuskDeliveryIndexer, DuskInterchainGasPaymasterIndexer,
+    DuskMailbox, DuskMailboxIndexer, DuskMerkleTreeHook, DuskMerkleTreeHookIndexer, DuskProvider,
+    DuskSigner, QueryRateLimit, RuesClient,
 };
 use hyperlane_dusk_types::{events, merkle::IncrementalMerkle, message, GasPaymentRecord};
 use serde_json::{json, Value};
@@ -36,6 +40,30 @@ use url::Url;
 const MAILBOX: [u8; 32] = [2; 32];
 const HOOK: [u8; 32] = [3; 32];
 const IGP: [u8; 32] = [4; 32];
+const VALIDATOR_ANNOUNCE: [u8; 32] = [5; 32];
+/// The genesis transfer contract, which reports the chain ID.
+const TRANSFER: [u8; 32] = {
+    let mut id = [0; 32];
+    id[0] = 1;
+    id
+};
+/// Where mainnet and testnet run Multicall for Dusk.
+const MULTICALL: [u8; 32] = [
+    0x93, 0xde, 0x28, 0x7b, 0x7d, 0x34, 0x9d, 0x67, 0x8a, 0x00, 0x38, 0xfe, 0x77, 0x72, 0xe8, 0x96,
+    0x0e, 0x1a, 0x84, 0xa1, 0xb5, 0xda, 0x2d, 0x0b, 0x1f, 0x62, 0xf5, 0x32, 0x61, 0x6c, 0xe1, 0xd4,
+];
+const IDENTITY: DeploymentIdentity = DeploymentIdentity {
+    chain_id: 0,
+    domain: ORIGIN,
+    mailbox: MAILBOX,
+    validator_announce: VALIDATOR_ANNOUNCE,
+    merkle_tree_hook: HOOK,
+};
+/// A pace no catch-up reaches, for counting requests rather than time.
+const UNPACED: QueryRateLimit = QueryRateLimit {
+    per_second: 1_000_000,
+    burst: 1_000_000,
+};
 const ORIGIN: u32 = 4242;
 const DESTINATION: u32 = 42;
 /// The height of the first record; record `i` is in block `FIRST + i`.
@@ -65,13 +93,13 @@ fn message_id(nonce: u32) -> [u8; 32] {
     message::id(&encoded(nonce))
 }
 
-fn payment(index: u32) -> GasPaymentRecord {
+fn payment(index: u32, per_block: u32) -> GasPaymentRecord {
     GasPaymentRecord {
         message_id: message_id(index),
         destination: DESTINATION,
         gas_limit: 100,
         payment: 1_000,
-        block_height: FIRST + u64::from(index),
+        block_height: FIRST + u64::from(index / per_block),
     }
 }
 
@@ -167,22 +195,34 @@ impl Drop for Server {
 }
 
 /// A node holding `records` dispatches, Merkle insertions and IGP payments,
-/// record `i` in block `FIRST + i`, that counts the requests it answers.
+/// record `i` in block `FIRST + i / per_block`, that counts the requests it
+/// answers. Its multicall, when it has one, answers an aggregate as one
+/// contract query.
 struct Chain {
     records: u32,
+    per_block: u32,
     finalized: u64,
     tree: Vec<u8>,
+    root: [u8; 32],
     /// Archive rows by contract, hex.
     rows: BTreeMap<String, Vec<Value>>,
     /// Refuse contract queries past 360 in a window of 2 s, as Rusk does.
     rate_limit: bool,
     window: Option<(Instant, u32)>,
+    multicall: bool,
     requests: BTreeMap<String, usize>,
+    /// The calls aggregates made, by kind.
+    calls: BTreeMap<String, usize>,
     refusals: usize,
 }
 
 impl Chain {
     fn new(records: u32, archive: bool, rate_limit: bool) -> Self {
+        Self::with_blocks(records, 1, archive, rate_limit)
+    }
+
+    /// Records `per_block` to a block.
+    fn with_blocks(records: u32, per_block: u32, archive: bool, rate_limit: bool) -> Self {
         let mut tree = IncrementalMerkle::new();
         for index in 0..records {
             tree.insert(message_id(index));
@@ -213,7 +253,7 @@ impl Chain {
                                 payment: 1_000,
                             }),
                         };
-                        let height = FIRST + u64::from(index);
+                        let height = FIRST + u64::from(index / per_block);
                         json!({
                             "id": i64::from(index), "block_height": height,
                             "block_hash": hash_hex(height), "origin": hex::encode([9; 32]),
@@ -227,14 +267,24 @@ impl Chain {
         }
         Self {
             records,
-            finalized: FIRST + u64::from(records) + 5,
+            per_block,
+            finalized: FIRST + u64::from(records / per_block) + 5,
+            root: tree.root(),
             tree: rkyv(&tree),
             rows,
             rate_limit,
             window: None,
+            multicall: false,
             requests: BTreeMap::new(),
+            calls: BTreeMap::new(),
             refusals: 0,
         }
+    }
+
+    /// This chain, with Multicall for Dusk deployed.
+    fn with_multicall(mut self, multicall: bool) -> Self {
+        self.multicall = multicall;
+        self
     }
 
     fn count(&mut self, kind: impl Into<String>) {
@@ -279,12 +329,7 @@ impl Chain {
             .strip_prefix("/on/contracts:")
             .and_then(|rest| rest.split_once('/'))
             .unwrap_or_else(|| panic!("unexpected request {path}"));
-        let name = match hex::decode(contract).unwrap().as_slice() {
-            c if c == MAILBOX => "mailbox",
-            c if c == HOOK => "hook",
-            c if c == IGP => "igp",
-            _ => panic!("unexpected contract {contract}"),
-        };
+        let contract: [u8; 32] = hex::decode(contract).unwrap().try_into().unwrap();
         if !self.admit_query() {
             reply(
                 stream,
@@ -294,10 +339,62 @@ impl Chain {
             );
             return;
         }
-        self.count(format!("{name}.{method}"));
+        if contract == MULTICALL {
+            self.count(format!("multicall.{method}"));
+            match self.multicall(method, &body) {
+                Some(value) => reply(stream, "200 OK", "", &value),
+                // Rusk 1.7.3 answers every failed query alike.
+                None => reply(
+                    stream,
+                    "500 Internal Server Error",
+                    "",
+                    br#"{"error":"Internal server error"}"#,
+                ),
+            }
+            return;
+        }
+        self.count(format!("{}.{method}", name(&contract)));
+        let value = self.query(&contract, method, &body);
+        reply(stream, "200 OK", "", &value);
+    }
+
+    /// The multicall's reply, or `None` where the query fails.
+    fn multicall(&mut self, method: &str, body: &[u8]) -> Option<Vec<u8>> {
+        if !self.multicall {
+            return None;
+        }
+        if method == "version" {
+            return Some(rkyv(&1u32));
+        }
+        assert_eq!(method, "aggregate");
+        let calls: Vec<Call> = hyperlane_dusk::rkyv_deserialize(body).unwrap();
+        if calls.len() > 256 {
+            return None;
+        }
+        let results = calls
+            .iter()
+            .map(|call| {
+                *self
+                    .calls
+                    .entry(format!("{}.{}", name(&call.contract), call.fn_name))
+                    .or_default() += 1;
+                Ok(self.query(&call.contract, &call.fn_name, &call.fn_args))
+            })
+            .collect();
+        let encoded = rkyv(&Aggregate {
+            height: self.finalized + 1,
+            results,
+        });
+        // The contract's own limit: its reply must fit 64 KiB.
+        (encoded.len() <= 64 * 1024).then_some(encoded)
+    }
+
+    /// A view's reply.
+    fn query(&self, contract: &[u8; 32], method: &str, body: &[u8]) -> Vec<u8> {
         let index = || u32::from_le_bytes(body[..4].try_into().unwrap());
-        let height = |index: u32| FIRST + u64::from(index);
-        let value = match (name, method) {
+        let per_block = self.per_block;
+        let height = |index: u32| FIRST + u64::from(index / per_block);
+        match (name(contract), method) {
             ("mailbox", "nonce") | ("hook", "count") | ("igp", "gas_payment_count") => {
                 self.records.to_le_bytes().to_vec()
             }
@@ -317,14 +414,26 @@ impl Chain {
                 )
             }
             ("hook", "tree") => self.tree.clone(),
-            ("igp", "gas_payment_at") => rkyv(&payment(index())),
+            ("hook", "root") => self.root.to_vec(),
+            ("igp", "gas_payment_at") => rkyv(&payment(index(), per_block)),
             ("igp", "gas_payments") => {
                 let limit = u32::from_le_bytes(body[4..8].try_into().unwrap());
-                rkyv(&(index()..index() + limit).map(payment).collect::<Vec<_>>())
+                rkyv(
+                    &(index()..index() + limit)
+                        .map(|index| payment(index, per_block))
+                        .collect::<Vec<_>>(),
+                )
             }
-            _ => panic!("unexpected contract query {name}.{method}"),
-        };
-        reply(stream, "200 OK", "", &value);
+            // The deployment check.
+            ("transfer", "chain_id") => vec![0],
+            ("mailbox" | "announce", "local_domain") => ORIGIN.to_le_bytes().to_vec(),
+            ("mailbox", "state_version") => 5u32.to_le_bytes().to_vec(),
+            ("announce" | "hook", "state_version") => 2u32.to_le_bytes().to_vec(),
+            ("announce" | "hook", "mailbox") => MAILBOX.to_vec(),
+            ("mailbox", "required_hook") => HOOK.to_vec(),
+            ("hook", "hook_type") => vec![3],
+            (name, method) => panic!("unexpected contract query {name}.{method}"),
+        }
     }
 
     fn graphql(&self, field: &str, query: &str) -> Value {
@@ -386,6 +495,18 @@ impl Chain {
     }
 }
 
+/// The name a request count gives a contract.
+fn name(contract: &[u8; 32]) -> &'static str {
+    match *contract {
+        MAILBOX => "mailbox",
+        HOOK => "hook",
+        IGP => "igp",
+        VALIDATOR_ANNOUNCE => "announce",
+        TRANSFER => "transfer",
+        _ => panic!("unexpected contract {}", hex::encode(contract)),
+    }
+}
+
 /// A scripted node serving a `Chain`.
 struct Node {
     chain: Arc<Mutex<Chain>>,
@@ -418,6 +539,11 @@ impl Node {
 
     fn refusals(&self) -> usize {
         self.chain.lock().unwrap().refusals
+    }
+
+    /// The calls aggregates made since the last call, by kind.
+    fn take_calls(&self) -> BTreeMap<String, usize> {
+        std::mem::take(&mut self.chain.lock().unwrap().calls)
     }
 }
 
@@ -462,13 +588,20 @@ fn total(requests: &BTreeMap<String, usize>) -> usize {
     requests.values().sum()
 }
 
+/// The multicall clients batch through, if `multicall`.
+fn multicall_of(multicall: bool) -> Option<[u8; 32]> {
+    multicall.then_some(MULTICALL)
+}
+
 /// The relayer's Dusk clients at idle for a minute, one tick every 5 s and
 /// a block finalized every 10 s with no new record: requests by kind.
-async fn relayer_idle_minute(records: u32) -> BTreeMap<String, usize> {
-    let node = Node::start(Chain::new(records, false, false));
+async fn relayer_idle_minute(records: u32, multicall: bool) -> BTreeMap<String, usize> {
+    let node = Node::start(Chain::new(records, false, false).with_multicall(multicall));
     let store = tempfile::tempdir().unwrap();
     let rues = Arc::new(
-        RuesClient::new_with_event_cursor_dir(node.url(), store.path().to_path_buf()).unwrap(),
+        RuesClient::new_with_event_cursor_dir(node.url(), store.path().to_path_buf())
+            .unwrap()
+            .with_multicall(multicall_of(multicall)),
     );
     let dispatches = DuskMailboxIndexer::new(rues.clone(), H256::from(MAILBOX), ORIGIN);
     let insertions = DuskMerkleTreeHookIndexer::new(rues.clone(), H256::from(HOOK));
@@ -514,14 +647,20 @@ async fn relayer_idle_minute(records: u32) -> BTreeMap<String, usize> {
 
 /// A validator's Dusk clients at idle for a minute: its Merkle hook indexer
 /// and its checkpoint reader, which has its own client.
-async fn validator_idle_minute(records: u32) -> BTreeMap<String, usize> {
-    let node = Node::start(Chain::new(records, false, false));
+async fn validator_idle_minute(records: u32, multicall: bool) -> BTreeMap<String, usize> {
+    let node = Node::start(Chain::new(records, false, false).with_multicall(multicall));
     let store = tempfile::tempdir().unwrap();
     let rues = Arc::new(
-        RuesClient::new_with_event_cursor_dir(node.url(), store.path().to_path_buf()).unwrap(),
+        RuesClient::new_with_event_cursor_dir(node.url(), store.path().to_path_buf())
+            .unwrap()
+            .with_multicall(multicall_of(multicall)),
     );
     let insertions = DuskMerkleTreeHookIndexer::new(rues.clone(), H256::from(HOOK));
-    let reader = Arc::new(RuesClient::new(node.url()).unwrap());
+    let reader = Arc::new(
+        RuesClient::new(node.url())
+            .unwrap()
+            .with_multicall(multicall_of(multicall)),
+    );
     let hook = DuskMerkleTreeHook::new(mailbox(reader, &node.url(), store.path(), false));
     let tick = || async {
         let (count, _) = insertions.latest_sequence_count_and_tip().await.unwrap();
@@ -547,13 +686,13 @@ async fn idle_requests_do_not_grow_with_history() {
     let mut relayer = Vec::new();
     let mut validator = Vec::new();
     for records in [0, 100, 10_000] {
-        let requests = relayer_idle_minute(records).await;
+        let requests = relayer_idle_minute(records, false).await;
         eprintln!(
             "relayer, {records} records: {} requests a minute: {requests:?}",
             total(&requests)
         );
         relayer.push(requests);
-        let requests = validator_idle_minute(records).await;
+        let requests = validator_idle_minute(records, false).await;
         eprintln!(
             "validator, {records} records: {} requests a minute: {requests:?}",
             total(&requests)
@@ -575,6 +714,219 @@ async fn idle_requests_do_not_grow_with_history() {
     for requests in &validator {
         assert_eq!(requests.get("gql:lastBlockPair"), Some(&12));
         assert!(total(requests) <= 12 + 6, "{requests:?}");
+    }
+}
+
+#[tokio::test]
+async fn idle_requests_with_a_multicall() {
+    for records in [0, 100, 10_000] {
+        let relayer = relayer_idle_minute(records, true).await;
+        eprintln!(
+            "relayer with a multicall, {records} records: {} requests a minute: {relayer:?}",
+            total(&relayer)
+        );
+        // Per newly finalized block, one aggregate carries the three counts
+        // and the waiting message's delivery check, where they were four
+        // queries.
+        assert_eq!(relayer.get("multicall.aggregate"), Some(&6), "{relayer:?}");
+        assert_eq!(total(&relayer), 12 + 6 * 3, "{relayer:?}");
+        let validator = validator_idle_minute(records, true).await;
+        eprintln!(
+            "validator with a multicall, {records} records: {} requests a minute: {validator:?}",
+            total(&validator)
+        );
+        // A validator reads one count per final block: nothing to batch.
+        assert_eq!(total(&validator), 12 + 6, "{validator:?}");
+    }
+}
+
+/// Every record a sequence indexer has, in the ranges of 2,000 that contract
+/// sync's forward cursor reads (`index.chunk` 1999), after reading its count.
+async fn index_all<T, I>(indexer: &I, records: u32) -> usize
+where
+    T: Send + Sync + 'static,
+    I: hyperlane_core::SequenceAwareIndexer<T>,
+{
+    let (count, _) = indexer.latest_sequence_count_and_tip().await.unwrap();
+    assert_eq!(count, Some(records));
+    let mut logs = 0;
+    let mut next = 0;
+    while next < records {
+        let end = next.saturating_add(1_999).min(records - 1);
+        logs += indexer.fetch_logs_in_range(next..=end).await.unwrap().len();
+        next = end + 1;
+    }
+    logs
+}
+
+/// A relayer started after `records` dispatches, Merkle insertions and IGP
+/// payments, `per_block` to a block: its deployment check, then each record
+/// indexer's count and records, together. Requests by kind, and the calls
+/// aggregates made.
+async fn restart_catch_up(
+    records: u32,
+    per_block: u32,
+    multicall: bool,
+) -> (BTreeMap<String, usize>, BTreeMap<String, usize>) {
+    let node =
+        Node::start(Chain::with_blocks(records, per_block, true, false).with_multicall(multicall));
+    let store = tempfile::tempdir().unwrap();
+    let rues = Arc::new(
+        RuesClient::new_with_event_cursor_dir(node.url(), store.path().to_path_buf())
+            .unwrap()
+            .with_query_rate_limit(UNPACED)
+            .with_multicall(multicall_of(multicall))
+            .with_identity(IDENTITY),
+    );
+    let dispatches = DuskMailboxIndexer::new(rues.clone(), H256::from(MAILBOX), ORIGIN);
+    let insertions = DuskMerkleTreeHookIndexer::new(rues.clone(), H256::from(HOOK));
+    let payments = DuskInterchainGasPaymasterIndexer::new(rues.clone(), H256::from(IGP));
+    let (dispatched, inserted, paid) = tokio::join!(
+        index_all(&dispatches, records),
+        index_all(&insertions, records),
+        index_all(&payments, records),
+    );
+    assert_eq!(
+        (dispatched, inserted, paid),
+        (records as usize, records as usize, records as usize)
+    );
+    RuesClient::forget_shared_client(&node.url(), store.path());
+    let (requests, calls) = (node.take_requests(), node.take_calls());
+    // The deployment check's ten views: ten queries, or the multicall's
+    // probe and one aggregate.
+    let views = [
+        "transfer.chain_id",
+        "mailbox.local_domain",
+        "announce.local_domain",
+        "mailbox.state_version",
+        "announce.state_version",
+        "announce.mailbox",
+        "mailbox.required_hook",
+        "hook.hook_type",
+        "hook.state_version",
+        "hook.mailbox",
+    ];
+    for view in views {
+        let (sent, batched) = if multicall {
+            (None, Some(&1))
+        } else {
+            (Some(&1), None)
+        };
+        assert_eq!(
+            (requests.get(view), calls.get(view)),
+            (sent, batched),
+            "{view}"
+        );
+    }
+    assert_eq!(
+        requests.get("multicall.version"),
+        multicall.then_some(&1),
+        "{requests:?}"
+    );
+    (requests, calls)
+}
+
+/// Contract queries among `requests`: one per aggregate.
+fn contract_queries(requests: &BTreeMap<String, usize>) -> usize {
+    requests
+        .iter()
+        .filter(|(kind, _)| !kind.starts_with("gql:"))
+        .map(|(_, count)| count)
+        .sum()
+}
+
+async fn report_catch_up(records: u32, per_block: u32) -> [usize; 2] {
+    let mut queries = [0; 2];
+    for (multicall, queries) in [false, true].into_iter().zip(&mut queries) {
+        let started = Instant::now();
+        let (requests, calls) = restart_catch_up(records, per_block, multicall).await;
+        *queries = contract_queries(&requests);
+        eprintln!(
+            "restart catch-up of {records} records, {per_block} a block, {}: {} requests, {} of them contract queries, in {:?}: {requests:?}; calls in aggregates: {calls:?}",
+            if multicall { "with a multicall" } else { "one query a read" },
+            total(&requests),
+            queries,
+            started.elapsed()
+        );
+    }
+    queries
+}
+
+#[tokio::test]
+async fn restart_catch_up_requests() {
+    // The deployment check, three counts, three searches over the records
+    // and the records themselves: one query each, or a few aggregates.
+    let [single, batched] = report_catch_up(100, 1).await;
+    assert!(single >= 330, "{single}");
+    assert!(batched <= 16, "{batched}");
+    let [single, batched] = report_catch_up(1_000, 10).await;
+    assert!(single >= 3_000, "{single}");
+    assert!(batched <= 40, "{batched}");
+}
+
+#[tokio::test]
+#[ignore = "a long measurement: about 36,000 requests to a scripted node"]
+async fn restart_catch_up_requests_for_ten_thousand_records() {
+    let [single, batched] = report_catch_up(10_000, 10).await;
+    assert!(single >= 30_000, "{single}");
+    assert!(batched <= 200, "{batched}");
+}
+
+/// The relayer checks whether `messages` messages it prepares together are
+/// delivered, at two final blocks in turn, as its prepare stage does for a
+/// batch of operations: requests by kind at each block.
+async fn delivery_checks(messages: u8, multicall: bool) -> Vec<BTreeMap<String, usize>> {
+    let node = Node::start(Chain::new(0, false, false).with_multicall(multicall));
+    let store = tempfile::tempdir().unwrap();
+    let rues = Arc::new(
+        RuesClient::new(node.url())
+            .unwrap()
+            .with_multicall(multicall_of(multicall)),
+    );
+    let destination = mailbox(rues.clone(), &node.url(), store.path(), false);
+    // Startup: the probe, and a check the relayer made before.
+    assert!(!destination.delivered(H256::zero()).await.unwrap());
+    node.take_requests();
+    let mut blocks = Vec::new();
+    for _ in 0..2 {
+        node.finalize_a_block();
+        rues.expire_block_pair().await;
+        let mut checks = tokio::task::JoinSet::new();
+        for message in 1..=messages {
+            let destination = destination.clone();
+            checks.spawn(async move { destination.delivered(H256::repeat_byte(message)).await });
+        }
+        while let Some(check) = checks.join_next().await {
+            assert!(!check.unwrap().unwrap());
+        }
+        blocks.push(node.take_requests());
+    }
+    blocks
+}
+
+#[tokio::test]
+async fn delivery_checks_prepared_together_share_aggregates() {
+    let single = delivery_checks(16, false).await;
+    for block in &single {
+        assert_eq!(block.get("mailbox.delivered"), Some(&16), "{block:?}");
+    }
+    let batched = delivery_checks(16, true).await;
+    eprintln!(
+        "16 delivery checks at two final blocks: one query a read {single:?}, with a multicall {batched:?}"
+    );
+    // At the first block, the checks go together as they are asked, in a
+    // few aggregates; at the next, all of them in one, with the check made
+    // before them.
+    let first = batched[0].get("multicall.aggregate").copied().unwrap_or(0);
+    assert!((1..=4).contains(&first), "{batched:?}");
+    assert_eq!(
+        batched[1].get("multicall.aggregate"),
+        Some(&1),
+        "{batched:?}"
+    );
+    for block in &batched {
+        assert!(!block.contains_key("mailbox.delivered"), "{block:?}");
+        assert_eq!(block.get("gql:lastBlockPair"), Some(&1), "{block:?}");
     }
 }
 

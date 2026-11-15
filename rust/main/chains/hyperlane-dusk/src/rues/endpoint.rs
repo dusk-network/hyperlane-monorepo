@@ -1,7 +1,8 @@
 //! What one agent process shares about each Rusk endpoint it sends requests
 //! to: how fast it sends contract queries, how it waits when the node
-//! refuses requests for its rate limit, the node's last final block, and
-//! where each contract's records cross final heights.
+//! refuses requests for its rate limit, the node's last final block, where
+//! each contract's records cross final heights, and what it knows of the
+//! multicall it batches reads through.
 //!
 //! Rusk 1.7.3's HTTP policy limits each class of request for all of a
 //! node's clients together. Contract queries get 180 a second, at most 360 in
@@ -30,6 +31,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 use url::Url;
 
+use super::batch::Multicall;
 use super::{BlockPair, DeploymentIdentity, IdentityGate};
 use crate::final_records::FinalRecords;
 
@@ -182,6 +184,9 @@ pub(crate) struct Endpoint {
     /// Whether the endpoint has been shown to serve a deployment, by
     /// deployment.
     identity_gates: StdMutex<HashMap<DeploymentIdentity, Arc<IdentityGate>>>,
+    /// What clients know of each multicall they batch reads through, by
+    /// contract.
+    multicalls: StdMutex<HashMap<[u8; 32], Arc<Multicall>>>,
 }
 
 type Endpoints = HashMap<String, Weak<Endpoint>>;
@@ -214,6 +219,7 @@ impl Endpoint {
             block_pair: tokio::sync::Mutex::new(None),
             final_records: StdMutex::new(HashMap::new()),
             identity_gates: StdMutex::new(HashMap::new()),
+            multicalls: StdMutex::new(HashMap::new()),
         });
         endpoints.insert(key, Arc::downgrade(&endpoint));
         endpoint
@@ -252,6 +258,17 @@ impl Endpoint {
                     attempt: tokio::sync::Mutex::new(None),
                 })
             })
+            .clone()
+    }
+
+    /// The multicall at `contract`, as every client of the endpoint that
+    /// batches reads through it shares it.
+    pub(crate) fn multicall(&self, contract: [u8; 32]) -> Arc<Multicall> {
+        self.multicalls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(contract)
+            .or_insert_with(|| Arc::new(Multicall::new(contract)))
             .clone()
     }
 
@@ -304,7 +321,9 @@ impl Endpoint {
         }
         match class {
             // The semaphore is never closed, so this always holds a permit.
-            RequestClass::ContractQuery => self.queries_in_flight.clone().acquire_owned().await.ok(),
+            RequestClass::ContractQuery => {
+                self.queries_in_flight.clone().acquire_owned().await.ok()
+            }
             RequestClass::Graphql | RequestClass::Other => None,
         }
     }

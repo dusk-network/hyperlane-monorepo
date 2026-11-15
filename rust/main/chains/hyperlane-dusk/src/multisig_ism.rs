@@ -10,7 +10,13 @@ use hyperlane_core::{
 
 use hyperlane_dusk_types::EthAddress;
 
+use crate::rues::{list_reply, rkyv_deserialize, Read};
 use crate::{DuskProvider, RuesClient};
+
+/// Validators a `validators_and_threshold` reply is sized for. A longer
+/// list still decodes; at worst its aggregate fails and it is read again on
+/// its own.
+const MAX_VALIDATORS: usize = 256;
 
 /// Dusk MultisigISM implementation.
 #[derive(Debug, Clone)]
@@ -61,11 +67,19 @@ impl MultisigIsm for DuskMultisigIsm {
         _message: &HyperlaneMessage,
     ) -> ChainResult<(Vec<H256>, u8)> {
         // Read the pair in one contract query so an owner update cannot be
-        // observed half-applied across independent RUES requests.
-        let (validators, threshold): (Vec<EthAddress>, u8) = self
-            .rues
-            .contract_query(&self.ism_id, "validators_and_threshold", &())
-            .await?;
+        // observed half-applied across independent RUES requests. Messages
+        // prepared together ask it together: it is read once for them, in
+        // an aggregate with their other reads, after those of the
+        // deployment's own contracts since a recipient may have chosen it.
+        let read = Read::new(
+            self.ism_id,
+            "validators_and_threshold",
+            &(),
+            list_reply(MAX_VALIDATORS, 20) + 8,
+        )?
+        .untrusted();
+        let (validators, threshold): (Vec<EthAddress>, u8) =
+            rkyv_deserialize(&self.rues.coalesced_read(read).await?)?;
 
         // Convert 20-byte Ethereum addresses to H256 (left-pad with 12 zero bytes).
         let validators_h256: Vec<H256> = validators

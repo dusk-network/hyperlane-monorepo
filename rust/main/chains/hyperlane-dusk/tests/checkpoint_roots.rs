@@ -16,10 +16,12 @@ use hyperlane_core::{
     HyperlaneDomainProtocol, HyperlaneDomainTechnicalStack, MerkleTreeHook, NativeToken,
     ReorgPeriod, H256,
 };
+use hyperlane_dusk::multicall::{Aggregate, Call};
 use hyperlane_dusk::{ConnectionConf, DuskMailbox, DuskMerkleTreeHook, DuskProvider, RuesClient};
 use url::Url;
 
 const HOOK: [u8; 32] = [2; 32];
+const MULTICALL: [u8; 32] = [0x93; 32];
 
 fn id(leaf: usize) -> [u8; 32] {
     hyperlane_dusk_types::message::keccak256(&(leaf as u64).to_be_bytes())
@@ -45,8 +47,15 @@ struct Hook {
     served: HashMap<usize, [u8; 32]>,
     /// Serve every `message_ids` page from this leaf on one ID short.
     short_from: Option<usize>,
-    /// Each contract query: its method and its arguments.
+    /// The root `root` serves instead of the tree's.
+    served_root: Option<[u8; 32]>,
+    /// The height aggregates report instead of the tip's.
+    state_height: Option<u64>,
+    /// Each contract query, and each call of an aggregate: its method and
+    /// its arguments.
     queries: Vec<(String, Vec<u8>)>,
+    /// The methods each aggregate called.
+    aggregates: Vec<Vec<String>>,
 }
 
 impl Hook {
@@ -89,13 +98,40 @@ impl Hook {
             .to_string()
             .into_bytes();
         }
+        if let Some(method) =
+            path.strip_prefix(&format!("/on/contracts:{}/", hex::encode(MULTICALL)))
+        {
+            if method == "version" {
+                return rkyv::to_bytes::<_, 256>(&1u32).unwrap().to_vec();
+            }
+            assert_eq!(method, "aggregate");
+            let calls: Vec<Call> = hyperlane_dusk::rkyv_deserialize(body).unwrap();
+            self.aggregates
+                .push(calls.iter().map(|call| call.fn_name.clone()).collect());
+            let results = calls
+                .iter()
+                .map(|call| {
+                    assert_eq!(call.contract, HOOK);
+                    Ok(self.view(&call.fn_name, &call.fn_args))
+                })
+                .collect();
+            let aggregate = Aggregate {
+                height: self.state_height.unwrap_or(self.finalized + 5),
+                results,
+            };
+            return rkyv::to_bytes::<_, 256>(&aggregate).unwrap().to_vec();
+        }
         let method = path
             .strip_prefix(&format!("/on/contracts:{}/", hex::encode(HOOK)))
             .unwrap()
             .to_owned();
-        self.queries.push((method.clone(), body.to_vec()));
+        self.view(&method, body)
+    }
+
+    fn view(&mut self, method: &str, body: &[u8]) -> Vec<u8> {
+        self.queries.push((method.to_owned(), body.to_vec()));
         let index = || u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
-        match method.as_str() {
+        match method {
             "count" => (self.ids.len() as u32).to_le_bytes().to_vec(),
             "inserted_block_height" => self.heights[index()].to_le_bytes().to_vec(),
             "message_id_at" => self.ids[index()].to_vec(),
@@ -114,6 +150,7 @@ impl Hook {
                 rkyv::to_bytes::<_, 256>(&page).unwrap().to_vec()
             }
             "tree" => rkyv::to_bytes::<_, 256>(&self.tree()).unwrap().to_vec(),
+            "root" => self.served_root.unwrap_or(self.tree().root()).to_vec(),
             method => panic!("unexpected contract query: {method}"),
         }
     }
@@ -202,6 +239,11 @@ impl Fixture {
     }
 
     fn adapter(&self) -> DuskMerkleTreeHook {
+        self.adapter_with(None)
+    }
+
+    /// The adapter of a chain that names `multicall`.
+    fn adapter_with(&self, multicall: Option<[u8; 32]>) -> DuskMerkleTreeHook {
         let domain = HyperlaneDomain::from_config(
             4242,
             "dusk-roots",
@@ -209,7 +251,11 @@ impl Fixture {
             HyperlaneDomainTechnicalStack::Other,
         )
         .unwrap();
-        let rues = Arc::new(RuesClient::new(self.url.clone()).unwrap());
+        let rues = Arc::new(
+            RuesClient::new(self.url.clone())
+                .unwrap()
+                .with_multicall(multicall),
+        );
         let provider = Arc::new(DuskProvider::new(domain.clone(), rues.clone()));
         DuskMerkleTreeHook::new(DuskMailbox::new(
             provider,
@@ -420,4 +466,189 @@ async fn a_short_page_fails_and_keeps_the_ids_read_before_it() {
         root_of(&fixture.hook_state().ids)
     );
     assert_eq!(fixture.hook_state().pages(), [(256, 256), (512, 88)]);
+}
+
+/// The methods of the queries sent on their own, not in an aggregate.
+fn single_queries(hook: &Hook) -> Vec<String> {
+    let in_aggregates: usize = hook.aggregates.iter().map(Vec::len).sum();
+    let mut queries: Vec<String> = hook
+        .queries
+        .iter()
+        .map(|(method, _)| method.clone())
+        .collect();
+    // Calls of aggregates are recorded as they are made, after the
+    // queries sent before them; count them out by kind.
+    let mut calls: HashMap<String, usize> = HashMap::new();
+    for method in hook.aggregates.iter().flatten() {
+        *calls.entry(method.clone()).or_default() += 1;
+    }
+    queries.retain(|method| match calls.get_mut(method) {
+        Some(left) if *left > 0 => {
+            *left -= 1;
+            false
+        }
+        _ => true,
+    });
+    assert_eq!(
+        queries.len() + in_aggregates,
+        hook.queries.len(),
+        "every call is a query"
+    );
+    queries
+}
+
+const SNAPSHOT_CHECKS: [&str; 4] = ["count", "root", "tree", "message_id_at"];
+
+#[tokio::test]
+async fn with_a_multicall_the_checks_and_last_pages_are_one_aggregate_at_one_state() {
+    let fixture = Fixture::start(hook_with(600, 10, 100));
+    let hook = fixture.adapter_with(Some(MULTICALL));
+    let checkpoint = hook.latest_checkpoint(&ReorgPeriod::None).await.unwrap();
+    let ids = fixture.hook_state().ids.clone();
+    assert_eq!(checkpoint.checkpoint.index, 599);
+    assert_eq!(checkpoint.checkpoint.root, root_of(&ids));
+    {
+        let state = fixture.hook_state();
+        // The probe, the search's two reads of 256 and 2 insertion
+        // heights, then the three pages with the hook's checks, at one
+        // state, instead of the pages, `message_id_at` and `tree` apart.
+        let sizes: Vec<usize> = state.aggregates.iter().map(Vec::len).collect();
+        assert_eq!(sizes, [0, 256, 2, 7]);
+        let mut snapshot = vec!["message_ids"; 3];
+        snapshot.extend(SNAPSHOT_CHECKS);
+        assert_eq!(state.aggregates[3], snapshot);
+        assert_eq!(state.pages(), [(0, 256), (256, 256), (512, 88)]);
+        // Only the count, read once per final block, went on its own.
+        assert_eq!(single_queries(&state), ["count"]);
+    }
+    // The start tree a validator reads is the same tree, and a checked
+    // tree is not checked again.
+    fixture.hook_state().aggregates.clear();
+    let tree = hook.tree(&ReorgPeriod::None).await.unwrap();
+    assert_eq!(tree.tree.root(), root_of(&ids));
+    assert!(fixture.hook_state().aggregates.is_empty());
+}
+
+#[tokio::test]
+async fn with_a_multicall_a_later_checkpoint_reads_its_new_ids_with_the_checks() {
+    let fixture = Fixture::start(hook_with(300, 10, 100));
+    let hook = fixture.adapter_with(Some(MULTICALL));
+    hook.latest_checkpoint(&ReorgPeriod::None).await.unwrap();
+    {
+        let mut state = fixture.hook_state();
+        state.push(100, 101);
+        state.finalized = 101;
+        state.aggregates.clear();
+        state.queries.clear();
+    }
+    fixture.next_tick().await;
+    let checkpoint = hook.latest_checkpoint(&ReorgPeriod::None).await.unwrap();
+    assert_eq!(checkpoint.checkpoint.index, 399);
+    assert_eq!(
+        checkpoint.checkpoint.root,
+        root_of(&fixture.hook_state().ids)
+    );
+    let state = fixture.hook_state();
+    // The heights of the 100 new insertions in one read, then their IDs
+    // and the checks in another: two aggregates and the count.
+    let mut snapshot = vec!["message_ids"];
+    snapshot.extend(SNAPSHOT_CHECKS);
+    assert_eq!(state.aggregates.len(), 2);
+    assert_eq!(state.aggregates[0].len(), 100);
+    assert_eq!(state.aggregates[1], snapshot);
+    assert_eq!(state.pages(), [(300, 100)]);
+    assert_eq!(single_queries(&state), ["count"]);
+}
+
+#[tokio::test]
+async fn with_a_multicall_a_long_history_reads_its_first_pages_before_the_snapshot() {
+    let fixture = Fixture::start(hook_with(3_000, 10, 100));
+    let hook = fixture.adapter_with(Some(MULTICALL));
+    let checkpoint = hook.latest_checkpoint(&ReorgPeriod::None).await.unwrap();
+    assert_eq!(
+        checkpoint.checkpoint.root,
+        root_of(&fixture.hook_state().ids)
+    );
+    let state = fixture.hook_state();
+    // Twelve pages: four ahead in one aggregate, then the seven full pages
+    // and the short last one that fit beside the checks.
+    let count = state.aggregates.len();
+    assert_eq!(state.aggregates[count - 2], ["message_ids"; 4]);
+    let snapshot = &state.aggregates[count - 1];
+    assert_eq!(snapshot.len(), 8 + 4);
+    assert_eq!(snapshot[8..], SNAPSHOT_CHECKS);
+    assert_eq!(state.pages().len(), 12);
+}
+
+#[tokio::test]
+async fn with_a_multicall_a_root_that_disagrees_is_never_signed_and_is_discarded() {
+    let mut state = hook_with(5, 10, 100);
+    state.served_root = Some([0xee; 32]);
+    let fixture = Fixture::start(state);
+    let hook = fixture.adapter_with(Some(MULTICALL));
+    let error = hook
+        .latest_checkpoint(&ReorgPeriod::None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("disagrees with the hook") && error.contains("the hook's root"),
+        "{error}"
+    );
+    // The tree was dropped: once the hook answers its own root, the tree
+    // is rebuilt from the first leaf.
+    fixture.hook_state().served_root = None;
+    fixture.hook_state().queries.clear();
+    let checkpoint = hook.latest_checkpoint(&ReorgPeriod::None).await.unwrap();
+    assert_eq!(
+        checkpoint.checkpoint.root,
+        root_of(&fixture.hook_state().ids)
+    );
+    assert_eq!(fixture.hook_state().pages(), [(0, 5)]);
+}
+
+#[tokio::test]
+async fn with_a_multicall_ids_that_disagree_with_the_hook_are_never_signed() {
+    let mut state = hook_with(5, 10, 100);
+    state.served.insert(2, [0xee; 32]);
+    let fixture = Fixture::start(state);
+    let hook = fixture.adapter_with(Some(MULTICALL));
+    let error = hook
+        .latest_checkpoint(&ReorgPeriod::None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("disagrees with the hook") && error.contains("the hook's own tree"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn with_a_multicall_a_state_below_the_checkpoints_block_is_read_again_later() {
+    let mut state = hook_with(5, 10, 100);
+    // A node behind the URL whose state lags the final block the count was
+    // found at.
+    state.state_height = Some(99);
+    let fixture = Fixture::start(state);
+    let hook = fixture.adapter_with(Some(MULTICALL));
+    let error = hook
+        .latest_checkpoint(&ReorgPeriod::None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("state at height 99 is below block 100") && !error.contains("disagrees"),
+        "{error}"
+    );
+    // Nothing of that state was taken: the next read, once the state is not
+    // behind, reads the IDs with the checks.
+    fixture.hook_state().state_height = None;
+    fixture.hook_state().queries.clear();
+    let checkpoint = hook.latest_checkpoint(&ReorgPeriod::None).await.unwrap();
+    assert_eq!(
+        checkpoint.checkpoint.root,
+        root_of(&fixture.hook_state().ids)
+    );
+    assert_eq!(fixture.hook_state().pages(), [(0, 5)]);
 }

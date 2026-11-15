@@ -48,6 +48,47 @@ how to run the local bridge.
   plus about 6 per newly final block, and a validator one a tick plus one,
   whatever the history (48 and 18 a minute on a 10 s chain). Finality is
   seen up to one tick later than a fresh read would see it.
+- **Batched reads.** A chain whose `batchContractAddress` names Multicall
+  for Dusk sends reads that do not depend on each other as one `aggregate`
+  query, which answers them all at one state; an aggregate is one request to
+  the pace and to the node's rate limit. Before its first aggregate, a
+  process checks that the multicall answers `version` with 1 and an empty
+  `aggregate` with no results. One that does not, or later answers wrongly,
+  is set aside with one warning, every read is one query again, and it is
+  probed again 10 minutes later. Without a `batchContractAddress` every read
+  is one query, as before. Through the multicall:
+  - the deployment check reads its ten views in one aggregate, and an
+    aggregation hook's three in one more, after the probe's two queries;
+  - the reads made once per final block, the record counts and the
+    delivery checks of messages the relayer is waiting on, go in one
+    aggregate per final block, which also carries those asked at the two
+    blocks before: an idle relayer sends 30 requests a minute instead of 48.
+    A validator reads one count per final block, which gains nothing (18);
+  - indexers read the heights, IDs and pages of a range of records together,
+    and search record heights 256 at a time: a restart's catch-up of 1,000
+    records sends 25 contract queries instead of 3,048, and of 10,000
+    records 151 instead of 30,132;
+  - a checkpoint's checks against the hook are one aggregate at one state
+    (see Checkpoints);
+  - messages prepared together read their recipient's ISM and its
+    `validators_and_threshold` once, and reads asked while an aggregate is
+    in flight, such as the first delivery checks of a batch of messages, go
+    together in the next one.
+
+  Each aggregate keeps within the multicall's 256 calls and 64 KiB of
+  argument and of reply by the longest reply each view gives, even if every
+  call fails with the longest panic message. One that fails as a whole is
+  split in two and each half sent again, and a half of one read goes as a
+  single query; when both halves fail, the reads go one query each. Rusk
+  1.7.3 answers every failed query with `500 Internal server error`, so a
+  reply past 64 KiB cannot be told from other failures. A call that fails
+  gives the error its single query would, `500`, here with the reason; one
+  that runs out of its share of gas is sent again as a single query, with
+  the query's whole gas. A call can change what the later calls of its query
+  read, so reads of contracts outside the deployment, such as an ISM a
+  recipient chose, go after the deployment's own, and their failures never
+  set the multicall aside. Every view the agent batches answers its caller
+  alike, so its reply in an aggregate is the bytes a single query returns.
 - **Indexing** uses finalized contract events only. Each event is matched to
   its block and transaction, and stored in the agent's `eventCursorDir`, which
   every agent process needs its own copy of. The Mailbox stores only the ID of
@@ -238,7 +279,14 @@ how to run the local bridge.
   those leaves, the hook's own `tree` must have the same count, root and
   root-making branch nodes. Otherwise the read fails, the tree is dropped and
   the next read rebuilds it, so a validator never signs a root computed from
-  IDs that disagree with the hook.
+  IDs that disagree with the hook. Through a multicall, the checks
+  (`count`, `root`, `tree` and `message_id_at` of the last leaf) and the
+  last pages of IDs that fit beside them are one aggregate, at one state,
+  instead of queries that can straddle a block; the hook's `root` must be
+  the computed one too, and the state's height at or above the block the
+  leaves were counted at, or the read fails and is tried again. The height
+  only shows that the state is not older than that block: it does not name a
+  block, and the leaves are final by their count, found as before.
 
 ## Supported
 
@@ -268,6 +316,7 @@ how to run the local bridge.
   "gasPrice": 2000,
   "contractQueriesPerSecond": 100,
   "contractQueryBurst": 20,
+  "batchContractAddress": "0x93de287b7d349d678a0038fe7772e8960e1a84a1b5da2d0b1f62f532616ce1d4",
   "maxBatchSize": 16,
   "mailbox": "0x<contract id>",
   "interchainGasPaymaster": "0x<contract id>",
@@ -289,6 +338,16 @@ with, since Rusk reports no gas for a simulation.
 contract queries to its endpoint (see Pacing above); an operator of a node
 that serves only its own agents can raise them together with the node's
 `[http.policy.global_limits.classes.contract_query]`.
+
+`batchContractAddress` names the Multicall for Dusk contract
+([HDauven/dusk-multicall](https://github.com/HDauven/dusk-multicall)) the
+agent batches its contract reads through (see Batched reads); on EVM chains
+the same setting names Multicall3. Mainnet and testnet run it at
+`0x93de287b7d349d678a0038fe7772e8960e1a84a1b5da2d0b1f62f532616ce1d4`. A
+contract ID follows the Wasm, the deploy nonce and the owner, not the chain,
+so a local chain that deploys the published Wasm with nonce 0 and the
+published owner gets the same ID. It has no default: without it, every read
+is one query.
 
 `maxBatchSize` (1 by default) is how many prepared deliveries the relayer
 submits together; above 1, with a helper that takes `--nonce` and
@@ -346,9 +405,11 @@ cargo test -p validator reorg
 cargo clippy -p hyperlane-dusk --all-targets -- -D warnings
 ```
 
-CI runs these through `.github/workflows/dusk-agent-gate.yml`. End-to-end
-tests against a live node are in the companion repository's `demo/`
-directory.
+`cargo test -p hyperlane-dusk --test node_load -- --ignored --nocapture`
+measures a restart's catch-up of 10,000 records, with and without a
+multicall, in a few minutes. CI runs the others through
+`.github/workflows/dusk-agent-gate.yml`. End-to-end tests against a live
+node are in the companion repository's `demo/` directory.
 
 ## Changes outside this crate
 

@@ -18,14 +18,19 @@ use hyperlane_dusk_types::merkle::{IncrementalMerkle as HookTree, TREE_DEPTH};
 
 use crate::final_records::FinalRecords;
 use crate::rues::{
-    bounded_body, bounded_error, bounded_json, bounded_text, rkyv_deserialize, rkyv_serialize,
-    BlockPair, LogLookup,
+    bounded_body, bounded_error, bounded_json, bounded_text, fits_one_aggregate, list_reply,
+    rkyv_deserialize, rkyv_serialize, BlockPair, LogLookup, Read, BOOL_REPLY, ID_REPLY, U32_REPLY,
+    U64_REPLY,
 };
 use crate::{ConnectionConf, DuskProvider, DuskSigner, HyperlaneDuskError, RuesClient};
 
 const TX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(120);
 /// Most message IDs one `message_ids` query returns.
 const MERKLE_HISTORY_PAGE_SIZE: u32 = 256;
+/// Pages of message IDs one aggregate carries.
+const MERKLE_PAGES_PER_AGGREGATE: usize = 7;
+/// The bytes of the hook's `tree` reply.
+const HOOK_TREE_REPLY: usize = std::mem::size_of::<rkyv::Archived<HookTree>>();
 /// Archive pages a delivery check reads to bring the delivery log up to
 /// date, on to the end of the block being read.
 const DELIVERED_LOG_PAGES: usize = 4;
@@ -429,11 +434,15 @@ impl DuskMailbox {
     /// `NotFinal`.
     async fn check_delivery(&self, id: H256, pair: &BlockPair) -> ChainResult<Delivery> {
         let id_bytes: [u8; 32] = id.into();
-        if !self
-            .rues
-            .contract_query::<_, bool>(&self.mailbox_id, "delivered", &(id_bytes,))
-            .await?
-        {
+        // Read after `pair`'s last final block was final. When batching, it
+        // can come from the endpoint's reads of that block, made before
+        // `pair` itself was read: such a reply can only be as stale as a
+        // check this keeps for the whole block, since a delivery counts
+        // only once its finalized `ProcessId` row does.
+        let read = Read::new(self.mailbox_id, "delivered", &(id_bytes,), BOOL_REPLY)?;
+        let delivered: bool =
+            rkyv_deserialize(&self.rues.tick_read(pair.finalized(), read).await?)?;
+        if !delivered {
             return Ok(Delivery::Absent);
         }
         let lookup = self
@@ -530,20 +539,20 @@ impl DuskMailbox {
         requested.low_u64()
     }
 
+    /// The hook's insertion count, read once per final block.
     async fn merkle_tree_count(&self) -> ChainResult<u32> {
-        Ok(self
-            .rues
-            .contract_query(&self.merkle_tree_hook_id, "count", &())
-            .await?)
+        let read = Read::new(self.merkle_tree_hook_id, "count", &(), U32_REPLY)?;
+        Ok(rkyv_deserialize(&self.rues.final_tick_read(read).await?)?)
     }
 
-    async fn merkle_insertion_height(&self, index: u32) -> ChainResult<u64> {
+    async fn merkle_insertion_heights(&self, indices: Vec<u32>) -> ChainResult<Vec<u64>> {
         Ok(self
             .rues
-            .contract_query(
-                &self.merkle_tree_hook_id,
+            .read_indexed(
+                self.merkle_tree_hook_id,
                 "inserted_block_height",
-                &(index,),
+                &indices,
+                U64_REPLY,
             )
             .await?)
     }
@@ -553,11 +562,13 @@ impl DuskMailbox {
     /// with the hook's indexer on the same endpoint, and free for a height
     /// asked before.
     async fn merkle_count_at_height(&self, block_height: u64) -> ChainResult<u32> {
+        let probes = self.rues.batch_capacity().await?;
         self.insertions
             .count_at_or_below(
                 block_height,
                 || self.merkle_tree_count(),
-                |index| self.merkle_insertion_height(index),
+                probes,
+                |indices| self.merkle_insertion_heights(indices),
             )
             .await
     }
@@ -568,8 +579,10 @@ impl DuskMailbox {
         Ok((finalized_count, finalized_height))
     }
 
-    /// The tree of the hook's first `count` leaves, ingested from the
-    /// message IDs it stores, and checked against the hook (`verify_tree`).
+    /// The tree of the hook's first `count` leaves, the insertions at or
+    /// below block `at_height`, ingested from the message IDs it stores, and
+    /// checked against the hook (`verify_tree`, or `verify_snapshot` when
+    /// one aggregate reads the checks at one state).
     ///
     /// The shared tree is extended page by page, so a call that is cancelled
     /// or fails to read keeps the pages it read. A tree of fewer leaves than
@@ -577,21 +590,27 @@ impl DuskMailbox {
     /// failed check drops the shared tree, so the next call rebuilds it from
     /// the hook's first leaf: no root is computed from IDs that disagree
     /// with the hook.
-    async fn tree_at(&self, count: u32) -> ChainResult<IncrementalMerkle> {
+    async fn tree_at(&self, count: u32, at_height: u64) -> ChainResult<IncrementalMerkle> {
         let mut shared = self.merkle.lock().await;
         if shared.verified == Some(count as usize) && shared.tree.count() == count as usize {
             return Ok(shared.tree.clone());
         }
         let extends_shared = shared.tree.count() <= count as usize;
-        let (tree, last) = if extends_shared {
-            self.extend_tree(&mut shared, count).await?;
-            (shared.tree.clone(), shared.last)
+        let mut earlier = MerkleCache::default();
+        let cache = if extends_shared {
+            &mut *shared
         } else {
-            let mut earlier = MerkleCache::default();
-            self.extend_tree(&mut earlier, count).await?;
-            (earlier.tree, earlier.last)
+            &mut earlier
         };
-        if let Err(detail) = self.verify_tree(&tree, last).await? {
+        let verdict = match self.snapshot_tree(cache, count, at_height).await? {
+            Some(verdict) => verdict,
+            None => {
+                self.extend_tree(cache, count).await?;
+                self.verify_tree(&cache.tree, cache.last).await?
+            }
+        };
+        let tree = cache.tree.clone();
+        if let Err(detail) = verdict {
             *shared = MerkleCache::default();
             warn!(
                 hook = %hex::encode(self.merkle_tree_hook_id),
@@ -616,30 +635,136 @@ impl DuskMailbox {
     /// page as long as asked.
     async fn extend_tree(&self, cache: &mut MerkleCache, count: u32) -> ChainResult<()> {
         loop {
-            let start = u32::try_from(cache.tree.count()).map_err(|_| {
-                HyperlaneDuskError::Other("Dusk Merkle tree count exceeds u32".into())
-            })?;
+            let start = cache_count(cache)?;
             if start >= count {
                 return Ok(());
             }
             let limit = (count - start).min(MERKLE_HISTORY_PAGE_SIZE);
-            let message_ids: Vec<[u8; 32]> = self
+            let page = self
                 .rues
-                .contract_query(&self.merkle_tree_hook_id, "message_ids", &(start, limit))
+                .contract_query_raw(
+                    &self.merkle_tree_hook_id,
+                    "message_ids",
+                    &rkyv_serialize(&(start, limit))?,
+                )
                 .await?;
-            if message_ids.len() != limit as usize {
-                return Err(HyperlaneDuskError::Other(format!(
-                    "MerkleTreeHook returned {} message IDs for page start={start} limit={limit}",
-                    message_ids.len()
-                ))
-                .into());
+            ingest_page(cache, &page, start, limit)?;
+        }
+    }
+
+    /// The `message_ids` pages from leaf `start` up to `count`: each page's
+    /// start, length and read.
+    fn tree_pages(&self, start: u32, count: u32) -> ChainResult<Vec<(u32, u32, Read)>> {
+        let mut pages = Vec::new();
+        let mut next = start;
+        while next < count {
+            let limit = (count - next).min(MERKLE_HISTORY_PAGE_SIZE);
+            pages.push((
+                next,
+                limit,
+                Read::new(
+                    self.merkle_tree_hook_id,
+                    "message_ids",
+                    &(next, limit),
+                    list_reply(limit as usize, 32),
+                )?,
+            ));
+            next += limit;
+        }
+        Ok(pages)
+    }
+
+    /// Extend `cache` to the hook's first `count` leaves and check it
+    /// against the hook, reading the checks (`count`, `root`, `tree` and
+    /// `message_id_at(count - 1)`), with the last pages of IDs that fit
+    /// beside them, in one aggregate: at one state, which must be at or
+    /// above block `at_height`, whose insertions the leaves are. `None`
+    /// when no aggregate can, and the caller reads them one query at a
+    /// time.
+    ///
+    /// The state's height only shows that it is not older than the block
+    /// the leaves were counted at. It does not name a block, and the leaves
+    /// are final by their count, found as before.
+    async fn snapshot_tree(
+        &self,
+        cache: &mut MerkleCache,
+        count: u32,
+        at_height: u64,
+    ) -> ChainResult<Option<Result<(), String>>> {
+        let Some(index) = count.checked_sub(1) else {
+            return Ok(None);
+        };
+        if self.rues.batch_capacity().await? == 1 {
+            return Ok(None);
+        }
+        let hook = self.merkle_tree_hook_id;
+        let checks = [
+            Read::new(hook, "count", &(), U32_REPLY)?,
+            Read::new(hook, "root", &(), ID_REPLY)?,
+            Read::new(hook, "tree", &(), HOOK_TREE_REPLY)?,
+            Read::new(hook, "message_id_at", &(index,), ID_REPLY)?,
+        ];
+        let pages = self.tree_pages(cache_count(cache)?, count)?;
+        // The pages before those that fit beside the checks go first, a few
+        // to an aggregate, each ingested once read.
+        let mut lead = pages.len();
+        while lead > 0 {
+            let candidate: Vec<Read> = pages[lead - 1..]
+                .iter()
+                .map(|(_, _, read)| read.clone())
+                .chain(checks.iter().cloned())
+                .collect();
+            if !fits_one_aggregate(&candidate) {
+                break;
             }
-            for message_id in message_ids {
-                let leaf = H256::from(message_id);
-                cache.tree.ingest(leaf);
-                cache.last = Some(leaf);
+            lead -= 1;
+        }
+        for chunk in pages[..lead].chunks(MERKLE_PAGES_PER_AGGREGATE) {
+            let reads: Vec<Read> = chunk.iter().map(|(_, _, read)| read.clone()).collect();
+            let replies = self.rues.read_all(&reads).await?;
+            for ((start, limit, _), reply) in chunk.iter().zip(replies) {
+                ingest_page(cache, &reply, *start, *limit)?;
             }
         }
+        let mut reads: Vec<Read> = pages[lead..]
+            .iter()
+            .map(|(_, _, read)| read.clone())
+            .collect();
+        reads.extend(checks);
+        let Some(snapshot) = self.rues.read_snapshot(&reads).await? else {
+            return Ok(None);
+        };
+        if snapshot.height < at_height {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Dusk endpoint's state at height {} is below block {at_height}, whose insertions the checkpoint holds; reading it again later",
+                snapshot.height
+            ))
+            .into());
+        }
+        let mut results = snapshot.results.into_iter();
+        let mut next = || {
+            results.next().unwrap_or_else(|| {
+                Err(HyperlaneDuskError::Other(
+                    "Dusk multicall snapshot returned too few results".into(),
+                ))
+            })
+        };
+        for (start, limit, _) in &pages[lead..] {
+            ingest_page(cache, &next()?, *start, *limit)?;
+        }
+        let hook_count: u32 = rkyv_deserialize(&next()?)?;
+        let root: [u8; 32] = rkyv_deserialize(&next()?)?;
+        let hook_tree: HookTree = rkyv_deserialize(&next()?)?;
+        let stored: [u8; 32] = rkyv_deserialize(&next()?)?;
+        Ok(Some(verify_snapshot(
+            &cache.tree,
+            cache.last,
+            index,
+            hook_count,
+            root,
+            &hook_tree,
+            stored,
+        )))
     }
 
     /// Check a tree computed from the hook's stored IDs against the hook
@@ -694,7 +819,7 @@ impl DuskMailbox {
     ) -> ChainResult<IncrementalMerkleAtBlock> {
         let (count, finalized_height) = self.finalized_merkle_view(reorg_period).await?;
         Ok(IncrementalMerkleAtBlock {
-            tree: self.tree_at(count).await?,
+            tree: self.tree_at(count, finalized_height).await?,
             block_height: Some(finalized_height),
         })
     }
@@ -709,7 +834,7 @@ impl DuskMailbox {
             ))
             .into());
         }
-        let tree = self.tree_at(count).await?;
+        let tree = self.tree_at(count, effective_height).await?;
         Ok(CheckpointAtBlock {
             checkpoint: Checkpoint {
                 merkle_tree_hook_address: H256::from_slice(&self.merkle_tree_hook_id),
@@ -720,6 +845,77 @@ impl DuskMailbox {
             block_height: Some(effective_height),
         })
     }
+}
+
+/// The leaves `cache` holds.
+fn cache_count(cache: &MerkleCache) -> ChainResult<u32> {
+    Ok(u32::try_from(cache.tree.count())
+        .map_err(|_| HyperlaneDuskError::Other("Dusk Merkle tree count exceeds u32".into()))?)
+}
+
+/// Ingest a `message_ids` reply from leaf `start`, which must hold the
+/// `limit` IDs asked.
+fn ingest_page(cache: &mut MerkleCache, reply: &[u8], start: u32, limit: u32) -> ChainResult<()> {
+    let message_ids: Vec<[u8; 32]> = rkyv_deserialize(reply)?;
+    if message_ids.len() != limit as usize {
+        return Err(HyperlaneDuskError::Other(format!(
+            "MerkleTreeHook returned {} message IDs for page start={start} limit={limit}",
+            message_ids.len()
+        ))
+        .into());
+    }
+    for message_id in message_ids {
+        let leaf = H256::from(message_id);
+        cache.tree.ingest(leaf);
+        cache.last = Some(leaf);
+    }
+    Ok(())
+}
+
+/// `verify_tree`'s check of `tree`, whose last leaf is `last`, from the
+/// hook's replies read at one state: its `count`, `root`, `tree` and the
+/// ID it stores at `index`, the tree's last. `Err(detail)` when they
+/// disagree with the tree or with each other.
+fn verify_snapshot(
+    tree: &IncrementalMerkle,
+    last: Option<H256>,
+    index: u32,
+    count: u32,
+    root: [u8; 32],
+    hook: &HookTree,
+    stored: [u8; 32],
+) -> Result<(), String> {
+    if hook.count != count {
+        return Err(format!(
+            "the hook's count {count} and its tree's {} differ at one state",
+            hook.count
+        ));
+    }
+    if last != Some(H256::from(stored)) {
+        return Err(format!(
+            "message_id_at({index}) is {:?}, the last ingested ID {last:?}",
+            H256::from(stored)
+        ));
+    }
+    if hook.count as usize != tree.count() {
+        return Ok(());
+    }
+    if !matches_hook_tree(tree, hook) {
+        return Err(format!(
+            "the hook's own tree of {} leaves has root {:?}, the computed one {:?}",
+            hook.count,
+            H256::from(hook.root()),
+            tree.root()
+        ));
+    }
+    if H256::from(root) != tree.root() {
+        return Err(format!(
+            "the hook's root {:?} is not the computed one {:?}",
+            H256::from(root),
+            tree.root()
+        ));
+    }
+    Ok(())
 }
 
 /// Whether `tree`, computed from the hook's stored IDs, is the hook's own
@@ -866,10 +1062,17 @@ impl Mailbox for DuskMailbox {
 
     async fn recipient_ism(&self, recipient: H256) -> ChainResult<H256> {
         let recipient_bytes: [u8; 32] = recipient.into();
-        let ism_bytes: [u8; 32] = self
-            .rues
-            .contract_query(&self.mailbox_id, "recipient_ism", &(recipient_bytes,))
-            .await?;
+        // Messages to one recipient prepared together ask it together. The
+        // Mailbox runs the recipient's own getter, so the read goes after
+        // the deployment's in an aggregate.
+        let read = Read::new(
+            self.mailbox_id,
+            "recipient_ism",
+            &(recipient_bytes,),
+            ID_REPLY,
+        )?
+        .untrusted();
+        let ism_bytes: [u8; 32] = rkyv_deserialize(&self.rues.coalesced_read(read).await?)?;
         Ok(H256::from_slice(&ism_bytes))
     }
 

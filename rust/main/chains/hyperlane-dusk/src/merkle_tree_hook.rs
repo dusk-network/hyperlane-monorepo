@@ -11,7 +11,9 @@ use hyperlane_core::{
 use hyperlane_dusk_types::events;
 
 use crate::final_records::FinalRecords;
-use crate::rues::{exact_event_data, rkyv_deserialize, rkyv_serialize};
+use crate::rues::{
+    exact_event_data, list_reply, rkyv_deserialize, rkyv_serialize, Read, U32_REPLY, U64_REPLY,
+};
 use crate::tx_sender::{dusk_tx_id_to_h512, h512_to_dusk_tx_id};
 use crate::RuesClient;
 
@@ -39,27 +41,28 @@ impl DuskMerkleTreeHookIndexer {
         }
     }
 
-    async fn insertion_height(&self, sequence: u32) -> ChainResult<u64> {
+    async fn insertion_heights(&self, sequences: Vec<u32>) -> ChainResult<Vec<u64>> {
         Ok(self
             .rues
-            .contract_query(&self.hook_id, "inserted_block_height", &(sequence,))
+            .read_indexed(self.hook_id, "inserted_block_height", &sequences, U64_REPLY)
             .await?)
     }
 
+    /// The hook's insertion count, read once per final block.
     async fn insertion_count(&self) -> ChainResult<u32> {
-        Ok(self
-            .rues
-            .contract_query(&self.hook_id, "count", &())
-            .await?)
+        let read = Read::new(self.hook_id, "count", &(), U32_REPLY)?;
+        Ok(rkyv_deserialize(&self.rues.final_tick_read(read).await?)?)
     }
 
     /// How many insertions are at or below final block `block_height`.
     async fn insertions_at_or_below(&self, block_height: u64) -> ChainResult<u32> {
+        let probes = self.rues.batch_capacity().await?;
         self.insertions
             .count_at_or_below(
                 block_height,
                 || self.insertion_count(),
-                |sequence| self.insertion_height(sequence),
+                probes,
+                |sequences| self.insertion_heights(sequences),
             )
             .await
     }
@@ -93,30 +96,42 @@ impl DuskMerkleTreeHookIndexer {
         Ok((finalized_count, finalized_tip))
     }
 
-    /// The message IDs the hook stores at `range`, a page of at most
-    /// `MESSAGE_ID_PAGE_SIZE` per query, each page as long as asked.
-    async fn message_ids(&self, range: RangeInclusive<u32>) -> ChainResult<Vec<[u8; 32]>> {
+    /// The pages of message IDs the hook stores at `range`, at most
+    /// `MESSAGE_ID_PAGE_SIZE` each: their start, length and read.
+    fn message_id_pages(&self, range: RangeInclusive<u32>) -> ChainResult<Vec<(u64, u64, Read)>> {
         let (start, end) = (u64::from(*range.start()), u64::from(*range.end()));
-        let mut ids = Vec::new();
+        let mut pages = Vec::new();
         let mut next = start;
         while next <= end {
             let limit = (end - next + 1).min(MESSAGE_ID_PAGE_SIZE);
-            let page: Vec<[u8; 32]> = self
-                .rues
-                .contract_query(&self.hook_id, "message_ids", &(next as u32, limit as u32))
-                .await?;
-            if page.len() as u64 != limit {
-                return Err(crate::HyperlaneDuskError::Other(format!(
-                    "MerkleTreeHook returned {} message IDs for page start={next} limit={limit}",
-                    page.len()
-                ))
-                .into());
-            }
-            ids.extend(page);
+            pages.push((
+                next,
+                limit,
+                Read::new(
+                    self.hook_id,
+                    "message_ids",
+                    &(next as u32, limit as u32),
+                    list_reply(limit as usize, 32),
+                )?,
+            ));
             next += limit;
         }
-        Ok(ids)
+        Ok(pages)
     }
+}
+
+/// The message IDs of a `message_ids` page from `start`, which must be as
+/// long as asked.
+fn message_id_page(reply: &[u8], start: u64, limit: u64) -> ChainResult<Vec<[u8; 32]>> {
+    let page: Vec<[u8; 32]> = rkyv_deserialize(reply)?;
+    if page.len() as u64 != limit {
+        return Err(crate::HyperlaneDuskError::Other(format!(
+            "MerkleTreeHook returned {} message IDs for page start={start} limit={limit}",
+            page.len()
+        ))
+        .into());
+    }
+    Ok(page)
 }
 
 #[async_trait]
@@ -128,13 +143,29 @@ impl Indexer<MerkleTreeInsertion> for DuskMerkleTreeHookIndexer {
         let (finalized_count, _) = self.finalized_insertion_count().await?;
 
         // The final insertions in the range: their IDs a page at a time,
-        // and each one's block.
+        // and each one's block, read together.
         let mut stored = Vec::new();
         let start = *range.start();
         let end = (*range.end()).min(finalized_count.saturating_sub(1));
         if start < finalized_count {
-            for (index, message_id) in (start..=end).zip(self.message_ids(start..=end).await?) {
-                let block_number = self.insertion_height(index).await?;
+            let pages = self.message_id_pages(start..=end)?;
+            let mut reads: Vec<Read> = pages.iter().map(|(_, _, read)| read.clone()).collect();
+            for index in start..=end {
+                reads.push(Read::new(
+                    self.hook_id,
+                    "inserted_block_height",
+                    &(index,),
+                    U64_REPLY,
+                )?);
+            }
+            let replies = self.rues.read_all(&reads).await?;
+            let (page_replies, height_replies) = replies.split_at(pages.len());
+            let mut message_ids = Vec::new();
+            for ((page_start, limit, _), reply) in pages.iter().zip(page_replies) {
+                message_ids.extend(message_id_page(reply, *page_start, *limit)?);
+            }
+            for ((index, message_id), reply) in (start..=end).zip(message_ids).zip(height_replies) {
+                let block_number: u64 = rkyv_deserialize(reply)?;
                 ensure_cursor_height(block_number)?;
                 stored.push((index, block_number, message_id));
             }

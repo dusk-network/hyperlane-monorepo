@@ -1,7 +1,8 @@
 use hyperlane_core::{ChainCommunicationError, HyperlaneCustomErrorWrapper, H512};
 
-/// Errors specific to the Dusk chain integration.
-#[derive(Debug, thiserror::Error)]
+/// Errors specific to the Dusk chain integration. Every reader of a batched
+/// read gets its own copy of the read's error.
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum HyperlaneDuskError {
     /// HTTP error communicating with the RUES endpoint.
     #[error("RUES HTTP request failed ({kind}, status={status:?})")]

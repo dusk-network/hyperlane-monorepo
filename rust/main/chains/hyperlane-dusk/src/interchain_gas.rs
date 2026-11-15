@@ -15,11 +15,15 @@ use hyperlane_core::{
 use hyperlane_dusk_types::{events, GasPaymentRecord};
 
 use crate::final_records::FinalRecords;
-use crate::rues::{exact_event_data, rkyv_serialize};
+use crate::rues::{
+    exact_event_data, list_reply, rkyv_deserialize, rkyv_serialize, Read, U32_REPLY,
+};
 use crate::tx_sender::{dusk_tx_id_to_h512, h512_to_dusk_tx_id};
 use crate::{DuskProvider, RuesClient};
 
 const GAS_PAYMENT_PAGE_SIZE: u32 = 256;
+/// The bytes of a stored payment record.
+const PAYMENT_REPLY: usize = std::mem::size_of::<rkyv::Archived<GasPaymentRecord>>();
 
 /// Dusk InterchainGasPaymaster implementation (marker contract).
 #[derive(Debug, Clone)]
@@ -79,27 +83,30 @@ impl DuskInterchainGasPaymasterIndexer {
         }
     }
 
-    async fn payment_record(&self, sequence: u32) -> ChainResult<GasPaymentRecord> {
-        Ok(self
+    /// The blocks of the payments at `sequences`, from their records.
+    async fn payment_heights(&self, sequences: Vec<u32>) -> ChainResult<Vec<u64>> {
+        let records: Vec<GasPaymentRecord> = self
             .rues
-            .contract_query(&self.igp_id, "gas_payment_at", &(sequence,))
-            .await?)
+            .read_indexed(self.igp_id, "gas_payment_at", &sequences, PAYMENT_REPLY)
+            .await?;
+        Ok(records.iter().map(|record| record.block_height).collect())
     }
 
+    /// The IGP's payment count, read once per final block.
     async fn payment_count(&self) -> ChainResult<u32> {
-        Ok(self
-            .rues
-            .contract_query(&self.igp_id, "gas_payment_count", &())
-            .await?)
+        let read = Read::new(self.igp_id, "gas_payment_count", &(), U32_REPLY)?;
+        Ok(rkyv_deserialize(&self.rues.final_tick_read(read).await?)?)
     }
 
     /// How many payments are at or below final block `block_height`.
     async fn payments_at_or_below(&self, block_height: u64) -> ChainResult<u32> {
+        let probes = self.rues.batch_capacity().await?;
         self.payments
             .count_at_or_below(
                 block_height,
                 || self.payment_count(),
-                |sequence| async move { Ok(self.payment_record(sequence).await?.block_height) },
+                probes,
+                |sequences| self.payment_heights(sequences),
             )
             .await
     }
@@ -132,35 +139,47 @@ impl DuskInterchainGasPaymasterIndexer {
     }
 
     /// The stored payment records in `range` below `count`, read a page of
-    /// records at a time.
+    /// records at a time, the pages together.
     async fn payment_records(
         &self,
         range: RangeInclusive<u32>,
         count: u32,
     ) -> ChainResult<Vec<(u32, GasPaymentRecord)>> {
-        let mut stored = Vec::new();
+        let mut pages = Vec::new();
         let mut next = *range.start();
         let requested_end = *range.end();
         while next < count && next <= requested_end {
             let limit = (count - next)
                 .min(requested_end.saturating_sub(next).saturating_add(1))
                 .min(GAS_PAYMENT_PAGE_SIZE);
-            let records: Vec<GasPaymentRecord> = self
-                .rues
-                .contract_query(&self.igp_id, "gas_payments", &(next, limit))
-                .await?;
+            pages.push((
+                next,
+                limit,
+                Read::new(
+                    self.igp_id,
+                    "gas_payments",
+                    &(next, limit),
+                    list_reply(limit as usize, PAYMENT_REPLY),
+                )?,
+            ));
+            next += limit;
+        }
+        let reads: Vec<Read> = pages.iter().map(|(_, _, read)| read.clone()).collect();
+        let replies = self.rues.read_all(&reads).await?;
+        let mut stored = Vec::new();
+        for ((start, limit, _), reply) in pages.into_iter().zip(replies) {
+            let records: Vec<GasPaymentRecord> = rkyv_deserialize(&reply)?;
             if records.len() != limit as usize {
                 return Err(crate::HyperlaneDuskError::Other(format!(
-                    "IGP returned {} payment records for page start={next} limit={limit}",
+                    "IGP returned {} payment records for page start={start} limit={limit}",
                     records.len()
                 ))
                 .into());
             }
             for (offset, record) in records.into_iter().enumerate() {
                 ensure_cursor_height(record.block_height)?;
-                stored.push((next + offset as u32, record));
+                stored.push((start + offset as u32, record));
             }
-            next += limit;
         }
         Ok(stored)
     }

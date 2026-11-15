@@ -31,6 +31,17 @@ pub struct ConnectionConf {
     pub query_rate_limit: QueryRateLimit,
 }
 
+impl ConnectionConf {
+    /// The Multicall for Dusk contract the chain batches its contract reads
+    /// through: its `batchContractAddress`, the chain setting that names
+    /// Multicall3 on EVM chains. Unset, every read is one query.
+    pub fn multicall(&self) -> Option<[u8; 32]> {
+        self.op_submission_config
+            .batch_contract_address
+            .map(|address| address.into())
+    }
+}
+
 impl fmt::Debug for ConnectionConf {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter

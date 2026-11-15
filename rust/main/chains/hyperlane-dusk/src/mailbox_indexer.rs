@@ -12,7 +12,9 @@ use hyperlane_core::{
 use hyperlane_dusk_types::{events, message};
 
 use crate::final_records::FinalRecords;
-use crate::rues::{rkyv_deserialize, rkyv_serialize, EventLog, LogEntry};
+use crate::rues::{
+    rkyv_deserialize, rkyv_serialize, EventLog, LogEntry, Read, ID_REPLY, U32_REPLY, U64_REPLY,
+};
 use crate::tx_sender::{dusk_tx_id_to_h512, h512_to_dusk_tx_id};
 use crate::RuesClient;
 
@@ -50,27 +52,33 @@ impl DuskMailboxIndexer {
         }
     }
 
-    async fn dispatch_height(&self, sequence: u32) -> ChainResult<u64> {
+    async fn dispatch_heights(&self, sequences: Vec<u32>) -> ChainResult<Vec<u64>> {
         Ok(self
             .rues
-            .contract_query(&self.mailbox_id, "dispatched_block_height", &(sequence,))
+            .read_indexed(
+                self.mailbox_id,
+                "dispatched_block_height",
+                &sequences,
+                U64_REPLY,
+            )
             .await?)
     }
 
+    /// The Mailbox's dispatch count, read once per final block.
     async fn dispatch_count(&self) -> ChainResult<u32> {
-        Ok(self
-            .rues
-            .contract_query(&self.mailbox_id, "nonce", &())
-            .await?)
+        let read = Read::new(self.mailbox_id, "nonce", &(), U32_REPLY)?;
+        Ok(rkyv_deserialize(&self.rues.final_tick_read(read).await?)?)
     }
 
     /// How many dispatches are at or below final block `block_height`.
     async fn dispatches_at_or_below(&self, block_height: u64) -> ChainResult<u32> {
+        let probes = self.rues.batch_capacity().await?;
         self.dispatches
             .count_at_or_below(
                 block_height,
                 || self.dispatch_count(),
-                |sequence| self.dispatch_height(sequence),
+                probes,
+                |sequences| self.dispatch_heights(sequences),
             )
             .await
     }
@@ -116,20 +124,29 @@ impl Indexer<HyperlaneMessage> for DuskMailboxIndexer {
 
         // The Mailbox stores only each message's ID and block. The message
         // itself is in the finalized Dispatch event that hashes to that ID.
-        let mut stored = Vec::new();
-        for nonce in range {
-            if nonce >= finalized_nonce {
-                break;
-            }
-            let block_number: u64 = self
-                .rues
-                .contract_query(&self.mailbox_id, "dispatched_block_height", &(nonce,))
-                .await?;
+        // Both are read for every final nonce of the range, together.
+        let nonces: Vec<u32> = range.take_while(|nonce| *nonce < finalized_nonce).collect();
+        let mut reads = Vec::with_capacity(nonces.len() * 2);
+        for nonce in &nonces {
+            reads.push(Read::new(
+                self.mailbox_id,
+                "dispatched_block_height",
+                &(*nonce,),
+                U64_REPLY,
+            )?);
+            reads.push(Read::new(
+                self.mailbox_id,
+                "dispatched_id",
+                &(*nonce,),
+                ID_REPLY,
+            )?);
+        }
+        let replies = self.rues.read_all(&reads).await?;
+        let mut stored = Vec::with_capacity(nonces.len());
+        for (nonce, replies) in nonces.into_iter().zip(replies.chunks_exact(2)) {
+            let block_number: u64 = rkyv_deserialize(&replies[0])?;
             ensure_cursor_height(block_number)?;
-            let message_id: [u8; 32] = self
-                .rues
-                .contract_query(&self.mailbox_id, "dispatched_id", &(nonce,))
-                .await?;
+            let message_id: [u8; 32] = rkyv_deserialize(&replies[1])?;
             stored.push(StoredDispatch {
                 nonce,
                 block_number,

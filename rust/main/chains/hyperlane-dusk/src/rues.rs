@@ -23,8 +23,12 @@ use hyperlane_core::{ReorgPeriod, H256, H512};
 
 use crate::HyperlaneDuskError;
 
+mod batch;
 mod endpoint;
 mod event_log;
+pub(crate) use batch::{
+    fits_one_aggregate, list_reply, Read, BOOL_REPLY, ID_REPLY, U32_REPLY, U64_REPLY, U8_REPLY,
+};
 pub use endpoint::QueryRateLimit;
 use endpoint::{Endpoint, RequestClass};
 use event_log::EventLogLocks;
@@ -54,6 +58,15 @@ const HELD_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// How many times a request the endpoint refuses for its rate limit is sent
 /// again before it fails. The waits in between add up to 15 to 30 s.
 const MAX_RATE_LIMIT_RETRIES: u32 = 4;
+/// The genesis transfer contract, which reports the node's chain ID.
+const TRANSFER_CONTRACT: [u8; 32] = {
+    let mut id = [0u8; 32];
+    id[0] = 1;
+    id
+};
+/// Most hooks a required aggregation hook lists that an identity check
+/// reads in one aggregate; a longer list is read again on its own.
+const MAX_AGGREGATED_HOOKS: usize = 64;
 /// Most non-final blocks a finality check reads. Rusk finalizes a block a
 /// few blocks after accepting it; a longer non-final chain means finality
 /// has stalled, and checks wait for it to catch up instead.
@@ -154,6 +167,9 @@ pub struct RuesClient {
     /// that requires the same deployment shares it, so the endpoint is
     /// checked once.
     identity: Option<Arc<IdentityGate>>,
+    /// The multicall independent reads are batched through, if any
+    /// (`with_multicall`), shared by every client of the endpoint.
+    multicall: Option<Arc<batch::Multicall>>,
 }
 
 impl fmt::Debug for RuesClient {
@@ -162,6 +178,7 @@ impl fmt::Debug for RuesClient {
             .debug_struct("RuesClient")
             .field("base_url", &"<redacted>")
             .field("event_store_configured", &self.event_store.is_some())
+            .field("multicall_configured", &self.multicall.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -808,6 +825,7 @@ impl RuesClient {
             non_final_cache: Arc::new(StdMutex::new(NonFinalEventCache::default())),
             event_logs: Arc::new(StdMutex::new(HashMap::new())),
             identity: None,
+            multicall: None,
         })
     }
 
@@ -985,23 +1003,19 @@ impl RuesClient {
     }
 
     async fn chain_id_unchecked(&self) -> Result<u8, HyperlaneDuskError> {
-        let mut transfer_contract = [0u8; 32];
-        transfer_contract[0] = 1;
-        let bytes = self
-            .contract_query_raw_unchecked(&transfer_contract, "chain_id", &[])
-            .await?;
-        match bytes.as_slice() {
-            [chain_id] => Ok(*chain_id),
-            _ => Err(HyperlaneDuskError::Other(format!(
-                "Unexpected Dusk chain_id response length: {}",
-                bytes.len()
-            ))),
-        }
+        parse_chain_id(
+            &self
+                .contract_query_raw_unchecked(&TRANSFER_CONTRACT, "chain_id", &[])
+                .await?,
+        )
     }
 
     /// Validate the endpoint and deployed Hyperlane contracts before an agent
     /// indexes or submits anything. Its own queries do not wait for
-    /// `ensure_identity`, which runs this.
+    /// `ensure_identity`, which runs this. With a usable multicall, the
+    /// reads go in one aggregate, and one more for an aggregation hook's;
+    /// otherwise each is sent when it is checked, so that a failed check
+    /// sends nothing after it.
     pub async fn validate_chain_identity(
         &self,
         expected_chain_id: u8,
@@ -1010,86 +1024,121 @@ impl RuesClient {
         validator_announce_id: &[u8; 32],
         merkle_tree_hook_id: &[u8; 32],
     ) -> Result<(), HyperlaneDuskError> {
-        let observed_chain_id = self.chain_id_unchecked().await?;
+        let view = |contract: &[u8; 32], method: &'static str, max_reply: usize| {
+            Read::new(*contract, method, &(), max_reply)
+        };
+        let chain_id = view(&TRANSFER_CONTRACT, "chain_id", U8_REPLY)?;
+        let domains = [
+            ("Mailbox", view(mailbox_id, "local_domain", U32_REPLY)?),
+            (
+                "ValidatorAnnounce",
+                view(validator_announce_id, "local_domain", U32_REPLY)?,
+            ),
+        ];
+        let mailbox_version = view(mailbox_id, "state_version", U32_REPLY)?;
+        let announce_version = view(validator_announce_id, "state_version", U32_REPLY)?;
+        let announce_binding = view(validator_announce_id, "mailbox", ID_REPLY)?;
+        let required_hook = view(mailbox_id, "required_hook", ID_REPLY)?;
+        let hook_type = view(merkle_tree_hook_id, "hook_type", U8_REPLY)?;
+        let hook_version = view(merkle_tree_hook_id, "state_version", U32_REPLY)?;
+        let hook_binding = view(merkle_tree_hook_id, "mailbox", ID_REPLY)?;
+        let mut reads = self
+            .prefetch(&[
+                chain_id.clone(),
+                domains[0].1.clone(),
+                domains[1].1.clone(),
+                mailbox_version.clone(),
+                announce_version.clone(),
+                announce_binding.clone(),
+                required_hook.clone(),
+                hook_type.clone(),
+                hook_version.clone(),
+                hook_binding.clone(),
+            ])
+            .await?;
+
+        let observed_chain_id = parse_chain_id(&reads.raw(self, &chain_id).await?)?;
         if observed_chain_id != expected_chain_id {
             return Err(HyperlaneDuskError::Other(format!(
                 "Configured Dusk chainId {expected_chain_id} does not match endpoint chain ID {observed_chain_id}"
             )));
         }
 
-        for (label, contract_id) in [
-            ("Mailbox", mailbox_id),
-            ("ValidatorAnnounce", validator_announce_id),
-        ] {
-            let observed_domain: u32 = self
-                .contract_query_unchecked(contract_id, "local_domain", &())
-                .await
-                .map_err(|error| {
-                    HyperlaneDuskError::Other(format!(
-                        "Failed to query Dusk {label} local_domain: {error}"
-                    ))
-                })?;
+        for (label, read) in &domains {
+            let observed_domain: u32 = reads.query(self, read).await.map_err(|error| {
+                HyperlaneDuskError::Other(format!(
+                    "Failed to query Dusk {label} local_domain: {error}"
+                ))
+            })?;
             if observed_domain != expected_domain {
                 return Err(HyperlaneDuskError::Other(format!(
                     "Configured Dusk domainId {expected_domain} does not match {label} local_domain {observed_domain}"
                 )));
             }
         }
-        self.validate_state_version(
-            mailbox_id,
+        Self::validate_state_version(
+            reads.query(self, &mailbox_version).await,
             "Mailbox",
             MAILBOX_STATE_VERSION,
             "stores dispatched message IDs (dispatched_id) and leaves deliveries to ProcessId events",
-        )
-        .await?;
-        self.validate_state_version(
-            validator_announce_id,
+        )?;
+        Self::validate_state_version(
+            reads.query(self, &announce_version).await,
             "ValidatorAnnounce",
             VALIDATOR_ANNOUNCE_STATE_VERSION,
             "stores location hashes (get_announced_storage_location_hashes) and leaves the locations to ValidatorAnnouncement events",
-        )
-        .await?;
-        self.validate_mailbox_binding(validator_announce_id, mailbox_id, "ValidatorAnnounce")
-            .await?;
+        )?;
+        Self::validate_mailbox_binding(
+            reads.query(self, &announce_binding).await?,
+            mailbox_id,
+            "ValidatorAnnounce",
+        )?;
 
         // The supported deployments attach the Merkle hook directly, or as a
         // child of the required static aggregation. A matching local domain
         // alone cannot identify the deployment whose checkpoints we sign.
-        let required: [u8; 32] = self
-            .contract_query_unchecked(mailbox_id, "required_hook", &())
-            .await?;
-        let hook_type: u8 = self
-            .contract_query_unchecked(merkle_tree_hook_id, "hook_type", &())
-            .await?;
+        let required: [u8; 32] = reads.query(self, &required_hook).await?;
+        let hook_type: u8 = reads.query(self, &hook_type).await?;
         if hook_type != 3 {
             return Err(HyperlaneDuskError::Other(
                 "Configured Dusk MerkleTreeHook does not have MerkleTree hook_type 3".into(),
             ));
         }
-        self.validate_state_version(
-            merkle_tree_hook_id,
+        Self::validate_state_version(
+            reads.query(self, &hook_version).await,
             "MerkleTreeHook",
             MERKLE_TREE_HOOK_STATE_VERSION,
             "stores the inserted message IDs (message_ids) that checkpoint roots are computed from",
-        )
-        .await?;
+        )?;
         if required == *merkle_tree_hook_id {
-            self.validate_mailbox_binding(merkle_tree_hook_id, mailbox_id, "MerkleTreeHook")
-                .await?;
+            Self::validate_mailbox_binding(
+                reads.query(self, &hook_binding).await?,
+                mailbox_id,
+                "MerkleTreeHook",
+            )?;
         } else {
-            let required_type: u8 = self
-                .contract_query_unchecked(&required, "hook_type", &())
+            let required_type = view(&required, "hook_type", U8_REPLY)?;
+            let required_binding = view(&required, "mailbox", ID_REPLY)?;
+            let required_hooks = view(&required, "hooks", list_reply(MAX_AGGREGATED_HOOKS, 32))?;
+            let mut required_reads = self
+                .prefetch(&[
+                    required_type.clone(),
+                    required_binding.clone(),
+                    required_hooks.clone(),
+                ])
                 .await?;
+            let required_type: u8 = required_reads.query(self, &required_type).await?;
             if required_type != 2 {
                 return Err(HyperlaneDuskError::Other(
                     "Dusk Mailbox required_hook must be the configured MerkleTreeHook or its static aggregation".into(),
                 ));
             }
-            self.validate_mailbox_binding(&required, mailbox_id, "required aggregation hook")
-                .await?;
-            let hooks: Vec<[u8; 32]> = self
-                .contract_query_unchecked(&required, "hooks", &())
-                .await?;
+            Self::validate_mailbox_binding(
+                required_reads.query(self, &required_binding).await?,
+                mailbox_id,
+                "required aggregation hook",
+            )?;
+            let hooks: Vec<[u8; 32]> = required_reads.query(self, &required_hooks).await?;
             if hooks
                 .iter()
                 .filter(|hook| *hook == merkle_tree_hook_id)
@@ -1100,21 +1149,20 @@ impl RuesClient {
                     "Dusk required aggregation must contain the configured MerkleTreeHook exactly once".into(),
                 ));
             }
-            self.validate_mailbox_binding(merkle_tree_hook_id, &required, "MerkleTreeHook")
-                .await?;
+            Self::validate_mailbox_binding(
+                reads.query(self, &hook_binding).await?,
+                &required,
+                "MerkleTreeHook",
+            )?;
         }
         Ok(())
     }
 
-    async fn validate_mailbox_binding(
-        &self,
-        contract: &[u8; 32],
+    fn validate_mailbox_binding(
+        mailbox: [u8; 32],
         expected_mailbox: &[u8; 32],
         label: &str,
     ) -> Result<(), HyperlaneDuskError> {
-        let mailbox: [u8; 32] = self
-            .contract_query_unchecked(contract, "mailbox", &())
-            .await?;
         if mailbox != *expected_mailbox {
             return Err(HyperlaneDuskError::Other(format!(
                 "Configured Dusk {label} mailbox does not match the configured deployment"
@@ -1127,21 +1175,17 @@ impl RuesClient {
     /// and contracts cannot be upgraded. An agent reading another version
     /// fails later on a query that is gone, with an unexplained node error,
     /// so only the version this agent reads is accepted.
-    async fn validate_state_version(
-        &self,
-        contract: &[u8; 32],
+    fn validate_state_version(
+        observed: Result<u32, HyperlaneDuskError>,
         label: &str,
         expected: u32,
         what: &str,
     ) -> Result<(), HyperlaneDuskError> {
-        let state_version: u32 = self
-            .contract_query_unchecked(contract, "state_version", &())
-            .await
-            .map_err(|error| {
-                HyperlaneDuskError::Other(format!(
-                    "Failed to query Dusk {label} state_version (this agent needs state_version {expected}): {error}"
-                ))
-            })?;
+        let state_version = observed.map_err(|error| {
+            HyperlaneDuskError::Other(format!(
+                "Failed to query Dusk {label} state_version (this agent needs state_version {expected}): {error}"
+            ))
+        })?;
         if state_version != expected {
             return Err(HyperlaneDuskError::Other(format!(
                 "Dusk {label} state_version {state_version} is not supported: this agent needs state_version {expected}, which {what}. Deploy contracts that match this agent's hyperlane-dusk-types pin"
@@ -1224,24 +1268,6 @@ impl RuesClient {
     {
         let body = rkyv_serialize(args)?;
         let response_bytes = self.contract_query_raw(contract_id, method, &body).await?;
-        rkyv_deserialize(&response_bytes)
-    }
-
-    async fn contract_query_unchecked<I, O>(
-        &self,
-        contract_id: &[u8; 32],
-        method: &str,
-        args: &I,
-    ) -> Result<O, HyperlaneDuskError>
-    where
-        I: Serialize<AllocSerializer<256>>,
-        O: Archive,
-        O::Archived: Deserialize<O, Infallible> + for<'b> rkyv::CheckBytes<DefaultValidator<'b>>,
-    {
-        let body = rkyv_serialize(args)?;
-        let response_bytes = self
-            .contract_query_raw_unchecked(contract_id, method, &body)
-            .await?;
         rkyv_deserialize(&response_bytes)
     }
 
@@ -2830,6 +2856,17 @@ fn shared_client_key(url: &Url, event_cursor_dir: &Path) -> (String, PathBuf) {
     canonical_url.set_path(url.path().trim_end_matches('/'));
     canonical_url.set_fragment(None);
     (canonical_url.to_string(), event_cursor_dir.to_path_buf())
+}
+
+/// The chain ID in a transfer contract `chain_id` reply: one byte.
+fn parse_chain_id(bytes: &[u8]) -> Result<u8, HyperlaneDuskError> {
+    match bytes {
+        [chain_id] => Ok(*chain_id),
+        _ => Err(HyperlaneDuskError::Other(format!(
+            "Unexpected Dusk chain_id response length: {}",
+            bytes.len()
+        ))),
+    }
 }
 
 fn validate_transaction_id(tx_id: &str) -> Result<(), HyperlaneDuskError> {
@@ -5083,6 +5120,97 @@ mod tests {
                 .unwrap_err();
             assert!(error.to_string().contains(diagnostic), "{error}");
         }
+    }
+
+    #[tokio::test]
+    async fn identity_checks_through_a_multicall_take_one_aggregate_per_hook_level() {
+        use crate::multicall::{Aggregate, CallError};
+        let mailbox = [3u8; 32];
+        let announce = [4u8; 32];
+        let merkle = [5u8; 32];
+        let aggregation = [6u8; 32];
+        let foreign = [7u8; 32];
+        let ok = |value: Vec<u8>| -> Result<Vec<u8>, CallError> { Ok(value) };
+        let aggregate = |results: Vec<Result<Vec<u8>, CallError>>| {
+            (
+                200,
+                rkyv_serialize(&Aggregate { height: 9, results }).unwrap(),
+            )
+        };
+        // The probe: version 1, and an empty aggregate.
+        let probe = || vec![(200, rkyv_serialize(&1u32).unwrap()), aggregate(vec![])];
+        // The ten views, in the order the check reads them.
+        let views = |required: [u8; 32], hook_mailbox: [u8; 32], mailbox_version: u32| {
+            aggregate(vec![
+                ok(vec![1]),
+                ok(rkyv_serialize(&4242u32).unwrap()),
+                ok(rkyv_serialize(&4242u32).unwrap()),
+                ok(rkyv_serialize(&mailbox_version).unwrap()),
+                ok(rkyv_serialize(&VALIDATOR_ANNOUNCE_STATE_VERSION).unwrap()),
+                ok(rkyv_serialize(&mailbox).unwrap()),
+                ok(rkyv_serialize(&required).unwrap()),
+                ok(vec![3]),
+                ok(rkyv_serialize(&MERKLE_TREE_HOOK_STATE_VERSION).unwrap()),
+                ok(rkyv_serialize(&hook_mailbox).unwrap()),
+            ])
+        };
+        let client = |responses: Vec<(u16, Vec<u8>)>| {
+            RuesClient::new(test_server(responses))
+                .unwrap()
+                .with_multicall(Some([0x93; 32]))
+        };
+        // The hook attached directly: three requests in all, where one query
+        // a view sent ten. The server answers no more.
+        let mut responses = probe();
+        responses.push(views(merkle, mailbox, MAILBOX_STATE_VERSION));
+        client(responses)
+            .validate_chain_identity(1, 4242, &mailbox, &announce, &merkle)
+            .await
+            .unwrap();
+        // Inside a static aggregation hook: one aggregate more for its three
+        // views.
+        let mut responses = probe();
+        responses.push(views(aggregation, aggregation, MAILBOX_STATE_VERSION));
+        responses.push(aggregate(vec![
+            ok(vec![2]),
+            ok(rkyv_serialize(&mailbox).unwrap()),
+            ok(rkyv_serialize(&vec![merkle, foreign]).unwrap()),
+        ]));
+        client(responses)
+            .validate_chain_identity(1, 4242, &mailbox, &announce, &merkle)
+            .await
+            .unwrap();
+        // The checks and their errors are those of single queries.
+        let mut responses = probe();
+        responses.push(views(merkle, mailbox, 4));
+        let error = client(responses)
+            .validate_chain_identity(1, 4242, &mailbox, &announce, &merkle)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "Dusk Mailbox state_version 4 is not supported: this agent needs state_version 5"
+            ),
+            "{error}"
+        );
+        let mut responses = probe();
+        let (_, mut failing) = views(merkle, mailbox, MAILBOX_STATE_VERSION);
+        let mut decoded: Aggregate = rkyv_deserialize(&failing).unwrap();
+        decoded.results[3] = Err(CallError::Unknown);
+        failing = rkyv_serialize(&decoded).unwrap();
+        responses.push((200, failing));
+        let error = client(responses)
+            .validate_chain_identity(1, 4242, &mailbox, &announce, &merkle)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "Failed to query Dusk Mailbox state_version (this agent needs state_version 5)"
+            ) && error.contains("(500)"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

@@ -14,7 +14,7 @@ use hyperlane_core::{
 use hyperlane_dusk_types::message::keccak256;
 use hyperlane_dusk_types::{events, EthAddress};
 
-use crate::rues::{rkyv_deserialize, rkyv_serialize, EventLog, LogLookup};
+use crate::rues::{list_reply, rkyv_deserialize, rkyv_serialize, EventLog, LogLookup, Read};
 use crate::{ConnectionConf, DuskProvider, DuskSigner, HyperlaneDuskError, RuesClient};
 
 const TX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(120);
@@ -88,6 +88,22 @@ fn decode_announcement(data: &[u8]) -> Option<events::ValidatorAnnouncement> {
         && location.len() <= MAX_ANNOUNCED_LOCATION_BYTES
         && rkyv_serialize(&announcement).ok()? == data)
         .then_some(announcement)
+}
+
+/// `hashes`, unless the contract lists more for `validator` than it keeps.
+fn checked_location_hashes(
+    validator: [u8; 20],
+    hashes: Vec<[u8; 32]>,
+) -> ChainResult<Vec<[u8; 32]>> {
+    if hashes.len() > MAX_LOCATIONS_PER_VALIDATOR {
+        return Err(HyperlaneDuskError::Other(format!(
+            "Dusk ValidatorAnnounce lists {} locations for validator 0x{}, more than its {MAX_LOCATIONS_PER_VALIDATOR}",
+            hashes.len(),
+            hex::encode(validator)
+        ))
+        .into());
+    }
+    Ok(hashes)
 }
 
 fn eth_address(validator: &H256) -> [u8; 20] {
@@ -165,15 +181,40 @@ impl DuskValidatorAnnounce {
                 &EthAddress(validator),
             )
             .await?;
-        if hashes.len() > MAX_LOCATIONS_PER_VALIDATOR {
-            return Err(HyperlaneDuskError::Other(format!(
-                "Dusk ValidatorAnnounce lists {} locations for validator 0x{}, more than its {MAX_LOCATIONS_PER_VALIDATOR}",
-                hashes.len(),
-                hex::encode(validator)
-            ))
-            .into());
+        checked_location_hashes(validator, hashes)
+    }
+
+    /// `location_hashes` of each of `validators`, read together.
+    async fn location_hashes_of(&self, validators: &[[u8; 20]]) -> Vec<ChainResult<Vec<[u8; 32]>>> {
+        let reads: Result<Vec<Read>, _> = validators
+            .iter()
+            .map(|validator| {
+                Read::new(
+                    self.va_id,
+                    "get_announced_storage_location_hashes",
+                    &EthAddress(*validator),
+                    list_reply(MAX_LOCATIONS_PER_VALIDATOR, 32),
+                )
+            })
+            .collect();
+        let results = match reads {
+            Ok(reads) => self.rues.read_each(&reads).await,
+            Err(error) => Err(error),
+        };
+        match results {
+            Ok(results) => validators
+                .iter()
+                .zip(results)
+                .map(|(validator, result)| {
+                    let hashes: Vec<[u8; 32]> = rkyv_deserialize(&result?)?;
+                    checked_location_hashes(*validator, hashes)
+                })
+                .collect(),
+            Err(error) => validators
+                .iter()
+                .map(|_| Err(error.clone().into()))
+                .collect(),
         }
-        Ok(hashes)
     }
 
     /// The locations of `hashes` that `validator` announced in finalized
@@ -356,23 +397,40 @@ impl ValidatorAnnounce for DuskValidatorAnnounce {
                 None
             }
         };
+        let addresses: Vec<[u8; 20]> = validators.iter().map(eth_address).collect();
+        let known: Vec<Option<Vec<String>>> = addresses
+            .iter()
+            .map(|address| {
+                finalized.and_then(|finalized| {
+                    self.reads()
+                        .locations
+                        .get(address)
+                        .filter(|(at, _)| *at == finalized)
+                        .map(|(_, locations)| locations.clone())
+                })
+            })
+            .collect();
+        // The lists not read at this final block, together.
+        let unknown: Vec<[u8; 20]> = addresses
+            .iter()
+            .zip(&known)
+            .filter(|(_, known)| known.is_none())
+            .map(|(address, _)| *address)
+            .collect();
+        let mut hashes = self.location_hashes_of(&unknown).await.into_iter();
         let mut all_locations = Vec::with_capacity(validators.len());
-        for validator in validators {
-            let address = eth_address(validator);
-            let known = finalized.and_then(|finalized| {
-                self.reads()
-                    .locations
-                    .get(&address)
-                    .filter(|(at, _)| *at == finalized)
-                    .map(|(_, locations)| locations.clone())
-            });
+        for ((validator, address), known) in validators.iter().zip(addresses).zip(known) {
             if let Some(locations) = known {
                 all_locations.push(locations);
                 continue;
             }
-            let locations = match self.location_hashes(address).await {
-                Ok(hashes) => self.announced_locations(&log, address, &hashes),
-                Err(error) => Err(error),
+            let locations = match hashes.next() {
+                Some(Ok(hashes)) => self.announced_locations(&log, address, &hashes),
+                Some(Err(error)) => Err(error),
+                None => Err(HyperlaneDuskError::Other(
+                    "Dusk ValidatorAnnounce read returned too few lists".into(),
+                )
+                .into()),
             };
             match locations {
                 Ok(locations) => {
