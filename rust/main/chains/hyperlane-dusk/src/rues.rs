@@ -229,11 +229,14 @@ impl PageSize {
 /// first whenever it returns any row from the fence's ID on. When the archive
 /// returns another row first, it numbers its rows differently: the
 /// contract's anchors are dropped and the scan starts over. When it returns
-/// no row from the fence's ID on, it may only be behind, so the scan asks
-/// whether the archive has finalized the fence row's block, which Rusk does
-/// in the same transaction that inserts the block's rows. If it has, its rows
-/// are numbered differently and the scan starts over; if not, the lookup
-/// fails until the archive catches up, and the anchors are kept.
+/// no row from the fence's ID on, it may only be behind, and the anchors are
+/// kept, with the lookup failing until it catches up, only on positive
+/// evidence of that: the archive has not finalized the fence row's block
+/// (Rusk does so in the same transaction that inserts the block's rows), the
+/// node's ledger holds that block under the anchor's hash, and the node has
+/// not finalized the block yet or the archive has not finalized the node's
+/// last final block either. Otherwise the archive will never return the
+/// fence row, and the scan starts over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ScanAnchor {
     before_block: u64,
@@ -1396,21 +1399,9 @@ impl RuesClient {
                     // Later rows without the fence row: an archive that only
                     // lagged would return the fence row first.
                     Some(_) => return Ok(ScanOutcome::WrongAnchor),
-                    // No row from the fence's ID on: the archive is behind,
-                    // unless it has finalized the fence row's block.
-                    None => {
-                        let fence_block_hash = hex::encode(anchor.fence_block_hash);
-                        return Ok(
-                            if self
-                                .check_finalized_block(anchor.fence_block, &fence_block_hash)
-                                .await?
-                            {
-                                ScanOutcome::WrongAnchor
-                            } else {
-                                ScanOutcome::ArchiveBehind(anchor)
-                            },
-                        );
-                    }
+                    // No row from the fence's ID on: the archive may be
+                    // behind, or may never return the fence row.
+                    None => return self.at_missing_fence(contract_id, anchor).await,
                 }
             }
 
@@ -1487,6 +1478,112 @@ impl RuesClient {
                 });
             }
         }
+    }
+
+    /// What a scan does when the archive returns no row from `anchor`'s
+    /// fence row on.
+    ///
+    /// The archive may be behind the one the anchor came from, and returns
+    /// the fence row once it catches up; then the anchor is kept and the
+    /// lookup fails until it does. But the archive may also never return the
+    /// row: it has finalized the fence row's block without it, the anchor
+    /// names a block the chain does not have, or the archive has passed the
+    /// block without finalizing it. Waiting would then stall every lookup
+    /// from the anchor for good, so the anchor is kept only on positive
+    /// evidence that the archive is behind, and dropped otherwise.
+    async fn at_missing_fence(
+        &self,
+        contract_id: &[u8; 32],
+        anchor: ScanAnchor,
+    ) -> Result<ScanOutcome, HyperlaneDuskError> {
+        let fence_hash = H256::from(anchor.fence_block_hash);
+        if self
+            .check_finalized_block(anchor.fence_block, &hex::encode(fence_hash))
+            .await?
+        {
+            // Finalized without the row: the rows are numbered differently.
+            return Ok(ScanOutcome::WrongAnchor);
+        }
+        match self.archive_lag(anchor.fence_block, fence_hash).await? {
+            None => Ok(ScanOutcome::ArchiveBehind(anchor)),
+            Some(reason) => {
+                warn!(
+                    contract = %hex::encode(contract_id),
+                    fence_block = anchor.fence_block,
+                    %reason,
+                    "Dusk archive will not reach a saved scan position; dropping it"
+                );
+                Ok(ScanOutcome::WrongAnchor)
+            }
+        }
+    }
+
+    /// Whether the archive has not finalized block `height` with `hash` only
+    /// because it is behind: `None` if so, and otherwise why it will not.
+    ///
+    /// The archive is behind only if the node's ledger holds that block, and
+    /// either the node has not finalized it yet, or the archive has not
+    /// finalized the node's last final block either. A ledger without the
+    /// block, or with another block at that height, or an archive that has
+    /// finalized a later block than this one without it, never finalizes it.
+    async fn archive_lag(
+        &self,
+        height: u64,
+        hash: H256,
+    ) -> Result<Option<String>, HyperlaneDuskError> {
+        match self.ledger_block_hash(height).await? {
+            None => return Ok(Some(format!("the node's ledger has no block {height}"))),
+            Some(ledger) if ledger != hash => {
+                return Ok(Some(format!(
+                    "the ledger's block {height} is {ledger:?}, not {hash:?}"
+                )))
+            }
+            Some(_) => {}
+        }
+        let pair = self.block_pair().await?;
+        if height > pair.finalized {
+            return Ok(None);
+        }
+        if self
+            .check_finalized_block(pair.finalized, &hex::encode(pair.finalized_hash))
+            .await?
+        {
+            return Ok(Some(format!(
+                "the archive has finalized block {}, the node's last final block, but not block {height}",
+                pair.finalized
+            )));
+        }
+        Ok(None)
+    }
+
+    /// The hash of the node's ledger block at `height`, or `None` when the
+    /// ledger has no block there.
+    async fn ledger_block_hash(&self, height: u64) -> Result<Option<H256>, HyperlaneDuskError> {
+        let data = self
+            .graphql_query(&format!(
+                "query {{ block(height: {height}) {{ header {{ hash }} }} }}"
+            ))
+            .await?;
+        let block = data.get("block").ok_or_else(|| {
+            HyperlaneDuskError::Other(format!(
+                "Rusk block response is missing block: {}",
+                bounded_json(&data)
+            ))
+        })?;
+        if block.is_null() {
+            return Ok(None);
+        }
+        let hash = block
+            .get("header")
+            .and_then(|header| header.get("hash"))
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                HyperlaneDuskError::Other(format!(
+                    "Rusk block {height} is missing its header hash: {}",
+                    bounded_json(block)
+                ))
+            })?;
+        parse_h256_hex(hash, "ledger block hash").map(Some)
     }
 
     /// The anchor a scan for `block_height` should start from: the one with
@@ -3473,6 +3570,12 @@ mod tests {
         /// `unfinalized`.
         block_checks: Arc<StdMutex<Vec<(u64, String)>>>,
         unfinalized: Arc<StdMutex<HashSet<u64>>>,
+        /// The node's last finalized block, which `lastBlockPair` reports
+        /// as both its tip and its last final block. The ledger holds every
+        /// block up to it, block `h` with hash `[h as u8; 32]` as in
+        /// `archive_row`, except the heights in `pruned`.
+        ledger_tip: Arc<StdMutex<u64>>,
+        pruned: Arc<StdMutex<HashSet<u64>>>,
         stop: Arc<std::sync::atomic::AtomicBool>,
         worker: Option<thread::JoinHandle<()>>,
     }
@@ -3489,6 +3592,8 @@ mod tests {
             let refusal = Arc::new(StdMutex::new(None));
             let block_checks = Arc::new(StdMutex::new(Vec::new()));
             let unfinalized = Arc::new(StdMutex::new(HashSet::new()));
+            let ledger_tip = Arc::new(StdMutex::new(1000));
+            let pruned = Arc::new(StdMutex::new(HashSet::new()));
             let stop = Arc::new(AtomicBool::new(false));
             let worker_rows = rows.clone();
             let worker_pages = pages.clone();
@@ -3496,6 +3601,8 @@ mod tests {
             let worker_refusal = refusal.clone();
             let worker_block_checks = block_checks.clone();
             let worker_unfinalized = unfinalized.clone();
+            let worker_ledger_tip = ledger_tip.clone();
+            let worker_pruned = pruned.clone();
             let worker_stop = stop.clone();
             let worker = thread::spawn(move || {
                 while !worker_stop.load(Ordering::SeqCst) {
@@ -3541,6 +3648,29 @@ mod tests {
                             200,
                             serde_json::json!({ "checkBlock": finalized }).to_string(),
                         )
+                    } else if let Some(rest) = query.strip_prefix("query { block(height: ") {
+                        let height = rest
+                            .split(|c: char| !c.is_ascii_digit())
+                            .next()
+                            .and_then(|height| height.parse::<u64>().ok())
+                            .unwrap();
+                        let block = (height <= *worker_ledger_tip.lock().unwrap()
+                            && !worker_pruned.lock().unwrap().contains(&height))
+                        .then(|| {
+                            serde_json::json!({"header": {"hash": hex::encode([height as u8; 32])}})
+                        });
+                        (200, serde_json::json!({ "block": block }).to_string())
+                    } else if query == "query { lastBlockPair { json } }" {
+                        let tip = *worker_ledger_tip.lock().unwrap();
+                        let block = serde_json::json!([tip, hex::encode([tip as u8; 32])]);
+                        (
+                            200,
+                            serde_json::json!({"lastBlockPair": {"json": {
+                                "last_block": block,
+                                "last_finalized_block": block,
+                            }}})
+                            .to_string(),
+                        )
                     } else {
                         (
                             200,
@@ -3563,6 +3693,8 @@ mod tests {
                 refusal,
                 block_checks,
                 unfinalized,
+                ledger_tip,
+                pruned,
                 stop,
                 worker: Some(worker),
             }
@@ -4912,8 +5044,9 @@ mod tests {
 
         // The node's archive is restored from an older copy and has not
         // inserted blocks 10 to 14 again yet. The contract records a
-        // dispatch at block 15.
+        // dispatch at block 15, the node's last final block.
         archive.rows.lock().unwrap().truncate(5);
+        *archive.ledger_tip.lock().unwrap() = 15;
         let error = client
             .finalized_contract_event(&contract_id, "dispatch", 1, 15, &[10])
             .await
@@ -4924,10 +5057,12 @@ mod tests {
                 .contains("has not reached the saved scan position"),
             "{error}"
         );
-        // The page at the position was empty and the archive has not
-        // finalized block 14, the fence row's block: the position is kept
-        // and the scan does not start over from the first row.
-        assert_eq!(archive.checked_heights(), [14, 14]);
+        // The page at the position was empty, the archive has not finalized
+        // block 14, the fence row's block, which the ledger holds under the
+        // position's hash, and it has not finalized block 15, the node's last
+        // final block, either: it is behind. The position is kept and the
+        // scan does not start over from the first row.
+        assert_eq!(archive.checked_heights(), [14, 14, 15]);
         assert_eq!(client.scan_anchors_of(&contract_id), anchors);
         assert_eq!(archive.pages(), vec![None, Some(8)]);
 
@@ -4991,5 +5126,107 @@ mod tests {
         assert_eq!(archive.pages(), vec![None, Some(8), None, Some(23)]);
         // Only the matched rows' blocks were checked.
         assert_eq!(archive.checked_heights(), [14, 15]);
+    }
+
+    #[tokio::test]
+    async fn a_scan_position_whose_block_hash_is_not_the_ledgers_is_dropped() {
+        let contract_id = [90u8; 32];
+        // An endpoint serves a row of block 7 under another block's hash.
+        // The row passes checkBlock there, and the scan keeps a position
+        // after it.
+        let mut forged = archive_row(i64::MAX, 7, 9, "dispatch", contract_id, &[1]);
+        forged["block_hash"] = serde_json::json!(hex::encode([0xee; 32]));
+        let archive = Archive::start(vec![forged]);
+        let directory = tempfile::tempdir().unwrap();
+        let poisoned = test_client_with_event_store(archive.url.clone(), directory.path());
+        poisoned
+            .finalized_contract_event(&contract_id, "dispatch", 0, 7, &[1])
+            .await
+            .unwrap();
+        assert_eq!(
+            poisoned.scan_anchors_of(&contract_id)[0].fence_block_hash,
+            [0xee; 32]
+        );
+        drop(poisoned);
+
+        // The endpoint now serves the real archive, which has no row from
+        // the position on and has not finalized block 7 under that hash.
+        *archive.rows.lock().unwrap() = vec![
+            archive_row(11, 7, 9, "dispatch", contract_id, &[1]),
+            archive_row(12, 8, 11, "dispatch", contract_id, &[2]),
+        ];
+        let repaired = test_client_with_event_store(archive.url.clone(), directory.path());
+        let later = repaired
+            .finalized_contract_event(&contract_id, "dispatch", 1, 8, &[2])
+            .await
+            .unwrap();
+        assert_eq!(later.block_height, 8);
+        // The ledger's block 7 has another hash: the position is not this
+        // chain's, so it is dropped and the scan starts over instead of
+        // waiting for an archive that will never reach it.
+        assert_eq!(archive.pages(), vec![None, Some(i64::MAX - 1), None]);
+        assert!(repaired
+            .scan_anchors_of(&contract_id)
+            .iter()
+            .all(|anchor| anchor.fence_block_hash != [0xee; 32]));
+    }
+
+    #[tokio::test]
+    async fn a_scan_position_in_a_block_the_archive_skipped_is_dropped() {
+        let contract_id = [91u8; 32];
+        let archive = Archive::start(one_row_per_block(contract_id));
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(archive.url.clone(), directory.path());
+        client
+            .finalized_contract_event(&contract_id, "dispatch", 0, 14, &[9])
+            .await
+            .unwrap();
+        let saved = client.scan_anchors_of(&contract_id);
+        assert_eq!(saved[0].fence_block, 14);
+
+        // Another node's archive behind the endpoint failed to finalize
+        // blocks 13 and 14, as Rusk does when its archive write fails, and
+        // has finalized block 16, the node's last final block, since. It
+        // numbers its rows like the first archive did up to block 12.
+        {
+            let mut rows = archive.rows.lock().unwrap();
+            rows.truncate(8);
+            rows.push(archive_row(8, 16, 1, "dispatch", contract_id, &[11]));
+        }
+        *archive.ledger_tip.lock().unwrap() = 16;
+        let matched = client
+            .finalized_contract_event(&contract_id, "dispatch", 1, 16, &[11])
+            .await
+            .unwrap();
+        assert_eq!(matched.block_height, 16);
+        // The archive has finalized block 16 without block 14, so it will
+        // never return the position's row: the scan started over.
+        assert_eq!(archive.pages(), vec![None, Some(8), None]);
+        assert!(!client.scan_anchors_of(&contract_id).contains(&saved[0]));
+    }
+
+    #[tokio::test]
+    async fn a_scan_position_in_a_block_the_node_does_not_hold_is_dropped() {
+        let contract_id = [92u8; 32];
+        let archive = Archive::start(one_row_per_block(contract_id));
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(archive.url.clone(), directory.path());
+        client
+            .finalized_contract_event(&contract_id, "dispatch", 0, 14, &[9])
+            .await
+            .unwrap();
+
+        // The endpoint now serves a node started from a snapshot after block
+        // 14: neither its ledger nor its archive holds the position's block,
+        // and its archive has numbered its rows from 0 since the snapshot.
+        *archive.rows.lock().unwrap() = vec![archive_row(0, 20, 1, "dispatch", contract_id, &[11])];
+        archive.pruned.lock().unwrap().extend(0..=19);
+        *archive.ledger_tip.lock().unwrap() = 30;
+        let matched = client
+            .finalized_contract_event(&contract_id, "dispatch", 1, 20, &[11])
+            .await
+            .unwrap();
+        assert_eq!(matched.block_height, 20);
+        assert_eq!(archive.pages(), vec![None, Some(8), None]);
     }
 }

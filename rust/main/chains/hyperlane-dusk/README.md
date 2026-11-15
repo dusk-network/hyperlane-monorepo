@@ -39,10 +39,13 @@ how to run the local bridge.
   insertion order and never deletes one, so if the archive returns another
   row first, it numbers its rows differently: the contract's positions are
   dropped and the scan starts over. If it returns no row from there on, the
-  scan asks the archive (`checkBlock(onlyFinalized)`) whether it has
-  finalized that row's block, which Rusk records together with the block's
-  rows. If it has, the scan starts over; if not, the archive is behind, and
-  the lookup fails until it catches up, keeping the positions.
+  archive may only be behind, and the positions are kept, with the lookup
+  failing until it catches up, only on evidence of that: the archive has not
+  finalized that row's block (`checkBlock(onlyFinalized)`, which Rusk
+  records together with the block's rows), the node's ledger holds that
+  block under the position's hash, and the node has not finalized the block
+  yet or the archive has not finalized the node's last final block either.
+  Otherwise the archive will never return the row, and the scan starts over.
 - **Block cache.** A scan reads the whole block it is looking in, and the
   block's rows stay in memory, so other lookups in the same block (a cursor
   with a small `index.chunk`, or one lookup per transaction) match against

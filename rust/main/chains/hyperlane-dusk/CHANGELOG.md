@@ -14,6 +14,7 @@
 
 ### Fixed
 
+- A saved archive scan position was kept whenever the archive returned no row from it and had not finalized its row's block, which also happens when the position names another hash for that block (a row served under a forged block hash), when the node's ledger lacks the block, or when the archive has passed the block without finalizing it. Lookups from such a position failed for good. A position is now kept only while the ledger holds its block under its hash and the node has not finalized that block yet or the archive has not finalized the node's last final block either; otherwise it is dropped and the scan starts over.
 - A relayed `process` was refused once its metadata and message passed 60,416 bytes, 1 KiB short of the 61,440 bytes of serialized arguments the `dusk-tx` helper accepts. The arguments are now serialized first and refused exactly when the helper would refuse them.
 - A Dusk delivery counted only once its block was final, whoever delivered the message. The relayer used to mark a message processed as soon as the node's tip held its delivery, and never retried it: if finality stalled past the relayer's confirmation delay and a rollback dropped the delivery, the message was lost. While no final block held the delivery, `delivered` failed and the relayer checked again later; a rolled-back delivery read as not delivered, and the message was relayed again.
 - A validator's startup waited until its announcement's block was final, instead of ending as soon as the node's tip held an announcement that a rollback could still drop.
