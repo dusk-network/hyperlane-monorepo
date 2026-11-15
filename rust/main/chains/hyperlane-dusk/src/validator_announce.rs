@@ -13,7 +13,7 @@ use hyperlane_core::{
 use hyperlane_dusk_types::message::keccak256;
 use hyperlane_dusk_types::{events, EthAddress};
 
-use crate::rues::{rkyv_deserialize, rkyv_serialize, BlockPair, EventLog, LogLookup};
+use crate::rues::{rkyv_deserialize, rkyv_serialize, EventLog, LogLookup};
 use crate::{ConnectionConf, DuskProvider, DuskSigner, HyperlaneDuskError, RuesClient};
 
 const TX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(120);
@@ -109,7 +109,9 @@ impl DuskValidatorAnnounce {
     /// the validator's list, and the check reports it only once its
     /// announcement is final, failing until then: Rusk can still roll the
     /// block back, and the validator would sign checkpoints that relayers
-    /// cannot find. Reads fail instead of reporting partial results.
+    /// cannot find. Finality comes from the client's announcement log alone,
+    /// so a client without an `eventCursorDir` never reports the location.
+    /// Reads fail instead of reporting partial results.
     pub fn with_own_location(mut self, location: impl Into<String>) -> Self {
         self.own_location = Some(location.into());
         self
@@ -171,13 +173,13 @@ impl DuskValidatorAnnounce {
 
     /// Whether `validator` has announced `location` in a final block: `[]`
     /// when its hash is not in the list, `[location]` once the announcement
-    /// is final, and an error until then.
-    ///
-    /// Where the announcement log holds every finalized announcement up to
-    /// the last final block, read before the list, that takes the
-    /// announcement in a block `checkBlock(onlyFinalized)` accepts. Where it
-    /// does not reach that far yet, it takes no block above the last final
-    /// one holding the announcement.
+    /// log holds the announcement in a block `checkBlock(onlyFinalized)`
+    /// accepts, and an error until then: while the announcement is in no
+    /// final block, and while the log does not reach the last final block
+    /// (read before the list), cannot be read, or the client keeps none.
+    /// That no block above the last final one holds the announcement never
+    /// shows that it is final: a block accepted and rolled back within the
+    /// check's own requests leaves no trace there.
     async fn own_announcement(
         &self,
         log: &EventLog,
@@ -211,61 +213,26 @@ impl DuskValidatorAnnounce {
             ))
         };
         let key = location_key(&validator, &location_hash);
-        match self
+        let detail = match self
             .rues
             .finalized_event_log_lookup(log, &key, &pair, ANNOUNCEMENT_LOG_PAGES)
             .await
         {
             Ok(LogLookup::Found(_)) => return Ok(vec![location.to_owned()]),
-            Ok(LogLookup::Absent { final_block }) => {
-                return Err(not_final(format!(
-                    "no finalized block up to block {final_block}, the last final one, holds the announcement"
-                ))
-                .into())
-            }
+            Ok(LogLookup::Absent { final_block }) => format!(
+                "no finalized block up to block {final_block}, the last final one, holds the announcement"
+            ),
             Ok(LogLookup::Unknown(reason)) => {
-                debug!(%reason, "Dusk announcement log cannot show finality; checking the blocks that are not final");
+                debug!(%reason, "Dusk announcement log cannot show the announcement final yet");
+                format!("the announcement log cannot show it final yet: {reason}")
             }
             Err(error) => {
-                debug!(%error, "Dusk announcement log is unavailable; checking the blocks that are not final");
+                let error = crate::rues::bounded_error(&error);
+                debug!(%error, "Dusk announcement log cannot be read; the announcement does not count yet");
+                format!("the announcement log that would show it final cannot be read: {error}")
             }
-        }
-        self.ensure_not_pending(&pair, validator, location, not_final)
-            .await?;
-        Ok(vec![location.to_owned()])
-    }
-
-    /// Fail while a block above `pair`'s last final one holds `validator`'s
-    /// announcement of `location`.
-    async fn ensure_not_pending(
-        &self,
-        pair: &BlockPair,
-        validator: [u8; 20],
-        location: &str,
-        not_final: impl Fn(String) -> HyperlaneDuskError,
-    ) -> ChainResult<()> {
-        let pending = self
-            .rues
-            .non_final_events(pair, &self.va_id, events::ValidatorAnnouncement::TOPIC)
-            .await
-            .map_err(|error| not_final(format!("its finality cannot be checked yet: {error}")))?;
-        for event in pending {
-            let announcement = rkyv_deserialize::<events::ValidatorAnnouncement>(&event.data)
-                .map_err(|error| {
-                    not_final(format!(
-                        "non-final block {} holds an undecodable announcement: {error}",
-                        event.block_height
-                    ))
-                })?;
-            if announcement.validator.0 == validator && announcement.storage_location == location {
-                return Err(not_final(format!(
-                    "block {} ({:?}) holds the announcement and is not final yet",
-                    event.block_height, event.block_hash
-                ))
-                .into());
-            }
-        }
-        Ok(())
+        };
+        Err(not_final(detail).into())
     }
 }
 
@@ -623,11 +590,18 @@ mod tests {
 
     #[tokio::test]
     async fn a_validators_own_check_rejects_errors_and_recovers() {
-        // Every block is final.
+        // Every block is final, and block 9 holds the announcement.
         let hash = "ab".repeat(32);
         let final_tip = format!(
             r#"{{"lastBlockPair":{{"json":{{"last_block":[9,"{hash}"],"last_finalized_block":[9,"{hash}"]}}}}}}"#
         )
+        .into_bytes();
+        let finalized = br#"{"checkBlock":true}"#.to_vec();
+        let page = serde_json::json!({"finalizedEvents": {"json": {
+            "events": [announcement_row(0, 1, LOCATION)],
+            "startCursor": "djE6MA==", "endCursor": "djE6MA==", "hasNextPage": false,
+        }}})
+        .to_string()
         .into_bytes();
         let too_many: Vec<String> = (0..17).map(|n| format!("s3://{n}")).collect();
         let too_many: Vec<&str> = too_many.iter().map(String::as_str).collect();
@@ -642,9 +616,16 @@ mod tests {
                     (200, hashes(&[LOCATION])),
                     (200, final_tip.clone()),
                     (200, hashes(&[LOCATION])),
-                    (200, br#"{"blocks":[]}"#.to_vec()),
+                    // The announcement log: the archive has finalized the
+                    // last final block, holds the announcement there, and
+                    // checkBlock accepts its block when it is taken and
+                    // when it is found.
+                    (200, finalized.clone()),
+                    (200, page.clone()),
+                    (200, finalized.clone()),
+                    (200, finalized.clone()),
                 ],
-                false,
+                true,
             );
             let client = client.with_own_location(LOCATION);
             assert!(client

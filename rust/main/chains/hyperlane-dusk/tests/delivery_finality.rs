@@ -96,6 +96,12 @@ struct Node {
     queries: Vec<String>,
     delivered_queries: usize,
     after_delivered_queries: Option<Hook>,
+    /// The same, after ValidatorAnnounce's location list was read a number
+    /// of times.
+    location_queries: usize,
+    after_location_queries: Option<Hook>,
+    /// The archive refuses every `finalizedEvents` request.
+    finalized_events_fail: bool,
     forks: u8,
 }
 
@@ -111,6 +117,9 @@ impl Node {
             queries: Vec::new(),
             delivered_queries: 0,
             after_delivered_queries: None,
+            location_queries: 0,
+            after_location_queries: None,
+            finalized_events_fail: false,
             forks: 0,
         };
         for _ in 0..=height {
@@ -194,6 +203,15 @@ impl Node {
                 .iter()
                 .map(|location| hyperlane_dusk_types::message::keccak256(location.as_bytes()))
                 .collect();
+            self.location_queries += 1;
+            if self
+                .after_location_queries
+                .as_ref()
+                .is_some_and(|(queries, _)| *queries == self.location_queries)
+            {
+                let (_, hook) = self.after_location_queries.take().unwrap();
+                hook(self);
+            }
             return rkyv::to_bytes::<_, 256>(&hashes).unwrap().to_vec();
         }
         panic!("unexpected request {path}");
@@ -212,6 +230,9 @@ impl Node {
     }
 
     fn graphql(&self, query: &str) -> serde_json::Value {
+        if query.contains("finalizedEvents(") && self.finalized_events_fail {
+            return serde_json::json!({"errors": [{"message": "archive unavailable"}]});
+        }
         if query.contains("finalizedEvents(") {
             let source = query
                 .split_once("contractId: \"")
@@ -550,7 +571,7 @@ async fn a_delivery_counts_only_once_its_block_is_final() {
     let fixture = Fixture::start(node);
 
     // The tip holds the delivery, but its block can still be rolled back.
-    let error = delivered(&fixture).await.unwrap_err();
+    let error = delivered_with_log(&fixture).await.unwrap_err();
     assert!(
         error.contains(&format!("delivered in Dusk block {block}")) && error.contains("not final"),
         "{error}"
@@ -558,7 +579,14 @@ async fn a_delivery_counts_only_once_its_block_is_final() {
 
     // Once that block is final, the delivery counts.
     fixture.node().finalized = block;
-    assert_eq!(delivered(&fixture).await, Ok(true));
+    assert_eq!(delivered_with_log(&fixture).await, Ok(true));
+    // Only through the delivery log: a client that keeps none never counts
+    // it, final or not.
+    let error = delivered(&fixture).await.unwrap_err();
+    assert!(
+        error.contains("cannot show it final yet") && error.contains("no eventCursorDir"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -567,7 +595,7 @@ async fn a_rolled_back_delivery_is_not_delivered_and_counts_again_once_final() {
     node.push(vec![Event::processed(MESSAGE)]);
     node.delivered.insert(MESSAGE);
     let fixture = Fixture::start(node);
-    assert!(delivered(&fixture).await.is_err());
+    assert!(delivered_with_log(&fixture).await.is_err());
 
     // A rollback drops the delivery: the relayer must relay the message again.
     {
@@ -576,7 +604,7 @@ async fn a_rolled_back_delivery_is_not_delivered_and_counts_again_once_final() {
         node.push(vec![]);
         node.delivered.clear();
     }
-    assert_eq!(delivered(&fixture).await, Ok(false));
+    assert_eq!(delivered_with_log(&fixture).await, Ok(false));
 
     // A new delivery waits for its own block.
     let block = {
@@ -586,9 +614,9 @@ async fn a_rolled_back_delivery_is_not_delivered_and_counts_again_once_final() {
         node.push(vec![]);
         block
     };
-    assert!(delivered(&fixture).await.is_err());
+    assert!(delivered_with_log(&fixture).await.is_err());
     fixture.node().finalized = block + 1;
-    assert_eq!(delivered(&fixture).await, Ok(true));
+    assert_eq!(delivered_with_log(&fixture).await, Ok(true));
 }
 
 #[tokio::test]
@@ -611,12 +639,12 @@ async fn a_rollback_while_a_delivery_is_checked_is_noticed() {
             }),
         ));
         let fixture = Fixture::start(node);
-        let error = delivered(&fixture).await.unwrap_err();
+        let error = delivered_with_log(&fixture).await.unwrap_err();
         assert!(
             error.contains("chain changed since its tip was block 101"),
             "{error}"
         );
-        assert_eq!(delivered(&fixture).await, Ok(false));
+        assert_eq!(delivered_with_log(&fixture).await, Ok(false));
     }
 }
 
@@ -630,30 +658,44 @@ async fn an_undelivered_message_reads_no_blocks() {
 }
 
 #[tokio::test]
-async fn a_delivery_without_events_in_non_final_blocks_is_final() {
+async fn events_that_are_not_the_delivery_never_make_it_count() {
+    let decoys = || {
+        vec![
+            // Another message's delivery.
+            Event::processed([0x12; 32]),
+            // A failed attempt to deliver this message.
+            Event {
+                reverted: true,
+                ..Event::processed(MESSAGE)
+            },
+            // The same bytes from another contract.
+            Event {
+                source: VALIDATOR_ANNOUNCE,
+                ..Event::processed(MESSAGE)
+            },
+        ]
+    };
     let mut node = Node::new(100);
-    node.push(vec![
-        // Another message's delivery.
-        Event::processed([0x12; 32]),
-        // A failed attempt to deliver this message.
-        Event {
-            reverted: true,
-            ..Event::processed(MESSAGE)
-        },
-        // The same bytes from another contract.
-        Event {
-            source: VALIDATOR_ANNOUNCE,
-            ..Event::processed(MESSAGE)
-        },
-    ]);
+    // Decoys in a final block, and in a block that is not final yet.
+    node.push(decoys());
+    node.finalized = 101;
+    node.push(decoys());
     node.push(vec![]);
     node.delivered.insert(MESSAGE);
     let fixture = Fixture::start(node);
-    let mailbox = fixture.mailbox();
-    assert!(mailbox.delivered(message_id()).await.unwrap());
+    let mailbox = fixture.mailbox_with_log();
+    let error = mailbox
+        .delivered(message_id())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("no finalized block up to block 101") && error.contains("no block above"),
+        "{error}"
+    );
 
     // A client reads each block's events once.
-    assert!(mailbox.delivered(message_id()).await.unwrap());
+    assert!(mailbox.delivered(message_id()).await.is_err());
     let events_read = fixture
         .node()
         .queries
@@ -661,20 +703,29 @@ async fn a_delivery_without_events_in_non_final_blocks_is_final() {
         .filter(|query| query.contains("contractEvents"))
         .count();
     assert_eq!(events_read, 2);
+
+    // The delivery itself counts once its block is final.
+    let block = fixture.node().push(vec![Event::processed(MESSAGE)]);
+    fixture.node().finalized = block;
+    assert!(mailbox.delivered(message_id()).await.unwrap());
 }
 
 #[tokio::test]
 async fn a_block_the_archive_has_not_stored_keeps_the_delivery_unsettled() {
     let mut node = Node::new(100);
-    let block = node.push(vec![]);
+    let block = node.push(vec![Event::processed(MESSAGE)]);
     node.chain[block as usize].archived = false;
     node.delivered.insert(MESSAGE);
     let fixture = Fixture::start(node);
-    let error = delivered(&fixture).await.unwrap_err();
+    let error = delivered_with_log(&fixture).await.unwrap_err();
     assert!(error.contains("has not stored the events"), "{error}");
 
-    fixture.node().chain[block as usize].archived = true;
-    assert_eq!(delivered(&fixture).await, Ok(true));
+    {
+        let mut node = fixture.node();
+        node.chain[block as usize].archived = true;
+        node.finalized = block;
+    }
+    assert_eq!(delivered_with_log(&fixture).await, Ok(true));
 }
 
 #[tokio::test]
@@ -687,28 +738,39 @@ async fn a_block_stored_after_the_reported_tip_is_read_too() {
     node.unreported = 1;
     node.delivered.insert(MESSAGE);
     let fixture = Fixture::start(node);
-    let error = delivered(&fixture).await.unwrap_err();
+    let error = delivered_with_log(&fixture).await.unwrap_err();
     assert!(error.contains("delivered in Dusk block 102"), "{error}");
 }
 
 #[tokio::test]
 async fn a_finality_stall_waits_instead_of_reading_every_block() {
     let mut node = Node::new(100);
-    for _ in 0..65 {
+    node.push(vec![]);
+    let block = node.push(vec![Event::processed(MESSAGE)]);
+    for _ in 0..63 {
         node.push(vec![]);
     }
     node.delivered.insert(MESSAGE);
     let fixture = Fixture::start(node);
-    let error = delivered(&fixture).await.unwrap_err();
+    let error = delivered_with_log(&fixture).await.unwrap_err();
     assert!(error.contains("65 blocks behind the tip"), "{error}");
-    assert_eq!(
-        fixture.node().queries,
-        vec!["query { lastBlockPair { json } }"]
+    let queries = fixture.node().queries.clone();
+    assert!(
+        queries
+            .iter()
+            .all(|query| !query.contains("blocks(range") && !query.contains("contractEvents")),
+        "{queries:?}"
     );
 
-    // At 64 blocks behind, the check reads them.
+    // At 64 blocks behind, the check reads them and names the delivery's.
     fixture.node().finalized = 101;
-    assert_eq!(delivered(&fixture).await, Ok(true));
+    let error = delivered_with_log(&fixture).await.unwrap_err();
+    assert!(
+        error.contains(&format!("delivered in Dusk block {block}")),
+        "{error}"
+    );
+    fixture.node().finalized = block;
+    assert_eq!(delivered_with_log(&fixture).await, Ok(true));
 }
 
 #[tokio::test]
@@ -718,7 +780,7 @@ async fn validator_startup_waits_until_its_announcement_is_final() {
     node.push(vec![]);
     node.locations = vec![LOCATION.to_owned()];
     let fixture = Fixture::start(node);
-    let strict = fixture.announcements().with_own_location(LOCATION);
+    let strict = fixture.announcements_with_log().with_own_location(LOCATION);
 
     let error = strict
         .get_announced_storage_locations(&[validator()])
@@ -726,7 +788,7 @@ async fn validator_startup_waits_until_its_announcement_is_final() {
         .unwrap_err()
         .to_string();
     assert!(
-        error.contains(LOCATION) && error.contains(&format!("block {block} (")),
+        error.contains(LOCATION) && error.contains("no finalized block up to block 100"),
         "{error}"
     );
 
@@ -755,6 +817,15 @@ async fn validator_startup_waits_until_its_announcement_is_final() {
             .unwrap(),
         vec![vec![LOCATION.to_owned()]]
     );
+    // A reader without an announcement log never reports it, final or not.
+    let error = fixture
+        .announcements()
+        .with_own_location(LOCATION)
+        .get_announced_storage_locations(&[validator()])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("no eventCursorDir"), "{error}");
 }
 
 #[tokio::test]
@@ -839,12 +910,14 @@ async fn a_rolled_back_announcement_is_not_announced() {
 #[tokio::test]
 async fn another_validators_pending_announcement_does_not_hold_startup() {
     let mut node = Node::new(100);
+    let block = node.push(vec![Event::announced(VALIDATOR, LOCATION)]);
     node.push(vec![Event::announced([0x44; 20], LOCATION)]);
     node.locations = vec![LOCATION.to_owned()];
+    node.finalized = block;
     let fixture = Fixture::start(node);
     assert_eq!(
         fixture
-            .announcements()
+            .announcements_with_log()
             .with_own_location(LOCATION)
             .get_announced_storage_locations(&[validator()])
             .await
@@ -911,23 +984,32 @@ async fn a_delivery_rolled_back_within_the_check_never_counts_with_a_delivery_lo
 }
 
 #[tokio::test]
-async fn a_delivery_log_short_of_the_last_final_block_falls_back_to_non_final_blocks() {
+async fn a_delivery_log_short_of_the_last_final_block_waits_for_it() {
     let mut node = Node::new(100);
     let block = node.push(vec![Event::processed(MESSAGE)]);
     node.push(vec![]);
     node.delivered.insert(MESSAGE);
     node.finalized = block;
     // The archive has not stored the last final block yet, so the log
-    // cannot hold every final delivery: the check reads the blocks above
-    // the last final one, which hold no event of it.
+    // cannot hold every final delivery. The blocks above the last final one
+    // hold no event of it, which does not make it final.
     node.chain[block as usize].archived = false;
     let fixture = Fixture::start(node);
-    assert_eq!(delivered_with_log(&fixture).await, Ok(true));
+    let error = delivered_with_log(&fixture).await.unwrap_err();
+    assert!(
+        error.contains("cannot show it final yet")
+            && error.contains("short of the last final block"),
+        "{error}"
+    );
     assert!(fixture
         .node()
         .queries
         .iter()
-        .any(|query| query.contains("blocks(range")));
+        .all(|query| !query.contains("blocks(range")));
+
+    // Once the archive stores it, the log finds the delivery there.
+    fixture.node().chain[block as usize].archived = true;
+    assert_eq!(delivered_with_log(&fixture).await, Ok(true));
 }
 
 #[tokio::test]
@@ -944,4 +1026,131 @@ async fn with_a_delivery_log_a_delivery_in_a_block_that_is_not_final_waits_for_i
     );
     fixture.node().finalized = block;
     assert_eq!(delivered_with_log(&fixture).await, Ok(true));
+}
+
+/// What a check can learn from its finalized event log while a rollback
+/// happens under it.
+#[derive(Clone, Copy, Debug)]
+enum LogCondition {
+    /// The client keeps no event log: it has no `eventCursorDir`.
+    Missing,
+    /// The log cannot reach the last final block, which the archive has not
+    /// stored yet.
+    Behind,
+    /// Reading the archive for the log fails.
+    Failing,
+}
+
+impl LogCondition {
+    const ALL: [Self; 3] = [Self::Missing, Self::Behind, Self::Failing];
+
+    fn apply(self, node: &mut Node) {
+        match self {
+            Self::Missing => {}
+            Self::Behind => {
+                let last_final = node.finalized as usize;
+                node.chain[last_final].archived = false;
+            }
+            Self::Failing => node.finalized_events_fail = true,
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_delivery_rolled_back_within_the_check_never_counts_without_a_complete_delivery_log() {
+    // As in `a_delivery_rolled_back_within_the_check_never_counts_with_a_delivery_log`:
+    // the state holds a delivery in block 101, which `lastBlockPair` does
+    // not report yet, and block 101 is replaced by a block without it
+    // between the check's state reads and its read of the blocks that are
+    // not final. Here the delivery log cannot show what the final blocks
+    // hold. That the blocks above the last final one hold no event of the
+    // delivery then shows nothing: the delivery must not count.
+    for condition in LogCondition::ALL {
+        let mut node = Node::new(100);
+        node.push(vec![Event::processed(MESSAGE)]);
+        node.unreported = 1;
+        node.delivered.insert(MESSAGE);
+        node.after_delivered_queries = Some((
+            2,
+            Box::new(|node: &mut Node| {
+                node.roll_back_to(100);
+                node.push(vec![]);
+                node.unreported = 0;
+                node.delivered.clear();
+            }),
+        ));
+        condition.apply(&mut node);
+        let fixture = Fixture::start(node);
+        let mailbox = match condition {
+            LogCondition::Missing => fixture.mailbox(),
+            LogCondition::Behind | LogCondition::Failing => fixture.mailbox_with_log(),
+        };
+        let first = mailbox
+            .delivered(message_id())
+            .await
+            .map_err(|error| error.to_string());
+        let error = first.expect_err(&format!("{condition:?}: a rolled-back delivery counted"));
+        assert!(
+            error.contains("delivered at the Dusk tip") && error.contains("final"),
+            "{condition:?}: {error}"
+        );
+        // The relayer checks again later and relays the message again.
+        assert_eq!(
+            mailbox
+                .delivered(message_id())
+                .await
+                .map_err(|error| error.to_string()),
+            Ok(false),
+            "{condition:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_announcement_rolled_back_within_the_check_never_counts_without_a_complete_log() {
+    // The same race at validator startup: the location list holds the
+    // announcement of block 101, which is replaced by a block without it
+    // after the check read the list twice.
+    for condition in LogCondition::ALL {
+        let mut node = Node::new(100);
+        node.push(vec![Event::announced(VALIDATOR, LOCATION)]);
+        node.unreported = 1;
+        node.locations = vec![LOCATION.to_owned()];
+        node.after_location_queries = Some((
+            2,
+            Box::new(|node: &mut Node| {
+                node.roll_back_to(100);
+                node.push(vec![]);
+                node.unreported = 0;
+                node.locations.clear();
+            }),
+        ));
+        condition.apply(&mut node);
+        let fixture = Fixture::start(node);
+        let strict = match condition {
+            LogCondition::Missing => fixture.announcements(),
+            LogCondition::Behind | LogCondition::Failing => fixture.announcements_with_log(),
+        }
+        .with_own_location(LOCATION);
+        let first = strict
+            .get_announced_storage_locations(&[validator()])
+            .await
+            .map_err(|error| error.to_string());
+        let error = first.expect_err(&format!(
+            "{condition:?}: a rolled-back announcement counted"
+        ));
+        assert!(
+            error.contains(LOCATION) && error.contains("final"),
+            "{condition:?}: {error}"
+        );
+        // The validator checks again and, the location gone, announces.
+        assert_eq!(
+            strict
+                .get_announced_storage_locations(&[validator()])
+                .await
+                .map_err(|error| error.to_string()),
+            Ok(vec![Vec::<String>::new()]),
+            "{condition:?}"
+        );
+    }
 }

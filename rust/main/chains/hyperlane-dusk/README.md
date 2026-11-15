@@ -109,26 +109,25 @@ how to run the local bridge.
   tip, which Rusk can roll back until a block is final, and Rusk 1.7.3 has
   no query of contract state at the last finalized block. The relayer stops
   retrying a message once the Mailbox reports it delivered, so `delivered`
-  reports a delivery the tip holds only once its block is final. Where the
-  delivery log holds every finalized delivery up to the last final block,
-  read with `lastBlockPair` before the state, the delivery counts only once
-  its `ProcessId` row is in a block `checkBlock(onlyFinalized)` accepts,
-  which no rollback can undo; until then the check names the non-final block
-  that holds it, and when no block does, the block was rolled back during
-  the check or the node's archive skipped it, which it logs as a warning.
-  Where the log does not reach that far yet, or the client has no
-  `eventCursorDir`, the delivery counts once no block above the last
-  finalized one emitted its `ProcessId` event, whoever delivered it: the
-  check reads the blocks above the last finalized one (`blocks`), which must
-  still hold the tip it read, so a rollback in between is noticed, though
-  not a block accepted and rolled back entirely within the check's own
-  requests; each block's events come from the archive (`contractEvents`).
-  Until the delivery is final, the check fails and the relayer tries again
-  later with its usual backoff; a rolled-back delivery reads as not
-  delivered, and the message is relayed again. A validator's startup waits
-  the same way until its announcement is final. When finality falls more
-  than 64 blocks behind the tip, the checks wait for it to catch up instead
-  of reading every block.
+  reports a delivery the tip holds only once the agent's delivery log holds
+  its `ProcessId` row in a block `checkBlock(onlyFinalized)` accepts, which
+  no rollback can undo, whoever delivered the message. Until then the check
+  fails as not final and the relayer tries again later with its usual
+  backoff; a rolled-back delivery reads as not delivered, and the message is
+  relayed again. That holds as well while the log does not reach the last
+  final block (read with `lastBlockPair` before the state), cannot be read,
+  or the client has no `eventCursorDir`: the blocks above the last final
+  one never make a delivery count, since a check reads them up to a tip
+  older than the state it read, and a block accepted and rolled back within
+  the check's own requests leaves no trace there. Where the log holds every
+  final block, the check reads those blocks (`blocks`, each block's events
+  from `contractEvents`) only to name the one that holds the delivery while
+  it is not final; when none does, the block was rolled back during the
+  check or the node's archive skipped it, which it logs as a warning. When
+  finality falls more than 64 blocks behind the tip, it waits for finality
+  to catch up instead of reading every block. A validator's startup reports
+  its own announcement only once its announcement log holds it in a block
+  `checkBlock(onlyFinalized)` accepts, and waits until then.
 - **Identity checks.** Building the agent's Dusk components makes no
   request. Before its first request, each client checks, once, that the
   endpoint serves the configured deployment: the node's chain ID, the

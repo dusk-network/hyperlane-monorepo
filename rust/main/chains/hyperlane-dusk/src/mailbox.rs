@@ -16,7 +16,8 @@ use hyperlane_dusk_types::events;
 use hyperlane_dusk_types::merkle::{IncrementalMerkle as HookTree, TREE_DEPTH};
 
 use crate::rues::{
-    bounded_body, bounded_json, bounded_text, rkyv_deserialize, rkyv_serialize, LogLookup,
+    bounded_body, bounded_error, bounded_json, bounded_text, rkyv_deserialize, rkyv_serialize,
+    LogLookup,
 };
 use crate::{ConnectionConf, DuskProvider, DuskSigner, HyperlaneDuskError, RuesClient};
 
@@ -418,15 +419,21 @@ impl Mailbox for DuskMailbox {
     ///
     /// The relayer stops retrying a message once this returns `true`, but
     /// the `delivered` query reads the node's tip, which Rusk can still roll
-    /// back. So a delivery the tip holds counts only once its block is final.
-    /// Where the agent's delivery log holds the archive's finalized
-    /// deliveries up to the last final block, that takes the delivery's
-    /// `ProcessId` row in a finalized block: no rollback can undo it. Where
-    /// the log does not reach that far yet, or there is none, the delivery
-    /// counts once no non-final block emitted its `ProcessId` event, whoever
-    /// delivered it. Until then this fails and the relayer checks again
-    /// later; a delivery that is rolled back reads as not delivered, and the
-    /// message is relayed again.
+    /// back. So a delivery the tip holds counts only once the agent's
+    /// delivery log holds its `ProcessId` row in a block that
+    /// `checkBlock(onlyFinalized)` accepts: no rollback can undo it, whoever
+    /// delivered the message. Without that row this fails with `NotFinal`,
+    /// whether the log holds every final block, does not reach the last one
+    /// yet, cannot be read, or the client keeps none, and the relayer checks
+    /// again later; a delivery that is rolled back reads as not delivered,
+    /// and the message is relayed again.
+    ///
+    /// The blocks above the last final one never make a delivery count. They
+    /// are read only where the log holds every final block, to name the
+    /// block that holds the delivery while it is not final: a check reads
+    /// the chain up to a tip that is older than the state it read, so a
+    /// block accepted and rolled back within its requests leaves no trace
+    /// there.
     async fn delivered(&self, id: H256) -> ChainResult<bool> {
         let id_bytes: [u8; 32] = id.into();
         let delivered_at_tip = || async {
@@ -452,18 +459,24 @@ impl Mailbox for DuskMailbox {
                 DELIVERED_LOG_PAGES,
             )
             .await;
-        // Without a finalized delivery, the blocks that are not final yet
-        // decide; where the log holds every final block, it never counts.
+        // Only a finalized delivery counts.
         let final_block = match lookup {
             Ok(LogLookup::Found(_)) => return Ok(true),
-            Ok(LogLookup::Absent { final_block }) => Some(final_block),
+            Ok(LogLookup::Absent { final_block }) => final_block,
             Ok(LogLookup::Unknown(reason)) => {
-                debug!(message_id = ?id, %reason, "Dusk delivery log cannot show finality; checking the blocks that are not final");
-                None
+                debug!(message_id = ?id, %reason, "Dusk delivery log cannot show the delivery final yet");
+                return Err(HyperlaneDuskError::NotFinal(format!(
+                    "Message {id:?} is delivered at the Dusk tip, but the delivery log cannot show it final yet: {reason}"
+                ))
+                .into());
             }
             Err(error) => {
-                debug!(message_id = ?id, %error, "Dusk delivery log is unavailable; checking the blocks that are not final");
-                None
+                let error = bounded_error(&error);
+                debug!(message_id = ?id, %error, "Dusk delivery log cannot be read; the delivery does not count yet");
+                return Err(HyperlaneDuskError::NotFinal(format!(
+                    "Message {id:?} is delivered at the Dusk tip, but the delivery log that would show it final cannot be read: {error}"
+                ))
+                .into());
             }
         };
         let pending = self
@@ -492,9 +505,6 @@ impl Mailbox for DuskMailbox {
                 .into());
             }
         }
-        let Some(final_block) = final_block else {
-            return Ok(true);
-        };
         // In no final block and in no block above them: a block that held
         // it was rolled back during this check, and the next one reads it
         // as not delivered, or the archive skipped the final block that
