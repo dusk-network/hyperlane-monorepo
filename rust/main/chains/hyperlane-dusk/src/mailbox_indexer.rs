@@ -319,6 +319,11 @@ fn delivery_key(data: &[u8]) -> Option<Vec<u8>> {
 /// block, in archive order (by transaction hash, then by emission). It is
 /// the same for every agent and endpoint whose archive holds the same
 /// blocks, but it is not the order of execution within a block.
+///
+/// Contract sync stores deliveries by their sequence, so every sequence below
+/// a count the indexer reports, and every delivery it serves, counts as
+/// published: the log never gives one of them another delivery, and halts
+/// instead if the endpoint's archive history changes under them.
 #[derive(Debug, Clone)]
 pub struct DuskDeliveryIndexer {
     rues: Arc<RuesClient>,
@@ -338,8 +343,8 @@ impl DuskDeliveryIndexer {
 
     /// The deliveries of `entries`, each in a block that
     /// `checkBlock(onlyFinalized)` still accepts. A block it no longer
-    /// accepts means the endpoint does not agree with the log, which is
-    /// dropped and rebuilt.
+    /// accepts means the endpoint does not agree with the log, which then
+    /// reads its blocks again.
     async fn deliveries(
         &self,
         entries: Vec<LogEntry>,
@@ -362,7 +367,7 @@ impl DuskDeliveryIndexer {
             if !finalized {
                 self.rues.reset_event_log(&self.log).await?;
                 return Err(crate::HyperlaneDuskError::FinalizedEventMismatch(format!(
-                    "Dusk delivery {} is in block {} ({:?}), which checkBlock(onlyFinalized) no longer accepts; the delivery log is rebuilt",
+                    "Dusk delivery {} is in block {} ({:?}), which checkBlock(onlyFinalized) no longer accepts; the delivery log reads its blocks again",
                     entry.sequence, entry.block_height, entry.block_hash
                 ))
                 .into());
@@ -410,11 +415,14 @@ impl Indexer<H256> for DuskDeliveryIndexer {
         &self,
         range: RangeInclusive<u32>,
     ) -> ChainResult<Vec<(Indexed<H256>, LogMeta)>> {
-        let entries = self.rues.event_log_entries(
-            &self.log,
-            u64::from(*range.start()),
-            u64::from(*range.end()),
-        )?;
+        let entries = self
+            .rues
+            .read_event_log_entries(
+                &self.log,
+                u64::from(*range.start()),
+                u64::from(*range.end()),
+            )
+            .await?;
         let logs = self.deliveries(entries).await?;
         debug!(count = logs.len(), "Fetched delivery logs");
         Ok(logs)
@@ -454,7 +462,8 @@ impl Indexer<H256> for DuskDeliveryIndexer {
         let transaction = crate::dusk_transaction_bytes(&tx_hash);
         let entries = self
             .rues
-            .event_log_block(&self.log, block_height)?
+            .read_event_log_block(&self.log, block_height)
+            .await?
             .into_iter()
             .filter(|entry| entry.origin == transaction)
             .collect();
@@ -525,9 +534,11 @@ impl SequenceAwareIndexer<H256> for DuskDeliveryIndexer {
     /// the height up to which it holds every finalized delivery.
     async fn latest_sequence_count_and_tip(&self) -> ChainResult<(Option<u32>, u32)> {
         let pair = self.rues.block_pair().await?;
+        // Contract sync takes the count as durable: those sequences are the
+        // deliveries it indexes, so they must keep their rows.
         let state = self
             .rues
-            .advance_event_log(&self.log, DELIVERY_LOG_PAGES, Some(&pair))
+            .advance_and_publish_event_log(&self.log, DELIVERY_LOG_PAGES, Some(&pair))
             .await?;
         let count = u32::try_from(state.count).map_err(|_| {
             crate::HyperlaneDuskError::Other(format!(

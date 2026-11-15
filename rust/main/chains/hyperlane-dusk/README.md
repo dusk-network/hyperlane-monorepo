@@ -42,11 +42,24 @@ how to run the local bridge.
   the topic and the position after the last row read, and the next call
   reads on from there. A block of more than 1,000,000 rows of the contract,
   or 32 MiB of rows of the topic, which no Rusk block holds, stops the log
-  with an error. The log never takes rows of a block it already holds, so
-  its numbering survives restarts and renumbered archives. A block that
-  `checkBlock` no longer accepts when a delivery is served drops the log,
-  which is then rebuilt. The delivery indexer's tip is the height up to which
-  the log holds every finalized delivery.
+  with an error. The log never numbers rows of a block it already holds
+  again, so its numbering survives restarts and archives that only number
+  their rows differently. An archive's history can change all the same: rows
+  can come out of block order, and a rebuilt archive can hold rows of a block
+  the old one skipped, or lack rows it had. Every block the log holds that a
+  pass reads again from its first row, as it does from the contract's first
+  row once the archive numbers its rows differently, must match the log's
+  rows of it, and every block the log holds rows of must come again before a
+  later block does. A row below a block read before it, or a block that
+  differs, drops the log's rows from that block on, and the log reads them
+  again; a block that `checkBlock` no longer accepts when a delivery is
+  served drops them all. The delivery indexer marks as published every
+  delivery below a count it reports to contract sync, and every delivery it
+  serves. The log keeps the dropped rows of published deliveries, and where
+  the rows it reads again would give one of those sequences another
+  delivery, it halts (see [Event log halts](#event-log-halts)). The delivery
+  indexer's tip is the height up to which the log holds every finalized
+  delivery.
 - **Announced locations.** ValidatorAnnounce keeps only the keccak256 of
   each location a validator announced, oldest first
   (`get_announced_storage_location_hashes`), and the locations are in its
@@ -209,6 +222,32 @@ announcement about 2.1M.
 The `duskKey` signer takes exactly one of `keyFile` (a regular file with no
 group or world permissions), `keyEnv` (an environment variable name) or `key`
 (inline; local development only).
+
+## Event log halts
+
+Contract sync indexes deliveries by their sequence in the delivery log, so
+the log never numbers a delivery it has published differently. When the
+endpoint's archive changes its finalized history under published
+deliveries (an archive rebuilt or repaired with rows it lacked, or another
+node's archive with a different history behind the same URL), every read
+of the delivery log fails with an error that starts with `CRITICAL` and
+names the contract, the topic, the block, the sequence and the rows, and
+the agent logs it as a critical error at most every 10 minutes. The
+indexer stops; the relayer's delivery checks, which never publish
+sequences, read their own log again instead of halting. To recover:
+
+1. Check the endpoint's archive, and use one whose finalized history you
+   trust.
+2. Stop the agent.
+3. Reset its database (the store its contract sync indexed deliveries
+   into, such as the scraper's) and its `eventCursorDir`, so that both
+   index the archive afresh.
+4. Start the agent again.
+
+An archive that only numbers its rows differently, or changes blocks whose
+deliveries no consumer has been told of, needs nothing: the log checks the
+blocks it holds against the archive and reads changed ones again. The
+announcement log is never read by sequence and never halts.
 
 ## Shared types
 

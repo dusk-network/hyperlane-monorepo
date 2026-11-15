@@ -634,3 +634,191 @@ async fn an_endless_block_holds_no_call_beyond_its_pages() {
         }
     }
 }
+
+/// What every call of a halted delivery log must report.
+fn assert_halted(error: &str, block: u64, sequence: u64) {
+    for expected in [
+        "CRITICAL",
+        &hex::encode(MAILBOX),
+        events::ProcessId::TOPIC,
+        &format!("block {block}"),
+        &format!("sequence {sequence}"),
+        "eventCursorDir",
+    ] {
+        assert!(error.contains(expected), "{expected:?} missing: {error}");
+    }
+}
+
+#[tokio::test]
+async fn rows_out_of_block_order_are_dropped_and_read_again_once_repaired() {
+    let mut node = Node::default();
+    node.finalize(10, vec![Row::delivery(1, message(1))]);
+    node.finalize(11, vec![Row::delivery(2, message(2))]);
+    // A faulty archive serves a row of block 10 after block 11's.
+    node.rows
+        .push((node.next_id, 10, Row::delivery(3, message(3))));
+    node.next_id += 1;
+    let fixture = Fixture::start(node);
+    let indexer = fixture.indexer();
+    let error = indexer.latest_sequence_count_and_tip().await.unwrap_err();
+    assert!(error.to_string().contains("below block 11"), "{error}");
+    // Block 10 may lack rows, and so may every block after it: the log
+    // keeps none of them.
+    assert!(indexer.fetch_logs_in_range(0..=2).await.unwrap().is_empty());
+    assert!(indexer.latest_sequence_count_and_tip().await.is_err());
+
+    // The archive is repaired, its rows numbered afresh in block order. No
+    // consumer has read a delivery yet, so the log numbers them afresh.
+    {
+        let mut node = fixture.node();
+        node.rows = vec![
+            (100, 10, Row::delivery(1, message(1))),
+            (101, 10, Row::delivery(3, message(3))),
+            (102, 11, Row::delivery(2, message(2))),
+        ];
+        node.next_id = 103;
+    }
+    assert_eq!(
+        all_deliveries(&indexer).await,
+        [
+            (0, message(1), 1, 10),
+            (1, message(3), 3, 10),
+            (2, message(2), 2, 11)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn rows_out_of_block_order_under_deliveries_already_read_halt_the_log() {
+    let mut node = Node::default();
+    node.finalize(10, vec![Row::delivery(1, message(1))]);
+    node.finalize(11, vec![Row::delivery(2, message(2))]);
+    let fixture = Fixture::start(node);
+    let indexer = fixture.indexer();
+    // Contract sync reads both deliveries: sequence 1 is block 11's.
+    assert_eq!(all_deliveries(&indexer).await.len(), 2);
+
+    // A faulty archive serves a row of block 10 after block 11's.
+    {
+        let mut node = fixture.node();
+        let id = node.next_id;
+        node.rows.push((id, 10, Row::delivery(3, message(3))));
+        node.next_id += 1;
+    }
+    let error = indexer.latest_sequence_count_and_tip().await.unwrap_err();
+    assert!(error.to_string().contains("below block 11"), "{error}");
+
+    // Repaired, the archive puts the row in block 10, so sequence 1, which
+    // a consumer has read as block 11's delivery, would become another
+    // delivery: the log stops instead of numbering them afresh.
+    {
+        let mut node = fixture.node();
+        node.rows = vec![
+            (100, 10, Row::delivery(1, message(1))),
+            (101, 10, Row::delivery(3, message(3))),
+            (102, 11, Row::delivery(2, message(2))),
+        ];
+        node.next_id = 103;
+    }
+    let error = indexer
+        .latest_sequence_count_and_tip()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_halted(&error, 10, 1);
+    // Every read fails the same way until the operator resets the agent.
+    fixture
+        .node()
+        .finalize(12, vec![Row::delivery(4, message(4))]);
+    assert_halted(
+        &indexer
+            .latest_sequence_count_and_tip()
+            .await
+            .unwrap_err()
+            .to_string(),
+        10,
+        1,
+    );
+    assert_halted(
+        &indexer
+            .fetch_logs_in_range(0..=0)
+            .await
+            .unwrap_err()
+            .to_string(),
+        10,
+        1,
+    );
+}
+
+/// An archive that skipped block 11, whose row is a delivery: Rusk's
+/// archive write of the block failed after the node finalized it.
+fn archive_without_block_11() -> Node {
+    let mut node = Node::default();
+    node.finalize(10, vec![Row::delivery(1, message(1))]);
+    node.finalize(12, vec![Row::delivery(3, message(3))]);
+    node
+}
+
+/// The operator rebuilds the archive with block 11 restored, numbering its
+/// rows afresh.
+fn rebuild_with_block_11(node: &mut Node) {
+    node.rows = vec![
+        (100, 10, Row::delivery(1, message(1))),
+        (101, 11, Row::delivery(2, message(2))),
+        (102, 12, Row::delivery(3, message(3))),
+    ];
+    node.next_id = 103;
+    node.archived.insert(11, block_hash(11));
+    node.transactions.insert(hex::encode([2u8; 32]), 11);
+}
+
+#[tokio::test]
+async fn rows_restored_in_a_rebuilt_archive_are_read() {
+    let fixture = Fixture::start(archive_without_block_11());
+    let indexer = fixture.indexer();
+    // A consumer looks up block 10's transaction, and so reads sequence 0
+    // alone; it is not told how many deliveries the log holds.
+    let logs = indexer.fetch_logs_by_tx_hash(transaction(1)).await.unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].0.sequence, Some(0));
+    rebuild_with_block_11(&mut fixture.node());
+    // The log reads its blocks again, finds block 11's delivery, and, no
+    // consumer having read sequence 1 or later, numbers them afresh.
+    assert_eq!(
+        indexer.latest_sequence_count_and_tip().await.unwrap(),
+        (Some(3), 12)
+    );
+    assert_eq!(
+        all_deliveries(&indexer).await,
+        [
+            (0, message(1), 1, 10),
+            (1, message(2), 2, 11),
+            (2, message(3), 3, 12)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn rows_restored_under_deliveries_already_read_halt_the_log() {
+    let fixture = Fixture::start(archive_without_block_11());
+    let indexer = fixture.indexer();
+    // Contract sync reads both deliveries: sequence 1 is block 12's.
+    assert_eq!(all_deliveries(&indexer).await.len(), 2);
+    rebuild_with_block_11(&mut fixture.node());
+    // Block 11's delivery would take sequence 1: the log stops instead.
+    let error = indexer
+        .latest_sequence_count_and_tip()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_halted(&error, 11, 1);
+    assert_halted(
+        &indexer
+            .latest_sequence_count_and_tip()
+            .await
+            .unwrap_err()
+            .to_string(),
+        11,
+        1,
+    );
+}

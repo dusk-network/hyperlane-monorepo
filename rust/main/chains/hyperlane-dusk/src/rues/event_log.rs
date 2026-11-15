@@ -14,16 +14,32 @@
 //! row of the topic as well, since the log then holds that the block has
 //! none. Rusk archives a finalized block's rows in one transaction, and
 //! blocks in height order, so a block's rows end at a row of a later block
-//! or at the end of the archive. A log never takes rows of a block it
-//! already holds, so its numbering does not change when the endpoint's
-//! archive numbers its rows differently.
+//! or at the end of the archive. A log never numbers rows of a block it
+//! already holds again, so its numbering does not change when the
+//! endpoint's archive only numbers its rows differently.
 //!
 //! A call reads at most the pages it is given. A block it has not read whole
-//! by then is staged in the event store, with the rows of the topic read so
-//! far and the position after the last row read, and the next call reads on
-//! from there; the rows become entries only once the block is whole and
-//! valid. A block of more rows than any Rusk block holds fails the log with
-//! an error instead.
+//! by then is staged in the event store, with the position after the last
+//! row read, and the next call reads on from there; its rows become entries
+//! only once the block is whole and valid. A block of more rows than any
+//! Rusk block holds fails the log with an error.
+//!
+//! The archive's history can change under a log: rows can come out of block
+//! order, and a rebuilt archive can hold rows of a block that the old one
+//! skipped, or lack rows it had. Every block a pass reads again that the log
+//! holds must match the log's rows of it exactly, and every block the log
+//! holds rows of must come again before a later block does. A row below a
+//! block read before it, or a block that differs, drops the log's rows from
+//! that block on, and the log reads them again. Consumers that index a log
+//! by its sequences (the delivery indexer's contract sync) mark the
+//! sequences they are told of or read as published: every sequence below a
+//! count they get, and every row they read. A log the previous version
+//! wrote has none published until then. Dropped rows of published sequences
+//! are kept, unseen, as evidence: the rows the log takes again under those
+//! sequences must be the
+//! same, and where one is not, the log stops with a critical error instead
+//! of numbering them differently, until the operator resets the agent's
+//! database and event store.
 
 use super::*;
 
@@ -31,6 +47,10 @@ use super::*;
 const MAX_ROWS_PER_KEY: usize = 64;
 /// Bytes of an encoded row before its data: height, block hash, origin.
 const ENTRY_HEADER_BYTES: usize = 8 + 32 + 32;
+/// Bytes of a log's state as the previous version wrote it, without the
+/// published sequences.
+const STATE_V1_BYTES: usize = 8 + 9 + 9;
+const STATE_BYTES: usize = STATE_V1_BYTES + 8;
 
 /// The lock that serializes each log's advances, by contract and topic.
 pub(super) type EventLogLocks = HashMap<([u8; 32], &'static str), Arc<tokio::sync::Mutex<()>>>;
@@ -91,6 +111,10 @@ pub(crate) struct LogState {
     /// block read whole, or the node's last final block if the archive had
     /// finalized it before the log read past it.
     pub complete_through: Option<u64>,
+    /// Consumers may have read every sequence below this one. It can exceed
+    /// `count` after the log dropped rows: the dropped rows of those
+    /// sequences are kept as evidence.
+    pub published: u64,
 }
 
 /// What a lookup of one key found among an event log's finalized rows.
@@ -114,6 +138,9 @@ enum LogScan {
     WrongAnchor,
     /// The archive has not reached the start position yet.
     ArchiveBehind,
+    /// A block the log holds differs in the archive now: the log dropped
+    /// its rows from that block on, and reads them again.
+    Rebuild,
 }
 
 /// Where a pass over a contract's rows starts.
@@ -131,7 +158,7 @@ struct Frontier {
     finalized: u64,
 }
 
-/// A row of the log's topic in the block being read.
+/// A row of the log's topic in a block the log takes.
 #[derive(Debug, Clone)]
 struct TopicRow {
     origin: [u8; 32],
@@ -146,18 +173,32 @@ impl TopicRow {
     }
 }
 
-/// The block a pass is reading, above the last block the log holds.
+/// What a pass does with the rows of the block it is reading.
+enum BlockKind {
+    /// A block above the log's last one: its rows of the topic, to take.
+    New {
+        topic: Vec<TopicRow>,
+        topic_bytes: usize,
+        /// How many of `topic` are in the event store's staging already.
+        staged: usize,
+    },
+    /// A block the log holds, read from its first row: its rows of the
+    /// topic must be the log's entries from `first` on. `matched` of them
+    /// have been.
+    Held { first: u64, matched: u64 },
+    /// The rest of the block of the anchor's fence row, which the pass did
+    /// not read from its first row.
+    Tail,
+}
+
+/// The block a pass is reading.
 struct OpenBlock {
     height: u64,
-    /// The block hash its first row names, which every row must name.
-    hash: H256,
+    /// The block hash its first row named, which every row must name.
+    hash: Option<H256>,
     /// Rows of the contract read in the block, of any topic.
     rows: u64,
-    /// Rows of the topic read in the block, in archive order.
-    topic: Vec<TopicRow>,
-    topic_bytes: usize,
-    /// How many of `topic` are in the event store's staging already.
-    staged: usize,
+    kind: BlockKind,
     /// Whether an earlier call staged the block.
     was_staged: bool,
 }
@@ -166,72 +207,36 @@ impl OpenBlock {
     fn new(height: u64) -> Self {
         Self {
             height,
-            hash: H256::zero(),
+            hash: None,
             rows: 0,
-            topic: Vec::new(),
-            topic_bytes: 0,
-            staged: 0,
+            kind: BlockKind::New {
+                topic: Vec::new(),
+                topic_bytes: 0,
+                staged: 0,
+            },
             was_staged: false,
         }
     }
 
-    /// Add the block's next row. Every row must name one block hash, and a
-    /// row of the topic must parse and name a key: otherwise the log stops
-    /// before the block. The block must stay within the log's bounds.
-    fn push(
-        &mut self,
-        log: &EventLog,
-        event: &FinalizedContractEvent,
-    ) -> Result<(), HyperlaneDuskError> {
-        let height = self.height;
-        let contract = hex::encode(log.contract_id);
-        let malformed = |reason: String| {
-            HyperlaneDuskError::Other(format!(
-                "Dusk archive row {} of {contract}/{} in block {height} is malformed ({reason}); the event log stops before its block until the endpoint serves it correctly",
-                event.id, log.topic
-            ))
-        };
-        let hash = parse_h256_hex(&event.block_hash, "archive row block hash")
-            .map_err(|error| malformed(error.to_string()))?;
-        if self.rows == 0 {
-            self.hash = hash;
-        } else if hash != self.hash {
-            return Err(HyperlaneDuskError::Other(format!(
-                "Dusk archive rows of contract {contract} in block {height} name more than one block hash; the event log stops before the block"
-            )));
+    fn held(height: u64, first: u64) -> Self {
+        Self {
+            kind: BlockKind::Held { first, matched: 0 },
+            ..Self::new(height)
         }
-        self.rows += 1;
-        if self.rows > log.limits.rows {
-            return Err(HyperlaneDuskError::Other(format!(
-                "Dusk archive serves more than {} rows of contract {contract} in block {height}, more than any Rusk block holds: the endpoint does not serve its archive as Rusk does, and the {} event log stops before the block",
-                log.limits.rows, log.topic
-            )));
+    }
+
+    fn tail(height: u64) -> Self {
+        Self {
+            kind: BlockKind::Tail,
+            ..Self::new(height)
         }
-        if event.reverted || event.topic != log.topic {
-            return Ok(());
-        }
-        let row = BlockRow::parse(event).map_err(|error| malformed(error.to_string()))?;
-        let key = (log.key_of)(&row.data)
-            .ok_or_else(|| malformed(format!("not a well-formed {} event", log.topic)))?;
-        let row = TopicRow {
-            origin: row.origin,
-            data: row.data,
-            key,
-        };
-        self.topic_bytes = self.topic_bytes.saturating_add(row.bytes());
-        if self.topic_bytes > log.limits.topic_bytes {
-            return Err(HyperlaneDuskError::Other(format!(
-                "Dusk archive serves more than {} bytes of {} rows of contract {contract} in block {height}, more than any Rusk block holds: the endpoint does not serve its archive as Rusk does, and the event log stops before the block",
-                log.limits.topic_bytes, log.topic
-            )));
-        }
-        self.topic.push(row);
-        Ok(())
     }
 }
 
-/// A block a call stopped inside, with its rows of the topic in the event
-/// store, and the position after the last row read.
+/// A block a call stopped inside, and the position after the last row read.
+/// For a block above the log's last one, its rows of the topic read so far
+/// are in the event store (`topic_rows` of them); for a block the log holds,
+/// `topic_rows` of them matched its entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StagedBlock {
     height: u64,
@@ -281,6 +286,14 @@ impl StagedBlock {
     }
 }
 
+/// The lower of `value` and `below`, where `None` is below everything.
+fn lowered(value: Option<u64>, below: Option<u64>) -> Option<u64> {
+    match (value, below) {
+        (Some(value), Some(below)) => Some(value.min(below)),
+        _ => None,
+    }
+}
+
 impl RuesClient {
     fn event_log_lock(&self, log: &EventLog) -> Arc<tokio::sync::Mutex<()>> {
         self.event_logs
@@ -308,7 +321,7 @@ impl RuesClient {
     /// that reads past the rows of that last final block, which the archive
     /// had finalized before the read, holds every row up to it; without it,
     /// the call reads `lastBlockPair` itself. No block above the node's last
-    /// final block is taken.
+    /// final block is taken. Fails while the log is halted.
     pub(crate) async fn advance_event_log(
         &self,
         log: &EventLog,
@@ -317,6 +330,37 @@ impl RuesClient {
     ) -> Result<LogState, HyperlaneDuskError> {
         let lock = self.event_log_lock(log);
         let _guard = lock.lock().await;
+        self.advance_locked_event_log(log, max_pages, finality)
+            .await
+    }
+
+    /// `advance_event_log` for a consumer that indexes the log by its
+    /// sequences and is told the count: every sequence below it counts as
+    /// published from now on.
+    pub(crate) async fn advance_and_publish_event_log(
+        &self,
+        log: &EventLog,
+        max_pages: usize,
+        finality: Option<&BlockPair>,
+    ) -> Result<LogState, HyperlaneDuskError> {
+        let lock = self.event_log_lock(log);
+        let _guard = lock.lock().await;
+        let mut state = self
+            .advance_locked_event_log(log, max_pages, finality)
+            .await?;
+        let count = state.count;
+        self.publish_event_log(log, &mut state, count)?;
+        Ok(state)
+    }
+
+    /// `advance_event_log`, with the log's lock held.
+    async fn advance_locked_event_log(
+        &self,
+        log: &EventLog,
+        max_pages: usize,
+        finality: Option<&BlockPair>,
+    ) -> Result<LogState, HyperlaneDuskError> {
+        self.ensure_event_log_runs(log)?;
         let mut state = self.event_log_state(log)?;
         let frontier = match finality {
             Some(pair) => Frontier {
@@ -337,10 +381,12 @@ impl RuesClient {
             }
             _ => None,
         };
-        let target = state.last_block.map_or(0, |block| block.saturating_add(1));
+        let target = |state: &LogState| state.last_block.map_or(0, |block| block.saturating_add(1));
         let mut start = match self.staged_block(log, &state)? {
             Some(staged) => PassStart::Staged(staged),
-            None => PassStart::Anchor(self.scan_anchor_at_or_below(&log.contract_id, target)?),
+            None => {
+                PassStart::Anchor(self.scan_anchor_at_or_below(&log.contract_id, target(&state))?)
+            }
         };
         let mut pages_left = max_pages.max(1);
         loop {
@@ -373,6 +419,11 @@ impl RuesClient {
                     );
                     return Ok(state);
                 }
+                LogScan::Rebuild => {
+                    start = PassStart::Anchor(
+                        self.scan_anchor_at_or_below(&log.contract_id, target(&state))?,
+                    );
+                }
                 LogScan::WrongAnchor if staged => {
                     warn!(
                         contract = %hex::encode(log.contract_id),
@@ -382,14 +433,15 @@ impl RuesClient {
                     let mut batch = WriteBatch::default();
                     self.unstage(log, &mut batch)?;
                     self.write_event_log(log, &state, batch)?;
-                    start =
-                        PassStart::Anchor(self.scan_anchor_at_or_below(&log.contract_id, target)?);
+                    start = PassStart::Anchor(
+                        self.scan_anchor_at_or_below(&log.contract_id, target(&state))?,
+                    );
                 }
                 LogScan::WrongAnchor if from_anchor => {
                     warn!(
                         contract = %hex::encode(log.contract_id),
                         topic = log.topic,
-                        "Dusk archive rows were renumbered; the event log reads on from the contract's first row"
+                        "Dusk archive rows were renumbered; the event log reads its blocks again from the contract's first row"
                     );
                     self.forget_scan_anchors(&log.contract_id)?;
                     start = PassStart::Anchor(None);
@@ -406,9 +458,11 @@ impl RuesClient {
         }
     }
 
-    /// One pass over the contract's rows from `start`, adding to `state`
-    /// every block above its last one that it reads whole, until it has used
-    /// `pages_left`. Saves its progress after every page.
+    /// One pass over the contract's rows from `start`, until it has used
+    /// `pages_left`. It adds to `state` every block above the log's last one
+    /// that it reads whole, and checks every block the log holds that it
+    /// reads from its first row against the log's rows. Saves its progress
+    /// after every page.
     async fn read_event_log(
         &self,
         log: &EventLog,
@@ -418,9 +472,37 @@ impl RuesClient {
         frontier: Frontier,
     ) -> Result<LogScan, HyperlaneDuskError> {
         let contract_id = &log.contract_id;
-        let (anchor, mut open) = match start {
-            PassStart::Anchor(anchor) => (anchor, None),
-            PassStart::Staged(staged) => (Some(staged.position), Some(self.reopen(log, &staged)?)),
+        // The block being read, how many of the log's rows the pass has
+        // accounted for (those of blocks below the next block it reads from
+        // its first row), and the highest block it has read a row of.
+        let (anchor, mut open, mut next_sequence, mut max_height) = match start {
+            PassStart::Anchor(None) => (None, None, 0, None),
+            PassStart::Anchor(Some(anchor)) => {
+                // Every row up to the fence row is below `before_block`, at
+                // most one above the log's last block, so the fence row's
+                // block is one the log holds.
+                let fence_block = anchor.fence_block;
+                let open = state
+                    .last_block
+                    .is_some_and(|last| fence_block <= last)
+                    .then(|| OpenBlock::tail(fence_block));
+                let next =
+                    self.first_sequence_at_or_above(log, state, fence_block.saturating_add(1))?;
+                (Some(anchor), open, next, Some(fence_block))
+            }
+            PassStart::Staged(staged) => {
+                let block = self.reopen(log, state, &staged)?;
+                let next = match block.kind {
+                    BlockKind::Held { first, .. } => first,
+                    _ => state.count,
+                };
+                (
+                    Some(staged.position),
+                    Some(block),
+                    next,
+                    Some(staged.height),
+                )
+            }
         };
         let start_before = anchor.map_or(0, |anchor| anchor.before_block);
         let mut rank = anchor.map_or(0, |anchor| anchor.rank);
@@ -469,26 +551,41 @@ impl RuesClient {
             let mut batch = WriteBatch::default();
             let mut passed_final = false;
             for event in events {
-                if let Some(block) = &open {
-                    if event.block_height < block.height {
-                        let error = HyperlaneDuskError::Other(format!(
-                            "Dusk archive row {} of contract {} is in block {}, below block {} before it",
-                            event.id,
-                            hex::encode(contract_id),
-                            event.block_height,
-                            block.height
-                        ));
-                        // Keep the blocks taken before it.
-                        self.write_event_log(log, state, batch)?;
-                        return Err(error);
-                    }
-                    if event.block_height > block.height {
-                        // The block being read ends before this row.
-                        if let Some(block) = open.take() {
-                            if let Err(error) = self
-                                .take_event_log_block(log, state, block, frontier, &mut batch)
-                                .await
-                            {
+                // Rusk archives blocks in height order.
+                if let Some(max) = max_height.filter(|max| event.block_height < *max) {
+                    let height = event.block_height;
+                    self.write_event_log(log, state, batch)?;
+                    self.drop_event_log_from(log, state, height)?;
+                    return Err(HyperlaneDuskError::FinalizedEventMismatch(format!(
+                        "Dusk archive row {} of contract {} is in block {height}, below block {max} before it: the archive does not serve its rows in block order. The {} event log dropped its rows from block {height} on and stops before that block until the endpoint serves its rows in order",
+                        event.id,
+                        hex::encode(contract_id),
+                        log.topic
+                    )));
+                }
+                max_height = Some(event.block_height);
+                if open
+                    .as_ref()
+                    .is_some_and(|block| event.block_height > block.height)
+                {
+                    // The block being read ends before this row.
+                    if let Some(block) = open.take() {
+                        match self
+                            .close_event_log_block(
+                                log,
+                                state,
+                                block,
+                                frontier,
+                                &mut next_sequence,
+                                &mut batch,
+                            )
+                            .await
+                        {
+                            Ok(None) => {}
+                            Ok(Some(height)) => {
+                                return self.event_log_diverged(log, state, batch, height)
+                            }
+                            Err(error) => {
                                 // Keep the blocks taken before it.
                                 self.write_event_log(log, state, batch)?;
                                 return Err(error);
@@ -496,36 +593,56 @@ impl RuesClient {
                         }
                     }
                 }
-                let held = state
-                    .last_block
-                    .is_some_and(|last| event.block_height <= last);
-                if open.is_none() && !held {
-                    // A block the log does not hold yet: only one the node
-                    // has finalized.
-                    if event.block_height > frontier.finalized {
-                        if event.block_height > frontier.latest.saturating_add(MAX_NON_FINAL_BLOCKS)
-                        {
-                            self.write_event_log(log, state, batch)?;
-                            return Err(HyperlaneDuskError::FinalizedEventMismatch(format!(
-                                "Dusk archive row {} of {}/{} is in block {}, above the node's tip {}: the endpoint does not serve its archive as Rusk does, and the event log stops before it",
-                                event.id,
-                                hex::encode(contract_id),
-                                log.topic,
-                                event.block_height,
-                                frontier.latest
-                            )));
+                if open.is_none() {
+                    let height = event.block_height;
+                    if state.last_block.is_some_and(|last| height <= last) {
+                        // A block the log holds, read again from its first
+                        // row. The log's rows of blocks before it must have
+                        // come again before it.
+                        let first = self.first_sequence_at_or_above(log, state, height)?;
+                        if first > next_sequence {
+                            let skipped = self.entry_height(log, next_sequence)?;
+                            return self.event_log_diverged(log, state, batch, skipped);
                         }
-                        // Finalized since `frontier` was read: the next call
-                        // takes it.
-                        passed_final = true;
-                        break;
+                        open = Some(OpenBlock::held(height, first));
+                    } else {
+                        if next_sequence < state.count {
+                            // Blocks the log holds rows of did not come again.
+                            let skipped = self.entry_height(log, next_sequence)?;
+                            return self.event_log_diverged(log, state, batch, skipped);
+                        }
+                        // A block the log does not hold yet: only one the
+                        // node has finalized.
+                        if height > frontier.finalized {
+                            if height > frontier.latest.saturating_add(MAX_NON_FINAL_BLOCKS) {
+                                self.write_event_log(log, state, batch)?;
+                                return Err(HyperlaneDuskError::FinalizedEventMismatch(format!(
+                                    "Dusk archive row {} of {}/{} is in block {height}, above the node's tip {}: the endpoint does not serve its archive as Rusk does, and the event log stops before it",
+                                    event.id,
+                                    hex::encode(contract_id),
+                                    log.topic,
+                                    frontier.latest
+                                )));
+                            }
+                            // Finalized since `frontier` was read: the next
+                            // call takes it.
+                            passed_final = true;
+                            break;
+                        }
+                        open = Some(OpenBlock::new(height));
                     }
-                    open = Some(OpenBlock::new(event.block_height));
                 }
                 if let Some(block) = &mut open {
-                    if let Err(error) = block.push(log, &event) {
-                        self.write_event_log(log, state, batch)?;
-                        return Err(error);
+                    match self.push_event_log_row(log, state, block, &event) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            let height = block.height;
+                            return self.event_log_diverged(log, state, batch, height);
+                        }
+                        Err(error) => {
+                            self.write_event_log(log, state, batch)?;
+                            return Err(error);
+                        }
                     }
                 }
                 previous_id = Some(event.id);
@@ -546,12 +663,25 @@ impl RuesClient {
                 // Rusk archives a finalized block's rows at once, so the
                 // archive's last block is whole.
                 if let Some(block) = open.take() {
-                    if let Err(error) = self
-                        .take_event_log_block(log, state, block, frontier, &mut batch)
+                    match self
+                        .close_event_log_block(
+                            log,
+                            state,
+                            block,
+                            frontier,
+                            &mut next_sequence,
+                            &mut batch,
+                        )
                         .await
                     {
-                        self.write_event_log(log, state, batch)?;
-                        return Err(error);
+                        Ok(None) => {}
+                        Ok(Some(height)) => {
+                            return self.event_log_diverged(log, state, batch, height)
+                        }
+                        Err(error) => {
+                            self.write_event_log(log, state, batch)?;
+                            return Err(error);
+                        }
                     }
                 }
             }
@@ -577,10 +707,133 @@ impl RuesClient {
         }
     }
 
+    /// Add the next row of `block`. Every row must name one block hash; a
+    /// row of the topic in a block above the log's last one must parse and
+    /// name a key, and the block must stay within the log's bounds:
+    /// otherwise the log stops before the block. `false` when a row of a
+    /// block the log holds is not the log's next row of it.
+    fn push_event_log_row(
+        &self,
+        log: &EventLog,
+        state: &LogState,
+        block: &mut OpenBlock,
+        event: &FinalizedContractEvent,
+    ) -> Result<bool, HyperlaneDuskError> {
+        if matches!(block.kind, BlockKind::Tail) {
+            return Ok(true);
+        }
+        let height = block.height;
+        let contract = hex::encode(log.contract_id);
+        let malformed = |reason: String| {
+            HyperlaneDuskError::Other(format!(
+                "Dusk archive row {} of {contract}/{} in block {height} is malformed ({reason}); the event log stops before its block until the endpoint serves it correctly",
+                event.id, log.topic
+            ))
+        };
+        let hash = parse_h256_hex(&event.block_hash, "archive row block hash")
+            .map_err(|error| malformed(error.to_string()))?;
+        if *block.hash.get_or_insert(hash) != hash {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Dusk archive rows of contract {contract} in block {height} name more than one block hash; the event log stops before the block"
+            )));
+        }
+        block.rows += 1;
+        if block.rows > log.limits.rows {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Dusk archive serves more than {} rows of contract {contract} in block {height}, more than any Rusk block holds: the endpoint does not serve its archive as Rusk does, and the {} event log stops before the block",
+                log.limits.rows, log.topic
+            )));
+        }
+        if event.reverted || event.topic != log.topic {
+            return Ok(true);
+        }
+        match &mut block.kind {
+            BlockKind::New {
+                topic, topic_bytes, ..
+            } => {
+                let row = BlockRow::parse(event).map_err(|error| malformed(error.to_string()))?;
+                let key = (log.key_of)(&row.data)
+                    .ok_or_else(|| malformed(format!("not a well-formed {} event", log.topic)))?;
+                let row = TopicRow {
+                    origin: row.origin,
+                    data: row.data,
+                    key,
+                };
+                *topic_bytes = topic_bytes.saturating_add(row.bytes());
+                if *topic_bytes > log.limits.topic_bytes {
+                    return Err(HyperlaneDuskError::Other(format!(
+                        "Dusk archive serves more than {} bytes of {} rows of contract {contract} in block {height}, more than any Rusk block holds: the endpoint does not serve its archive as Rusk does, and the event log stops before the block",
+                        log.limits.topic_bytes, log.topic
+                    )));
+                }
+                topic.push(row);
+                Ok(true)
+            }
+            BlockKind::Held { first, matched } => {
+                let sequence = first.saturating_add(*matched);
+                if sequence >= state.count {
+                    return Ok(false);
+                }
+                let (Ok(row), Some(entry)) =
+                    (BlockRow::parse(event), self.event_log_entry(log, sequence)?)
+                else {
+                    return Ok(false);
+                };
+                if entry.block_height != height
+                    || entry.block_hash != row.block_hash
+                    || entry.origin != row.origin
+                    || entry.data != row.data
+                {
+                    return Ok(false);
+                }
+                *matched += 1;
+                Ok(true)
+            }
+            BlockKind::Tail => Ok(true),
+        }
+    }
+
+    /// Finish a block the pass read whole: take a block above the log's last
+    /// one, and check that one the log holds has no more rows in the log
+    /// than the pass read. Moves `next_sequence` past the block's rows.
+    /// `Some(height)` when the log's rows of the block differ.
+    async fn close_event_log_block(
+        &self,
+        log: &EventLog,
+        state: &mut LogState,
+        block: OpenBlock,
+        frontier: Frontier,
+        next_sequence: &mut u64,
+        batch: &mut WriteBatch,
+    ) -> Result<Option<u64>, HyperlaneDuskError> {
+        match block.kind {
+            BlockKind::Tail => Ok(None),
+            BlockKind::Held { first, matched } => {
+                let next = first.saturating_add(matched);
+                if next < state.count && self.entry_height(log, next)? == block.height {
+                    return Ok(Some(block.height));
+                }
+                *next_sequence = next;
+                if block.was_staged {
+                    self.unstage(log, batch)?;
+                }
+                Ok(None)
+            }
+            BlockKind::New { .. } => {
+                self.take_event_log_block(log, state, block, frontier, batch)
+                    .await?;
+                *next_sequence = state.count;
+                Ok(None)
+            }
+        }
+    }
+
     /// Add a block read whole to the log: its rows of the topic, numbered on
     /// from the log's count. The block must be at or below the node's last
     /// final block and `checkBlock(onlyFinalized)` must accept it, whether or
-    /// not it has rows of the topic: otherwise the log stops before it.
+    /// not it has rows of the topic: otherwise the log stops before it. A
+    /// row under a published sequence must be the row consumers read there:
+    /// otherwise the log halts.
     async fn take_event_log_block(
         &self,
         log: &EventLog,
@@ -590,6 +843,11 @@ impl RuesClient {
         batch: &mut WriteBatch,
     ) -> Result<(), HyperlaneDuskError> {
         let height = block.height;
+        let (BlockKind::New { topic, .. }, Some(hash)) = (block.kind, block.hash) else {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Dusk event log took block {height} without reading it"
+            )));
+        };
         if height > frontier.finalized {
             return Err(HyperlaneDuskError::FinalizedEventMismatch(format!(
                 "Dusk archive serves finalized {}/{} rows of block {height}, above the node's last final block {}; the event log stops before it",
@@ -599,37 +857,181 @@ impl RuesClient {
             )));
         }
         if !self
-            .check_finalized_block(height, &hex::encode(block.hash))
+            .check_finalized_block(height, &hex::encode(hash))
             .await?
         {
             return Err(HyperlaneDuskError::FinalizedEventMismatch(format!(
-                "Dusk archive serves finalized {}/{} rows of block {height} ({:?}), which checkBlock(onlyFinalized) rejects; the event log stops before the block",
+                "Dusk archive serves finalized {}/{} rows of block {height} ({hash:?}), which checkBlock(onlyFinalized) rejects; the event log stops before the block",
                 hex::encode(log.contract_id),
-                log.topic,
-                block.hash
+                log.topic
             )));
         }
-        for row in block.topic {
-            let sequence = state.count;
-            batch.put(
-                event_log_entry_key(log, sequence),
-                encode_entry(height, block.hash, &row.origin, &row.data),
-            );
-            batch.put(event_log_lookup_key(log, &row.key, sequence), []);
-            state.count = sequence.checked_add(1).ok_or_else(|| {
+        let mut sequence = state.count;
+        for row in &topic {
+            if sequence < state.published {
+                let read = self.event_log_entry(log, sequence)?;
+                let same = read.as_ref().is_some_and(|read| {
+                    read.block_height == height
+                        && read.block_hash == hash
+                        && read.origin == row.origin
+                        && read.data == row.data
+                });
+                if !same {
+                    let read = match read {
+                        Some(read) => format!(
+                            "the row of transaction {} in block {}",
+                            hex::encode(read.origin),
+                            read.block_height
+                        ),
+                        None => "a row the event store no longer holds".to_owned(),
+                    };
+                    return Err(self.halt_event_log(
+                        log,
+                        height,
+                        format!(
+                            "CRITICAL: the Dusk {} event log of contract {} would number its rows differently from what consumers have read: sequence {sequence}, read as {read}, would be the row of transaction {} in block {height}, so the endpoint's finalized archive history changed under it. The log stops instead of numbering them again. Check the endpoint's archive, then stop the agent, reset its database and its eventCursorDir, and start it again so that both index the archive afresh",
+                            log.topic,
+                            hex::encode(log.contract_id),
+                            hex::encode(row.origin)
+                        ),
+                    )?);
+                }
+            }
+            sequence = sequence.checked_add(1).ok_or_else(|| {
                 HyperlaneDuskError::Other("Dusk event log row count overflows".into())
             })?;
+        }
+        for (sequence, row) in (state.count..).zip(&topic) {
+            if sequence >= state.published {
+                batch.put(
+                    event_log_entry_key(log, sequence),
+                    encode_entry(height, hash, &row.origin, &row.data),
+                );
+                batch.put(event_log_lookup_key(log, &row.key, sequence), []);
+            }
         }
         if block.was_staged {
             self.unstage(log, batch)?;
         }
+        state.count = sequence;
         state.last_block = Some(height);
         Ok(())
     }
 
+    /// The log's rows of a block it holds differ from the archive's now:
+    /// drop them from `height` on, after `batch`, and read them again.
+    fn event_log_diverged(
+        &self,
+        log: &EventLog,
+        state: &mut LogState,
+        batch: WriteBatch,
+        height: u64,
+    ) -> Result<LogScan, HyperlaneDuskError> {
+        self.write_event_log(log, state, batch)?;
+        warn!(
+            contract = %hex::encode(log.contract_id),
+            topic = log.topic,
+            block_height = height,
+            "Dusk archive's rows of a block the event log holds differ from the log's; the log reads its rows again from that block on"
+        );
+        self.drop_event_log_from(log, state, height)?;
+        Ok(LogScan::Rebuild)
+    }
+
+    /// Drop the log's rows of blocks from `height` on, so that it reads
+    /// them again, with any staged block. The rows of published sequences
+    /// stay in the event store, unseen, as evidence the rows taken again
+    /// under them must match.
+    fn drop_event_log_from(
+        &self,
+        log: &EventLog,
+        state: &mut LogState,
+        height: u64,
+    ) -> Result<(), HyperlaneDuskError> {
+        let first = self.first_sequence_at_or_above(log, state, height)?;
+        let kept = state.published.clamp(first, state.count.max(first));
+        let mut batch = WriteBatch::default();
+        for sequence in kept..state.count {
+            if let Some(entry) = self.event_log_entry(log, sequence)? {
+                if let Some(key) = (log.key_of)(&entry.data) {
+                    batch.delete(event_log_lookup_key(log, &key, sequence));
+                }
+            }
+            batch.delete(event_log_entry_key(log, sequence));
+        }
+        self.unstage(log, &mut batch)?;
+        let dropped = state.count.saturating_sub(first);
+        let below = height.checked_sub(1);
+        state.count = first;
+        state.last_block = lowered(state.last_block, below);
+        state.complete_through = lowered(state.complete_through, below);
+        self.write_event_log(log, state, batch)?;
+        warn!(
+            contract = %hex::encode(log.contract_id),
+            topic = log.topic,
+            block_height = height,
+            dropped,
+            kept_as_evidence = kept.saturating_sub(first),
+            "Dusk event log dropped its rows from a block on and reads them again"
+        );
+        Ok(())
+    }
+
+    /// Stop the log for good with `message`, and report it as a critical
+    /// error. Every read of the log fails with it until the event store is
+    /// reset.
+    fn halt_event_log(
+        &self,
+        log: &EventLog,
+        height: u64,
+        message: String,
+    ) -> Result<HyperlaneDuskError, HyperlaneDuskError> {
+        let mut write_options = WriteOptions::default();
+        write_options.set_sync(true);
+        self.event_store()?
+            .put_opt(event_log_halt_key(log), message.as_bytes(), &write_options)
+            .map_err(|error| {
+                HyperlaneDuskError::Other(format!(
+                    "Failed to persist the halt of the Dusk {} event log: {error}",
+                    log.topic
+                ))
+            })?;
+        error!(
+            contract = %hex::encode(log.contract_id),
+            topic = log.topic,
+            block_height = height,
+            %message,
+            "CRITICAL: Dusk event log halted"
+        );
+        Ok(HyperlaneDuskError::EventLogHalted(message))
+    }
+
+    /// Fail with the log's halt, if it is halted.
+    fn ensure_event_log_runs(&self, log: &EventLog) -> Result<(), HyperlaneDuskError> {
+        let Some(message) = self
+            .event_store()?
+            .get(event_log_halt_key(log))
+            .map_err(|error| event_log_read_error(log, error))?
+        else {
+            return Ok(());
+        };
+        let message = String::from_utf8_lossy(&message).into_owned();
+        if critical_report_due(&log.contract_id, &format!("halted {}", log.topic), 0) {
+            error!(
+                contract = %hex::encode(log.contract_id),
+                topic = log.topic,
+                %message,
+                "CRITICAL: Dusk event log is halted"
+            );
+        }
+        Err(HyperlaneDuskError::EventLogHalted(message))
+    }
+
     /// Stage `block`, which the pass read up to `row`, the contract's `rank`th
-    /// row: its rows of the topic not staged yet, and the position after
-    /// `row`.
+    /// row, with the position after `row`: for a block above the log's last
+    /// one, its rows of the topic not staged yet; for one the log holds, how
+    /// many of its rows matched. The rest of a fence row's block is not
+    /// staged: the next call starts after the position this one ends at.
     fn stage(
         &self,
         log: &EventLog,
@@ -638,31 +1040,45 @@ impl RuesClient {
         rank: u64,
         batch: &mut WriteBatch,
     ) -> Result<(), HyperlaneDuskError> {
+        let Some(hash) = block.hash else {
+            return Ok(());
+        };
         let Some(position) = ScanAnchor::after_row(row, block.height.saturating_add(1), rank)?
         else {
             return Ok(());
         };
-        for (index, topic) in block.topic.iter().enumerate().skip(block.staged) {
-            let mut value = topic.origin.to_vec();
-            value.extend_from_slice(&topic.data);
-            batch.put(event_log_staged_row_key(log, index as u64), value);
-        }
-        block.staged = block.topic.len();
+        let (topic_rows, topic_bytes) = match &mut block.kind {
+            BlockKind::Tail => return Ok(()),
+            BlockKind::Held { matched, .. } => (*matched, 0),
+            BlockKind::New {
+                topic,
+                topic_bytes,
+                staged,
+            } => {
+                for (index, topic) in topic.iter().enumerate().skip(*staged) {
+                    let mut value = topic.origin.to_vec();
+                    value.extend_from_slice(&topic.data);
+                    batch.put(event_log_staged_row_key(log, index as u64), value);
+                }
+                *staged = topic.len();
+                (topic.len() as u64, *topic_bytes as u64)
+            }
+        };
         let staged = StagedBlock {
             height: block.height,
-            hash: block.hash,
+            hash,
             rows: block.rows,
-            topic_rows: block.topic.len() as u64,
-            topic_bytes: block.topic_bytes as u64,
+            topic_rows,
+            topic_bytes,
             position,
         };
         batch.put(event_log_staged_key(log), staged.encode());
+        block.was_staged = true;
         Ok(())
     }
 
-    /// The block an earlier call staged above the log's last block, if any.
-    /// A staged block that does not decode, or that the log holds already,
-    /// is dropped with its rows, and its rows are read again.
+    /// The block an earlier call staged, if any. One that does not decode is
+    /// dropped with its rows, and its block is read again.
     fn staged_block(
         &self,
         log: &EventLog,
@@ -675,9 +1091,7 @@ impl RuesClient {
         else {
             return Ok(None);
         };
-        if let Some(staged) = StagedBlock::decode(&bytes)
-            .filter(|staged| state.last_block.is_none_or(|last| staged.height > last))
-        {
+        if let Some(staged) = StagedBlock::decode(&bytes) {
             return Ok(Some(staged));
         }
         let mut batch = WriteBatch::default();
@@ -686,12 +1100,28 @@ impl RuesClient {
         Ok(None)
     }
 
-    /// The block `staged` holds, with its rows of the topic, to read on.
+    /// The block `staged` holds, to read on: above the log's last block, with
+    /// its rows of the topic read so far; one the log holds, with how many
+    /// of its rows matched.
     fn reopen(
         &self,
         log: &EventLog,
+        state: &LogState,
         staged: &StagedBlock,
     ) -> Result<OpenBlock, HyperlaneDuskError> {
+        let mut block = OpenBlock {
+            hash: Some(staged.hash),
+            rows: staged.rows,
+            was_staged: true,
+            ..OpenBlock::new(staged.height)
+        };
+        if state.last_block.is_some_and(|last| staged.height <= last) {
+            block.kind = BlockKind::Held {
+                first: self.first_sequence_at_or_above(log, state, staged.height)?,
+                matched: staged.topic_rows,
+            };
+            return Ok(block);
+        }
         let store = self.event_store()?;
         let corrupt = || {
             HyperlaneDuskError::Other(format!(
@@ -716,15 +1146,12 @@ impl RuesClient {
             topic_bytes = topic_bytes.saturating_add(row.bytes());
             topic.push(row);
         }
-        Ok(OpenBlock {
-            height: staged.height,
-            hash: staged.hash,
-            rows: staged.rows,
+        block.kind = BlockKind::New {
             staged: topic.len(),
             topic,
             topic_bytes,
-            was_staged: true,
-        })
+        };
+        Ok(block)
     }
 
     /// Drop the staged block and its rows.
@@ -769,12 +1196,7 @@ impl RuesClient {
         let Some(bytes) = self
             .event_store()?
             .get(event_log_state_key(log))
-            .map_err(|error| {
-                HyperlaneDuskError::Other(format!(
-                    "Failed to read the Dusk {} event log: {error}",
-                    log.topic
-                ))
-            })?
+            .map_err(|error| event_log_read_error(log, error))?
         else {
             return Ok(LogState::default());
         };
@@ -786,15 +1208,95 @@ impl RuesClient {
         })
     }
 
-    /// The log's rows `first` to `last`, those it has.
+    /// The log's rows `first` to `last`, those it has, as a consumer that
+    /// indexes the log by its sequences reads them: they count as published
+    /// from now on.
+    pub(crate) async fn read_event_log_entries(
+        &self,
+        log: &EventLog,
+        first: u64,
+        last: u64,
+    ) -> Result<Vec<LogEntry>, HyperlaneDuskError> {
+        let lock = self.event_log_lock(log);
+        let _guard = lock.lock().await;
+        self.ensure_event_log_runs(log)?;
+        let mut state = self.event_log_state(log)?;
+        let entries = self.entries_in(log, &state, first, last)?;
+        if let Some(entry) = entries.last() {
+            self.publish_event_log(log, &mut state, entry.sequence.saturating_add(1))?;
+        }
+        Ok(entries)
+    }
+
+    /// The log's rows of block `height`, as a consumer that indexes the log
+    /// by its sequences reads them: they count as published from now on.
+    pub(crate) async fn read_event_log_block(
+        &self,
+        log: &EventLog,
+        height: u64,
+    ) -> Result<Vec<LogEntry>, HyperlaneDuskError> {
+        let lock = self.event_log_lock(log);
+        let _guard = lock.lock().await;
+        self.ensure_event_log_runs(log)?;
+        let mut state = self.event_log_state(log)?;
+        let first = self.first_sequence_at_or_above(log, &state, height)?;
+        let mut entries = Vec::new();
+        for sequence in first..state.count {
+            let Some(entry) = self.event_log_entry(log, sequence)? else {
+                break;
+            };
+            if entry.block_height != height {
+                break;
+            }
+            entries.push(entry);
+        }
+        if let Some(entry) = entries.last() {
+            self.publish_event_log(log, &mut state, entry.sequence.saturating_add(1))?;
+        }
+        Ok(entries)
+    }
+
+    /// Record that consumers may have read every sequence below `through`,
+    /// before they get the rows.
+    fn publish_event_log(
+        &self,
+        log: &EventLog,
+        state: &mut LogState,
+        through: u64,
+    ) -> Result<(), HyperlaneDuskError> {
+        if through > state.published {
+            state.published = through;
+            self.write_event_log(log, state, WriteBatch::default())?;
+        }
+        Ok(())
+    }
+
+    /// The log's rows `first` to `last`, those it has, without publishing
+    /// them.
+    #[cfg(test)]
     pub(crate) fn event_log_entries(
         &self,
         log: &EventLog,
         first: u64,
         last: u64,
     ) -> Result<Vec<LogEntry>, HyperlaneDuskError> {
+        let state = self.event_log_state(log)?;
+        self.entries_in(log, &state, first, last)
+    }
+
+    /// The log's rows `first` to `last` below its count.
+    fn entries_in(
+        &self,
+        log: &EventLog,
+        state: &LogState,
+        first: u64,
+        last: u64,
+    ) -> Result<Vec<LogEntry>, HyperlaneDuskError> {
         let mut entries = Vec::new();
-        for sequence in first..=last {
+        let Some(end) = state.count.checked_sub(1).map(|top| top.min(last)) else {
+            return Ok(entries);
+        };
+        for sequence in first..=end {
             match self.event_log_entry(log, sequence)? {
                 Some(entry) => entries.push(entry),
                 None => break,
@@ -811,12 +1313,7 @@ impl RuesClient {
         let Some(bytes) = self
             .event_store()?
             .get(event_log_entry_key(log, sequence))
-            .map_err(|error| {
-                HyperlaneDuskError::Other(format!(
-                    "Failed to read the Dusk {} event log: {error}",
-                    log.topic
-                ))
-            })?
+            .map_err(|error| event_log_read_error(log, error))?
         else {
             return Ok(None);
         };
@@ -828,22 +1325,51 @@ impl RuesClient {
         })
     }
 
+    /// The height of the block of the log's row `sequence`, which it holds.
+    fn entry_height(&self, log: &EventLog, sequence: u64) -> Result<u64, HyperlaneDuskError> {
+        self.event_log_entry(log, sequence)?
+            .map(|entry| entry.block_height)
+            .ok_or_else(|| {
+                HyperlaneDuskError::Other(format!(
+                    "Row {sequence} of the Dusk {} event log is missing from eventCursorDir",
+                    log.topic
+                ))
+            })
+    }
+
+    /// The sequence of the log's first row in block `height` or above, or
+    /// its count. The log is in block order, so a binary search finds it.
+    fn first_sequence_at_or_above(
+        &self,
+        log: &EventLog,
+        state: &LogState,
+        height: u64,
+    ) -> Result<u64, HyperlaneDuskError> {
+        let (mut low, mut high) = (0u64, state.count);
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.entry_height(log, middle)? < height {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        Ok(low)
+    }
+
     /// The rows that name `key`, in log order, at most `MAX_ROWS_PER_KEY`.
     pub(crate) fn event_log_find(
         &self,
         log: &EventLog,
         key: &[u8],
     ) -> Result<Vec<LogEntry>, HyperlaneDuskError> {
+        self.ensure_event_log_runs(log)?;
+        let count = self.event_log_state(log)?.count;
         let store = self.event_store()?;
         let prefix = event_log_lookup_prefix(log, key);
         let mut entries = Vec::new();
         for item in store.iterator(IteratorMode::From(&prefix, Direction::Forward)) {
-            let (stored, _) = item.map_err(|error| {
-                HyperlaneDuskError::Other(format!(
-                    "Failed to read the Dusk {} event log: {error}",
-                    log.topic
-                ))
-            })?;
+            let (stored, _) = item.map_err(|error| event_log_read_error(log, error))?;
             if !stored.starts_with(&prefix) || entries.len() >= MAX_ROWS_PER_KEY {
                 break;
             }
@@ -857,73 +1383,29 @@ impl RuesClient {
                         log.topic
                     ))
                 })?;
-            if let Some(entry) = self.event_log_entry(log, sequence)? {
+            // Rows kept as evidence are not the log's.
+            if sequence >= count {
+                break;
+            }
+            if let Some(entry) = self
+                .event_log_entry(log, sequence)?
+                .filter(|entry| (log.key_of)(&entry.data).as_deref() == Some(key))
+            {
                 entries.push(entry);
             }
         }
         Ok(entries)
     }
 
-    /// The log's rows of block `height`. The log is in block order, so a
-    /// binary search finds the first.
-    pub(crate) fn event_log_block(
-        &self,
-        log: &EventLog,
-        height: u64,
-    ) -> Result<Vec<LogEntry>, HyperlaneDuskError> {
-        let count = self.event_log_state(log)?.count;
-        let (mut low, mut high) = (0u64, count);
-        while low < high {
-            let middle = low + (high - low) / 2;
-            let below = self
-                .event_log_entry(log, middle)?
-                .is_some_and(|entry| entry.block_height < height);
-            if below {
-                low = middle + 1;
-            } else {
-                high = middle;
-            }
-        }
-        let mut entries = Vec::new();
-        let mut sequence = low;
-        while let Some(entry) = self.event_log_entry(log, sequence)? {
-            if entry.block_height != height {
-                break;
-            }
-            entries.push(entry);
-            sequence += 1;
-        }
-        Ok(entries)
-    }
-
-    /// Drop every row of the log, which then reads again from the
-    /// contract's first row: the endpoint no longer agrees with it.
+    /// Read the log again from the contract's first row: the endpoint no
+    /// longer agrees with it. Its rows are dropped, but those of published
+    /// sequences are kept as evidence the rows read again must match.
     pub(crate) async fn reset_event_log(&self, log: &EventLog) -> Result<(), HyperlaneDuskError> {
         let lock = self.event_log_lock(log);
         let _guard = lock.lock().await;
-        let store = self.event_store()?;
-        let prefix = event_log_prefix(log);
-        let mut batch = WriteBatch::default();
-        for item in store.iterator(IteratorMode::From(&prefix, Direction::Forward)) {
-            let (key, _) = item.map_err(|error| {
-                HyperlaneDuskError::Other(format!(
-                    "Failed to read the Dusk {} event log: {error}",
-                    log.topic
-                ))
-            })?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            batch.delete(key);
-        }
-        let mut write_options = WriteOptions::default();
-        write_options.set_sync(true);
-        store.write_opt(batch, &write_options).map_err(|error| {
-            HyperlaneDuskError::Other(format!(
-                "Failed to drop the Dusk {} event log: {error}",
-                log.topic
-            ))
-        })
+        self.ensure_event_log_runs(log)?;
+        let mut state = self.event_log_state(log)?;
+        self.drop_event_log_from(log, &mut state, 0)
     }
 
     /// Whether a row with `key` is in a final block, read after advancing
@@ -951,7 +1433,7 @@ impl RuesClient {
             }
             self.reset_event_log(log).await?;
             return Ok(LogLookup::Unknown(format!(
-                "checkBlock(onlyFinalized) no longer accepts block {} ({:?}) of the {} event log, which is dropped",
+                "checkBlock(onlyFinalized) no longer accepts block {} ({:?}) of the {} event log, which is read again",
                 entry.block_height, entry.block_hash, log.topic
             )));
         }
@@ -1025,6 +1507,13 @@ fn event_log_staged_row_key(log: &EventLog, index: u64) -> Vec<u8> {
     key
 }
 
+/// Why the log halted, once it has.
+fn event_log_halt_key(log: &EventLog) -> Vec<u8> {
+    let mut key = event_log_prefix(log);
+    key.push(b'h');
+    key
+}
+
 fn event_log_read_error(log: &EventLog, error: impl fmt::Display) -> HyperlaneDuskError {
     HyperlaneDuskError::Other(format!(
         "Failed to read the Dusk {} event log: {error}",
@@ -1055,31 +1544,44 @@ fn decode_entry(sequence: u64, bytes: &[u8]) -> Option<LogEntry> {
 }
 
 fn encode_state(state: &LogState) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(26);
+    let mut bytes = Vec::with_capacity(STATE_BYTES);
     bytes.extend_from_slice(&state.count.to_be_bytes());
     for height in [state.last_block, state.complete_through] {
         bytes.push(u8::from(height.is_some()));
         bytes.extend_from_slice(&height.unwrap_or_default().to_be_bytes());
     }
+    bytes.extend_from_slice(&state.published.to_be_bytes());
     bytes
 }
 
+/// A state the previous version wrote records no published sequences.
 fn decode_state(bytes: &[u8]) -> Option<LogState> {
-    if bytes.len() != 26 {
+    if bytes.len() != STATE_BYTES && bytes.len() != STATE_V1_BYTES {
         return None;
     }
+    let number = |offset: usize| -> Option<u64> {
+        Some(u64::from_be_bytes(
+            bytes.get(offset..offset + 8)?.try_into().ok()?,
+        ))
+    };
     let height = |offset: usize| -> Option<Option<u64>> {
-        let value = u64::from_be_bytes(bytes.get(offset + 1..offset + 9)?.try_into().ok()?);
+        let value = number(offset + 1)?;
         match bytes.get(offset)? {
             0 => Some(None),
             1 => Some(Some(value)),
             _ => None,
         }
     };
+    let published = if bytes.len() == STATE_BYTES {
+        number(STATE_V1_BYTES)?
+    } else {
+        0
+    };
     Some(LogState {
-        count: u64::from_be_bytes(bytes.get(..8)?.try_into().ok()?),
+        count: number(0)?,
         last_block: height(8)?,
         complete_through: height(17)?,
+        published,
     })
 }
 
@@ -1249,11 +1751,13 @@ mod tests {
                 count: 7,
                 last_block: Some(11),
                 complete_through: Some(12),
+                published: 9,
             },
             LogState {
                 count: 0,
                 last_block: None,
                 complete_through: Some(0),
+                published: 0,
             },
         ] {
             assert_eq!(decode_state(&encode_state(&state)), Some(state));
@@ -1262,6 +1766,17 @@ mod tests {
         corrupt[8] = 2;
         assert!(decode_state(&corrupt).is_none());
         assert!(decode_state(&corrupt[1..]).is_none());
+        // A state the previous version wrote records no published sequences.
+        let state = LogState {
+            count: 7,
+            last_block: Some(11),
+            complete_through: Some(12),
+            published: 0,
+        };
+        assert_eq!(
+            decode_state(&encode_state(&state)[..STATE_V1_BYTES]),
+            Some(state)
+        );
     }
 
     #[test]

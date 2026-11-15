@@ -78,6 +78,12 @@ pub enum HyperlaneDuskError {
     /// archive does not help; its node has to repair it.
     #[error("{0}")]
     ArchiveMissingRows(String),
+    /// An event log found that the endpoint's finalized history changed
+    /// under sequences consumers have read. It stops, rather than number
+    /// them differently, until the operator resets the agent's database and
+    /// its event store.
+    #[error("{0}")]
+    EventLogHalted(String),
     /// Generic error.
     #[error("{0}")]
     Other(String),

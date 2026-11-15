@@ -57,19 +57,21 @@ const NON_FINAL_EVENT_CACHE_BLOCKS: usize = 256;
 type SharedRuesClients = HashMap<(String, PathBuf), RuesClient>;
 static SHARED_RUES_CLIENTS: OnceLock<StdMutex<SharedRuesClients>> = OnceLock::new();
 
-/// How often the same missing block is reported as a critical error. The
-/// lookup fails, and contract sync retries it, far more often.
+/// How often the same critical condition, such as a missing block, is
+/// reported as a critical error. The lookup fails, and contract sync retries
+/// it, far more often.
 const ARCHIVE_GAP_REPORT_INTERVAL: Duration = Duration::from_secs(600);
-/// Most missing blocks whose last report is remembered.
+/// Most critical conditions whose last report is remembered.
 const ARCHIVE_GAP_REPORT_KEYS: usize = 1024;
 
 type ArchiveGapKey = ([u8; 32], String, u64);
 static ARCHIVE_GAP_REPORTS: OnceLock<StdMutex<HashMap<ArchiveGapKey, std::time::Instant>>> =
     OnceLock::new();
 
-/// Whether a missing block of a contract and topic is due to be reported
-/// again, recording the report if so.
-fn archive_gap_report_due(contract_id: &[u8; 32], topic: &str, block_height: u64) -> bool {
+/// Whether a critical condition of a contract and topic at a block, such as
+/// a missing block or a halted event log, is due to be reported again,
+/// recording the report if so.
+fn critical_report_due(contract_id: &[u8; 32], topic: &str, block_height: u64) -> bool {
     let reports = ARCHIVE_GAP_REPORTS.get_or_init(|| StdMutex::new(HashMap::new()));
     let mut reports = reports.lock().unwrap_or_else(PoisonError::into_inner);
     let now = std::time::Instant::now();
@@ -1554,7 +1556,7 @@ impl RuesClient {
                 "Dusk archive skipped finalized block {block_height} ({ledger_hash:?}): it has finalized block {passed} but not this one, and holds none of the {topic} rows of contract {contract} that its finalized state records there for sequences {sequences}. The node failed to archive the block and will not add its rows; repair or rebuild its archive, or use another endpoint"
             )
         };
-        if archive_gap_report_due(contract_id, topic, block_height) {
+        if critical_report_due(contract_id, topic, block_height) {
             error!(
                 contract = %contract,
                 topic,
@@ -5590,7 +5592,7 @@ mod tests {
         assert_eq!(archive.checked_heights(), [1000, 8, 7]);
         // The critical report was made and is not due again yet; the lookup
         // keeps failing on every retry.
-        assert!(!archive_gap_report_due(&contract_id, "dispatch", 7));
+        assert!(!critical_report_due(&contract_id, "dispatch", 7));
         assert!(matches!(
             client
                 .finalized_contract_event(&contract_id, "dispatch", 0, 7, &[7])
@@ -5677,12 +5679,12 @@ mod tests {
     #[test]
     fn archive_gap_reports_are_rate_limited_per_block() {
         let contract_id = [106u8; 32];
-        assert!(archive_gap_report_due(&contract_id, "dispatch", 7));
-        assert!(!archive_gap_report_due(&contract_id, "dispatch", 7));
+        assert!(critical_report_due(&contract_id, "dispatch", 7));
+        assert!(!critical_report_due(&contract_id, "dispatch", 7));
         // Another block, topic or contract is reported on its own.
-        assert!(archive_gap_report_due(&contract_id, "dispatch", 8));
-        assert!(archive_gap_report_due(&contract_id, "process_id", 7));
-        assert!(archive_gap_report_due(&[107u8; 32], "dispatch", 7));
+        assert!(critical_report_due(&contract_id, "dispatch", 8));
+        assert!(critical_report_due(&contract_id, "process_id", 7));
+        assert!(critical_report_due(&[107u8; 32], "dispatch", 7));
     }
 
     /// Ten dispatch rows, one per block from 5 to 14, with IDs 0 to 9.
