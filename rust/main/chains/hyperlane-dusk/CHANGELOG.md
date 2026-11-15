@@ -12,6 +12,7 @@
 
 ### Fixed
 
+- A `finalizedEvents` page over the agent's 4 MiB response limit was asked for again at the same position with half the rows, down to one, instead of failing at that position on every retry. 200 Mailbox rows exceed the limit once dispatched message bodies average more than about 20 KiB, and dispatch and delivery indexing stopped for good at the first such page.
 - A lookup that ran ahead of the archive, between the node finalizing a block and the archive inserting its rows, kept its scan position instead of sending the next scan back to the contract's first row.
 - The `process` simulation passed only on the encoding of the `()` that `process` returns. Any other success reply, such as a proxy's error page sent with status 200, failed the simulation instead of letting the transaction burn its gas limit.
 - Response bodies were cut to 1 KiB before they went into errors or logs, instead of being copied in whole, up to 4 MiB.

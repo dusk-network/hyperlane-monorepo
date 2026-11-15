@@ -25,12 +25,19 @@ const ORIGIN: u32 = 4242;
 /// Rusk 1.7.3 clamps `finalizedEvents(limit)` to this many rows
 /// (`rusk/src/lib/http/chain/graphql/archive/events.rs`, `MAX_LIMIT`).
 const RUSK_MAX_PAGE: usize = 200;
+/// The most bytes of a reply the agent reads (`MAX_RUES_RESPONSE_BYTES`).
+/// Rusk itself sends a `finalizedEvents` page whole, however large.
+const RESPONSE_LIMIT: usize = 4 * 1024 * 1024;
 
 /// One `finalizedEvents` call.
 #[derive(Clone, Debug)]
 struct PageRequest {
     contract: [u8; 32],
     after: Option<i64>,
+    /// The `limit` the request asked for, before Rusk's clamp.
+    limit: usize,
+    /// Bytes of the reply body.
+    reply_len: usize,
 }
 
 /// The node: Mailbox and MerkleTreeHook state plus an archive that behaves
@@ -51,6 +58,11 @@ struct Node {
     finalized: u64,
     pages: Vec<PageRequest>,
     block_checks: usize,
+    /// Bytes in each dispatched message body; one byte when zero.
+    body_len: usize,
+    /// When set, every `finalizedEvents` reply to a request for `limit` rows
+    /// is padded with JSON whitespace to `page_reply_len(limit)` bytes.
+    page_reply_len: Option<fn(usize) -> usize>,
 }
 
 impl Node {
@@ -62,7 +74,8 @@ impl Node {
         let mut by_origin: BTreeMap<[u8; 32], Vec<Emitted>> = BTreeMap::new();
         for _ in 0..dispatches {
             let nonce = self.dispatches.len() as u32;
-            let message = message::encode(3, nonce, ORIGIN, [7; 32], 42, [8; 32], &[nonce as u8]);
+            let body = vec![nonce as u8; self.body_len.max(1)];
+            let message = message::encode(3, nonce, ORIGIN, [7; 32], 42, [8; 32], &body);
             let id = message::id(&message);
             let tx = message::keccak256(&[b"tx".as_slice(), &nonce.to_be_bytes()].concat());
             by_origin.insert(
@@ -174,6 +187,44 @@ impl Node {
             .collect()
     }
 
+    fn page_requests(&self, contract: [u8; 32]) -> Vec<PageRequest> {
+        self.pages
+            .iter()
+            .filter(|request| request.contract == contract)
+            .cloned()
+            .collect()
+    }
+
+    /// The reply body to one HTTP request.
+    fn reply(&mut self, path: &str, body: &[u8]) -> Vec<u8> {
+        if path != "/on/graphql/query" {
+            let (contract, method) = path
+                .strip_prefix("/on/contracts:")
+                .and_then(|rest| rest.split_once('/'))
+                .unwrap();
+            let contract = hex::decode(contract).unwrap().try_into().unwrap();
+            return self.contract_query(contract, method, body);
+        }
+        let query = std::str::from_utf8(body).unwrap();
+        if !query.contains("finalizedEvents(") {
+            return serde_json::to_vec(&self.graphql(query)).unwrap();
+        }
+        let (page, limit) = self.finalized_events(query);
+        let mut reply = serde_json::to_vec(&page).unwrap();
+        if let Some(len) = self
+            .page_reply_len
+            .map(|page_reply_len| page_reply_len(limit))
+        {
+            if reply.len() < len {
+                reply.resize(len, b' ');
+            }
+        }
+        if let Some(request) = self.pages.last_mut() {
+            request.reply_len = reply.len();
+        }
+        reply
+    }
+
     fn graphql(&mut self, query: &str) -> Value {
         if query == "query { lastBlockPair { json } }" {
             json!({"lastBlockPair":{"json":{
@@ -183,8 +234,6 @@ impl Node {
         } else if query.contains("checkBlock(") {
             self.block_checks += 1;
             json!({"checkBlock": true})
-        } else if query.contains("finalizedEvents(") {
-            self.finalized_events(query)
         } else {
             panic!("unexpected GraphQL query: {query}")
         }
@@ -192,14 +241,14 @@ impl Node {
 
     /// `finalizedEvents` as Rusk 1.7.3 answers it: rows with `id > cursor`
     /// in ID order, `limit` clamped to 1..=200, one extra row fetched to
-    /// decide `hasNextPage`.
-    fn finalized_events(&mut self, query: &str) -> Value {
+    /// decide `hasNextPage`. Also returns the requested limit.
+    fn finalized_events(&mut self, query: &str) -> (Value, usize) {
         let contract_hex = query
             .split_once("contractId: \"")
             .and_then(|(_, rest)| rest.split('"').next())
             .unwrap();
         let contract: [u8; 32] = hex::decode(contract_hex).unwrap().try_into().unwrap();
-        let limit = query
+        let requested = query
             .split_once("limit: ")
             .map(|(_, rest)| {
                 rest.split(|c: char| !c.is_ascii_digit())
@@ -208,14 +257,19 @@ impl Node {
                     .parse::<usize>()
                     .unwrap()
             })
-            .unwrap_or(50)
-            .clamp(1, RUSK_MAX_PAGE);
+            .unwrap_or(50);
+        let limit = requested.clamp(1, RUSK_MAX_PAGE);
         let after = query.split_once("cursor: \"").map(|(_, rest)| {
             let cursor = rest.split('"').next().unwrap();
             let text = String::from_utf8(STANDARD.decode(cursor).unwrap()).unwrap();
             text.strip_prefix("v1:").unwrap().parse::<i64>().unwrap()
         });
-        self.pages.push(PageRequest { contract, after });
+        self.pages.push(PageRequest {
+            contract,
+            after,
+            limit: requested,
+            reply_len: 0,
+        });
         let mut page: Vec<Value> = self
             .rows
             .iter()
@@ -229,12 +283,13 @@ impl Node {
         let cursor = |row: Option<&Value>| {
             row.map(|row| STANDARD.encode(format!("v1:{}", row["id"].as_i64().unwrap())))
         };
-        json!({"finalizedEvents":{"json":{
+        let page = json!({"finalizedEvents":{"json":{
             "events": page,
             "startCursor": cursor(page.first()),
             "endCursor": cursor(page.last()),
             "hasNextPage": has_next,
-        }}})
+        }}});
+        (page, requested)
     }
 
     fn contract_query(&self, contract: [u8; 32], method: &str, body: &[u8]) -> Vec<u8> {
@@ -310,6 +365,11 @@ impl Fixture {
                 stream
                     .set_read_timeout(Some(Duration::from_secs(3)))
                     .unwrap();
+                // A client that refuses a large reply may stop reading before
+                // it closes the connection.
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
                 let mut reader = BufReader::new(&mut stream);
                 let mut request = String::new();
                 reader.read_line(&mut request).unwrap();
@@ -328,27 +388,16 @@ impl Fixture {
                 }
                 let mut body = vec![0; length];
                 reader.read_exact(&mut body).unwrap();
-                let reply = {
-                    let mut node = worker_node.lock().unwrap();
-                    if path == "/on/graphql/query" {
-                        serde_json::to_vec(&node.graphql(std::str::from_utf8(&body).unwrap()))
-                            .unwrap()
-                    } else {
-                        let (contract, method) = path
-                            .strip_prefix("/on/contracts:")
-                            .and_then(|rest| rest.split_once('/'))
-                            .unwrap();
-                        let contract = hex::decode(contract).unwrap().try_into().unwrap();
-                        node.contract_query(contract, method, &body)
-                    }
-                };
-                write!(
+                let reply = worker_node.lock().unwrap().reply(&path, &body);
+                // The agent hangs up on a reply whose Content-Length is over
+                // its limit without reading the body, so a failed write is
+                // expected here.
+                let _ = write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     reply.len()
-                )
-                .unwrap();
-                stream.write_all(&reply).unwrap();
+                );
+                let _ = stream.write_all(&reply);
             }
         });
         Self {
@@ -491,4 +540,152 @@ async fn an_archive_that_lags_finality_keeps_the_scan_position() {
         pages[before_retry..].iter().all(Option::is_some),
         "a lagging archive must not restart the scan from genesis: {pages:?}"
     );
+}
+
+/// Whether the agent read a `finalizedEvents` reply, rather than refusing it
+/// for being over its limit.
+fn read_whole(request: &PageRequest) -> bool {
+    request.reply_len <= RESPONSE_LIMIT
+}
+
+#[tokio::test]
+async fn large_dispatches_across_blocks_are_read_in_pages_that_fit() {
+    const BODY: usize = 48 * 1024;
+    let fixture = Fixture::start();
+    {
+        let mut node = fixture.node();
+        node.body_len = BODY;
+        for height in [100, 101, 102] {
+            node.finalize_block(height, 45, 0, true);
+        }
+    }
+    let rues = fixture.client();
+    let messages = DuskMailboxIndexer::new(rues.clone(), H256::from(MAILBOX), ORIGIN)
+        .fetch_logs_in_range(0..=134)
+        .await
+        .unwrap();
+    let insertions = DuskMerkleTreeHookIndexer::new(rues, H256::from(HOOK))
+        .fetch_logs_in_range(0..=134)
+        .await
+        .unwrap();
+
+    let node = fixture.node();
+    assert_eq!(messages.len(), 135);
+    assert_eq!(insertions.len(), 135);
+    for (nonce, (message, meta)) in messages.iter().enumerate() {
+        assert_eq!(message.inner().nonce, nonce as u32);
+        assert_eq!(message.inner().body, vec![nonce as u8; BODY]);
+        assert_eq!(message.inner().id(), H256::from(node.dispatches[nonce].1));
+        assert_eq!(meta.transaction_id, h512(node.dispatch_tx[nonce]));
+        assert_eq!(meta.block_number, 100 + nonce as u64 / 45);
+    }
+
+    // A block's 45 Dispatch rows are over the limit, so 200 and 100 rows are
+    // too; 50 rows fit. A refused reply is asked for again at the same
+    // cursor with half the rows.
+    let requests = node.page_requests(MAILBOX);
+    for (request, next) in requests.iter().zip(requests.iter().skip(1)) {
+        if !read_whole(request) {
+            assert_eq!(
+                (next.after, next.limit),
+                (request.after, request.limit / 2),
+                "{requests:?}"
+            );
+        }
+    }
+    let read: Vec<_> = requests
+        .iter()
+        .filter(|request| read_whole(request))
+        .collect();
+    assert!(
+        read.iter().all(|request| request.limit == 50),
+        "{requests:?}"
+    );
+    let refused = requests.len() - read.len();
+    eprintln!(
+        "mailbox rows={} requests={} (refused {refused}, read {}); hook requests={:?}",
+        node.contract_rows(MAILBOX),
+        requests.len(),
+        read.len(),
+        node.page_requests(HOOK)
+            .iter()
+            .map(|request| request.limit)
+            .collect::<Vec<_>>()
+    );
+    // Three scans, each refused at 200 and 100 rows before reading 50.
+    assert_eq!(refused, 6, "{requests:?}");
+    // The hook's small rows still come 200 at a time.
+    assert!(node
+        .page_requests(HOOK)
+        .iter()
+        .all(|request| request.limit == RUSK_MAX_PAGE && read_whole(request)));
+}
+
+#[tokio::test]
+async fn a_reply_of_exactly_the_limit_is_read_and_one_byte_more_is_split() {
+    let fixture = Fixture::start();
+    {
+        let mut node = fixture.node();
+        node.finalize_block(100, 3, 0, true);
+        node.page_reply_len = Some(|limit| {
+            if limit == RUSK_MAX_PAGE {
+                RESPONSE_LIMIT + 1
+            } else {
+                RESPONSE_LIMIT
+            }
+        });
+    }
+    let logs = DuskMailboxIndexer::new(fixture.client(), H256::from(MAILBOX), ORIGIN)
+        .fetch_logs_in_range(0..=2)
+        .await
+        .unwrap();
+    assert_eq!(logs.len(), 3);
+    let requests: Vec<_> = fixture
+        .node()
+        .page_requests(MAILBOX)
+        .iter()
+        .map(|request| (request.after, request.limit, request.reply_len))
+        .collect();
+    assert_eq!(
+        requests,
+        vec![
+            (None, RUSK_MAX_PAGE, RESPONSE_LIMIT + 1),
+            (None, RUSK_MAX_PAGE / 2, RESPONSE_LIMIT),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_row_larger_than_the_limit_fails_with_a_short_error() {
+    let fixture = Fixture::start();
+    {
+        let mut node = fixture.node();
+        // The row's data is hex, so this body alone is over the limit. A Rusk
+        // event carries at most 64 KiB of data, so only a faulty endpoint
+        // serves such a row.
+        node.body_len = RESPONSE_LIMIT / 2 + 1;
+        node.finalize_block(100, 1, 0, true);
+    }
+    let indexer = DuskMailboxIndexer::new(fixture.client(), H256::from(MAILBOX), ORIGIN);
+    for attempt in 1..=2 {
+        let error = indexer
+            .fetch_logs_in_range(0..=0)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not fit"), "{error}");
+        assert!(error.contains(&RESPONSE_LIMIT.to_string()), "{error}");
+        assert!(error.len() < 1024, "{} bytes: {error}", error.len());
+        // Each attempt halves from 200 rows to one at the same cursor, then
+        // gives up until contract sync retries.
+        let requests = fixture.node().page_requests(MAILBOX);
+        assert!(requests.iter().all(|request| request.after.is_none()));
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.limit)
+                .collect::<Vec<_>>(),
+            [200, 100, 50, 25, 12, 6, 3, 1].repeat(attempt)
+        );
+    }
 }

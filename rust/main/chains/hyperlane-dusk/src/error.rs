@@ -19,6 +19,15 @@ pub enum HyperlaneDuskError {
         /// Response body.
         body: String,
     },
+    /// A response body over the agent's transport limit, refused from its
+    /// declared length or once reading it passed the limit.
+    #[error("{context} response exceeds {limit} bytes")]
+    ResponseTooLarge {
+        /// What the request was for.
+        context: &'static str,
+        /// The limit, in bytes.
+        limit: usize,
+    },
     /// rkyv deserialization error.
     #[error("rkyv deserialization error: {0}")]
     RkyvDeserialize(String),

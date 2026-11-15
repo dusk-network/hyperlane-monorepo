@@ -15,7 +15,7 @@ use rkyv::{check_archived_root, Archive, Deserialize, Infallible, Serialize};
 use rocksdb::{Direction, IteratorMode, Options, WriteBatch, WriteOptions, DB};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 use serde_json::Value as JsonValue;
-use tracing::warn;
+use tracing::{debug, warn};
 use url::Url;
 
 use hyperlane_core::{ReorgPeriod, H256, H512};
@@ -126,6 +126,75 @@ struct FinalizedEventPage {
     start_cursor: Option<String>,
     end_cursor: Option<String>,
     has_next_page: bool,
+}
+
+/// The answer to one `finalizedEvents` request.
+enum PageReply {
+    /// The page, and the size of its reply in bytes.
+    Page(FinalizedEventPage, usize),
+    /// The reply was too large to read.
+    TooLarge {
+        /// Why, for an error once one row is too many.
+        reason: String,
+        /// Whether the agent's own byte limit refused it, rather than the
+        /// endpoint or a proxy in front of it.
+        by_agent: bool,
+    },
+}
+
+/// How many rows a scan asks each `finalizedEvents` request for.
+///
+/// Rusk returns up to 200 rows a page and sends the page whole, but the agent
+/// reads at most `MAX_RUES_RESPONSE_BYTES` of a reply. An event carries up to
+/// 64 KiB of data, 128 KiB as hex, so 200 rows of large dispatches do not
+/// fit. A reply over the limit is asked for again at the same cursor with
+/// half as many rows, down to one.
+///
+/// The smaller size holds for the rest of the scan, since rows next to large
+/// ones are often large too, with one exception: the agent knows its own
+/// limit, so after a full page that used at most a quarter of it the size
+/// doubles again, up to 200, and one block of large events does not slow
+/// down the rest of a long scan. An endpoint that refuses pages itself does
+/// not say how much it accepts, so after such a refusal the size only
+/// shrinks. Each scan starts at 200; finding the size again costs a few
+/// refused replies, which the agent refuses from their declared length
+/// without reading them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PageSize {
+    rows: usize,
+    may_grow: bool,
+}
+
+impl PageSize {
+    const fn largest() -> Self {
+        Self {
+            rows: FINALIZED_EVENT_PAGE_SIZE,
+            may_grow: true,
+        }
+    }
+
+    fn rows(self) -> usize {
+        self.rows
+    }
+
+    /// Halve after a reply over the limit. `false` when a single row was
+    /// already too large.
+    fn shrink(&mut self, by_agent: bool) -> bool {
+        self.may_grow &= by_agent;
+        if self.rows <= 1 {
+            return false;
+        }
+        self.rows /= 2;
+        true
+    }
+
+    /// Double after a full page of `rows` rows whose reply took `bytes`
+    /// bytes, if twice as many rows of that size use at most half the limit.
+    fn after_page(&mut self, rows: usize, bytes: usize) {
+        if self.may_grow && rows == self.rows && bytes <= MAX_RUES_RESPONSE_BYTES / 4 {
+            self.rows = (self.rows * 2).min(FINALIZED_EVENT_PAGE_SIZE);
+        }
+    }
 }
 
 /// A persisted position in one contract's archive rows, just after the row
@@ -506,6 +575,13 @@ impl RuesClient {
 
     /// Execute a GraphQL query against the node's `/on/graphql/query` endpoint.
     pub async fn graphql_query(&self, query: &str) -> Result<JsonValue, HyperlaneDuskError> {
+        let (payload, _) = self.graphql_reply(query).await?;
+        graphql_data(payload)
+    }
+
+    /// Send a GraphQL query and parse its JSON reply, without looking at any
+    /// GraphQL errors in it. Also returns the size of the reply in bytes.
+    async fn graphql_reply(&self, query: &str) -> Result<(JsonValue, usize), HyperlaneDuskError> {
         let url = self.endpoint("/on/graphql/query");
 
         let response = self
@@ -528,21 +604,7 @@ impl RuesClient {
                 bounded_body(&body)
             ))
         })?;
-
-        if let Some(errors) = payload
-            .get("errors")
-            .filter(|errors| graphql_errors_present(errors))
-        {
-            return Err(HyperlaneDuskError::Other(format!(
-                "GraphQL query returned errors: {}",
-                bounded_json(errors)
-            )));
-        }
-
-        // The legacy `/on/graphql/query` route returns the data object
-        // directly on success. Accept the canonical `/graphql` envelope too so
-        // callers do not accidentally depend on the deprecated response shape.
-        Ok(payload.get("data").cloned().unwrap_or(payload))
+        Ok((payload, body.len()))
     }
 
     /// Match the contract-state records of one block to their finalized
@@ -762,12 +824,20 @@ impl RuesClient {
         let mut previous_id =
             start.and_then(|anchor| anchor.fence_id.checked_sub(1).filter(|id| *id >= 0));
         let mut fence = start;
+        let mut size = PageSize::largest();
         loop {
             let cursor = previous_id.map(canonical_event_cursor);
-            let page = self
-                .finalized_event_page(contract_id, cursor.as_deref())
+            let (page, bytes) = self
+                .finalized_event_page(contract_id, cursor.as_deref(), &mut size)
                 .await?;
-            validate_finalized_event_page(contract_id, cursor.as_deref(), previous_id, &page)?;
+            validate_finalized_event_page(
+                contract_id,
+                cursor.as_deref(),
+                previous_id,
+                size.rows(),
+                &page,
+            )?;
+            size.after_page(page.events.len(), bytes);
             let has_next_page = page.has_next_page;
             let mut events = page.events.into_iter();
             if let Some(anchor) = fence.take() {
@@ -1044,11 +1114,50 @@ impl RuesClient {
             })
     }
 
+    /// The page of the contract's archive rows after `cursor`, asking for
+    /// `size` rows, and for fewer at the same cursor while the reply is too
+    /// large to read. Returns the page and the size of its reply in bytes.
     async fn finalized_event_page(
         &self,
         contract_id: &[u8; 32],
         cursor: Option<&str>,
-    ) -> Result<FinalizedEventPage, HyperlaneDuskError> {
+        size: &mut PageSize,
+    ) -> Result<(FinalizedEventPage, usize), HyperlaneDuskError> {
+        loop {
+            let (reason, by_agent) = match self
+                .finalized_event_page_reply(contract_id, cursor, size.rows())
+                .await?
+            {
+                PageReply::Page(page, bytes) => return Ok((page, bytes)),
+                PageReply::TooLarge { reason, by_agent } => (reason, by_agent),
+            };
+            if !size.shrink(by_agent) {
+                return Err(HyperlaneDuskError::Other(format!(
+                    "One Dusk archive row of contract {} after finalizedEvents cursor {} does not fit the {MAX_RUES_RESPONSE_BYTES}-byte response limit. Rusk events carry at most 64 KiB of data, so the endpoint does not serve its archive as Rusk does: {reason}",
+                    hex::encode(contract_id),
+                    cursor.unwrap_or("<first row>")
+                )));
+            }
+            debug!(
+                contract = %hex::encode(contract_id),
+                rows = size.rows(),
+                "Dusk finalizedEvents reply was too large; asking for fewer rows"
+            );
+        }
+    }
+
+    /// One `finalizedEvents` request for `limit` rows after `cursor`.
+    async fn finalized_event_page_reply(
+        &self,
+        contract_id: &[u8; 32],
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<PageReply, HyperlaneDuskError> {
+        let unusable = |error: &dyn fmt::Display| {
+            HyperlaneDuskError::Other(format!(
+                "Dusk endpoint does not provide usable archive finalizedEvents pagination: {error}"
+            ))
+        };
         let cursor_argument = match cursor {
             Some(cursor) => format!(
                 ", cursor: {}",
@@ -1061,14 +1170,32 @@ impl RuesClient {
             None => String::new(),
         };
         let query = format!(
-            "query {{ finalizedEvents(contractId: \"{}\", limit: {FINALIZED_EVENT_PAGE_SIZE}{cursor_argument}) {{ json }} }}",
+            "query {{ finalizedEvents(contractId: \"{}\", limit: {limit}{cursor_argument}) {{ json }} }}",
             hex::encode(contract_id)
         );
-        let data = self.graphql_query(&query).await.map_err(|error| {
-            HyperlaneDuskError::Other(format!(
-                "Dusk endpoint does not provide usable archive finalizedEvents pagination: {error}"
-            ))
-        })?;
+        let (payload, bytes) = match self.graphql_reply(&query).await {
+            Ok(reply) => reply,
+            Err(error) => {
+                return match reply_too_large(&error) {
+                    Some(by_agent) => Ok(PageReply::TooLarge {
+                        reason: error.to_string(),
+                        by_agent,
+                    }),
+                    None => Err(unusable(&error)),
+                }
+            }
+        };
+        if let Some(errors) = graphql_errors(&payload) {
+            let errors = format!("GraphQL query returned errors: {}", bounded_json(errors));
+            if reports_oversized_reply(&errors) {
+                return Ok(PageReply::TooLarge {
+                    reason: errors,
+                    by_agent: false,
+                });
+            }
+            return Err(unusable(&errors));
+        }
+        let data = graphql_data(payload)?;
         let page = data
             .get("finalizedEvents")
             .and_then(|events| events.get("json"))
@@ -1078,11 +1205,12 @@ impl RuesClient {
                     bounded_json(&data)
                 ))
             })?;
-        serde_json::from_value(page.clone()).map_err(|error| {
+        let page = serde_json::from_value(page.clone()).map_err(|error| {
             HyperlaneDuskError::Other(format!(
                 "Failed to decode Rusk finalizedEvents page: {error}"
             ))
-        })
+        })?;
+        Ok(PageReply::Page(page, bytes))
     }
 
     /// `checkBlock(onlyFinalized: true)` for one block.
@@ -1408,6 +1536,7 @@ fn validate_finalized_event_page(
     contract_id: &[u8; 32],
     requested_cursor: Option<&str>,
     previous_id: Option<i64>,
+    requested_limit: usize,
     page: &FinalizedEventPage,
 ) -> Result<(), HyperlaneDuskError> {
     let source = hex::encode(contract_id);
@@ -1425,9 +1554,9 @@ fn validate_finalized_event_page(
             )));
         }
     }
-    if page.events.len() > FINALIZED_EVENT_PAGE_SIZE {
+    if page.events.len() > requested_limit {
         return Err(HyperlaneDuskError::Other(format!(
-            "Rusk finalizedEvents returned {} rows above requested limit {FINALIZED_EVENT_PAGE_SIZE}",
+            "Rusk finalizedEvents returned {} rows above requested limit {requested_limit}",
             page.events.len()
         )));
     }
@@ -1709,6 +1838,57 @@ fn graphql_errors_present(errors: &JsonValue) -> bool {
     }
 }
 
+/// The GraphQL errors a reply carries, if any.
+fn graphql_errors(payload: &JsonValue) -> Option<&JsonValue> {
+    payload
+        .get("errors")
+        .filter(|errors| graphql_errors_present(errors))
+}
+
+/// The data of a GraphQL reply, or its errors as an error.
+fn graphql_data(payload: JsonValue) -> Result<JsonValue, HyperlaneDuskError> {
+    if let Some(errors) = graphql_errors(&payload) {
+        return Err(HyperlaneDuskError::Other(format!(
+            "GraphQL query returned errors: {}",
+            bounded_json(errors)
+        )));
+    }
+    // The legacy `/on/graphql/query` route returns the data object directly
+    // on success. Accept the canonical `/graphql` envelope too so callers do
+    // not accidentally depend on the deprecated response shape.
+    Ok(payload.get("data").cloned().unwrap_or(payload))
+}
+
+/// Whether a failed `finalizedEvents` request shows that its reply was too
+/// large to read: `Some(true)` when the agent's own transport limit refused
+/// it, `Some(false)` when the endpoint or a proxy in front of it says so.
+fn reply_too_large(error: &HyperlaneDuskError) -> Option<bool> {
+    match error {
+        HyperlaneDuskError::ResponseTooLarge { .. } => Some(true),
+        HyperlaneDuskError::RuesResponse { status, body }
+            if *status == StatusCode::PAYLOAD_TOO_LARGE.as_u16()
+                || reports_oversized_reply(body) =>
+        {
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+/// Whether endpoint-supplied error text says a reply was too large, as in
+/// "GraphQL query response exceeds 4194304 bytes" or "response too large".
+/// Taking an unrelated error for one only costs smaller pages: a scan that
+/// gets down to one row reports the error.
+fn reports_oversized_reply(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    ["response", "payload", "body"]
+        .iter()
+        .any(|subject| text.contains(subject))
+        && ["exceed", "too large", "too big"]
+            .iter()
+            .any(|verb| text.contains(verb))
+}
+
 fn tx_confirmation_timeout_error(
     tx_id: &str,
     timeout: Duration,
@@ -1748,15 +1928,17 @@ fn strip_hex_prefix(value: &str) -> &str {
 
 async fn read_bounded_body(
     mut response: reqwest::Response,
-    context: &str,
+    context: &'static str,
 ) -> Result<Vec<u8>, HyperlaneDuskError> {
+    let too_large = || HyperlaneDuskError::ResponseTooLarge {
+        context,
+        limit: MAX_RUES_RESPONSE_BYTES,
+    };
     if response
         .content_length()
         .is_some_and(|length| length > MAX_RUES_RESPONSE_BYTES as u64)
     {
-        return Err(HyperlaneDuskError::Other(format!(
-            "{context} response exceeds {MAX_RUES_RESPONSE_BYTES} bytes"
-        )));
+        return Err(too_large());
     }
 
     let mut body = Vec::with_capacity(
@@ -1767,9 +1949,7 @@ async fn read_bounded_body(
     );
     while let Some(chunk) = response.chunk().await? {
         if chunk.len() > MAX_RUES_RESPONSE_BYTES.saturating_sub(body.len()) {
-            return Err(HyperlaneDuskError::Other(format!(
-                "{context} response exceeds {MAX_RUES_RESPONSE_BYTES} bytes"
-            )));
+            return Err(too_large());
         }
         body.extend_from_slice(&chunk);
     }
@@ -2304,6 +2484,12 @@ mod tests {
         /// The cursor ID of each `finalizedEvents` request; `None` asks for
         /// the contract's first rows.
         pages: Arc<StdMutex<Vec<Option<i64>>>>,
+        /// The `limit` of each `finalizedEvents` request.
+        limits: Arc<StdMutex<Vec<usize>>>,
+        /// When set to `(rows, status, body)`, a `finalizedEvents` request
+        /// for more than `rows` rows gets this reply instead, as from a node
+        /// or proxy that refuses large replies.
+        refusal: Arc<StdMutex<Option<(usize, u16, String)>>>,
         stop: Arc<std::sync::atomic::AtomicBool>,
         worker: Option<thread::JoinHandle<()>>,
     }
@@ -2316,9 +2502,16 @@ mod tests {
             let url = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
             let rows = Arc::new(StdMutex::new(rows));
             let pages = Arc::new(StdMutex::new(Vec::new()));
+            let limits = Arc::new(StdMutex::new(Vec::new()));
+            let refusal = Arc::new(StdMutex::new(None));
             let stop = Arc::new(AtomicBool::new(false));
-            let (worker_rows, worker_pages, worker_stop) =
-                (rows.clone(), pages.clone(), stop.clone());
+            let (worker_rows, worker_pages, worker_limits, worker_refusal, worker_stop) = (
+                rows.clone(),
+                pages.clone(),
+                limits.clone(),
+                refusal.clone(),
+                stop.clone(),
+            );
             let worker = thread::spawn(move || {
                 while !worker_stop.load(Ordering::SeqCst) {
                     let Ok((mut stream, _)) = listener.accept() else {
@@ -2326,31 +2519,57 @@ mod tests {
                         continue;
                     };
                     stream.set_nonblocking(false).unwrap();
+                    // The client may stop reading a reply it refuses.
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
                     let query = String::from_utf8(read_request_body(&mut stream)).unwrap();
-                    let reply = if query.contains("finalizedEvents(") {
-                        let rows = worker_rows.lock().unwrap();
-                        Self::page(&rows, &query, &mut worker_pages.lock().unwrap())
+                    let (status, reply) = if query.contains("finalizedEvents(") {
+                        let limit = Self::limit(&query);
+                        worker_limits.lock().unwrap().push(limit);
+                        match worker_refusal.lock().unwrap().clone() {
+                            Some((rows, status, body)) if limit > rows => (status, body),
+                            _ => {
+                                let rows = worker_rows.lock().unwrap();
+                                let page =
+                                    Self::page(&rows, &query, &mut worker_pages.lock().unwrap());
+                                (200, page.to_string())
+                            }
+                        }
                     } else if query.contains("checkBlock(") {
-                        serde_json::json!({"checkBlock": true})
+                        (200, serde_json::json!({"checkBlock": true}).to_string())
                     } else {
-                        serde_json::json!({"errors": [{"message": "unexpected query"}]})
-                    }
-                    .to_string();
-                    write!(
+                        (
+                            200,
+                            serde_json::json!({"errors": [{"message": "unexpected query"}]})
+                                .to_string(),
+                        )
+                    };
+                    let _ = write!(
                         stream,
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                        "HTTP/1.1 {status} Reply\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
                         reply.len()
-                    )
-                    .unwrap();
+                    );
                 }
             });
             Self {
                 url,
                 rows,
                 pages,
+                limits,
+                refusal,
                 stop,
                 worker: Some(worker),
             }
+        }
+
+        /// The `limit` a `finalizedEvents` query asks for.
+        fn limit(query: &str) -> usize {
+            query
+                .split_once("limit: ")
+                .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
+                .and_then(|limit| limit.parse::<usize>().ok())
+                .unwrap_or(50)
         }
 
         fn page(rows: &[JsonValue], query: &str, pages: &mut Vec<Option<i64>>) -> JsonValue {
@@ -2358,12 +2577,7 @@ mod tests {
                 .split_once("contractId: \"")
                 .and_then(|(_, rest)| rest.split('"').next())
                 .unwrap();
-            let limit = query
-                .split_once("limit: ")
-                .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
-                .and_then(|limit| limit.parse::<usize>().ok())
-                .unwrap_or(50)
-                .clamp(1, 200);
+            let limit = Self::limit(query).clamp(1, 200);
             let after = query
                 .split_once("cursor: \"")
                 .and_then(|(_, rest)| rest.split('"').next())
@@ -2391,6 +2605,10 @@ mod tests {
 
         fn pages(&self) -> Vec<Option<i64>> {
             self.pages.lock().unwrap().clone()
+        }
+
+        fn limits(&self) -> Vec<usize> {
+            self.limits.lock().unwrap().clone()
         }
     }
 
@@ -2538,9 +2756,14 @@ mod tests {
             end_cursor: Some("same".into()),
             has_next_page: true,
         };
-        assert!(
-            validate_finalized_event_page(&contract_id, Some("same"), Some(10), &page).is_err()
-        );
+        assert!(validate_finalized_event_page(
+            &contract_id,
+            Some("same"),
+            Some(10),
+            FINALIZED_EVENT_PAGE_SIZE,
+            &page
+        )
+        .is_err());
     }
 
     #[tokio::test]
@@ -3161,5 +3384,135 @@ mod tests {
         assert!(error
             .to_string()
             .contains("does not match endpoint chain ID 2"));
+    }
+
+    #[test]
+    fn page_size_halves_to_one_row_and_grows_back_after_small_full_pages() {
+        let mut size = PageSize::largest();
+        let mut sizes = vec![size.rows()];
+        while size.shrink(true) {
+            sizes.push(size.rows());
+        }
+        assert_eq!(sizes, [200, 100, 50, 25, 12, 6, 3, 1]);
+        // A full page that used at most a quarter of the limit doubles the
+        // size; a larger reply or a short page does not.
+        size.after_page(1, MAX_RUES_RESPONSE_BYTES / 4);
+        assert_eq!(size.rows(), 2);
+        size.after_page(2, MAX_RUES_RESPONSE_BYTES / 4 + 1);
+        size.after_page(1, 10);
+        assert_eq!(size.rows(), 2);
+        for _ in 0..10 {
+            size.after_page(size.rows(), 10);
+        }
+        assert_eq!(size.rows(), FINALIZED_EVENT_PAGE_SIZE);
+        // An endpoint that refuses replies does not say how much it accepts,
+        // so the size no longer grows.
+        assert!(size.shrink(false));
+        size.after_page(size.rows(), 10);
+        assert_eq!(size.rows(), FINALIZED_EVENT_PAGE_SIZE / 2);
+    }
+
+    #[test]
+    fn oversized_replies_are_told_apart_from_other_failures() {
+        let ours = HyperlaneDuskError::ResponseTooLarge {
+            context: "GraphQL query",
+            limit: MAX_RUES_RESPONSE_BYTES,
+        };
+        assert_eq!(
+            ours.to_string(),
+            "GraphQL query response exceeds 4194304 bytes"
+        );
+        assert_eq!(reply_too_large(&ours), Some(true));
+        for (status, body) in [
+            (413, "Payload Too Large"),
+            (500, "GraphQL query response exceeds 4194304 bytes"),
+            (502, "upstream response too large"),
+        ] {
+            let error = HyperlaneDuskError::RuesResponse {
+                status,
+                body: body.into(),
+            };
+            assert_eq!(reply_too_large(&error), Some(false), "{error}");
+        }
+        for error in [
+            HyperlaneDuskError::RuesResponse {
+                status: 500,
+                body: "Cannot fetch events: database is locked".into(),
+            },
+            HyperlaneDuskError::RuesResponse {
+                status: 503,
+                body: "temporarily unavailable".into(),
+            },
+            HyperlaneDuskError::RuesHttp {
+                kind: "timeout",
+                status: None,
+            },
+            HyperlaneDuskError::Other("GraphQL query returned errors: Invalid cursor".into()),
+        ] {
+            assert_eq!(reply_too_large(&error), None, "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_that_refuses_large_pages_is_asked_for_fewer_rows() {
+        let contract_id = [77u8; 32];
+        let rows: Vec<JsonValue> = (0..120)
+            .map(|id| {
+                let data = (id as u16).to_be_bytes();
+                archive_row(id, 5 + id as u64 / 40, 1, "dispatch", contract_id, &data)
+            })
+            .collect();
+        for (status, body) in [
+            (
+                200,
+                r#"{"errors":[{"message":"GraphQL query response exceeds 4194304 bytes"}]}"#,
+            ),
+            (413, "Payload Too Large"),
+        ] {
+            let archive = Archive::start(rows.clone());
+            *archive.refusal.lock().unwrap() = Some((30, status, body.to_owned()));
+            let directory = tempfile::tempdir().unwrap();
+            let client = test_client_with_event_store(archive.url.clone(), directory.path());
+            let matched = client
+                .finalized_contract_event(&contract_id, "dispatch", 0, 7, &100u16.to_be_bytes())
+                .await
+                .unwrap();
+            assert_eq!(matched.block_height, 7);
+            // Halved at the first cursor until the endpoint accepted, then
+            // kept, since the endpoint did not say how much it accepts.
+            assert_eq!(archive.limits(), [200, 100, 50, 25, 25, 25, 25, 25]);
+            assert_eq!(
+                archive.pages(),
+                [None, Some(24), Some(49), Some(74), Some(99)]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pages_grow_back_after_a_block_of_large_rows() {
+        let contract_id = [78u8; 32];
+        // 40 rows of 100 KiB, 200 KiB as hex, then 400 small rows.
+        let mut rows: Vec<JsonValue> = (0..40)
+            .map(|id| archive_row(id, 5, 1, "other", contract_id, &[id as u8; 100 * 1024]))
+            .collect();
+        rows.extend((40..440).map(|id| {
+            let data = (id as u16).to_be_bytes();
+            archive_row(id, 6 + id as u64 / 100, 1, "dispatch", contract_id, &data)
+        }));
+        let archive = Archive::start(rows);
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(archive.url.clone(), directory.path());
+        let matched = client
+            .finalized_contract_event(&contract_id, "dispatch", 0, 10, &439u16.to_be_bytes())
+            .await
+            .unwrap();
+        assert_eq!(matched.block_height, 10);
+        // 25 large rows are over the limit and 12 fit. The page that ends
+        // the large rows used under a quarter of the limit, so the size
+        // doubles back to 200.
+        assert_eq!(
+            archive.limits(),
+            [200, 100, 50, 25, 12, 12, 12, 12, 24, 48, 96, 192, 200]
+        );
     }
 }

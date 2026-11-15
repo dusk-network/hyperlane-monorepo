@@ -25,7 +25,11 @@ how to run the local bridge.
   finalized `Dispatch` event whose message hashes to that ID.
 - **Archive scans** read a contract's `finalizedEvents` 200 rows at a time
   (Rusk's maximum) and match every record of a block in one pass over that
-  block's rows. Each scan starts from a saved position just before the block,
+  block's rows. The agent reads at most 4 MiB of a reply, and 200 rows of
+  large dispatches are more than that, so a page over the limit is asked for
+  again at the same position with half the rows, down to one. A Rusk event
+  carries at most 64 KiB of data, so a single row always fits; one that does
+  not is reported as an endpoint fault. Each scan starts from a saved position just before the block,
   kept in `eventCursorDir` (about one per 200 rows), so a restart or an archive
   that lags behind finality does not send the scan back to the contract's
   first row. Before reusing a position, the scan checks that the archive still
