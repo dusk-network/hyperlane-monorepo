@@ -305,10 +305,20 @@ impl Endpoint {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Wait until a request of `class` may go out. A contract query also
-    /// takes one of the endpoint's in-flight slots, which it holds until it
-    /// drops the permit.
+    /// Wait until a request of `class` may go out, and send it at once. A
+    /// contract query first takes one of the endpoint's in-flight slots,
+    /// which it holds until it drops the permit, and only then its slot in
+    /// the pace: queries that waited for an in-flight slot behind slow ones
+    /// go out at the pace once those finish, not all at once, and a refusal
+    /// that arrived while they waited holds them back.
     pub(crate) async fn admit(&self, class: RequestClass) -> Option<OwnedSemaphorePermit> {
+        let permit = match class {
+            // The semaphore is never closed, so this always holds a permit.
+            RequestClass::ContractQuery => {
+                self.queries_in_flight.clone().acquire_owned().await.ok()
+            }
+            RequestClass::Graphql | RequestClass::Other => None,
+        };
         loop {
             let slot = self.schedules()[class.index()].reserve(Instant::now());
             if slot > Instant::now() {
@@ -316,15 +326,8 @@ impl Endpoint {
             }
             // A refusal while this request waited holds it back as well.
             if Instant::now() >= self.schedules()[class.index()].held_until {
-                break;
+                return permit;
             }
-        }
-        match class {
-            // The semaphore is never closed, so this always holds a permit.
-            RequestClass::ContractQuery => {
-                self.queries_in_flight.clone().acquire_owned().await.ok()
-            }
-            RequestClass::Graphql | RequestClass::Other => None,
         }
     }
 
@@ -462,6 +465,57 @@ mod tests {
         let mut schedule = Schedule::new(Some(limit(100, 20)), now);
         let last = (0..1000).map(|_| schedule.reserve(now)).last().unwrap();
         assert_eq!(last.duration_since(now), Duration::from_millis(9_800));
+    }
+
+    /// Queries that wait for an in-flight slot behind slow ones go out at
+    /// the pace once the slow ones finish, not all at once, and a refusal
+    /// that arrives while they wait holds them back.
+    #[tokio::test]
+    async fn queries_waiting_for_an_in_flight_slot_keep_the_pace_and_holds() {
+        const WAITING: usize = 40;
+        let interval = Duration::from_millis(20);
+        let endpoint = Endpoint::of(&Url::parse("http://127.0.0.1:9/waiting-for-slots").unwrap());
+        endpoint.set_query_rate_limit(limit(50, 2));
+        let start = Instant::now();
+        // Slow queries take every in-flight slot for a second.
+        let mut slow = tokio::task::JoinSet::new();
+        for _ in 0..MAX_QUERIES_IN_FLIGHT {
+            let endpoint = endpoint.clone();
+            slow.spawn(async move {
+                let permit = endpoint.admit(RequestClass::ContractQuery).await;
+                tokio::time::sleep_until(start + Duration::from_secs(1)).await;
+                drop(permit);
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let mut waiting = tokio::task::JoinSet::new();
+        for _ in 0..WAITING {
+            let endpoint = endpoint.clone();
+            waiting.spawn(async move {
+                let permit = endpoint.admit(RequestClass::ContractQuery).await;
+                let sent = Instant::now();
+                drop(permit);
+                sent
+            });
+        }
+        // The endpoint refuses a query while they wait.
+        tokio::time::sleep_until(start + Duration::from_millis(500)).await;
+        let held_until = start + Duration::from_millis(1_500);
+        endpoint.schedules()[RequestClass::ContractQuery.index()].hold(held_until);
+        let mut sent = Vec::new();
+        while let Some(joined) = waiting.join_next().await {
+            sent.push(joined.unwrap());
+        }
+        while slow.join_next().await.is_some() {}
+        sent.sort();
+        let early = sent.iter().filter(|sent| **sent < held_until).count();
+        assert_eq!(early, 0, "{early} queries went out during the hold");
+        // After a hold the queries go at the steady pace, one an interval.
+        let span = sent[WAITING - 1].duration_since(sent[0]);
+        assert!(
+            span >= interval * (WAITING as u32 - 2),
+            "{WAITING} queries went out within {span:?}"
+        );
     }
 
     #[test]

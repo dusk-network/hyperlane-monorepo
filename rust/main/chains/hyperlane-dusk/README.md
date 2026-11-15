@@ -25,11 +25,16 @@ how to run the local bridge.
   endpoint in an agent process shares one pace for contract queries:
   `contractQueriesPerSecond` (100 by default) and `contractQueryBurst` (20),
   with at most 8 in flight, which leaves room for the node's other clients.
+  A query takes one of the 8 in-flight slots before its place in the pace,
+  so the queries that wait behind slow ones go out at the pace once those
+  finish, not all at once.
   A request the node refuses for its rate limit, on any route, holds back
   every request of its class from that process for the `Retry-After` plus up
   to as long again at random, and is sent again after a wait that doubles
   with each refusal in a row, also at random within it, so that indexers do
   not come back together; after 4 refusals in a row (15 to 30 s) it fails.
+  A request checks for such a hold just before it goes out, after any wait
+  for its pace or an in-flight slot.
   The node refuses a request before it runs it, so sending it again is safe.
 - **Finality is read once per tick.** Finalized data changes only when the
   node's last final block does. Every client of an endpoint in a process
