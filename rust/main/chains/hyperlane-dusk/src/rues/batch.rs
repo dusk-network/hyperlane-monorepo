@@ -51,6 +51,8 @@ const REPROBE_INTERVAL: Duration = Duration::from_secs(600);
 /// Most reads a final block's batch carries because they were asked at the
 /// blocks before it.
 const MAX_WATCHED_READS: usize = 1024;
+/// Most bytes of replies, with their arguments, kept for a final block.
+const MAX_TICK_REPLY_BYTES: usize = 1024 * 1024;
 
 /// Reply sizes of the views the agent batches, in bytes.
 pub(crate) const BOOL_REPLY: usize = 1;
@@ -188,31 +190,80 @@ enum Availability {
 
 /// The reads asked at the endpoint's last final block, and the reads asked
 /// at the blocks before it, which the next block's batch carries.
+///
+/// Replies are kept only for watched reads, and dropped with them, at most
+/// `MAX_TICK_REPLY_BYTES` with their arguments: while finality stalls, ever
+/// new reads asked at the same final block, such as delivery checks of new
+/// messages, cannot grow them without bound.
 #[derive(Debug, Default)]
 struct TickReads {
     /// Final blocks seen, counting from one.
     epoch: u64,
     final_block: Option<u64>,
-    /// The replies read after `final_block` was final.
+    /// The replies of watched reads, read after `final_block` was final.
     replies: HashMap<ReadKey, Vec<u8>>,
-    /// Reads asked lately, with the epoch they were last asked at.
-    watched: HashMap<ReadKey, (Read, u64)>,
+    /// The bytes of `replies` and of their reads' arguments.
+    reply_bytes: usize,
+    /// Reads asked lately, with the epoch they were last asked at and when,
+    /// counted in reads asked, so that the least recently asked goes first.
+    watched: HashMap<ReadKey, (Read, u64, u64)>,
+    /// Reads asked so far.
+    asked: u64,
 }
 
 impl TickReads {
     fn watch(&mut self, read: &Read) {
-        let epoch = self.epoch;
-        self.watched.insert(read.key(), (read.clone(), epoch));
+        let key = read.key();
+        self.asked += 1;
+        self.watched
+            .insert(key.clone(), (read.clone(), self.epoch, self.asked));
         if self.watched.len() > MAX_WATCHED_READS {
             let oldest = self
                 .watched
                 .iter()
-                .min_by_key(|(_, (_, asked))| *asked)
+                .filter(|(watched, _)| **watched != key)
+                .min_by_key(|(_, (_, epoch, asked))| (*epoch, *asked))
                 .map(|(key, _)| key.clone());
             if let Some(oldest) = oldest {
                 self.watched.remove(&oldest);
+                self.drop_reply(&oldest);
             }
         }
+    }
+
+    /// Keep `reply` of the read `key` for this final block, if the read is
+    /// watched and the reply fits the bound.
+    fn keep(&mut self, key: ReadKey, reply: Vec<u8>) {
+        if !self.watched.contains_key(&key) {
+            return;
+        }
+        self.drop_reply(&key);
+        let bytes = key.2.len().saturating_add(reply.len());
+        if self.reply_bytes.saturating_add(bytes) > MAX_TICK_REPLY_BYTES {
+            return;
+        }
+        self.reply_bytes += bytes;
+        self.replies.insert(key, reply);
+    }
+
+    fn drop_reply(&mut self, key: &ReadKey) {
+        if let Some(reply) = self.replies.remove(key) {
+            self.reply_bytes = self
+                .reply_bytes
+                .saturating_sub(key.2.len().saturating_add(reply.len()));
+        }
+    }
+
+    /// Read at final block `final_block` from now on: the replies of the
+    /// block before go, and so do the reads not asked at the last blocks.
+    fn next_block(&mut self, final_block: u64) {
+        self.epoch += 1;
+        self.final_block = Some(final_block);
+        self.replies.clear();
+        self.reply_bytes = 0;
+        let epoch = self.epoch;
+        self.watched
+            .retain(|_, (_, asked, _)| asked.saturating_add(2) >= epoch);
     }
 }
 
@@ -388,7 +439,7 @@ impl RuesClient {
                 let reply = self.coalesced(&multicall, read).await?;
                 let mut tick = multicall.tick.lock().await;
                 if tick.final_block == Some(final_block) {
-                    tick.replies.insert(key, reply.clone());
+                    tick.keep(key, reply.clone());
                 }
                 Ok(reply)
             }
@@ -398,18 +449,13 @@ impl RuesClient {
                 self.query_read(&read).await
             }
             _ => {
-                tick.epoch += 1;
-                tick.final_block = Some(final_block);
-                tick.replies.clear();
-                let epoch = tick.epoch;
-                tick.watched
-                    .retain(|_, (_, asked)| asked.saturating_add(2) >= epoch);
+                tick.next_block(final_block);
                 let mut reads = vec![read.clone()];
                 reads.extend(
                     tick.watched
                         .iter()
                         .filter(|(watched, _)| **watched != key)
-                        .map(|(_, (watched, _))| watched.clone()),
+                        .map(|(_, (watched, _, _))| watched.clone()),
                 );
                 tick.watch(&read);
                 // Others asking at this block wait for these replies.
@@ -418,11 +464,11 @@ impl RuesClient {
                 for (read, result) in reads.iter().zip(results) {
                     if own.is_none() {
                         if let Ok(reply) = &result {
-                            tick.replies.insert(read.key(), reply.clone());
+                            tick.keep(read.key(), reply.clone());
                         }
                         own = Some(result);
                     } else if let Ok(reply) = result {
-                        tick.replies.insert(read.key(), reply);
+                        tick.keep(read.key(), reply);
                     }
                 }
                 own.unwrap_or_else(|| {
@@ -1532,6 +1578,79 @@ mod tests {
         // A block older than the one read: one query.
         assert_eq!(tick(13, 2).await, reply(2));
         assert_eq!(node.requests(), strings(&["echo"]));
+    }
+
+    /// What a client keeps of the reads of its last final block: how many
+    /// reads it watches, how many replies it keeps, whether every reply is
+    /// of a watched read, and the bytes of the replies and their arguments.
+    async fn kept_tick_reads(client: &RuesClient) -> (usize, usize, bool, usize) {
+        let multicall = client.multicall.as_ref().unwrap();
+        let tick = multicall.tick.lock().await;
+        let bytes = tick
+            .replies
+            .iter()
+            .map(|((_, _, args), reply)| args.len() + reply.len())
+            .sum();
+        (
+            tick.watched.len(),
+            tick.replies.len(),
+            tick.replies
+                .keys()
+                .all(|key| tick.watched.contains_key(key)),
+            bytes,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_finality_stall_keeps_a_bounded_number_of_replies() {
+        let node = Node::start(Behaviour::Works);
+        let client = node.client().with_query_rate_limit(QueryRateLimit {
+            per_second: 1_000_000,
+            burst: 1_000_000,
+        });
+        client.batch_capacity().await.unwrap();
+        // The node finalizes nothing while delivery checks of ever new
+        // messages are asked at its last final block.
+        let asked = MAX_WATCHED_READS as u32 * 3;
+        for value in 0..asked {
+            assert_eq!(
+                client.tick_read(10, echo(value)).await.unwrap(),
+                reply(value)
+            );
+        }
+        let (watched, replies, all_watched, _) = kept_tick_reads(&client).await;
+        assert!(watched <= MAX_WATCHED_READS, "{watched} reads watched");
+        assert!(replies <= MAX_WATCHED_READS, "{replies} replies kept");
+        assert!(all_watched, "a reply outlived its watched read");
+        // The latest read is kept: asked again at the block, it is answered
+        // from memory.
+        node.requests();
+        assert_eq!(
+            client.tick_read(10, echo(asked - 1)).await.unwrap(),
+            reply(asked - 1)
+        );
+        assert!(node.requests().is_empty());
+
+        // Long replies are kept within a bound of bytes.
+        let node = Node::start(Behaviour::Works);
+        let client = node.client().with_query_rate_limit(QueryRateLimit {
+            per_second: 1_000_000,
+            burst: 1_000_000,
+        });
+        client.batch_capacity().await.unwrap();
+        for len in 60_000u32..60_100 {
+            let read = Read::new(VIEWS, "bytes", &(len,), U8_REPLY).unwrap();
+            assert_eq!(
+                client.tick_read(10, read).await.unwrap().len(),
+                len as usize
+            );
+        }
+        let (_, _, all_watched, bytes) = kept_tick_reads(&client).await;
+        assert!(all_watched);
+        assert!(
+            bytes <= MAX_TICK_REPLY_BYTES,
+            "{bytes} bytes of replies kept"
+        );
     }
 
     #[tokio::test]

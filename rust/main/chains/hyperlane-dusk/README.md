@@ -68,7 +68,10 @@ how to run the local bridge.
     delivery checks of messages the relayer is waiting on, go in one
     aggregate per final block, which also carries those asked at the two
     blocks before: an idle relayer sends 30 requests a minute instead of 48.
-    A validator reads one count per final block, which gains nothing (18);
+    A validator reads one count per final block, which gains nothing (18).
+    An endpoint keeps the replies of at most 1,024 such reads, the least
+    recently asked going first, and 1 MiB of them, also while finality
+    stalls and new messages are checked at the same final block;
   - indexers read the heights, IDs and pages of a range of records together,
     and search record heights 256 at a time: a restart's catch-up of 1,000
     records sends 25 contract queries instead of 3,048, and of 10,000
