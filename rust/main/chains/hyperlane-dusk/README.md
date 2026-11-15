@@ -151,7 +151,12 @@ how to run the local bridge.
   finality falls more than 64 blocks behind the tip, it waits for finality
   to catch up instead of reading every block. A validator's startup reports
   its own announcement only once its announcement log holds it in a block
-  `checkBlock(onlyFinalized)` accepts, and waits until then.
+  `checkBlock(onlyFinalized)` accepts, and waits until then. Each check
+  reads at most 4 pages of the archive (16 for announcements) to bring its
+  log up to date, so an agent started with an empty `eventCursorDir`
+  confirms deliveries, or its announcement, only once its log has read the
+  contract's history that far, a few checks for a young contract and more
+  for a long history.
 - **Identity checks.** Building the agent's Dusk components makes no
   request. Before its first request, each client checks, once, that the
   endpoint serves the configured deployment: the node's chain ID, the

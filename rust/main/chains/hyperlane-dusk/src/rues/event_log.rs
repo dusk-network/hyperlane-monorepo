@@ -428,7 +428,7 @@ impl RuesClient {
                     warn!(
                         contract = %hex::encode(log.contract_id),
                         topic = log.topic,
-                        "Dusk archive rows were renumbered; the event log reads its staged block again"
+                        "Dusk event log cannot read on from its staged block; it reads the block again"
                     );
                     let mut batch = WriteBatch::default();
                     self.unstage(log, &mut batch)?;
@@ -491,7 +491,18 @@ impl RuesClient {
                 (Some(anchor), open, next, Some(fence_block))
             }
             PassStart::Staged(staged) => {
-                let block = self.reopen(log, state, &staged)?;
+                let block = match self.reopen(log, state, &staged) {
+                    Ok(block) => block,
+                    Err(error) => {
+                        warn!(
+                            contract = %hex::encode(contract_id),
+                            topic = log.topic,
+                            %error,
+                            "Dusk event log cannot read its staged block back; it reads the block again"
+                        );
+                        return Ok(LogScan::WrongAnchor);
+                    }
+                };
                 let next = match block.kind {
                     BlockKind::Held { first, .. } => first,
                     _ => state.count,
@@ -598,13 +609,15 @@ impl RuesClient {
                     if state.last_block.is_some_and(|last| height <= last) {
                         // A block the log holds, read again from its first
                         // row. The log's rows of blocks before it must have
-                        // come again before it.
-                        let first = self.first_sequence_at_or_above(log, state, height)?;
-                        if first > next_sequence {
+                        // come again before it, so its own rows, if any,
+                        // start at the next row the pass accounts for.
+                        if next_sequence < state.count {
                             let skipped = self.entry_height(log, next_sequence)?;
-                            return self.event_log_diverged(log, state, batch, skipped);
+                            if skipped < height {
+                                return self.event_log_diverged(log, state, batch, skipped);
+                            }
                         }
-                        open = Some(OpenBlock::held(height, first));
+                        open = Some(OpenBlock::held(height, next_sequence));
                     } else {
                         if next_sequence < state.count {
                             // Blocks the log holds rows of did not come again.
@@ -1699,6 +1712,86 @@ mod tests {
         assert_eq!(data, [vec![7], vec![207], vec![151], vec![0xee]]);
         // Nothing stays staged once the block is taken.
         assert!(client.staged_block(&log, &state).unwrap().is_none());
+    }
+
+    /// Renumber `rows` from 1,000, as a rebuilt archive would.
+    fn renumbered(rows: Vec<JsonValue>) -> Vec<JsonValue> {
+        rows.into_iter()
+            .enumerate()
+            .map(|(id, mut row)| {
+                row["id"] = serde_json::json!(1000 + id as i64);
+                row
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn blocks_the_log_holds_that_a_rebuilt_archive_lacks_are_read_again() {
+        let contract_id = [125u8; 32];
+        let deliver = |id: i64, height: u64, data: u8| {
+            archive_row(id, height, data, "deliver", contract_id, &[data])
+        };
+        let rows = vec![
+            deliver(0, 5, 0xa1),
+            deliver(1, 5, 0xa2),
+            deliver(2, 6, 0xb),
+            deliver(3, 7, 0xc),
+        ];
+        let archive = Archive::start(rows.clone());
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(archive.url.clone(), directory.path());
+        let log = test_log(contract_id, BLOCK_LIMITS);
+        let data = |client: &RuesClient| -> Vec<Vec<u8>> {
+            client
+                .event_log_entries(&log, 0, 9)
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.data)
+                .collect()
+        };
+        let state = client.advance_event_log(&log, 16, None).await.unwrap();
+        assert_eq!((state.count, state.last_block), (4, Some(7)));
+
+        // A rebuilt archive lacks block 6's row: the log, which holds it,
+        // drops its rows from block 6 on and takes block 7 again.
+        *archive.rows.lock().unwrap() =
+            renumbered(vec![rows[0].clone(), rows[1].clone(), rows[3].clone()]);
+        let state = client.advance_event_log(&log, 16, None).await.unwrap();
+        assert_eq!((state.count, state.last_block), (3, Some(7)));
+        assert_eq!(data(&client), [vec![0xa1], vec![0xa2], vec![0xc]]);
+
+        // Another lacks the second row of block 5: the log reads block 5
+        // again from that row on.
+        *archive.rows.lock().unwrap() = renumbered(vec![rows[0].clone(), rows[3].clone()]);
+        let state = client.advance_event_log(&log, 16, None).await.unwrap();
+        assert_eq!((state.count, state.last_block), (2, Some(7)));
+        assert_eq!(data(&client), [vec![0xa1], vec![0xc]]);
+    }
+
+    #[tokio::test]
+    async fn a_staged_block_whose_rows_are_lost_is_read_again() {
+        let contract_id = [124u8; 32];
+        let rows: Vec<_> = (0..300)
+            .map(|id| {
+                let topic = if id % 100 == 3 { "deliver" } else { "other" };
+                archive_row(id, 5, 1, topic, contract_id, &[id as u8])
+            })
+            .collect();
+        let archive = Archive::start(rows);
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(archive.url.clone(), directory.path());
+        let log = test_log(contract_id, BLOCK_LIMITS);
+        client.advance_event_log(&log, 1, None).await.unwrap();
+        // The staged row of block 5 is lost from the event store.
+        client
+            .event_store()
+            .unwrap()
+            .delete(event_log_staged_row_key(&log, 1))
+            .unwrap();
+        // The log reads the block again instead of failing on every call.
+        let state = client.advance_event_log(&log, 16, None).await.unwrap();
+        assert_eq!((state.count, state.last_block), (3, Some(5)));
+        assert_eq!(archive.pages(), [None, None, Some(199)]);
     }
 
     #[tokio::test]
