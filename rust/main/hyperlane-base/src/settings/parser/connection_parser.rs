@@ -1093,6 +1093,17 @@ pub fn build_dusk_connection_conf(
         .get_opt_key("gasLimit")
         .parse_u64()
         .unwrap_or(5_000_000);
+    // No block holds a transaction over the block gas limit, and the mempool
+    // keeps it until it expires.
+    if gas_limit > hyperlane_dusk::RUSK_BLOCK_GAS_LIMIT {
+        err.push(
+            (&chain.cwp).add("gaslimit"),
+            eyre!(
+                "Dusk gasLimit {gas_limit} exceeds Rusk's block gas limit of {}",
+                hyperlane_dusk::RUSK_BLOCK_GAS_LIMIT
+            ),
+        );
+    }
 
     let gas_price = chain
         .chain(err)

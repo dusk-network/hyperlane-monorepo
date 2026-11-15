@@ -151,7 +151,11 @@ how to run the local bridge.
   helper from the companion repository. The agent runs it as a subprocess
   (`DUSK_TX_BIN`, or `dusk-tx` on `PATH`) and passes the RPC URL and signing
   key on stdin. Before retrying an uncertain submission, the agent reconciles
-  it against the transaction hash it prepared.
+  it against the transaction hash it prepared. A delivery is submitted with
+  the gas limit the relayer's gas policy asks for, which follows the gas the
+  sender paid for, but at most `gasLimit` and Rusk's block gas limit of
+  3,000,000,000: the mempool keeps a transaction over the block gas limit
+  without any block taking it, and a failed transaction pays its whole limit.
 - **Delivery simulation.** Dusk charges a failed transaction its whole gas
   limit. Before submitting `process`, the relayer runs it as an unsigned
   contract query, which Rusk executes in a throwaway session. If the query
@@ -258,10 +262,12 @@ how to run the local bridge.
 ```
 
 `gasLimit` is the gas ceiling of every transaction the agent sends, and
-defaults to 5,000,000. A failed Dusk transaction pays its whole limit, so
-keep it close to what the agent needs: a relayed `process` costs about 1.95M
-gas plus 0.22M per signature the Dusk ISM checks, and a validator
-announcement about 2.1M.
+defaults to 5,000,000, at most Rusk's block gas limit of 3,000,000,000. A
+failed Dusk transaction pays its whole limit, so keep it close to what the
+agent needs: a relayed `process` costs about 1.95M gas plus 0.22M per
+signature the Dusk ISM checks, and a validator announcement about 2.1M. It
+is also the estimate the relayer's gas payment policy compares payments
+with, since Rusk reports no gas for a simulation.
 
 `contractQueriesPerSecond` and `contractQueryBurst` pace the agent's
 contract queries to its endpoint (see Pacing above); an operator of a node

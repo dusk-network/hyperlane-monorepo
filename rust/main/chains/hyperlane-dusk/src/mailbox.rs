@@ -40,6 +40,9 @@ const MAX_DELIVERY_CHECKS: usize = 4096;
 const SIMULATION_REUSE: Duration = Duration::from_secs(2);
 /// Simulations a Mailbox remembers.
 const MAX_REMEMBERED_SIMULATIONS: usize = 1024;
+/// Rusk 1.7.3's block gas limit (`DEFAULT_BLOCK_GAS_LIMIT`). The mempool
+/// admits a transaction with a higher limit, but no block can hold it.
+pub const RUSK_BLOCK_GAS_LIMIT: u64 = 3_000_000_000;
 
 /// What a delivery check found.
 #[derive(Debug, Clone)]
@@ -311,6 +314,28 @@ impl DuskMailbox {
         Ok(Delivery::NotFinal(format!(
             "Message {id:?} is delivered at the Dusk tip, but no finalized block up to block {final_block}, the last final one, holds its delivery, and no block above it does either: the block that did was rolled back during this check, or the node's archive skipped it"
         )))
+    }
+
+    /// The gas limit a delivery is submitted with: the relayer's, which
+    /// follows the gas the sender paid for, but at most the configured
+    /// `gasLimit` and Rusk's block gas limit. A failed Dusk transaction pays
+    /// its whole limit, and one above the block gas limit stays in the
+    /// mempool for good.
+    fn submission_gas_limit(&self, message: &HyperlaneMessage, requested: Option<U256>) -> u64 {
+        let ceiling = self.conn.gas_limit.min(RUSK_BLOCK_GAS_LIMIT);
+        let Some(requested) = requested else {
+            return ceiling;
+        };
+        if requested > U256::from(ceiling) {
+            debug!(
+                message_id = ?message.id(),
+                requested = %requested,
+                ceiling,
+                "Dusk delivery gas limit capped at the configured gasLimit"
+            );
+            return ceiling;
+        }
+        requested.low_u64()
     }
 
     async fn merkle_tree_count(&self) -> ChainResult<u32> {
@@ -669,17 +694,7 @@ impl Mailbox for DuskMailbox {
 
         let encoded = Self::encode_message(message);
         let args = crate::tx_sender::process_args(metadata, &encoded)?;
-
-        let gas_limit = tx_gas_limit
-            .map(|limit| {
-                if limit > U256::from(u64::MAX) {
-                    return Err(HyperlaneDuskError::Other(format!(
-                        "Dusk transaction gas limit {limit} exceeds u64"
-                    )));
-                }
-                Ok(limit.low_u64())
-            })
-            .transpose()?;
+        let gas_limit = self.submission_gas_limit(message, tx_gas_limit);
 
         // The relayer simulates through process_estimate_costs before calling
         // this, and that simulation stands when it passed moments ago.
@@ -699,7 +714,7 @@ impl Mailbox for DuskMailbox {
             &self.mailbox_id,
             "process",
             &args,
-            gas_limit,
+            Some(gas_limit),
         )
         .await;
 
@@ -916,5 +931,55 @@ mod tests {
         assert_eq!(mailbox.address(), mailbox_id);
         assert_eq!(hook.address(), hook_id);
         assert_ne!(mailbox.address(), hook.address());
+    }
+
+    #[test]
+    fn a_delivery_gas_limit_is_at_most_gas_limit_and_the_block_gas_limit() {
+        let mailbox = |gas_limit: u64| {
+            let rues =
+                Arc::new(RuesClient::new(Url::parse("http://127.0.0.1:1").unwrap()).unwrap());
+            let domain = HyperlaneDomain::from_config(
+                4242,
+                "dusk-test",
+                HyperlaneDomainProtocol::Dusk,
+                HyperlaneDomainTechnicalStack::Other,
+            )
+            .unwrap();
+            let provider = Arc::new(DuskProvider::new(domain.clone(), rues.clone()));
+            DuskMailbox::new(
+                provider,
+                rues,
+                H256::from([1u8; 32]),
+                H256::from([2u8; 32]),
+                domain,
+                None,
+                ConnectionConf {
+                    url: Url::parse("http://127.0.0.1:1").unwrap(),
+                    chain_id: 1,
+                    event_cursor_dir: std::env::temp_dir(),
+                    gas_limit,
+                    gas_price: 1,
+                    native_token: NativeToken::default(),
+                    op_submission_config: OpSubmissionConfig::default(),
+                    query_rate_limit: crate::QueryRateLimit::default(),
+                },
+            )
+        };
+        let message = HyperlaneMessage::default();
+        let five_million = mailbox(5_000_000);
+        let limit =
+            |requested: Option<U256>| five_million.submission_gas_limit(&message, requested);
+        assert_eq!(limit(None), 5_000_000);
+        assert_eq!(limit(Some(U256::from(2_000_000))), 2_000_000);
+        // A sender that paid for more gas does not raise what a failed
+        // delivery pays, nor one over u64.
+        assert_eq!(limit(Some(U256::from(9_000_000_000u64))), 5_000_000);
+        assert_eq!(limit(Some(U256::MAX)), 5_000_000);
+        // No block holds more than the block gas limit, whatever the
+        // configuration says (the parser refuses such a gasLimit).
+        assert_eq!(
+            mailbox(u64::MAX).submission_gas_limit(&message, None),
+            RUSK_BLOCK_GAS_LIMIT
+        );
     }
 }

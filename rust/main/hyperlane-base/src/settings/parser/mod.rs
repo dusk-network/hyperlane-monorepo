@@ -1330,6 +1330,18 @@ mod test {
         assert_eq!(gas_limit(&value), 5_000_000);
         value["gaslimit"] = json!(30_000_000);
         assert_eq!(gas_limit(&value), 30_000_000);
+        // No block holds more.
+        value["gaslimit"] = json!(3_000_000_000u64);
+        assert_eq!(gas_limit(&value), 3_000_000_000);
+        value["gaslimit"] = json!(3_000_000_001u64);
+        let error = parse_chain(
+            ValueParser::new(Default::default(), &value),
+            "test",
+            "fallback",
+        )
+        .expect_err("a gasLimit over the block gas limit must be rejected")
+        .to_string();
+        assert!(error.contains("block gas limit"), "{error}");
     }
 
     #[test]
