@@ -30,13 +30,21 @@ how to run the local bridge.
   block order and within a block in archive order (by transaction hash),
   numbered from zero. A delivery's sequence is its number there, the same for
   any endpoint whose archive holds the same blocks, but not its order of
-  execution within a block. The log takes a block's rows once it has read all
-  of them and `checkBlock(onlyFinalized)` accepted the block; a row that does
-  not parse stops it before its block. It reads on from the closest saved
-  scan position below the first block it lacks, at most 16 pages per indexer
-  call and 4 per delivery check, and never takes rows of a block it already
-  holds, so its numbering survives restarts and renumbered archives. A block
-  that `checkBlock` no longer accepts when a delivery is served drops the log,
+  execution within a block. The log takes a block once it has read all of
+  its rows, they all name one block hash, the block is at or below the
+  node's last final block and `checkBlock(onlyFinalized)` accepted it, also
+  when the block has no row of the topic, since the log then holds that it
+  has none; a row that does not parse stops it before its block, and a row
+  more than 64 blocks above the node's tip fails the read. It reads on from
+  the closest saved scan position below the first block it lacks, at most 16
+  pages per indexer call and 4 per delivery check, even inside a block: a
+  block not read whole by then is staged in `eventCursorDir` with its rows of
+  the topic and the position after the last row read, and the next call
+  reads on from there. A block of more than 1,000,000 rows of the contract,
+  or 32 MiB of rows of the topic, which no Rusk block holds, stops the log
+  with an error. The log never takes rows of a block it already holds, so
+  its numbering survives restarts and renumbered archives. A block that
+  `checkBlock` no longer accepts when a delivery is served drops the log,
   which is then rebuilt. The delivery indexer's tip is the height up to which
   the log holds every finalized delivery.
 - **Announced locations.** ValidatorAnnounce keeps only the keccak256 of

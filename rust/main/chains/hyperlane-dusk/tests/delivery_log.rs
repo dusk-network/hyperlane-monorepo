@@ -42,6 +42,9 @@ struct Row {
     topic: &'static str,
     data: Vec<u8>,
     reverted: bool,
+    /// The block hash the archive serves the row under, when it is not its
+    /// block's.
+    block_hash: Option<String>,
 }
 
 impl Row {
@@ -51,6 +54,7 @@ impl Row {
             topic: events::ProcessId::TOPIC,
             data: process_id(message_id),
             reverted: false,
+            block_hash: None,
         }
     }
 
@@ -60,6 +64,7 @@ impl Row {
             topic,
             data: vec![1, 2, 3],
             reverted: false,
+            block_hash: None,
         }
     }
 }
@@ -81,6 +86,9 @@ struct Node {
     pages: Vec<Option<i64>>,
     /// Each transaction's block.
     transactions: HashMap<String, u64>,
+    /// When set, the archive serves rows of this block without end after its
+    /// own rows: every page is full and has a next one.
+    endless: Option<u64>,
 }
 
 impl Node {
@@ -140,15 +148,27 @@ impl Node {
                 text.strip_prefix("v1:").unwrap().parse::<i64>().unwrap()
             });
             self.pages.push(after);
-            let mut page: Vec<Value> = self
+            let mut rows: Vec<(i64, u64, Row)> = self
                 .rows
                 .iter()
                 .filter(|(id, _, _)| *id > after.unwrap_or(-1))
                 .take(limit + 1)
+                .cloned()
+                .collect();
+            if let Some(height) = self.endless {
+                let mut id = self.next_id.max(after.unwrap_or(-1) + 1);
+                while rows.len() <= limit {
+                    rows.push((id, height, Row::other(0xee, events::Dispatch::TOPIC)));
+                    id += 1;
+                }
+            }
+            let mut page: Vec<Value> = rows
+                .iter()
                 .map(|(id, height, row)| {
                     json!({
                         "id": id, "block_height": height,
-                        "block_hash": hex::encode(block_hash(*height)),
+                        "block_hash": row.block_hash.clone()
+                            .unwrap_or_else(|| hex::encode(block_hash(*height))),
                         "origin": hex::encode(row.origin), "topic": row.topic,
                         "source": hex::encode(MAILBOX), "data": hex::encode(&row.data),
                         "reverted": row.reverted,
@@ -406,14 +426,16 @@ async fn a_long_history_is_read_a_bounded_number_of_pages_at_a_time() {
     let indexer = fixture.indexer();
     let (first, tip) = indexer.latest_sequence_count_and_tip().await.unwrap();
     // 16 pages hold 32 blocks. The log takes a block once it reads a row of
-    // the next, one page more, and stops at that boundary.
-    assert_eq!((first, tip), (Some(320), 131));
-    assert_eq!(fixture.node().pages.len(), 17);
+    // the next, so block 131, whose last row ends the 16th page, is not
+    // whole yet: the call stops there and stages it.
+    assert_eq!((first, tip), (Some(310), 130));
+    assert_eq!(fixture.node().pages.len(), 16);
     let (second, tip) = indexer.latest_sequence_count_and_tip().await.unwrap();
     assert_eq!((second, tip), (Some(400), 139));
-    // The second call started at the last row of block 131.
+    // The second call started at the last row it had read, of block 131.
     let pages = fixture.node().pages.clone();
-    assert_eq!(pages[17], Some(3198));
+    assert_eq!(pages[16], Some(3198));
+    assert_eq!(pages.len(), 21);
 }
 
 #[tokio::test]
@@ -485,4 +507,130 @@ async fn a_malformed_delivery_row_stops_the_log_before_its_block() {
         indexer.latest_sequence_count_and_tip().await.unwrap(),
         (Some(2), 11)
     );
+}
+
+#[tokio::test]
+async fn a_row_of_another_topic_above_the_nodes_tip_never_becomes_progress() {
+    let mut node = Node::default();
+    node.finalize(10, vec![Row::delivery(1, message(1))]);
+    // A faulty archive serves a row of another topic in block 2^32, under a
+    // hash that does not parse. Taken as a block without deliveries, it
+    // would make the log hold every delivery up to block 2^32, past the
+    // indexer's u32 cursor range and the node's last final block, for good.
+    node.rows.push((
+        node.next_id,
+        1 << 32,
+        Row {
+            block_hash: Some("not a block hash".into()),
+            ..Row::other(9, events::Dispatch::TOPIC)
+        },
+    ));
+    node.next_id += 1;
+    let fixture = Fixture::start(node);
+    let indexer = fixture.indexer();
+    let error = indexer.latest_sequence_count_and_tip().await.unwrap_err();
+    assert!(
+        error.to_string().contains("above the node's tip"),
+        "{error}"
+    );
+    // The endpoint drops the row and finalizes block 11: the log reads on
+    // from block 10.
+    {
+        let mut node = fixture.node();
+        node.rows.pop();
+        node.finalize(11, vec![Row::delivery(2, message(2))]);
+    }
+    assert_eq!(
+        indexer.latest_sequence_count_and_tip().await.unwrap(),
+        (Some(2), 11)
+    );
+}
+
+#[tokio::test]
+async fn a_block_without_deliveries_that_checkblock_rejects_stops_the_log() {
+    let mut node = Node::default();
+    node.finalize(10, vec![Row::delivery(1, message(1))]);
+    node.finalize(11, vec![Row::other(2, events::Dispatch::TOPIC)]);
+    node.finalize(12, vec![Row::delivery(3, message(3))]);
+    // The endpoint serves block 11's rows, but checkBlock does not accept
+    // the block: the log must not take it, nor pass it.
+    node.rejected.push(11);
+    let fixture = Fixture::start(node);
+    let indexer = fixture.indexer();
+    let error = indexer.latest_sequence_count_and_tip().await.unwrap_err();
+    assert!(error.to_string().contains("block 11"), "{error}");
+    let entries = indexer.fetch_logs_in_range(0..=1).await.unwrap();
+    assert_eq!(entries.len(), 1);
+    // Once the endpoint agrees, the log reads on.
+    fixture.node().rejected.clear();
+    assert_eq!(
+        all_deliveries(&indexer).await,
+        [(0, message(1), 1, 10), (1, message(3), 3, 12)]
+    );
+}
+
+#[tokio::test]
+async fn a_block_longer_than_a_calls_pages_is_read_on_where_the_call_stopped() {
+    // Block 10 holds 4,000 rows, 20 pages, with a delivery in every 100th;
+    // block 11 holds one delivery.
+    let mut node = Node::default();
+    let rows = (0..4000u32)
+        .map(|row| {
+            if row % 100 == 0 {
+                Row::delivery((row / 100) as u8, message((row / 100) as u8))
+            } else {
+                Row::other(0xee, events::Dispatch::TOPIC)
+            }
+        })
+        .collect();
+    node.finalize(10, rows);
+    node.finalize(11, vec![Row::delivery(0xf1, message(0xf1))]);
+    let fixture = Fixture::start(node);
+    let indexer = fixture.indexer();
+    // A call reads 16 pages and no more, even inside a block: block 10 is
+    // not whole yet, so the log takes nothing.
+    assert_eq!(
+        indexer.latest_sequence_count_and_tip().await.unwrap(),
+        (Some(0), 0)
+    );
+    assert_eq!(fixture.node().pages.len(), 16);
+    // The next call reads on from the last row the first one read, and
+    // takes both blocks.
+    assert_eq!(
+        indexer.latest_sequence_count_and_tip().await.unwrap(),
+        (Some(41), 11)
+    );
+    let pages = fixture.node().pages.clone();
+    assert_eq!(pages[16], Some(3198), "{pages:?}");
+    assert_eq!(pages.len(), 21);
+    let deliveries = all_deliveries(&indexer).await;
+    assert_eq!(deliveries.len(), 41);
+    assert_eq!(deliveries[40], (40, message(0xf1), 0xf1, 11));
+}
+
+#[tokio::test]
+async fn an_endless_block_holds_no_call_beyond_its_pages() {
+    let mut node = Node::default();
+    node.finalize(10, vec![Row::delivery(1, message(1))]);
+    // A faulty endpoint serves rows of block 11 without end.
+    node.endless = Some(11);
+    node.finalized = 11;
+    let fixture = Fixture::start(node);
+    let indexer = fixture.indexer();
+    for call in 1..=3 {
+        let counted = tokio::time::timeout(
+            Duration::from_secs(20),
+            indexer.latest_sequence_count_and_tip(),
+        )
+        .await
+        .expect("a call must return once it has read its pages");
+        assert_eq!(counted.unwrap(), (Some(1), 10));
+        // Each call reads 16 pages, from the last row the one before read.
+        let pages = fixture.node().pages.clone();
+        assert_eq!(pages.len(), 16 * call, "{pages:?}");
+        if call > 1 {
+            let last_read = 3199 * (call as i64 - 1);
+            assert_eq!(pages[16 * (call - 1)], Some(last_read - 1));
+        }
+    }
 }

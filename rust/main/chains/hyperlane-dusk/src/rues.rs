@@ -25,7 +25,7 @@ use crate::HyperlaneDuskError;
 
 mod event_log;
 use event_log::EventLogLocks;
-pub(crate) use event_log::{EventLog, LogEntry, LogLookup};
+pub(crate) use event_log::{EventLog, LogEntry, LogLookup, BLOCK_LIMITS};
 
 const MAX_RUES_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// Rows per `finalizedEvents` page: the most Rusk 1.7.3 returns
@@ -3491,7 +3491,7 @@ mod tests {
         Url::parse(&format!("http://{address}")).unwrap()
     }
 
-    fn test_client_with_event_store(url: Url, path: &std::path::Path) -> RuesClient {
+    pub(super) fn test_client_with_event_store(url: Url, path: &std::path::Path) -> RuesClient {
         let mut options = Options::default();
         options.create_if_missing(true);
         let mut client = RuesClient::new(url).unwrap();
@@ -3900,7 +3900,7 @@ mod tests {
         }
     }
 
-    fn archive_row(
+    pub(super) fn archive_row(
         id: i64,
         height: u64,
         origin: u8,
@@ -3942,9 +3942,9 @@ mod tests {
 
     /// An archive endpoint that pages `finalizedEvents` by cursor as Rusk
     /// 1.7.3 does and answers `checkBlock` with `finalized`.
-    struct Archive {
-        url: Url,
-        rows: Arc<StdMutex<Vec<JsonValue>>>,
+    pub(super) struct Archive {
+        pub(super) url: Url,
+        pub(super) rows: Arc<StdMutex<Vec<JsonValue>>>,
         /// The cursor ID of each `finalizedEvents` request; `None` asks for
         /// the contract's first rows.
         pages: Arc<StdMutex<Vec<Option<i64>>>>,
@@ -3963,14 +3963,14 @@ mod tests {
         /// as both its tip and its last final block. The ledger holds every
         /// block up to it, block `h` with hash `[h as u8; 32]` as in
         /// `archive_row`, except the heights in `pruned`.
-        ledger_tip: Arc<StdMutex<u64>>,
+        pub(super) ledger_tip: Arc<StdMutex<u64>>,
         pruned: Arc<StdMutex<HashSet<u64>>>,
         stop: Arc<std::sync::atomic::AtomicBool>,
         worker: Option<thread::JoinHandle<()>>,
     }
 
     impl Archive {
-        fn start(rows: Vec<JsonValue>) -> Self {
+        pub(super) fn start(rows: Vec<JsonValue>) -> Self {
             use std::sync::atomic::{AtomicBool, Ordering};
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -4129,7 +4129,7 @@ mod tests {
             }}})
         }
 
-        fn pages(&self) -> Vec<Option<i64>> {
+        pub(super) fn pages(&self) -> Vec<Option<i64>> {
             self.pages.lock().unwrap().clone()
         }
 
@@ -4137,7 +4137,7 @@ mod tests {
             self.limits.lock().unwrap().clone()
         }
 
-        fn checked_heights(&self) -> Vec<u64> {
+        pub(super) fn checked_heights(&self) -> Vec<u64> {
             self.block_checks
                 .lock()
                 .unwrap()

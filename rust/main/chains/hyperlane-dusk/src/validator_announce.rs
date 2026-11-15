@@ -30,6 +30,7 @@ fn announcement_log(va_id: [u8; 32]) -> EventLog {
         contract_id: va_id,
         topic: events::ValidatorAnnouncement::TOPIC,
         key_of: announcement_key,
+        limits: crate::rues::BLOCK_LIMITS,
     }
 }
 
@@ -559,8 +560,13 @@ mod tests {
             ],
             "startCursor": "djE6MA==", "endCursor": "djE6Mg==", "hasNextPage": false,
         }}});
+        let final_tip = format!(
+            r#"{{"lastBlockPair":{{"json":{{"last_block":[9,"{hash}"],"last_finalized_block":[9,"{hash}"]}}}}}}"#,
+            hash = "ab".repeat(32)
+        );
         let (client, worker, _directory) = reader(
             vec![
+                (200, final_tip.into_bytes()),
                 (200, page.to_string().into_bytes()),
                 (200, br#"{"checkBlock":true}"#.to_vec()),
                 // Listed in order of announcement; one listed hash has no

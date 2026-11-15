@@ -299,6 +299,7 @@ pub(crate) fn delivery_log(mailbox_id: [u8; 32]) -> EventLog {
         contract_id: mailbox_id,
         topic: events::ProcessId::TOPIC,
         key_of: delivery_key,
+        limits: crate::rues::BLOCK_LIMITS,
     }
 }
 
