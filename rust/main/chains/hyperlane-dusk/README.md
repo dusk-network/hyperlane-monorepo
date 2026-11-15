@@ -113,7 +113,10 @@ how to run the local bridge.
   delivery log holds every finalized delivery up to the last final block,
   read with `lastBlockPair` before the state, the delivery counts only once
   its `ProcessId` row is in a block `checkBlock(onlyFinalized)` accepts,
-  which no rollback can undo. Where the log does not reach that far yet, or
+  which no rollback can undo; until then the check names the non-final block
+  that holds it, and when no block does, the block was rolled back during the
+  check or the node's archive skipped it, which it logs as a warning. Where
+  the log does not reach that far yet, or
   the client has no `eventCursorDir`, the delivery counts once no block
   above the last finalized one emitted its `ProcessId` event, whoever
   delivered it: the check reads the blocks above the last finalized one

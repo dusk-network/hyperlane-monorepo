@@ -452,21 +452,20 @@ impl Mailbox for DuskMailbox {
                 DELIVERED_LOG_PAGES,
             )
             .await;
-        match lookup {
+        // Without a finalized delivery, the blocks that are not final yet
+        // decide; where the log holds every final block, it never counts.
+        let final_block = match lookup {
             Ok(LogLookup::Found(_)) => return Ok(true),
-            Ok(LogLookup::Absent { final_block }) => {
-                return Err(HyperlaneDuskError::NotFinal(format!(
-                    "Message {id:?} is delivered at the Dusk tip, but no finalized block up to block {final_block}, the last final one, holds its delivery"
-                ))
-                .into())
-            }
+            Ok(LogLookup::Absent { final_block }) => Some(final_block),
             Ok(LogLookup::Unknown(reason)) => {
                 debug!(message_id = ?id, %reason, "Dusk delivery log cannot show finality; checking the blocks that are not final");
+                None
             }
             Err(error) => {
                 debug!(message_id = ?id, %error, "Dusk delivery log is unavailable; checking the blocks that are not final");
+                None
             }
-        }
+        };
         let pending = self
             .rues
             .non_final_events(&pair, &self.mailbox_id, events::ProcessId::TOPIC)
@@ -493,7 +492,22 @@ impl Mailbox for DuskMailbox {
                 .into());
             }
         }
-        Ok(true)
+        let Some(final_block) = final_block else {
+            return Ok(true);
+        };
+        // In no final block and in no block above them: a block that held
+        // it was rolled back during this check, and the next one reads it
+        // as not delivered, or the archive skipped the final block that
+        // holds it and this stays so.
+        warn!(
+            message_id = ?id,
+            final_block,
+            "Dusk Mailbox reports a delivery that neither the archive's finalized deliveries nor the blocks above the last final one hold"
+        );
+        Err(HyperlaneDuskError::NotFinal(format!(
+            "Message {id:?} is delivered at the Dusk tip, but no finalized block up to block {final_block}, the last final one, holds its delivery, and no block above it does either: the block that did was rolled back during this check, or the node's archive skipped it"
+        ))
+        .into())
     }
 
     async fn default_ism(&self) -> ChainResult<H256> {

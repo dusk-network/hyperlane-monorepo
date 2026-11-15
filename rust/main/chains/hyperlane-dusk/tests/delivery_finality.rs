@@ -929,3 +929,19 @@ async fn a_delivery_log_short_of_the_last_final_block_falls_back_to_non_final_bl
         .iter()
         .any(|query| query.contains("blocks(range")));
 }
+
+#[tokio::test]
+async fn with_a_delivery_log_a_delivery_in_a_block_that_is_not_final_waits_for_it() {
+    let mut node = Node::new(100);
+    let block = node.push(vec![Event::processed(MESSAGE)]);
+    node.push(vec![]);
+    node.delivered.insert(MESSAGE);
+    let fixture = Fixture::start(node);
+    let error = delivered_with_log(&fixture).await.unwrap_err();
+    assert!(
+        error.contains(&format!("delivered in Dusk block {block}")) && error.contains("not final"),
+        "{error}"
+    );
+    fixture.node().finalized = block;
+    assert_eq!(delivered_with_log(&fixture).await, Ok(true));
+}
