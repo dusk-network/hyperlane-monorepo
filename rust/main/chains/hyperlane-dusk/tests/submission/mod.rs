@@ -630,7 +630,9 @@ type Faults = Arc<Mutex<Vec<(Route, Option<u64>, Fault)>>>;
 /// `pipelines` file exists. A call reads the URL and the key from stdin,
 /// logs its arguments to `invocations`, asks the endpoint for the chain ID,
 /// signs with `--nonce` or the account's nonce plus one (read from
-/// `committed`, as dusk-tx reads the account), and prints `Prepared TX`.
+/// `committed`, as dusk-tx reads the account), and prints `Prepared TX`
+/// with the transaction's hash: like a Moonlight transaction's, the hash of
+/// what is signed, so the same call with the same nonce has the same hash.
 /// With `--ack-before-send` it then reads one more line from stdin, within
 /// 30 s, and logs it to `words` (`<eof>` when stdin closed first): any
 /// line but `send` makes it print `Not submitted:` and stop without
@@ -657,7 +659,7 @@ printf '%s\n' "$*" >> "$dir/invocations"
 IFS= read -r url || exit 89
 IFS= read -r key || exit 89
 [ -n "$url" ] && [ -n "$key" ] || exit 89
-nonce=""; given=""; wait=1; args=""; fn=""; gas_price=1; gas_limit=0; ack=""
+nonce=""; given=""; wait=1; args=""; fn=""; gas_price=1; gas_limit=0; ack=""; contract=""
 shift
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -665,6 +667,7 @@ while [ $# -gt 0 ]; do
     --no-wait) wait="" ;;
     --ack-before-send) ack=1 ;;
     --args) args="$2"; shift ;;
+    --contract) contract="$2"; shift ;;
     --fn-name) fn="$2"; shift ;;
     --gas-price) gas_price="$2"; shift ;;
     --gas-limit) gas_limit="$2"; shift ;;
@@ -709,8 +712,10 @@ post "/on/contracts:010000000000000000000000000000000000000000000000000000000000
   || fail "HTTP error: $reply"
 [ "$status" = 200 ] || fail "Query chain_id failed ($status): $reply"
 if [ -z "$nonce" ]; then nonce=$(( $(cat "$dir/committed") + 1 )); fi
-echo x >> "$dir/calls"
-tx=$(printf '%032x%032x' "$nonce" "$(wc -l < "$dir/calls")")
+# Like a Moonlight transaction's hash, it hashes what is signed: the same
+# call with the same nonce is the same transaction.
+tx=$(printf '%s|%s|%s|%s|%s|%s|%s' "$key" "$contract" "$nonce" "$gas_price" "$gas_limit" "$fn" "$args" \
+  | sha256sum | cut -c1-64)
 mode=""
 if [ -f "$dir/mode-$nonce" ]; then mode="$(cat "$dir/mode-$nonce")"; rm -f "$dir/mode-$nonce"; fi
 if [ "$mode" = gate ]; then
@@ -788,7 +793,7 @@ impl Node {
     pub fn start_with(pipelines: bool, finality_lag: Option<u64>) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let dir = directory.path().to_path_buf();
-        for file in ["calls", "invocations", "words"] {
+        for file in ["invocations", "words"] {
             std::fs::write(dir.join(file), "").unwrap();
         }
         if pipelines {

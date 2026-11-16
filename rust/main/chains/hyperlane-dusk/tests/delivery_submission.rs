@@ -1346,13 +1346,16 @@ async fn a_batch_sends_nothing_past_its_deadline_whatever_the_helper_or_the_node
 /// The stand-in sends its transaction only on the word `send`, which it
 /// reads once it has printed the hash. A relayer that dies leaves it with a
 /// closed stdin, and one that writes anything else gets nothing sent
-/// either: it says so, as dusk-tx does.
+/// either: it says so, as dusk-tx does. Like a Moonlight transaction's, its
+/// hash is that of what it signs, so the same call signs the same
+/// transaction each time.
 #[test]
 fn the_helper_sends_only_on_the_word_to_send() {
     use std::io::{BufRead, BufReader, Write};
     use std::process::{Command, Stdio};
 
     let node = Node::start(false);
+    let mut hashes = Vec::new();
     for (word, sent) in [(None, false), (Some("nope"), false), (Some("send"), true)] {
         let mut helper = Command::new(node.helper())
             .args([
@@ -1388,6 +1391,7 @@ fn the_helper_sends_only_on_the_word_to_send() {
             line.clear();
             assert!(stderr.read_line(&mut line).unwrap() > 0, "no hash printed");
         }
+        hashes.push(line.trim_start()["Prepared TX ".len()..][..64].to_owned());
         if let Some(word) = word {
             writeln!(stdin, "{word}").unwrap();
         }
@@ -1400,6 +1404,8 @@ fn the_helper_sends_only_on_the_word_to_send() {
         assert_eq!(node.propagated().len(), usize::from(sent), "{word:?}");
     }
     assert_eq!(node.words(), ["1 <eof>", "1 nope", "1 send"]);
+    assert!(hashes.iter().all(|hash| *hash == hashes[0]), "{hashes:?}");
+    assert_eq!(node.included()[0].tx.id, hashes[0]);
 }
 
 /// A delivery's transaction is kept before the node sees any of it: when
