@@ -278,6 +278,42 @@ how to run the local bridge.
   submission passed and before the helper read the account's nonce: the
   helper signed the next nonce, and a second transaction landed and failed,
   paying its whole gas limit.
+- **Known issue of deliveries one at a time: a dropped transaction can
+  land after its message went again.** A kept transaction that is in
+  neither the node's mempool nor a block 60 s after it was prepared is
+  forgotten, and the next submission has `dusk-tx` sign the message again
+  with the account's nonce plus one. A signed Moonlight transaction does
+  not expire, though, so this can cost one failed transaction when all of
+  these happen:
+  1. a delivery's transaction M, with nonce n, reached the network while
+     another transaction of the relayer's key, A with nonce n−1, was in a
+     block that was not final yet;
+  2. that block was rolled back: A went back into the mempool, ahead of M,
+     whose outcome the relayer did not know, and the account's nonce went
+     back below n−1;
+  3. the relayer's node then dropped A, and M with it, as Rusk drops an
+     account's later nonces with the one it evicts, while another node
+     kept M;
+  4. M's message was submitted again more than 60 s after M was prepared:
+     M is in neither the node's mempool nor a block, so the relayer forgets
+     it, and `dusk-tx` signs the message again with nonce n−1, which lands
+     and delivers it.
+
+  The node that kept M can then put it in a block, or hand it back to the
+  relayer's node: nonce n is now the account's next, so M lands and fails,
+  the message being delivered, and pays its whole gas limit (the
+  delivery's, at most `gasLimit`), which no outcome reports to the
+  relayer. The recipient cannot run twice: the Mailbox delivers a message
+  once. Signing the message again with M's nonce instead would need that
+  nonce, which `dusk-tx` chooses and does not report before it sends, and
+  a transaction for every nonce below it that nothing else fills, or the
+  signer would wait on that gap for good. The fix, needed before mainnet:
+  keep each delivery's nonce and signed transaction until a transaction
+  with that nonce is in a final block, and send that same transaction
+  again when it was dropped, filling any free nonce below it (the
+  pipelined path's reservations, once their own known issues are fixed),
+  or a Rusk transaction expiry that lets a dropped transaction be waited
+  out for good.
 - **Waiting for a block.** The node builds a block from what its mempool
   holds when the block's round starts, so a transaction it admits is in a
   block 10 to 20 s later on a 10 s chain. `dusk-tx` waits for a delivery
@@ -373,7 +409,8 @@ how to run the local bridge.
 - **Known issues of pipelined deliveries.** The last review of the
   pipelined path found six faults that are not fixed. **Do not enable
   `pipelineDeliveries` on a public network until they are.** The default,
-  one delivery at a time, has none of them.
+  one delivery at a time, has none of them; its own known issue is listed
+  above.
   1. *Switching pipelining off forgets transactions that can still land.*
      A reservation whose transactions are in neither the mempool nor a
      block, past the 60 s drop grace and with its nonce unused, is
