@@ -71,8 +71,9 @@ pub async fn dusk_tx_call(
 
 /// `dusk_tx_call`, whose transaction the helper sends only once `keep` has
 /// kept its hash (`--ack-before-send`). The helper prints
-/// `Prepared TX <hash>;` once it has signed the transaction and waits for
-/// a word on its stdin: `keep` is called with that hash, and only once it
+/// `Prepared TX <hash>; nonce <N>; ...` once it has signed the transaction
+/// and waits for a word on its stdin: `keep` is called with that hash and
+/// nonce (none from a helper before it named it), and only once it
 /// succeeds does the agent write `send`, which lets the helper preverify
 /// and propagate the transaction. When `keep` fails, the agent closes the
 /// helper's stdin instead, so the helper sends nothing and the call fails
