@@ -843,6 +843,92 @@ impl DuskMailbox {
         }
     }
 
+    /// Wait out the deliveries a pipelined run of this signer left in
+    /// flight, before a delivery goes one at a time: fails, and the relayer
+    /// tries again later, while one of them may still be admitted ahead of
+    /// it. Nothing is read from the node, and nothing changes how the
+    /// delivery is signed, when there are none: only `dusk-tx` chooses the
+    /// nonce of a delivery sent one at a time.
+    ///
+    /// The node's last final block is read first, then the account, then
+    /// each transaction. A delivery whose transaction is in a final block
+    /// is forgotten. So is one whose transaction is in neither the mempool
+    /// nor a block while the account has used its nonce, or after
+    /// `SubmissionLimits::drop_grace` with its nonce unused and not held by
+    /// the mempool: nothing of it can be admitted any more. One whose
+    /// transaction is in a block that is not final yet is kept until it
+    /// is, but holds nothing up: `dusk-tx` signs above its nonce, and a
+    /// rollback puts it back into the mempool, where the node refuses
+    /// another transaction of its nonce. One that may still be admitted
+    /// holds every delivery back: its transaction is in the mempool, it was
+    /// sent within the drop grace, the mempool holds its nonce for a
+    /// transaction it does not name, or it cannot be looked up.
+    async fn wait_out_pipelined(&self, signer: &DuskSigner) -> ChainResult<()> {
+        let key = signer_key(signer);
+        // A record that does not decode holds everything back: its nonce
+        // and transaction are unknown.
+        let leftovers = self.rues.sent_deliveries(&key)?;
+        if leftovers.is_empty() {
+            return Ok(());
+        }
+        let finalized = self.rues.block_pair().await?.finalized();
+        let account = self.rues.account_status(&signer.address_string()).await?;
+        let now = unix_millis();
+        let grace = u64::try_from(self.limits.drop_grace.as_millis()).unwrap_or(u64::MAX);
+        let mut live = 0usize;
+        for (message_id, sent) in leftovers {
+            let status = match sent.tx_id {
+                Some(tx_id) => Some(self.rues.transaction_status(&hex::encode(tx_id)).await.ok()),
+                None => None,
+            };
+            let gone = match status {
+                Some(Some(TransactionStatus::Included { block_height, .. })) => {
+                    if block_height > finalized {
+                        continue;
+                    }
+                    true
+                }
+                Some(Some(TransactionStatus::Pending) | None) => false,
+                Some(Some(TransactionStatus::Unknown)) | None => {
+                    sent.nonce <= account.nonce
+                        || (sent.nonce >= account.next_nonce
+                            && now.saturating_sub(sent.sent_at) >= grace)
+                }
+            };
+            if gone {
+                debug!(
+                    ?message_id,
+                    nonce = sent.nonce,
+                    "Dusk delivery a pipelined run left in flight can no longer be admitted; forgetting it"
+                );
+                self.release_nonce(&key, message_id);
+            } else {
+                live += 1;
+            }
+        }
+        if live == 0 {
+            return Ok(());
+        }
+        warn!(
+            live,
+            "Dusk deliveries a pipelined run left in flight may still be admitted; deliveries one at a time wait until they are in blocks or gone"
+        );
+        Err(HyperlaneDuskError::Other(format!(
+            "{live} Dusk deliveries a pipelined run of this signer left in flight may still be admitted; the next delivery goes once they are in blocks or gone"
+        ))
+        .into())
+    }
+
+    /// How many deliveries of the signer the event store keeps in flight,
+    /// for tests.
+    #[doc(hidden)]
+    pub fn deliveries_in_flight(&self) -> ChainResult<usize> {
+        let Some(signer) = &self.signer else {
+            return Ok(0);
+        };
+        Ok(self.rues.sent_deliveries(&signer_key(signer))?.len())
+    }
+
     /// Submit one delivery, one at a time, as Dusk relayers always have:
     /// `dusk-tx` signs it with the account's nonce plus one, as the node
     /// reports it, sends it and waits for its block. No nonce is chosen or
@@ -1723,6 +1809,7 @@ impl Mailbox for DuskMailbox {
                 .process_pipelined(signer, message.id(), &args, gas_limit)
                 .await;
         }
+        self.wait_out_pipelined(signer).await?;
         self.process_one(signer, &args, gas_limit).await
     }
 

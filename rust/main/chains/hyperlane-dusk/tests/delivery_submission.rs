@@ -585,3 +585,190 @@ async fn a_signer_keeps_a_bounded_number_of_deliveries_outstanding() {
     node.settle(8).await;
     std::env::remove_var("DUSK_TX_BIN");
 }
+
+/// Whether a call after the first `calls` signed with a nonce the agent
+/// chose.
+fn chose_a_nonce_since(node: &Node, calls: usize) -> bool {
+    node.invocations()[calls..]
+        .iter()
+        .any(|call| call.contains("--nonce") || call.contains("--no-wait"))
+}
+
+#[tokio::test]
+async fn one_at_a_time_waits_out_deliveries_a_pipelined_run_left_in_flight() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start(true);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let store = tempfile::tempdir().unwrap();
+    let deliveries: Vec<_> = (0..4).map(delivery).collect();
+    node.pause(true);
+    let pipelined = node
+        .durable_mailbox(store.path(), true)
+        .with_submission_limits(patient(64));
+    pipelined
+        .process_deliveries(&deliveries[..3])
+        .await
+        .unwrap();
+    assert_eq!(node.propagated(), [1, 2, 3]);
+    drop(pipelined);
+    node.restart(store.path());
+
+    // The relayer comes back with pipelining off. While the pipelined
+    // transactions wait in the mempool, neither a delivery that run sent
+    // nor a new one goes.
+    let relayer = node
+        .durable_mailbox(store.path(), false)
+        .with_submission_limits(patient(64));
+    let calls = node.invocations().len();
+    for (message, metadata, gas_limit) in [&deliveries[1], &deliveries[3]] {
+        let error = relayer
+            .process(message, metadata, *gas_limit)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("pipelined run"), "{error}");
+    }
+    assert_eq!(node.invocations().len(), calls);
+    assert_eq!(node.propagated(), [1, 2, 3]);
+    assert_eq!(relayer.deliveries_in_flight().unwrap(), 3);
+
+    // Once they are in final blocks, deliveries go one at a time again,
+    // each signed by dusk-tx, and nothing is kept in flight.
+    node.pause(false);
+    node.wait_until_final(3).await;
+    node.expire_block_pair().await;
+    let (message, metadata, gas_limit) = &deliveries[3];
+    let outcome = relayer
+        .process(message, metadata, *gas_limit)
+        .await
+        .unwrap();
+    assert!(outcome.executed);
+    assert_eq!(node.propagated(), [1, 2, 3, 4]);
+    assert!(!chose_a_nonce_since(&node, calls));
+    assert_eq!(relayer.deliveries_in_flight().unwrap(), 0);
+    node.settle(4).await;
+    drop(relayer);
+    node.restart(store.path());
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+#[tokio::test]
+async fn deliveries_the_mempool_dropped_hold_up_one_at_a_time_delivery_only_briefly() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start(true);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let store = tempfile::tempdir().unwrap();
+    let deliveries: Vec<_> = (0..2).map(delivery).collect();
+    // Deliveries in neither the mempool nor a block count as dropped after
+    // a second, and a batch waits 100 ms for its blocks.
+    let limits = SubmissionLimits {
+        receipt: Duration::from_millis(100),
+        drop_grace: Duration::from_secs(1),
+        ..SubmissionLimits::default()
+    };
+    node.pause(true);
+    let pipelined = node
+        .durable_mailbox(store.path(), true)
+        .with_submission_limits(limits);
+    pipelined.process_deliveries(&deliveries).await.unwrap();
+    // The mempool drops both, and the relayer comes back with pipelining
+    // off.
+    node.evict_from(1);
+    drop(pipelined);
+    node.restart(store.path());
+    let relayer = node
+        .durable_mailbox(store.path(), false)
+        .with_submission_limits(limits);
+    let calls = node.invocations().len();
+    // Within the drop grace they may still be on their way to the mempool.
+    let (message, metadata, gas_limit) = &deliveries[0];
+    let error = relayer
+        .process(message, metadata, *gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("pipelined run"), "{error}");
+    // After it, nothing of them can be admitted: they are forgotten, and
+    // the deliveries go one at a time, with the nonces dusk-tx reads.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    node.pause(false);
+    one_by_one(&relayer, &deliveries).await;
+    assert_eq!(node.propagated(), [1, 2, 1, 2]);
+    assert!(!chose_a_nonce_since(&node, calls));
+    assert_eq!(relayer.deliveries_in_flight().unwrap(), 0);
+    node.settle(2).await;
+    drop(relayer);
+    node.restart(store.path());
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+#[tokio::test]
+async fn a_pipelined_delivery_in_a_block_that_is_not_final_holds_nothing_up() {
+    let _env = HELPER_ENV.lock().await;
+    // Finality moves only by hand.
+    let node = Node::start_with(true, None);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let store = tempfile::tempdir().unwrap();
+    let deliveries: Vec<_> = (0..3).map(delivery).collect();
+    let start = node.height();
+    let pipelined = node
+        .durable_mailbox(store.path(), true)
+        .with_submission_limits(patient(64));
+    pipelined
+        .process_deliveries(&deliveries[..1])
+        .await
+        .unwrap();
+    node.wait_until("the pipelined delivery is in a block", |model| {
+        model.nonce == 1
+    })
+    .await;
+    drop(pipelined);
+    node.restart(store.path());
+
+    // Its block is not final: it is kept, but the next delivery goes one
+    // at a time at once, above its nonce.
+    let relayer = node
+        .durable_mailbox(store.path(), false)
+        .with_submission_limits(patient(64));
+    let calls = node.invocations().len();
+    let (message, metadata, gas_limit) = &deliveries[1];
+    assert!(
+        relayer
+            .process(message, metadata, *gas_limit)
+            .await
+            .unwrap()
+            .executed
+    );
+    assert_eq!(node.propagated(), [1, 2]);
+    assert_eq!(relayer.deliveries_in_flight().unwrap(), 1);
+
+    // A rollback puts both back into the mempool; the chain takes them
+    // again in nonce order, and each message is delivered once.
+    node.rollback_to(start);
+    node.settle(2).await;
+    assert_eq!(
+        node.included()
+            .iter()
+            .map(|tx| tx.tx.nonce)
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+    // Once its block is final, it is forgotten.
+    let height = node.height();
+    node.finalize_to(height);
+    node.expire_block_pair().await;
+    let (message, metadata, gas_limit) = &deliveries[2];
+    assert!(
+        relayer
+            .process(message, metadata, *gas_limit)
+            .await
+            .unwrap()
+            .executed
+    );
+    assert_eq!(relayer.deliveries_in_flight().unwrap(), 0);
+    assert!(!chose_a_nonce_since(&node, calls));
+    node.settle(3).await;
+    drop(relayer);
+    node.restart(store.path());
+    std::env::remove_var("DUSK_TX_BIN");
+}

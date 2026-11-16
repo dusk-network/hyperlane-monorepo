@@ -921,6 +921,17 @@ impl Node {
         }
     }
 
+    /// Wait until a final block holds the account's transaction of
+    /// `nonce`.
+    pub async fn wait_until_final(&self, nonce: u64) {
+        self.wait_until(&format!("nonce {nonce} is in a final block"), |model| {
+            model.blocks.iter().any(|(height, block)| {
+                *height <= model.finalized && block.txs.iter().any(|tx| tx.tx.nonce == nonce)
+            })
+        })
+        .await;
+    }
+
     /// Wait until blocks hold `count` transactions, then a few blocks more,
     /// and check that no message was delivered by more than one
     /// transaction.
@@ -958,6 +969,15 @@ impl Node {
             RuesClient::new_with_event_cursor_dir(self.url.clone(), store.to_path_buf()).unwrap(),
         );
         mailbox(rues, &self.url, store, pipelined)
+    }
+
+    /// Make the agent read the tip and the last final block again at its
+    /// next request, as if a tick had passed.
+    pub async fn expire_block_pair(&self) {
+        RuesClient::new(self.url.clone())
+            .unwrap()
+            .expire_block_pair()
+            .await;
     }
 
     /// Close the event store at `store`, as the agent's exit does.
