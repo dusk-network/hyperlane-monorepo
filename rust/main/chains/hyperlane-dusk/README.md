@@ -275,8 +275,8 @@ how to run the local bridge.
   `call --help`, once per process), pipelines: the relayer submits a batch
   of deliveries as consecutive transactions of its account, each once the
   node holds the one before, and they share a block. A configuration that
-  only sets `maxBatchSize`, as the deploy scripts write it, delivers one at
-  a time. The agent logs the mode once at startup. **While it pipelines, a
+  only sets `maxBatchSize` delivers one at a time; the deploy scripts write
+  neither setting. The agent logs the mode once at startup. **While it pipelines, a
   relayer must be the only process that signs with its key on that chain:
   no other relayer, validator or wallet may use the key.** One that finds a
   nonce it holds used by a transaction it did not sign logs a critical
@@ -497,8 +497,6 @@ how to run the local bridge.
   "contractQueriesPerSecond": 100,
   "contractQueryBurst": 20,
   "batchContractAddress": "0x93de287b7d349d678a0038fe7772e8960e1a84a1b5da2d0b1f62f532616ce1d4",
-  "maxBatchSize": 16,
-  "pipelineDeliveries": false,
   "mailbox": "0x<contract id>",
   "interchainGasPaymaster": "0x<contract id>",
   "validatorAnnounce": "0x<contract id>",
@@ -530,7 +528,8 @@ so a local chain that deploys the published Wasm with nonce 0 and the
 published owner gets the same ID. It has no default: without it, every read
 is one query.
 
-`pipelineDeliveries` (false by default) opts the chain into pipelined
+`pipelineDeliveries` (false by default, left out above, as the deploy
+scripts leave it and `maxBatchSize` out) opts the chain into pipelined
 deliveries, which are experimental. Only with it and a `maxBatchSize` (1 by
 default) above 1 does the relayer submit up to `maxBatchSize` prepared
 deliveries together, as consecutive transactions (see Pipelined
