@@ -527,12 +527,11 @@ impl DuskMailbox {
     /// Submit one delivery of `message`, one at a time, as Dusk relayers
     /// always have: `dusk-tx` signs it with the account's nonce plus one, as
     /// the node reports it, sends it and waits for its block. No nonce is
-    /// chosen or kept here. While an earlier transaction of the signer is
-    /// in the mempool, the node refuses another with its nonce at
-    /// preverification, so a delivery submitted again while its first
-    /// transaction waits is refused, and at most one of them can be in a
-    /// block. When the helper's outcome is unknown, the transaction it
-    /// prepared is followed by its exact hash.
+    /// chosen here. While an earlier transaction of the signer is in the
+    /// mempool, the node refuses another with its nonce at preverification,
+    /// so at most one transaction of a nonce can be in a block. When the
+    /// helper's outcome is unknown, the transaction it prepared is followed
+    /// by its exact hash.
     ///
     /// That hash is kept for the message as soon as the helper prints it,
     /// before it propagates the transaction, and a delivery submitted again
@@ -601,8 +600,15 @@ impl DuskMailbox {
             }
             Err(error @ HyperlaneDuskError::NotSubmitted(_)) => {
                 // Nothing of it reached the node, so there is nothing to
-                // follow.
-                self.rues.forget_prepared_delivery(&key, message)?;
+                // follow. Kept, it would only hold the next submission back
+                // for the drop grace.
+                if let Err(forget) = self.rues.forget_prepared_delivery(&key, message) {
+                    debug!(
+                        message_id = ?message,
+                        error = %bounded_error(&forget),
+                        "Failed to forget the transaction of a Dusk delivery the node refused"
+                    );
+                }
                 return Err(error.into());
             }
             Err(error) => return Err(error.into()),
