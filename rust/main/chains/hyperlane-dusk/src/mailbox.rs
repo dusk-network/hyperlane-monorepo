@@ -775,10 +775,11 @@ impl DuskMailbox {
     /// signed only once the one before has left the mempool, so the latest
     /// is the one that may still be in it. It is looked up once: a
     /// transaction whose outcome was reported, or found out of the mempool,
-    /// is not looked up again. Waits at most `SubmissionLimits::receipt`,
-    /// lookups included, then fails, signing nothing, and the relayer tries
-    /// again later.
+    /// is not looked up again. Waits at most `SubmissionLimits::receipt`
+    /// from its call, the scan of kept transactions and lookups included,
+    /// then fails, signing nothing, and the relayer tries again later.
     async fn wait_for_signer(&self, signer: &DuskSigner, message: H256) -> ChainResult<()> {
+        let deadline = tokio::time::Instant::now() + self.limits.receipt;
         let key = signer_key(signer);
         let latest = self
             .rues
@@ -799,7 +800,6 @@ impl DuskMailbox {
             return Ok(());
         }
         let tx_id = hex::encode(delivery.tx_id);
-        let deadline = tokio::time::Instant::now() + self.limits.receipt;
         let busy = || -> ChainCommunicationError {
             HyperlaneDuskError::Other(format!(
                 "The Dusk signer's transaction {tx_id}, kept for message {other:?}, is still in the mempool, or could not be looked up in time; the delivery of message {message:?} goes once it has left it"
