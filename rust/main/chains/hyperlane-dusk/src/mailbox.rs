@@ -776,7 +776,8 @@ impl DuskMailbox {
     /// is the one that may still be in it. It is looked up once: a
     /// transaction whose outcome was reported, or found out of the mempool,
     /// is not looked up again. Waits at most `SubmissionLimits::receipt`,
-    /// then fails, signing nothing, and the relayer tries again later.
+    /// lookups included, then fails, signing nothing, and the relayer tries
+    /// again later.
     async fn wait_for_signer(&self, signer: &DuskSigner, message: H256) -> ChainResult<()> {
         let key = signer_key(signer);
         let latest = self
@@ -799,9 +800,21 @@ impl DuskMailbox {
         }
         let tx_id = hex::encode(delivery.tx_id);
         let deadline = tokio::time::Instant::now() + self.limits.receipt;
+        let busy = || -> ChainCommunicationError {
+            HyperlaneDuskError::Other(format!(
+                "The Dusk signer's transaction {tx_id}, kept for message {other:?}, is still in the mempool, or could not be looked up in time; the delivery of message {message:?} goes once it has left it"
+            ))
+            .into()
+        };
         let mut waited = false;
         loop {
-            if self.rues.transaction_status(&tx_id).await? != TransactionStatus::Pending {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(busy());
+            }
+            let status = tokio::time::timeout_at(deadline, self.rues.transaction_status(&tx_id))
+                .await
+                .map_err(|_| busy())??;
+            if status != TransactionStatus::Pending {
                 self.settle(delivery.tx_id);
                 return Ok(());
             }
@@ -815,12 +828,6 @@ impl DuskMailbox {
                 waited = true;
             }
             let now = tokio::time::Instant::now();
-            if now >= deadline {
-                return Err(HyperlaneDuskError::Other(format!(
-                    "The Dusk signer's transaction {tx_id}, kept for message {other:?}, is still in the mempool; the delivery of message {message:?} goes once it has left it"
-                ))
-                .into());
-            }
             tokio::time::sleep_until((now + self.limits.block / 2).min(deadline)).await;
         }
     }

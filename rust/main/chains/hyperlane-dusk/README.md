@@ -243,11 +243,13 @@ how to run the local bridge.
   way: the next one reaches the node after the next block's round has
   started. Before a delivery is simulated and signed, it waits for the
   transaction kept for the signer's latest delivery of another message to
-  leave the mempool, for at most the 120 s receipt wait, signing nothing
-  meanwhile: that transaction holds the nonce the helper would sign with,
-  and a relayer restarted while one waited there used to sign every other
-  ready message with it, each refused at preverification with an error. Only
-  that transaction is looked up, and only until its outcome is known.
+  leave the mempool, for at most the 120 s receipt wait, lookups included,
+  signing nothing meanwhile (a lookup the node has not answered by then is
+  given up, and the delivery fails, to be tried again): that transaction
+  holds the nonce the helper would sign with, and a relayer restarted while
+  one waited there used to sign every other ready message with it, each
+  refused at preverification with an error. Only that transaction is looked
+  up, and only until its outcome is known.
 - **A delivery's transaction is kept before it is sent, until the delivery
   is done.** The helper signs the transaction, prints its hash, and waits
   for the agent's word before it preverifies and propagates it

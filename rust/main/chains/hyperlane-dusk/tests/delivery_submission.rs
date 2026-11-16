@@ -2406,3 +2406,112 @@ async fn deliveries_wait_for_the_signers_transaction_in_flight_after_a_restart()
     node.restart(store.path());
     std::env::remove_var("DUSK_TX_BIN");
 }
+
+/// A Mailbox that submits one at a time, waiting at most `budget` for the
+/// signer's transaction in flight, and the transaction of a first delivery
+/// it keeps, waiting in the mempool of a node whose blocks hold nothing.
+async fn wait_behind_one_in_the_mempool(
+    budget: Duration,
+) -> (Node, hyperlane_dusk::DuskMailbox, String) {
+    let node = Node::start(false);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    node.helper_waits(10);
+    let mailbox = node
+        .mailbox(false)
+        .with_submission_limits(SubmissionLimits {
+            receipt: budget,
+            ..patient(64)
+        });
+    node.pause(true);
+    let (message, metadata, gas_limit) = delivery(0);
+    let error = mailbox
+        .process(&message, &metadata, gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("to be included"), "{error}");
+    let kept = node.model().mempool[&1].id.clone();
+    (node, mailbox, kept)
+}
+
+/// A delivery behind the signer's transaction in the mempool waits for it
+/// `SubmissionLimits::receipt`, lookups included, and no longer: behind one
+/// that stays there, it fails then, signing nothing, and goes once that one
+/// has landed.
+#[tokio::test]
+async fn a_delivery_behind_a_transaction_that_stays_in_the_mempool_waits_its_budget_only() {
+    let _env = HELPER_ENV.lock().await;
+    let budget = Duration::from_secs(1);
+    let (node, mailbox, _) = wait_behind_one_in_the_mempool(budget).await;
+    let calls = node.invocations().len();
+    let (message, metadata, gas_limit) = delivery(1);
+    let started = std::time::Instant::now();
+    let error = mailbox
+        .process(&message, &metadata, gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    let waited = started.elapsed();
+    assert!(
+        error.contains("is still in the mempool, or could not be looked up in time"),
+        "{error}"
+    );
+    assert!(
+        waited >= budget && waited < budget + Duration::from_millis(300),
+        "waited {waited:?}"
+    );
+    assert_eq!(node.invocations().len(), calls);
+    node.pause(false);
+    deliver(&mailbox, &(message, metadata, gas_limit)).await;
+    node.settle(2).await;
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+/// The review's case (w14): the wait's lookup of the signer's transaction
+/// in flight is answered only past the wait's deadline, and says it landed.
+/// The wait used to take that answer however late, and sign the delivery
+/// then; behind a node that stalls, it waited as long as the node did. It
+/// now ends at its deadline, signing nothing, and the delivery goes when
+/// the relayer tries it again.
+#[tokio::test]
+async fn the_signer_wait_ends_at_its_deadline_while_a_lookup_goes_unanswered() {
+    let _env = HELPER_ENV.lock().await;
+    let budget = Duration::from_secs(1);
+    let (node, mailbox, kept) = wait_behind_one_in_the_mempool(budget).await;
+    let calls = node.invocations().len();
+    let gate = std::sync::Arc::new(Gate::default());
+    node.inject(Route::Graphql, None, Fault::Hold(gate.clone()));
+    let (message, metadata, gas_limit) = delivery(1);
+    let started = tokio::time::Instant::now();
+    let waiting = tokio::spawn({
+        let mailbox = mailbox.clone();
+        let (message, metadata) = (message.clone(), metadata.clone());
+        async move { mailbox.process(&message, &metadata, gas_limit).await }
+    });
+    node.wait_until("the lookup reaches the node", |_| {
+        gate.waiting.load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+    // Meanwhile the transaction lands, as the held lookup would answer.
+    node.pause(false);
+    node.wait_until("the kept transaction is in a block", |model| {
+        model.included(&kept).is_some()
+    })
+    .await;
+    let ended =
+        tokio::time::timeout_at(started + budget + Duration::from_millis(300), waiting).await;
+    gate.open();
+    let error = ended
+        .expect("the wait outlived its deadline")
+        .unwrap()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("is still in the mempool, or could not be looked up in time"),
+        "{error}"
+    );
+    assert_eq!(node.invocations().len(), calls);
+    deliver(&mailbox, &(message, metadata, gas_limit)).await;
+    node.settle(2).await;
+    std::env::remove_var("DUSK_TX_BIN");
+}
