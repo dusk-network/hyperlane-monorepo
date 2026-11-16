@@ -30,7 +30,7 @@ use super::*;
 const PREPARED_DELIVERY_PREFIX: &[u8] = b"dusk-prepared-delivery-v1:";
 /// Bytes of an encoded prepared delivery: when it was prepared, its
 /// transaction, and whether its failure was reported. One kept before
-/// that flag lacks its byte, and reads as not reported.
+/// that flag lacks its byte, and reads as reported.
 const PREPARED_DELIVERY_BYTES: usize = 8 + 32 + 1;
 /// Most deliveries sent one at a time whose transaction a signer keeps by
 /// default (`SubmissionLimits::prepared`): past it, only those whose
@@ -65,8 +65,14 @@ impl PreparedDelivery {
         let prepared_at = fields.u64()?;
         let tx_id = fields.hash()?;
         let failure_reported = match fields.0 {
-            // Kept before the flag.
-            [] => false,
+            // Kept before the flag, by a build of 2026-11-16 before
+            // c28d00d47b: no released relayer wrote one. That build
+            // reported a failure it saw at once and kept the record, so
+            // the relayer may have charged it already, and upstream adds
+            // up the gas of every outcome reported. Read as reported, the
+            // record is never charged twice; the cost is at most one late
+            // failure's gas left uncharged.
+            [] => true,
             [0] => false,
             [1] => true,
             _ => return None,
@@ -900,11 +906,12 @@ mod tests {
             };
             assert_eq!(PreparedDelivery::decode(&delivery.encode()), Some(delivery));
             let encoded = delivery.encode();
-            // One kept before the flag reads as not reported.
+            // One kept before the flag reads as reported, so it is never
+            // charged twice.
             assert_eq!(
                 PreparedDelivery::decode(&encoded[..40]),
                 Some(PreparedDelivery {
-                    failure_reported: false,
+                    failure_reported: true,
                     ..delivery
                 })
             );
