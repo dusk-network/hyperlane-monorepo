@@ -1748,9 +1748,9 @@ async fn a_transaction_that_failed_after_its_submission_returned_is_reported_wit
         .to_string();
     assert!(error.contains("to be included"), "{error}");
     let first = node.model().mempool[&1].id.clone();
-    // Another relayer's delivery lands first, so ours fails in its block,
-    // which becomes final; then that delivery does not count after all.
-    node.deliver_elsewhere(&delivery);
+    // Meanwhile the recipient started to revert: the transaction fails in
+    // its block, which becomes final, and the message stays undelivered.
+    node.recipient_reverts(&delivery, true);
     node.pause(false);
     node.wait_until("the first transaction is in a block", |model| {
         model.included(&first).is_some()
@@ -1759,8 +1759,9 @@ async fn a_transaction_that_failed_after_its_submission_returned_is_reported_wit
     let height = node.height();
     node.finalize_to(height);
     node.expire_block_pair().await;
-    node.undeliver(&delivery);
-    // Submitted again, the delivery reports that failure and sends nothing.
+    // Once the recipient takes it again, the relayer submits the delivery
+    // again: it reports that failure and sends nothing.
+    node.recipient_reverts(&delivery, false);
     let calls = node.invocations().len();
     let outcome = mailbox
         .process(message, metadata, *gas_limit)

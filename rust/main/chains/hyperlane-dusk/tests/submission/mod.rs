@@ -20,7 +20,8 @@
 //! - A block holds the consecutive nonces, from the account's next one,
 //!   that the mempool held when the block before it came, as Rusk builds a
 //!   candidate when its round starts. A transaction that delivers a message
-//!   a block already delivered fails and pays its whole gas limit.
+//!   a block already delivered fails and pays its whole gas limit, and so
+//!   does one whose recipient reverts, which leaves the message undelivered.
 //! - Finality advances on its own, `finality_lag` blocks behind the tip, or
 //!   by hand; a rollback reverts the blocks above a height that is not
 //!   final, restores the account's nonce and puts their transactions back
@@ -212,6 +213,9 @@ pub struct Model {
     pub nonce: u64,
     /// The `process` arguments delivered at the tip, by hex.
     delivered: HashSet<String>,
+    /// The `process` arguments whose recipient reverts, by hex: their
+    /// simulation and their transactions fail, and nothing is delivered.
+    reverting: HashSet<String>,
     pub mempool: BTreeMap<u64, Tx>,
     /// What the mempool held when the last block came: the next block's
     /// candidate.
@@ -236,6 +240,7 @@ impl Model {
             finality_lag,
             nonce: 0,
             delivered: HashSet::new(),
+            reverting: HashSet::new(),
             mempool: BTreeMap::new(),
             candidate: HashSet::new(),
             prequeue: BTreeMap::new(),
@@ -387,7 +392,9 @@ impl Model {
     }
 
     fn execute(&mut self, tx: Tx, height: u64) -> Included {
-        let error = if tx.delivers() && !self.delivered.insert(tx.args.clone()) {
+        let error = if tx.delivers() && self.reverting.contains(&tx.args) {
+            Some("Panic: the recipient reverted".to_owned())
+        } else if tx.delivers() && !self.delivered.insert(tx.args.clone()) {
             Some("Panic: message already delivered".to_owned())
         } else {
             None
@@ -1072,6 +1079,23 @@ impl Node {
         self.model().delivered.insert(process_args_hex(delivery));
     }
 
+    /// Make `delivery`'s recipient revert, or take it again: while it
+    /// reverts, the delivery's simulation fails, and so does a transaction
+    /// that delivers it, in its block, leaving it undelivered.
+    pub fn recipient_reverts(
+        &self,
+        delivery: &(HyperlaneMessage, Metadata, Option<U256>),
+        reverts: bool,
+    ) {
+        let args = process_args_hex(delivery);
+        let mut model = self.model();
+        if reverts {
+            model.reverting.insert(args);
+        } else {
+            model.reverting.remove(&args);
+        }
+    }
+
     /// Take back `deliver_elsewhere`: the message is not delivered at the
     /// tip, as if that delivery had not counted.
     pub fn undeliver(&self, delivery: &(HyperlaneMessage, Metadata, Option<U256>)) {
@@ -1224,7 +1248,12 @@ fn serve(
                     .into_bytes(),
             ),
             Route::Simulation => {
-                if model.delivered.contains(&hex::encode(&body)) {
+                if model.reverting.contains(&hex::encode(&body)) {
+                    (
+                        "500 Internal Server Error",
+                        b"the recipient reverted".to_vec(),
+                    )
+                } else if model.delivered.contains(&hex::encode(&body)) {
                     ("500 Internal Server Error", b"already delivered".to_vec())
                 } else {
                     // The encoding of `()`.
