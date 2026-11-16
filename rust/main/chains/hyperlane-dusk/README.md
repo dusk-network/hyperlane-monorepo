@@ -334,6 +334,20 @@ how to run the local bridge.
   (the pipelined path's reservations, once their own known issues are
   fixed), or a Rusk transaction expiry that lets a dropped transaction be
   waited out for good.
+- **Known issue of delivery gas accounting: a crash at one point leaves one
+  failure uncharged.** The relayer charges a delivery's gas to its message
+  at most once, never twice. Before `process` returns a failed outcome, the
+  agent notes on the delivery's kept transaction that its failure was
+  reported, so that it is never reported again; only then does the relayer
+  add that gas to the message's expenditure, in its own database. A relayer
+  that stops between the two, or whose write to that database fails (it logs
+  the error and goes on), leaves that failure's gas uncharged: at most one
+  failed attempt's gas, its whole gas limit, per crash at that exact point,
+  and the message's payment pays for one more attempt than it covers. A
+  record kept before the agent noted reported failures, which only builds of
+  2026-11-16 wrote, reads as reported for the same reason, at the same cost.
+  Charging exactly once would need both databases written together, or the
+  relayer to record expenditure by transaction; neither is done.
 - **Waiting for a block.** The node builds a block from what its mempool
   holds when the block's round starts, so a transaction it admits is in a
   block 10 to 20 s later on a 10 s chain. `dusk-tx` waits for a delivery
