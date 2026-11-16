@@ -568,7 +568,7 @@ impl DuskMailbox {
             }
         }
         self.room_for_prepared(&key, message).await?;
-        let keep = |tx_id: &str| -> Result<(), HyperlaneDuskError> {
+        let keep = |tx_id: &str, nonce: Option<u64>| -> Result<(), HyperlaneDuskError> {
             let tx_id = hex::decode(tx_id)
                 .ok()
                 .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
@@ -582,6 +582,7 @@ impl DuskMailbox {
                 tx_id,
                 prepared_at: unix_millis(),
                 failure_reported: false,
+                nonce,
             };
             self.rues
                 .keep_prepared_delivery(&key, message, &prepared, self.limits.prepared)
@@ -868,6 +869,19 @@ impl DuskMailbox {
     #[doc(hidden)]
     pub fn fail_prepared_writes(&self, keeps: usize, forgets: usize) {
         self.rues.fail_prepared_writes(keeps, forgets);
+    }
+
+    /// The nonce of the transaction kept for the last submission of
+    /// `message` one at a time, when the helper named it, for tests.
+    #[doc(hidden)]
+    pub fn prepared_nonce(&self, message: H256) -> ChainResult<Option<u64>> {
+        let Some(signer) = &self.signer else {
+            return Ok(None);
+        };
+        Ok(self
+            .rues
+            .prepared_delivery(&signer_key(signer), message)?
+            .and_then(|prepared| prepared.nonce))
     }
 
     /// The transaction kept for the last submission of `message` one at a

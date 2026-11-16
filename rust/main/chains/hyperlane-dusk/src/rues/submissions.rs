@@ -29,9 +29,11 @@ use super::*;
 /// time.
 const PREPARED_DELIVERY_PREFIX: &[u8] = b"dusk-prepared-delivery-v1:";
 /// Bytes of an encoded prepared delivery: when it was prepared, its
-/// transaction, and whether its failure was reported. One kept before
-/// that flag lacks its byte, and reads as reported.
-const PREPARED_DELIVERY_BYTES: usize = 8 + 32 + 1;
+/// transaction, whether its failure was reported, and the nonce it is
+/// signed with, when the helper named it. One kept before the nonce lacks
+/// its 8 bytes; one kept before the flag also lacks that byte, and reads
+/// as reported.
+const PREPARED_DELIVERY_BYTES: usize = 8 + 32 + 1 + 8;
 /// Most deliveries sent one at a time whose transaction a signer keeps by
 /// default (`SubmissionLimits::prepared`): past it, only those whose
 /// transactions are in final blocks are forgotten to make room, and
@@ -49,6 +51,10 @@ pub(crate) struct PreparedDelivery {
     /// Its failure in a block was reported to the relayer as an outcome,
     /// which charged the gas it spent to its message.
     pub failure_reported: bool,
+    /// The nonce it is signed with, which the helper names with its hash
+    /// (one from before it did names none): once the signer's account has
+    /// used it in a final block, the transaction can no longer execute.
+    pub nonce: Option<u64>,
 }
 
 impl PreparedDelivery {
@@ -57,6 +63,9 @@ impl PreparedDelivery {
         bytes.extend_from_slice(&self.prepared_at.to_be_bytes());
         bytes.extend_from_slice(&self.tx_id);
         bytes.push(u8::from(self.failure_reported));
+        if let Some(nonce) = self.nonce {
+            bytes.extend_from_slice(&nonce.to_be_bytes());
+        }
         bytes
     }
 
@@ -64,7 +73,12 @@ impl PreparedDelivery {
         let mut fields = Fields(bytes);
         let prepared_at = fields.u64()?;
         let tx_id = fields.hash()?;
-        let failure_reported = match fields.0 {
+        let (flag, nonce) = match fields.0.len() {
+            0 | 1 => (fields.0, None),
+            9 => (fields.take(1)?, Some(fields.u64()?)),
+            _ => return None,
+        };
+        let failure_reported = match flag {
             // Kept before the flag, by a build of 2026-11-16 before
             // c28d00d47b: no released relayer wrote one. That build
             // reported a failure it saw at once and kept the record, so
@@ -81,6 +95,7 @@ impl PreparedDelivery {
             tx_id,
             prepared_at,
             failure_reported,
+            nonce,
         })
     }
 }
@@ -898,20 +913,30 @@ mod tests {
 
     #[test]
     fn prepared_deliveries_round_trip_and_reject_corruption() {
-        for failure_reported in [false, true] {
+        for (failure_reported, nonce) in [(false, Some(u64::MAX)), (true, Some(0)), (false, None)] {
             let delivery = PreparedDelivery {
                 tx_id: [7; 32],
                 prepared_at: 1_700_000_000_000,
                 failure_reported,
+                nonce,
             };
             assert_eq!(PreparedDelivery::decode(&delivery.encode()), Some(delivery));
             let encoded = delivery.encode();
+            // Without the nonce it reads as one kept before the nonce was.
+            assert_eq!(
+                PreparedDelivery::decode(&encoded[..41]),
+                Some(PreparedDelivery {
+                    nonce: None,
+                    ..delivery
+                })
+            );
             // One kept before the flag reads as reported, so it is never
             // charged twice.
             assert_eq!(
                 PreparedDelivery::decode(&encoded[..40]),
                 Some(PreparedDelivery {
                     failure_reported: true,
+                    nonce: None,
                     ..delivery
                 })
             );
@@ -936,6 +961,7 @@ mod tests {
             tx_id: [tx; 32],
             prepared_at,
             failure_reported: false,
+            nonce: Some(prepared_at),
         };
         let directory = tempfile::tempdir().unwrap();
         let url = Url::parse("http://127.0.0.1:9/prepared-deliveries").unwrap();

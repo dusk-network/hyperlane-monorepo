@@ -119,9 +119,10 @@ pub(crate) async fn dusk_tx_call_kept(
     .await
 }
 
-/// What keeps the hash of the transaction the helper prepared, before the
-/// helper may send it.
-pub(crate) type Keep<'a> = dyn Fn(&str) -> Result<(), HyperlaneDuskError> + Sync + 'a;
+/// What keeps the hash of the transaction the helper prepared, with the
+/// nonce it is signed with when the helper names it, before the helper may
+/// send it.
+pub(crate) type Keep<'a> = dyn Fn(&str, Option<u64>) -> Result<(), HyperlaneDuskError> + Sync + 'a;
 
 /// A transaction the helper signed, which nothing has sent yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -700,11 +701,12 @@ struct HelperRun {
     word: Word,
 }
 
-/// Keep `tx_id` with `ack`'s `keep`, and only once that succeeds write the
-/// word that lets the helper send it. What the helper was told.
-async fn answer(ack: Ack<'_>, tx_id: &str) -> Word {
+/// Keep `tx_id`, signed with `nonce` when the helper named it, with
+/// `ack`'s `keep`, and only once that succeeds write the word that lets the
+/// helper send it. What the helper was told.
+async fn answer(ack: Ack<'_>, tx_id: &str, nonce: Option<u64>) -> Word {
     let Ack { mut stdin, keep } = ack;
-    if let Err(error) = keep(tx_id) {
+    if let Err(error) = keep(tx_id, nonce) {
         // Dropping stdin closes it: the helper sends nothing.
         return Word::Withheld(format!(
             "its hash could not be kept: {}",
@@ -758,11 +760,11 @@ async fn wait_for_child_output(
         loop {
             tokio::select! {
                 status = child.wait() => return status,
-                tx_id = &mut prepared_tx_receiver, if naming => {
+                prepared = &mut prepared_tx_receiver, if naming => {
                     naming = false;
-                    if let Ok(tx_id) = tx_id {
+                    if let Ok((tx_id, nonce)) = prepared {
                         if let Some(ack) = ack.take() {
-                            word = answer(ack, &tx_id).await;
+                            word = answer(ack, &tx_id, nonce).await;
                         }
                         prepared_tx_id = Some(tx_id);
                     }
@@ -791,7 +793,8 @@ async fn wait_for_child_output(
             let _ = child.kill().await;
             let _ = child.wait().await;
             drain_timed_out_readers(&mut stdout_task, &mut stderr_task).await;
-            let prepared_tx_id = prepared_tx_id.or_else(|| prepared_tx_receiver.try_recv().ok());
+            let prepared_tx_id = prepared_tx_id
+                .or_else(|| prepared_tx_receiver.try_recv().ok().map(|(tx_id, _)| tx_id));
             if let Word::Withheld(why) = word {
                 return Err(HyperlaneDuskError::NotSubmitted(format!(
                     "{detail}; it was not let send a transaction ({why}), so it sent none"
@@ -805,7 +808,8 @@ async fn wait_for_child_output(
     // A normal or signaled exit can interrupt the helper after propagation just
     // as a timeout can; the prepared hash remains authoritative in every case.
     let (stdout, stderr) = tokio::join!(stdout_task, stderr_task);
-    let prepared_tx_id = prepared_tx_id.or_else(|| prepared_tx_receiver.try_recv().ok());
+    let prepared_tx_id =
+        prepared_tx_id.or_else(|| prepared_tx_receiver.try_recv().ok().map(|(tx_id, _)| tx_id));
     let stdout = stdout
         .map_err(|error| {
             helper_failure(
@@ -915,7 +919,7 @@ async fn drain_timed_out_readers(stdout: &mut PipeReader, stderr: &mut PipeReade
 async fn read_bounded_stream(
     reader: impl AsyncRead + Unpin,
     stream_name: &'static str,
-    mut prepared_tx_sender: Option<oneshot::Sender<String>>,
+    mut prepared_tx_sender: Option<oneshot::Sender<(String, Option<u64>)>>,
 ) -> Result<Vec<u8>, HyperlaneDuskError> {
     let mut reader = reader.take((MAX_DUSK_TX_STREAM_BYTES + 1) as u64);
     let mut bytes = Vec::new();
@@ -925,13 +929,19 @@ async fn read_bounded_stream(
             HyperlaneDuskError::Other(format!("Failed to read dusk-tx {stream_name}: {error}"))
         })?;
         if count == 0 {
+            // Stderr closed: what came of the prepared line is all there is.
+            if let (Some(sender), Some(prepared)) =
+                (prepared_tx_sender.take(), prepared_tx(&bytes, true))
+            {
+                let _ = sender.send(prepared);
+            }
             return Ok(bytes);
         }
         bytes.extend_from_slice(&chunk[..count]);
         if prepared_tx_sender.is_some() {
-            if let Some(tx_id) = prepared_tx_id(&bytes) {
+            if let Some(prepared) = prepared_tx(&bytes, false) {
                 if let Some(sender) = prepared_tx_sender.take() {
-                    let _ = sender.send(tx_id);
+                    let _ = sender.send(prepared);
                 }
             }
         }
@@ -943,14 +953,39 @@ async fn read_bounded_stream(
     }
 }
 
-fn prepared_tx_id(stderr: &[u8]) -> Option<String> {
+/// The transaction the helper prepared, from its stderr so far: the hash
+/// on its `Prepared TX <hash>; nonce <N>; ...` line, and the nonce, which a
+/// helper from before it named the nonce leaves out (`Prepared TX <hash>;
+/// ...`). The hash is everything before the line's first `;`, and is read
+/// once that `;` has come; the nonce once its own `;` has, since the helper
+/// may write the line in pieces. With `ended`, stderr is closed, and what
+/// came of the line is all there is. A nonce that is not a number, or that
+/// lacks its `;` and so may be cut short, is left out.
+fn prepared_tx(stderr: &[u8], ended: bool) -> Option<(String, Option<u64>)> {
     String::from_utf8_lossy(stderr).lines().find_map(|line| {
-        let (tx_id, _) = line
-            .trim_start()
-            .strip_prefix("Prepared TX ")?
-            .split_once(';')?;
-        (tx_id.len() == 64 && tx_id.bytes().all(|byte| byte.is_ascii_hexdigit()))
-            .then(|| tx_id.to_ascii_lowercase())
+        let mut fields = line.trim_start().strip_prefix("Prepared TX ")?.split(';');
+        let tx_id = fields.next()?;
+        let after = fields.next()?;
+        if tx_id.len() != 64 || !tx_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        let tx_id = tx_id.to_ascii_lowercase();
+        match after.strip_prefix(" nonce ") {
+            Some(nonce) => {
+                let whole = fields.next().is_some();
+                if !whole && !ended {
+                    return None;
+                }
+                let digits = !nonce.is_empty() && nonce.bytes().all(|byte| byte.is_ascii_digit());
+                Some((
+                    tx_id,
+                    (whole && digits).then(|| nonce.parse().ok()).flatten(),
+                ))
+            }
+            // The nonce may still come.
+            None if " nonce ".starts_with(after) && !ended => None,
+            None => Some((tx_id, None)),
+        }
     })
 }
 
@@ -1235,9 +1270,10 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
-    /// The prepared line, as `dusk-tx` prints it.
+    /// The prepared line, as `dusk-tx` prints it for a transaction signed
+    /// with nonce 7.
     fn prepared_line(tx_id: &str) -> String {
-        format!("printf '  Prepared TX {tx_id}; reconcile this exact hash before retrying if submission is interrupted\\n' >&2")
+        format!("printf '  Prepared TX {tx_id}; nonce 7; reconcile this exact hash before retrying if submission is interrupted\\n' >&2")
     }
 
     /// A shell helper running `script`, with a stdin the caller writes.
@@ -1264,7 +1300,7 @@ mod tests {
                 prepared_line(&tx_id)
             ));
             let kept = StdMutex::new(Vec::new());
-            let keep = |tx_id: &str| {
+            let keep = |tx_id: &str, _: Option<u64>| {
                 kept.lock().unwrap().push(tx_id.to_owned());
                 Ok(())
             };
@@ -1298,10 +1334,10 @@ mod tests {
         ));
         let started = std::time::Instant::now();
         let kept = StdMutex::new(Vec::new());
-        let keep = |tx_id: &str| {
+        let keep = |tx_id: &str, nonce: Option<u64>| {
             kept.lock()
                 .unwrap()
-                .push((tx_id.to_owned(), started.elapsed()));
+                .push((tx_id.to_owned(), nonce, started.elapsed()));
             Ok(())
         };
         let ack = Ack {
@@ -1317,12 +1353,12 @@ mod tests {
         assert_eq!(run.output.stdout, br#"{"word":"send"}"#);
         let kept = kept.into_inner().unwrap();
         assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].0, tx_id);
+        assert_eq!((kept[0].0.as_str(), kept[0].1), (tx_id.as_str(), Some(7)));
         // Kept about a second before the helper was done.
         assert!(
-            kept[0].1 + Duration::from_millis(500) < finished,
+            kept[0].2 + Duration::from_millis(500) < finished,
             "{:?} {finished:?}",
-            kept[0].1
+            kept[0].2
         );
     }
 
@@ -1339,7 +1375,9 @@ mod tests {
             prepared_line(&tx_id),
             sent.display()
         ));
-        let keep = |_: &str| Err(HyperlaneDuskError::Other("the event store is gone".into()));
+        let keep = |_: &str, _: Option<u64>| {
+            Err(HyperlaneDuskError::Other("the event store is gone".into()))
+        };
         let ack = Ack {
             stdin: child.stdin.take().unwrap(),
             keep: &keep,
@@ -1415,35 +1453,86 @@ mod tests {
         ));
     }
 
+    /// The helper may write its prepared line in pieces: the hash is read
+    /// once its `;` has come, and the nonce once its own `;` has, so a
+    /// nonce cut short is never read.
     #[tokio::test]
     async fn prepared_transaction_is_retained_before_stderr_closes() {
         let tx_id = "AB".repeat(32);
         let (mut writer, reader) = tokio::io::duplex(256);
         let (sender, mut receiver) = oneshot::channel();
         let reader_task = tokio::spawn(read_bounded_stream(reader, "stderr", Some(sender)));
-        writer.write_all(b"  Prepared TX ").await.unwrap();
-        writer.write_all(&tx_id.as_bytes()[..32]).await.unwrap();
-        tokio::task::yield_now().await;
-        assert!(matches!(
-            receiver.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
-        writer.write_all(&tx_id.as_bytes()[32..]).await.unwrap();
+        for piece in [
+            &b"  Prepared TX "[..],
+            &tx_id.as_bytes()[..32],
+            &tx_id.as_bytes()[32..],
+            b";",
+            b" nonce 4",
+        ] {
+            writer.write_all(piece).await.unwrap();
+            tokio::task::yield_now().await;
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+        }
         writer
-            .write_all(b"; reconcile this exact hash\n")
+            .write_all(b"2; reconcile this exact hash\n")
             .await
             .unwrap();
         let observed = tokio::time::timeout(Duration::from_secs(1), receiver)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(observed, tx_id.to_ascii_lowercase());
+        assert_eq!(observed, (tx_id.to_ascii_lowercase(), Some(42)));
         drop(writer);
         reader_task.await.unwrap().unwrap();
-        assert!(prepared_tx_id(b"Prepared TX abc; reconcile").is_none());
-        assert!(
-            prepared_tx_id(format!("Prepared TX {}; reconcile", "z".repeat(64)).as_bytes())
-                .is_none()
+    }
+
+    /// The prepared line names the hash, and the nonce after it when the
+    /// helper names one: a helper from before it did is still read.
+    #[test]
+    fn the_prepared_line_names_the_hash_and_maybe_the_nonce() {
+        let tx_id = "ab".repeat(32);
+        let read = |line: String, ended| prepared_tx(line.as_bytes(), ended);
+        assert_eq!(
+            read(
+                format!("  Prepared TX {tx_id}; nonce 42; reconcile\n"),
+                false
+            ),
+            Some((tx_id.clone(), Some(42)))
+        );
+        // A helper from before it named the nonce.
+        assert_eq!(
+            read(
+                format!("  Prepared TX {tx_id}; reconcile this exact hash\n"),
+                false
+            ),
+            Some((tx_id.clone(), None))
+        );
+        // A nonce that is not a number is left out.
+        assert_eq!(
+            read(
+                format!("  Prepared TX {tx_id}; nonce x7; reconcile\n"),
+                false
+            ),
+            Some((tx_id.clone(), None))
+        );
+        // Stderr closed after a nonce without its `;`: it may be cut short.
+        assert_eq!(
+            read(format!("  Prepared TX {tx_id}; nonce 4"), true),
+            Some((tx_id.clone(), None))
+        );
+        assert_eq!(read(format!("  Prepared TX {tx_id}; nonce 4"), false), None);
+        assert_eq!(read(format!("  Prepared TX {tx_id};"), false), None);
+        assert_eq!(
+            read(format!("  Prepared TX {tx_id};"), true),
+            Some((tx_id.clone(), None))
+        );
+        assert_eq!(read("Prepared TX abc; reconcile".into(), true), None);
+        assert_eq!(
+            read(format!("Prepared TX {}; reconcile", "z".repeat(64)), true),
+            None
         );
     }
 
@@ -1461,7 +1550,7 @@ mod tests {
         let mut stdout = tokio::spawn(read_bounded_stream(tokio::io::empty(), "stdout", None));
         let mut stderr = tokio::spawn(read_bounded_stream(reader, "stderr", Some(sender)));
         drain_timed_out_readers(&mut stdout, &mut stderr).await;
-        assert_eq!(receiver.try_recv().unwrap(), tx_id);
+        assert_eq!(receiver.try_recv().unwrap(), (tx_id, None));
     }
 
     #[cfg(unix)]

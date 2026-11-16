@@ -637,9 +637,11 @@ type Faults = Arc<Mutex<Vec<(Route, Option<u64>, Fault)>>>;
 /// `pipelines` file exists. A call reads the URL and the key from stdin,
 /// logs its arguments to `invocations`, asks the endpoint for the chain ID,
 /// signs with `--nonce` or the account's nonce plus one (read from
-/// `committed`, as dusk-tx reads the account), and prints `Prepared TX`
-/// with the transaction's hash: like a Moonlight transaction's, the hash of
-/// what is signed, so the same call with the same nonce has the same hash.
+/// `committed`, as dusk-tx reads the account), and prints
+/// `Prepared TX <hash>; nonce <N>; ...`, or, while the `old-line` file
+/// exists, `Prepared TX <hash>; ...` as a dusk-tx from before it named the
+/// nonce. Like a Moonlight transaction's, the hash is that of what is
+/// signed, so the same call with the same nonce has the same hash.
 /// With `--ack-before-send` it then reads one more line from stdin, within
 /// 30 s, and logs it to `words` (`<eof>` when stdin closed first): any
 /// line but `send` makes it print `Not submitted:` and stop without
@@ -729,7 +731,11 @@ if [ "$mode" = gate ]; then
   : > "$dir/gated-$nonce"
   while [ ! -f "$dir/open-$nonce" ]; do sleep 0.01; done
 fi
-printf '  Prepared TX %s; reconcile this exact hash before retrying if submission is interrupted\n' "$tx" >&2
+if [ -f "$dir/old-line" ]; then
+  printf '  Prepared TX %s; reconcile this exact hash before retrying if submission is interrupted\n' "$tx" >&2
+else
+  printf '  Prepared TX %s; nonce %s; reconcile this exact hash before retrying if submission is interrupted\n' "$tx" "$nonce" >&2
+fi
 if [ "$mode" = gate ]; then : > "$dir/printed-$nonce"; fi
 if [ -n "$ack" ]; then
   # As dusk-tx: only the line `send` sends.
@@ -883,6 +889,17 @@ impl Node {
     /// How long the stand-in waits for a block, in tries of 20 ms.
     pub fn helper_waits(&self, tries: u32) {
         std::fs::write(self.directory.path().join("wait-tries"), tries.to_string()).unwrap();
+    }
+
+    /// Make the stand-in name no nonce on its prepared line, as a dusk-tx
+    /// from before it did, or name it again.
+    pub fn old_prepared_line(&self, old: bool) {
+        let file = self.directory.path().join("old-line");
+        if old {
+            std::fs::write(file, "").unwrap();
+        } else {
+            let _ = std::fs::remove_file(file);
+        }
     }
 
     /// Make the stand-in's `call --help` leave out `--ack-before-send`, as

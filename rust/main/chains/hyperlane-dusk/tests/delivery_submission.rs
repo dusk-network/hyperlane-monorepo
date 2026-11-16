@@ -1431,6 +1431,8 @@ async fn a_delivery_is_kept_before_the_helper_may_send_it() {
     .await;
     let kept = mailbox.prepared_transaction(message.id()).unwrap();
     assert!(kept.is_some());
+    // With the nonce the helper named.
+    assert_eq!(mailbox.prepared_nonce(message.id()).unwrap(), Some(1));
     assert_eq!(node.words(), ["1 send"]);
     gate.open();
     let outcome = first.await.unwrap().unwrap();
@@ -1707,6 +1709,8 @@ async fn a_dusk_tx_build_sends_only_on_the_agents_word() {
     })
     .await;
     let kept = mailbox.prepared_transaction(message.id()).unwrap().unwrap();
+    // A dusk-tx that names the nonce it signed with: the account's next.
+    assert_eq!(mailbox.prepared_nonce(message.id()).unwrap(), Some(1));
     gate.open();
     let error = submission.await.unwrap().unwrap_err().to_string();
     assert!(
