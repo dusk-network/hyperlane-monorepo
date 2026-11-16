@@ -667,7 +667,9 @@ impl DuskMailbox {
     /// stopped, and those in final blocks are forgotten: they can neither
     /// be rolled back nor land again. One that may still land, in the
     /// mempool, in a block that is not final, or in neither, is never
-    /// forgotten for room. While there is none, the delivery fails, and the
+    /// forgotten for room, and neither is one that failed in a final block
+    /// before its failure was reported: its gas would never be charged to
+    /// its message. While there is none, the delivery fails, and the
     /// relayer tries it again later, once kept transactions have settled.
     async fn room_for_prepared(&self, key: &[u8; 32], message: H256) -> ChainResult<()> {
         let mut kept = self.rues.prepared_deliveries(key)?;
@@ -677,13 +679,13 @@ impl DuskMailbox {
             return Ok(());
         }
         // One that does not decode cannot be looked up.
-        let mut candidates: Vec<(u64, H256, [u8; 32])> = kept
+        let mut candidates: Vec<(u64, H256, PreparedDelivery)> = kept
             .iter()
             .filter_map(|(other, delivery)| {
-                delivery.map(|delivery| (delivery.prepared_at, *other, delivery.tx_id))
+                delivery.map(|delivery| (delivery.prepared_at, *other, delivery))
             })
             .collect();
-        candidates.sort();
+        candidates.sort_by_key(|(prepared_at, other, _)| (*prepared_at, *other));
         let after = *self
             .prepared_scan
             .lock()
@@ -694,17 +696,26 @@ impl DuskMailbox {
         let finalized = self.rues.finalized_block_height().await?;
         let mut freed = 0;
         let looked = candidates.len().min(PREPARED_LOOKUPS);
-        for (prepared_at, other, tx_id) in candidates.iter().cycle().skip(start).take(looked) {
+        for (prepared_at, other, delivery) in candidates.iter().cycle().skip(start).take(looked) {
             *self
                 .prepared_scan
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = Some((*prepared_at, *other));
+            let tx_id = delivery.tx_id;
             let status = self.rues.transaction_status(&hex::encode(tx_id)).await?;
-            if !matches!(status, TransactionStatus::Included { block_height, .. } if block_height <= finalized)
-            {
+            let TransactionStatus::Included {
+                block_height,
+                receipt,
+            } = status
+            else {
+                continue;
+            };
+            // A failure not reported yet waits for its message's next
+            // submission, which reports it (`follow_prepared`).
+            if block_height > finalized || (receipt.error.is_some() && !delivery.failure_reported) {
                 continue;
             }
-            if self.rues.forget_prepared_transaction(key, *other, *tx_id)? {
+            if self.rues.forget_prepared_transaction(key, *other, tx_id)? {
                 debug!(
                     message_id = ?other,
                     tx_id = %hex::encode(tx_id),
@@ -719,10 +730,10 @@ impl DuskMailbox {
         warn!(
             kept = kept.len(),
             looked,
-            "A Dusk signer keeps the transactions of as many deliveries as it may, and none it looked up is in a final block; the next delivery goes once one is"
+            "A Dusk signer keeps the transactions of as many deliveries as it may, and none it looked up can be forgotten yet; the next delivery goes once one can"
         );
         Err(HyperlaneDuskError::Other(format!(
-            "The Dusk signer keeps the transactions of {} deliveries, the most it keeps, and none of the {looked} it looked up is in a final block: each may still land, so none is forgotten for room. The delivery of message {message:?} goes once kept transactions settle",
+            "The Dusk signer keeps the transactions of {} deliveries, the most it keeps, and none of the {looked} it looked up can be forgotten for room yet: each may still land, or failed without its failure reported yet. The delivery of message {message:?} goes once kept transactions settle",
             kept.len()
         ))
         .into())

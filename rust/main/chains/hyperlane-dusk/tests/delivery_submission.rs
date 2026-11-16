@@ -1834,3 +1834,96 @@ async fn a_refused_delivery_keeps_the_helpers_error_when_its_transaction_cannot_
     node.settle(1).await;
     std::env::remove_var("DUSK_TX_BIN");
 }
+
+/// At the bound, a kept transaction that failed in a final block is not
+/// forgotten for room before its failure is reported: its gas would never
+/// be charged to its message. Once the relayer submits that message again
+/// and the failure is reported, it can go. Room-making used to forget
+/// every transaction in a final block, failed or not.
+#[tokio::test]
+async fn a_failure_not_reported_yet_is_not_forgotten_for_room() {
+    let _env = HELPER_ENV.lock().await;
+    // Finality moves only by hand.
+    let node = Node::start_with(false, None);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    // The helper waits 200 ms for a block, the Mailbox 600 ms.
+    node.helper_waits(10);
+    let mailbox = node
+        .mailbox(false)
+        .with_submission_limits(SubmissionLimits {
+            prepared: 2,
+            ..patient(64)
+        });
+    let deliveries: Vec<_> = (0..3).map(delivery).collect();
+    // The first delivery's outcome is unknown; its recipient then reverts,
+    // and its transaction fails in a block that becomes final.
+    node.pause(true);
+    let (message, metadata, gas_limit) = &deliveries[0];
+    let error = mailbox
+        .process(message, metadata, *gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("to be included"), "{error}");
+    node.recipient_reverts(&deliveries[0], true);
+    node.pause(false);
+    node.wait_until("the first transaction is in a block", |model| {
+        model.nonce == 1
+    })
+    .await;
+    let height = node.height();
+    node.finalize_to(height);
+    node.expire_block_pair().await;
+    // The second lands, in a block that is not final yet.
+    let (message, metadata, gas_limit) = &deliveries[1];
+    assert!(
+        mailbox
+            .process(message, metadata, *gas_limit)
+            .await
+            .unwrap()
+            .executed
+    );
+    // At the bound, neither can go: the third delivery is not signed.
+    let calls = node.invocations().len();
+    let (message, metadata, gas_limit) = &deliveries[2];
+    let error = mailbox
+        .process(message, metadata, *gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("the most it keeps"), "{error}");
+    assert_eq!(node.invocations().len(), calls);
+    assert!(mailbox
+        .prepared_transaction(deliveries[0].0.id())
+        .unwrap()
+        .is_some());
+    // The recipient takes the first message again, and submitted again,
+    // its failure is reported.
+    node.recipient_reverts(&deliveries[0], false);
+    let (message, metadata, gas_limit) = &deliveries[0];
+    assert!(
+        !mailbox
+            .process(message, metadata, *gas_limit)
+            .await
+            .unwrap()
+            .executed
+    );
+    // Reported, and with the second's block final, both go for room.
+    let height = node.height();
+    node.finalize_to(height);
+    node.expire_block_pair().await;
+    let (message, metadata, gas_limit) = &deliveries[2];
+    assert!(
+        mailbox
+            .process(message, metadata, *gas_limit)
+            .await
+            .unwrap()
+            .executed
+    );
+    assert_eq!(
+        mailbox.prepared_transaction(deliveries[0].0.id()).unwrap(),
+        None
+    );
+    assert_eq!(node.propagated(), [1, 2, 3]);
+    std::env::remove_var("DUSK_TX_BIN");
+}

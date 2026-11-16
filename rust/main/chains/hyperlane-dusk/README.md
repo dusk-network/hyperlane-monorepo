@@ -260,24 +260,25 @@ how to run the local bridge.
   up, the oldest first and on later tries on from where the last look
   stopped, at most 16 at a time, and forgets those in final blocks. One that
   may still land, in the mempool, in a block that is not final, or in
-  neither, is never forgotten for room: while none can go, deliveries fail
-  without being signed, and the relayer tries them again once kept
-  transactions settle. A delivery submitted again looks its transaction up
-  first: in a block and executed, it is the delivery's outcome, and the
-  relayer's confirmation goes on from it; failed in a block, and not
-  reported yet, as when it failed after the submission that prepared it had
-  returned, that failure is the delivery's outcome, with the gas it spent,
-  so that the relayer charges it to the message and its gas payment policy
-  decides on another attempt, and nothing else is sent then; failed and
-  reported, the delivery goes again once that block is final; in the
-  mempool, it is followed to its block; in neither, the delivery goes again
-  only 60 s after the transaction was prepared, as it may still be on its
-  way to the node. A transaction the node refused at preverification is not
-  kept. Otherwise, after a submission whose outcome was unknown, the first
-  transaction could land after the relayer's simulation of the next
-  submission passed and before the helper read the account's nonce: the
-  helper signed the next nonce, and a second transaction landed and failed,
-  paying its whole gas limit.
+  neither, is never forgotten for room, and neither is one that failed in a
+  final block before its failure was reported, whose gas would then never be
+  charged: while none can go, deliveries fail without being signed, and the
+  relayer tries them again once kept transactions settle. A delivery
+  submitted again looks its transaction up first: in a block and executed,
+  it is the delivery's outcome, and the relayer's confirmation goes on from
+  it; failed in a block, and not reported yet, as when it failed after the
+  submission that prepared it had returned, that failure is the delivery's
+  outcome, with the gas it spent, so that the relayer charges it to the
+  message and its gas payment policy decides on another attempt, and nothing
+  else is sent then; failed and reported, the delivery goes again once that
+  block is final; in the mempool, it is followed to its block; in neither,
+  the delivery goes again only 60 s after the transaction was prepared, as
+  it may still be on its way to the node. A transaction the node refused at
+  preverification is not kept. Otherwise, after a submission whose outcome
+  was unknown, the first transaction could land after the relayer's
+  simulation of the next submission passed and before the helper read the
+  account's nonce: the helper signed the next nonce, and a second
+  transaction landed and failed, paying its whole gas limit.
 - **Known issue of deliveries one at a time: a dropped transaction can
   land after its message went again.** A kept transaction that is in
   neither the node's mempool nor a block 60 s after it was prepared is
