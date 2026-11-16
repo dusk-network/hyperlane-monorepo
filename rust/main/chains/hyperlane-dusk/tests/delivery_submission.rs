@@ -1649,3 +1649,67 @@ async fn a_signer_at_its_bound_of_kept_transactions_forgets_only_final_ones() {
     node.settle(2).await;
     std::env::remove_var("DUSK_TX_BIN");
 }
+
+/// The agent and a dusk-tx build agree on `--ack-before-send`. A hash the
+/// agent cannot keep leaves dusk-tx without the word: the node gets the
+/// chain ID and account queries alone, and dusk-tx's refusal reads as
+/// `NotSubmitted`. A hash the agent keeps lets dusk-tx preverify its
+/// transaction, only then; the stand-in node refuses a real Moonlight
+/// transaction there, so that delivery is not submitted either. Runs only
+/// when asked (`--ignored`), with `DUSK_TX_REAL_BIN` naming the build.
+#[tokio::test]
+#[ignore = "runs a dusk-tx build: set DUSK_TX_REAL_BIN to its path"]
+async fn a_dusk_tx_build_sends_only_on_the_agents_word() {
+    let _env = HELPER_ENV.lock().await;
+    let bin = std::env::var("DUSK_TX_REAL_BIN").expect("DUSK_TX_REAL_BIN names a dusk-tx build");
+    let node = Node::start(false);
+    std::env::set_var("DUSK_TX_BIN", &bin);
+    let mailbox = node
+        .mailbox(false)
+        .with_submission_limits(SubmissionLimits {
+            drop_grace: Duration::from_secs(60),
+            ..patient(64)
+        });
+    let (message, metadata, gas_limit) = delivery(0);
+    mailbox.fail_prepared_writes(1, 0);
+    let error = mailbox
+        .process(&message, &metadata, gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("was not let send it"), "{error}");
+    assert!(
+        error.contains("Not submitted: stdin closed before the line \"send\""),
+        "{error}"
+    );
+    assert_eq!(node.requests_to("/chain_id"), 1);
+    assert_eq!(node.requests_to("/account"), 1);
+    assert_eq!(node.requests_to("/preverify"), 0);
+    assert_eq!(node.requests_to("/propagate"), 0);
+    assert_eq!(mailbox.prepared_transaction(message.id()).unwrap(), None);
+
+    // Kept, the transaction is preverified only once it is.
+    let gate = std::sync::Arc::new(Gate::default());
+    node.inject(Route::Preverify, None, Fault::Hold(gate.clone()));
+    let submission = tokio::spawn({
+        let mailbox = mailbox.clone();
+        let (message, metadata) = (message.clone(), metadata.clone());
+        async move { mailbox.process(&message, &metadata, gas_limit).await }
+    });
+    node.wait_until("the preverification reaches the node", |_| {
+        gate.waiting.load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+    let kept = mailbox.prepared_transaction(message.id()).unwrap().unwrap();
+    gate.open();
+    let error = submission.await.unwrap().unwrap_err().to_string();
+    assert!(
+        error.contains(&format!(
+            "Transaction {kept} submission failed: Preverify rejected before propagation"
+        )),
+        "{error}"
+    );
+    assert_eq!(node.requests_to("/propagate"), 0);
+    assert_eq!(mailbox.prepared_transaction(message.id()).unwrap(), None);
+    std::env::remove_var("DUSK_TX_BIN");
+}

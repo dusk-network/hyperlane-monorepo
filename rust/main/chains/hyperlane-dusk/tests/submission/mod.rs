@@ -28,9 +28,11 @@
 //! - Evicting a transaction drops the mempool's later nonces of the account
 //!   with it, as Rusk's cascading delete does.
 //!
-//! The account status (`nonce`, `next_nonce`), the `process` simulation,
+//! The account status (`nonce`, `next_nonce`, and the transfer contract's
+//! `account` query that dusk-tx reads), the `process` simulation,
 //! `lastBlockPair` and the transaction lookups (`mempoolTx`, `tx`) read
-//! this state. Faults can refuse, hold or lose a request at a route.
+//! this state. Faults can refuse, hold or lose a request at a route, and
+//! the path of every request is logged.
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -218,6 +220,8 @@ pub struct Model {
     blocks: BTreeMap<u64, Block>,
     ledger: HashMap<String, Included>,
     pub events: Vec<Event>,
+    /// The path of every request the node got, in order.
+    pub requests: Vec<String>,
     /// Blocks hold no transaction while set.
     pub paused: bool,
 }
@@ -238,6 +242,7 @@ impl Model {
             blocks: BTreeMap::new(),
             ledger: HashMap::new(),
             events: Vec::new(),
+            requests: Vec::new(),
             paused: false,
         };
         model.publish();
@@ -950,6 +955,15 @@ impl Node {
             .collect()
     }
 
+    /// How many requests the node got whose path ends with `route`.
+    pub fn requests_to(&self, route: &str) -> usize {
+        self.model()
+            .requests
+            .iter()
+            .filter(|path| path.ends_with(route))
+            .count()
+    }
+
     /// Every refusal, with the nonce of the transaction refused.
     pub fn refusals(&self) -> Vec<(u64, Refusal)> {
         self.model()
@@ -1130,8 +1144,18 @@ fn serve(
     path: &str,
     body: Vec<u8>,
 ) {
+    state.lock().unwrap().requests.push(path.to_owned());
     if path.ends_with("/chain_id") {
         return reply(stream, "200 OK", &[0]);
+    }
+    // The transfer contract's `account` query, as dusk-tx reads the
+    // account: its `AccountData`, the nonce and the balance, as rkyv
+    // archives them.
+    if path.ends_with("/account") {
+        let nonce = state.lock().unwrap().nonce;
+        let mut account = nonce.to_le_bytes().to_vec();
+        account.extend_from_slice(&(1u64 << 50).to_le_bytes());
+        return reply(stream, "200 OK", &account);
     }
     let Some(route) = route_of(path) else {
         return reply(stream, "404 Not Found", b"not served");
