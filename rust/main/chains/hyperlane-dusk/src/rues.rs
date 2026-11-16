@@ -36,7 +36,7 @@ use event_log::EventLogLocks;
 pub(crate) use event_log::{CheckHold, EventLog, LogEntry, LogLookup, LogState, BLOCK_LIMITS};
 pub(crate) use submissions::{
     Holder, PreparedDelivery, Reservation, SentDelivery, Submission, TransactionStatus,
-    MAX_RESERVATION_TXS,
+    MAX_PREPARED_DELIVERIES, MAX_RESERVATION_TXS,
 };
 
 const MAX_RUES_RESPONSE_BYTES: usize = 4 * 1024 * 1024;

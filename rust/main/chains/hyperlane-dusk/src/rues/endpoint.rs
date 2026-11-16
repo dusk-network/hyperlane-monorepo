@@ -36,7 +36,7 @@ use url::Url;
 use hyperlane_core::H256;
 
 use super::batch::Multicall;
-use super::submissions::{PreparedDelivery, Reservation, SentDelivery, MAX_PREPARED_DELIVERIES};
+use super::submissions::{PreparedDelivery, Reservation, SentDelivery};
 use super::{BlockPair, DeploymentIdentity, IdentityGate};
 use crate::final_records::FinalRecords;
 
@@ -204,6 +204,9 @@ pub(crate) struct Endpoint {
     /// The transactions prepared for deliveries sent one at a time, by
     /// signer and message, for clients that keep no event store.
     prepared: StdMutex<BTreeMap<([u8; 32], H256), PreparedDelivery>>,
+    /// Held while a change to those kept in an event store depends on what
+    /// it holds.
+    prepared_writes: StdMutex<()>,
     /// How many of the next keeps and forgets of those transactions fail,
     /// as when an event store cannot be written, for tests.
     prepared_faults: StdMutex<(usize, usize)>,
@@ -213,6 +216,11 @@ pub(crate) struct Endpoint {
 }
 
 type Endpoints = HashMap<String, Weak<Endpoint>>;
+
+/// The keys of the deliveries `signer` keeps a transaction for.
+fn prepared_range(signer: &[u8; 32]) -> std::ops::RangeInclusive<([u8; 32], H256)> {
+    (*signer, H256::zero())..=(*signer, H256::repeat_byte(0xff))
+}
 type FinalRecordsByContract = HashMap<([u8; 32], &'static str), Arc<FinalRecords>>;
 static ENDPOINTS: OnceLock<StdMutex<Endpoints>> = OnceLock::new();
 
@@ -247,6 +255,7 @@ impl Endpoint {
             sent_deliveries: StdMutex::new(BTreeMap::new()),
             reservations: StdMutex::new(BTreeMap::new()),
             prepared: StdMutex::new(BTreeMap::new()),
+            prepared_writes: StdMutex::new(()),
             prepared_faults: StdMutex::new((0, 0)),
             stopped: StdMutex::new(HashSet::new()),
         });
@@ -374,32 +383,64 @@ impl Endpoint {
         self.prepared().get(&(*signer, message)).copied()
     }
 
-    /// Keep `delivery`, and at most `MAX_PREPARED_DELIVERIES` of the
-    /// signer's, forgetting the one prepared longest ago past it.
+    /// Keep `delivery` for `message`, instead of the one kept before. With
+    /// none kept for it, fails without keeping it while the signer keeps
+    /// `limit` already: how many it keeps.
     pub(crate) fn keep_prepared_delivery(
         &self,
         signer: &[u8; 32],
         message: H256,
         delivery: PreparedDelivery,
-    ) {
+        limit: usize,
+    ) -> Result<(), usize> {
         let mut prepared = self.prepared();
-        prepared.remove(&(*signer, message));
-        let range = (*signer, H256::zero())..=(*signer, H256::repeat_byte(0xff));
-        while prepared.range(range.clone()).count() >= MAX_PREPARED_DELIVERIES {
-            let oldest = prepared
-                .range(range.clone())
-                .min_by_key(|(_, kept)| kept.prepared_at)
-                .map(|(key, _)| *key);
-            match oldest {
-                Some(oldest) => prepared.remove(&oldest),
-                None => break,
-            };
+        if !prepared.contains_key(&(*signer, message)) {
+            let kept = prepared.range(prepared_range(signer)).count();
+            if kept >= limit {
+                return Err(kept);
+            }
         }
         prepared.insert((*signer, message), delivery);
+        Ok(())
+    }
+
+    /// Every delivery the signer keeps a transaction for.
+    pub(crate) fn prepared_deliveries(&self, signer: &[u8; 32]) -> Vec<(H256, PreparedDelivery)> {
+        self.prepared()
+            .range(prepared_range(signer))
+            .map(|((_, message), delivery)| (*message, *delivery))
+            .collect()
     }
 
     pub(crate) fn forget_prepared_delivery(&self, signer: &[u8; 32], message: H256) {
         self.prepared().remove(&(*signer, message));
+    }
+
+    /// Forget the transaction kept for `message` only if it is still
+    /// `tx_id`. Whether it was.
+    pub(crate) fn forget_prepared_transaction(
+        &self,
+        signer: &[u8; 32],
+        message: H256,
+        tx_id: [u8; 32],
+    ) -> bool {
+        let mut prepared = self.prepared();
+        let kept = prepared
+            .get(&(*signer, message))
+            .is_some_and(|delivery| delivery.tx_id == tx_id);
+        if kept {
+            prepared.remove(&(*signer, message));
+        }
+        kept
+    }
+
+    /// Held while a change to the transactions kept in an event store for
+    /// deliveries depends on what it holds, so that no other changes them
+    /// in between.
+    pub(crate) fn prepared_writes(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.prepared_writes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Make the next `keeps` keeps and `forgets` forgets of prepared

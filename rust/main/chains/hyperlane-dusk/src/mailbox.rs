@@ -66,6 +66,9 @@ const DROP_GRACE: Duration = Duration::from_secs(60);
 /// Rusk bounds only the transactions it holds back for an earlier nonce,
 /// not those it admitted in nonce order.
 const MAX_OUTSTANDING_DELIVERIES: usize = 64;
+/// Most kept transactions a delivery looks up to make room for its own
+/// (`DuskMailbox::room_for_prepared`).
+const PREPARED_LOOKUPS: usize = 16;
 
 /// What a delivery check found.
 #[derive(Debug, Clone)]
@@ -209,6 +212,9 @@ pub struct SubmissionLimits {
     /// Most deliveries the signer has outstanding: sent, and in no block
     /// yet.
     pub outstanding: usize,
+    /// Most deliveries sent one at a time whose transaction the signer
+    /// keeps (`DuskMailbox::room_for_prepared`).
+    pub prepared: usize,
 }
 
 impl Default for SubmissionLimits {
@@ -220,6 +226,7 @@ impl Default for SubmissionLimits {
             batch: BATCH_SEND_TIMEOUT,
             drop_grace: DROP_GRACE,
             outstanding: MAX_OUTSTANDING_DELIVERIES,
+            prepared: crate::rues::MAX_PREPARED_DELIVERIES,
         }
     }
 }
@@ -245,6 +252,9 @@ pub struct DuskMailbox {
     /// arguments, shared by every clone.
     simulations: Arc<StdMutex<HashMap<[u8; 32], std::time::Instant>>>,
     limits: SubmissionLimits,
+    /// Where the last look for room among the transactions kept for
+    /// deliveries stopped: when it was prepared, and its message.
+    prepared_scan: Arc<StdMutex<Option<(u64, H256)>>>,
     /// Whether deliveries are pipelined (`ConnectionConf::pipelines_deliveries`).
     /// Otherwise each goes one at a time: `dusk-tx` signs it with the
     /// account's nonce plus one, as the node reports it, and waits for its
@@ -296,6 +306,7 @@ impl DuskMailbox {
             delivery_checks: Arc::default(),
             simulations: Arc::default(),
             limits: SubmissionLimits::default(),
+            prepared_scan: Arc::default(),
             pipelined,
         }
     }
@@ -556,6 +567,7 @@ impl DuskMailbox {
                 return Ok(outcome);
             }
         }
+        self.room_for_prepared(&key, message).await?;
         let keep = |tx_id: &str| -> Result<(), HyperlaneDuskError> {
             let tx_id = hex::decode(tx_id)
                 .ok()
@@ -571,7 +583,7 @@ impl DuskMailbox {
                 prepared_at: unix_millis(),
             };
             self.rues
-                .keep_prepared_delivery(&key, message, &prepared)
+                .keep_prepared_delivery(&key, message, &prepared, self.limits.prepared)
                 .inspect_err(|error| {
                     warn!(
                         message_id = ?message,
@@ -623,6 +635,74 @@ impl DuskMailbox {
             Err(error) => return Err(error.into()),
         };
         self.outcome_of(&tx_id).await
+    }
+
+    /// Make room to keep a transaction for `message`: a signer keeps those
+    /// of at most `SubmissionLimits::prepared` deliveries. At the bound,
+    /// kept transactions are looked up, at most `PREPARED_LOOKUPS`, the
+    /// oldest first and on later tries on from where the last look
+    /// stopped, and those in final blocks are forgotten: they can neither
+    /// be rolled back nor land again. One that may still land, in the
+    /// mempool, in a block that is not final, or in neither, is never
+    /// forgotten for room. While there is none, the delivery fails, and the
+    /// relayer tries it again later, once kept transactions have settled.
+    async fn room_for_prepared(&self, key: &[u8; 32], message: H256) -> ChainResult<()> {
+        let mut kept = self.rues.prepared_deliveries(key)?;
+        kept.retain(|(other, _)| *other != message);
+        let limit = self.limits.prepared;
+        if kept.len() < limit {
+            return Ok(());
+        }
+        // One that does not decode cannot be looked up.
+        let mut candidates: Vec<(u64, H256, [u8; 32])> = kept
+            .iter()
+            .filter_map(|(other, delivery)| {
+                delivery.map(|delivery| (delivery.prepared_at, *other, delivery.tx_id))
+            })
+            .collect();
+        candidates.sort();
+        let after = *self
+            .prepared_scan
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let start = after.map_or(0, |after| {
+            candidates.partition_point(|(prepared_at, other, _)| (*prepared_at, *other) <= after)
+        });
+        let finalized = self.rues.finalized_block_height().await?;
+        let mut freed = 0;
+        let looked = candidates.len().min(PREPARED_LOOKUPS);
+        for (prepared_at, other, tx_id) in candidates.iter().cycle().skip(start).take(looked) {
+            *self
+                .prepared_scan
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some((*prepared_at, *other));
+            let status = self.rues.transaction_status(&hex::encode(tx_id)).await?;
+            if !matches!(status, TransactionStatus::Included { block_height, .. } if block_height <= finalized)
+            {
+                continue;
+            }
+            if self.rues.forget_prepared_transaction(key, *other, *tx_id)? {
+                debug!(
+                    message_id = ?other,
+                    tx_id = %hex::encode(tx_id),
+                    "Forgot the transaction kept for a Dusk delivery, in a final block, to make room"
+                );
+                freed += 1;
+            }
+        }
+        if kept.len() - freed < limit {
+            return Ok(());
+        }
+        warn!(
+            kept = kept.len(),
+            looked,
+            "A Dusk signer keeps the transactions of as many deliveries as it may, and none it looked up is in a final block; the next delivery goes once one is"
+        );
+        Err(HyperlaneDuskError::Other(format!(
+            "The Dusk signer keeps the transactions of {} deliveries, the most it keeps, and none of the {looked} it looked up is in a final block: each may still land, so none is forgotten for room. The delivery of message {message:?} goes once kept transactions settle",
+            kept.len()
+        ))
+        .into())
     }
 
     /// What the transaction prepared for an earlier submission of

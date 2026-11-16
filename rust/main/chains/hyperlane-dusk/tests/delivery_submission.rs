@@ -1572,3 +1572,80 @@ async fn deliveries_need_a_helper_that_waits_for_the_word_to_send() {
     assert!(node.propagated().is_empty());
     std::env::remove_var("DUSK_TX_BIN");
 }
+
+/// A signer keeps the transactions of at most `SubmissionLimits::prepared`
+/// deliveries. At the bound, the kept ones are looked up, and only those in
+/// final blocks are forgotten for room: one that may still land stays, and
+/// while none can go, deliveries are not signed but fail, and go once kept
+/// transactions settle. The one prepared longest ago used to go, whatever
+/// became of its transaction.
+#[tokio::test]
+async fn a_signer_at_its_bound_of_kept_transactions_forgets_only_final_ones() {
+    let _env = HELPER_ENV.lock().await;
+    // Finality moves only by hand.
+    let node = Node::start_with(false, None);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let mailbox = node
+        .mailbox(false)
+        .with_submission_limits(SubmissionLimits {
+            prepared: 2,
+            ..patient(64)
+        });
+    let lost = delivery(9);
+    let deliveries: Vec<_> = (0..2).map(delivery).collect();
+    // The helper names the first transaction but never sends it: for all
+    // the relayer knows, it may still land, and it stays kept.
+    node.next_submission(1, "lose");
+    let (message, metadata, gas_limit) = &lost;
+    let error = mailbox
+        .process(message, metadata, *gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("to be included"), "{error}");
+    // A delivery lands, in a block that is not final yet.
+    let (message, metadata, gas_limit) = &deliveries[0];
+    assert!(
+        mailbox
+            .process(message, metadata, *gas_limit)
+            .await
+            .unwrap()
+            .executed
+    );
+    assert_eq!(node.propagated(), [1]);
+    // At the bound, neither kept transaction is in a final block: the next
+    // delivery is not signed.
+    let calls = node.invocations().len();
+    let (message, metadata, gas_limit) = &deliveries[1];
+    let error = mailbox
+        .process(message, metadata, *gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("may still land"), "{error}");
+    assert_eq!(node.invocations().len(), calls);
+    // Once the landed one's block is final, its transaction is forgotten
+    // for room and the delivery goes; the one that may still land stays.
+    let height = node.height();
+    node.finalize_to(height);
+    node.expire_block_pair().await;
+    assert!(
+        mailbox
+            .process(message, metadata, *gas_limit)
+            .await
+            .unwrap()
+            .executed
+    );
+    assert_eq!(node.propagated(), [1, 2]);
+    assert!(mailbox.prepared_transaction(lost.0.id()).unwrap().is_some());
+    assert_eq!(
+        mailbox.prepared_transaction(deliveries[0].0.id()).unwrap(),
+        None
+    );
+    assert!(mailbox
+        .prepared_transaction(deliveries[1].0.id())
+        .unwrap()
+        .is_some());
+    node.settle(2).await;
+    std::env::remove_var("DUSK_TX_BIN");
+}

@@ -242,26 +242,31 @@ how to run the local bridge.
   is done.** The helper signs the transaction, prints its hash, and waits
   for the agent's word before it preverifies and propagates it
   (`call --ack-before-send`). The agent keeps that hash for the message in
-  `eventCursorDir` (in memory without one), and only once it is kept
-  writes `send` to the helper's stdin. A hash it cannot keep leaves the
-  helper without the word: the helper sends nothing and says
-  `Not submitted:`, and the delivery fails and goes again at once, since
-  nothing was kept. So does a delivery whose relayer stops or dies before
-  the word: the helper's stdin closes with it. The relayer needs a
-  `dusk-tx` whose `call --help` lists `--ack-before-send`, which it asks
-  once per process; with another, it refuses to deliver and says which
-  `dusk-tx` it needs. The hash stays until the relayer confirms the
-  message delivered, at most 1,024 a signer. A delivery
-  submitted again looks its transaction up first: in a block and executed,
-  it is the delivery's outcome, and the relayer's confirmation goes on from
-  it; failed in a block, the delivery goes again once that block is final;
-  in the mempool, it is followed to its block; in neither, the delivery
-  goes again only 60 s after the transaction was prepared, as it may still
-  be on its way to the node. A transaction the node refused at
-  preverification is not kept. Otherwise, after a submission whose outcome
-  was unknown, the first transaction could land after the relayer's
-  simulation of the next submission passed and before the helper read the
-  account's nonce: the helper signed the next nonce, and a second
+  `eventCursorDir` (in memory without one), and only once it is kept writes
+  `send` to the helper's stdin. A hash it cannot keep leaves the helper
+  without the word: the helper sends nothing and says `Not submitted:`, and
+  the delivery fails and goes again at once, since nothing was kept. So does
+  a delivery whose relayer stops or dies before the word: the helper's stdin
+  closes with it. The relayer needs a `dusk-tx` whose `call --help` lists
+  `--ack-before-send`, which it asks once per process; with another, it
+  refuses to deliver and says which `dusk-tx` it needs. The hash stays until
+  the relayer confirms the message delivered. A signer keeps those of at
+  most 1,024 deliveries: at the bound, a delivery looks kept transactions
+  up, the oldest first and on later tries on from where the last look
+  stopped, at most 16 at a time, and forgets those in final blocks. One that
+  may still land, in the mempool, in a block that is not final, or in
+  neither, is never forgotten for room: while none can go, deliveries fail
+  without being signed, and the relayer tries them again once kept
+  transactions settle. A delivery submitted again looks its transaction up
+  first: in a block and executed, it is the delivery's outcome, and the
+  relayer's confirmation goes on from it; failed in a block, the delivery
+  goes again once that block is final; in the mempool, it is followed to its
+  block; in neither, the delivery goes again only 60 s after the transaction
+  was prepared, as it may still be on its way to the node. A transaction the
+  node refused at preverification is not kept. Otherwise, after a submission
+  whose outcome was unknown, the first transaction could land after the
+  relayer's simulation of the next submission passed and before the helper
+  read the account's nonce: the helper signed the next nonce, and a second
   transaction landed and failed, paying its whole gas limit.
 - **Waiting for a block.** The node builds a block from what its mempool
   holds when the block's round starts, so a transaction it admits is in a
