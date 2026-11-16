@@ -20,16 +20,18 @@
 //! A delivery sent one at a time keeps the transaction `dusk-tx` prepared
 //! for it (`dusk-prepared-delivery-v1:`), by the hash the helper prints
 //! before it propagates it, so that the delivery is not sent again while
-//! that transaction may still land.
+//! that transaction may still land, and whether its failure was reported
+//! to the relayer, so that the gas it spent is reported once.
 
 use super::*;
 
 /// The prefix of the transactions prepared for deliveries sent one at a
 /// time.
 const PREPARED_DELIVERY_PREFIX: &[u8] = b"dusk-prepared-delivery-v1:";
-/// Bytes of an encoded prepared delivery: when it was prepared, and its
-/// transaction.
-const PREPARED_DELIVERY_BYTES: usize = 8 + 32;
+/// Bytes of an encoded prepared delivery: when it was prepared, its
+/// transaction, and whether its failure was reported. One kept before
+/// that flag lacks its byte, and reads as not reported.
+const PREPARED_DELIVERY_BYTES: usize = 8 + 32 + 1;
 /// Most deliveries sent one at a time whose transaction a signer keeps by
 /// default (`SubmissionLimits::prepared`): past it, only those whose
 /// transactions are in final blocks are forgotten to make room, and
@@ -44,6 +46,9 @@ pub(crate) struct PreparedDelivery {
     pub tx_id: [u8; 32],
     /// When the helper named it, in milliseconds since the Unix epoch.
     pub prepared_at: u64,
+    /// Its failure in a block was reported to the relayer as an outcome,
+    /// which charged the gas it spent to its message.
+    pub failure_reported: bool,
 }
 
 impl PreparedDelivery {
@@ -51,17 +56,25 @@ impl PreparedDelivery {
         let mut bytes = Vec::with_capacity(PREPARED_DELIVERY_BYTES);
         bytes.extend_from_slice(&self.prepared_at.to_be_bytes());
         bytes.extend_from_slice(&self.tx_id);
+        bytes.push(u8::from(self.failure_reported));
         bytes
     }
 
     fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != PREPARED_DELIVERY_BYTES {
-            return None;
-        }
         let mut fields = Fields(bytes);
+        let prepared_at = fields.u64()?;
+        let tx_id = fields.hash()?;
+        let failure_reported = match fields.0 {
+            // Kept before the flag.
+            [] => false,
+            [0] => false,
+            [1] => true,
+            _ => return None,
+        };
         Some(Self {
-            prepared_at: fields.u64()?,
-            tx_id: fields.hash()?,
+            tx_id,
+            prepared_at,
+            failure_reported,
         })
     }
 }
@@ -476,6 +489,41 @@ impl RuesClient {
             .map_err(in_flight_error)
     }
 
+    /// Note that the failure of `tx_id`, kept for `message`, was reported
+    /// to the relayer, if that transaction is still the one kept for it.
+    pub(crate) fn report_prepared_failure(
+        &self,
+        signer: &[u8; 32],
+        message: H256,
+        tx_id: [u8; 32],
+    ) -> Result<(), HyperlaneDuskError> {
+        if self.endpoint.prepared_write_fails(true) {
+            return Err(in_flight_error("a failure a test injected"));
+        }
+        let Some(store) = &self.event_store else {
+            self.endpoint
+                .report_prepared_failure(signer, message, tx_id);
+            return Ok(());
+        };
+        let key = prepared_delivery_key(signer, message);
+        let _writes = self.endpoint.prepared_writes();
+        let kept = store
+            .get(&key)
+            .map_err(in_flight_error)?
+            .and_then(|bytes| PreparedDelivery::decode(&bytes))
+            .filter(|delivery| delivery.tx_id == tx_id);
+        let Some(delivery) = kept else {
+            return Ok(());
+        };
+        let reported = PreparedDelivery {
+            failure_reported: true,
+            ..delivery
+        };
+        store
+            .put_opt(key, reported.encode(), &synced())
+            .map_err(in_flight_error)
+    }
+
     /// Every delivery `signer` keeps a transaction for, with that
     /// transaction, or `None` for one the event store holds that does not
     /// decode: its transaction is unknown.
@@ -561,7 +609,7 @@ impl RuesClient {
     /// Make the next `keeps` keeps and `forgets` forgets of the
     /// transactions kept for deliveries sent one at a time fail, as they
     /// do when the event store cannot be written, for tests of what such a
-    /// failure does.
+    /// failure does. Noting that a failure was reported is a keep.
     pub(crate) fn fail_prepared_writes(&self, keeps: usize, forgets: usize) {
         self.endpoint.fail_prepared_writes(keeps, forgets);
     }
@@ -844,16 +892,30 @@ mod tests {
 
     #[test]
     fn prepared_deliveries_round_trip_and_reject_corruption() {
-        let delivery = PreparedDelivery {
-            tx_id: [7; 32],
-            prepared_at: 1_700_000_000_000,
-        };
-        assert_eq!(PreparedDelivery::decode(&delivery.encode()), Some(delivery));
-        let encoded = delivery.encode();
-        assert!(PreparedDelivery::decode(&encoded[1..]).is_none());
-        let mut longer = encoded;
-        longer.push(0);
-        assert!(PreparedDelivery::decode(&longer).is_none());
+        for failure_reported in [false, true] {
+            let delivery = PreparedDelivery {
+                tx_id: [7; 32],
+                prepared_at: 1_700_000_000_000,
+                failure_reported,
+            };
+            assert_eq!(PreparedDelivery::decode(&delivery.encode()), Some(delivery));
+            let encoded = delivery.encode();
+            // One kept before the flag reads as not reported.
+            assert_eq!(
+                PreparedDelivery::decode(&encoded[..40]),
+                Some(PreparedDelivery {
+                    failure_reported: false,
+                    ..delivery
+                })
+            );
+            assert!(PreparedDelivery::decode(&encoded[..39]).is_none());
+            let mut longer = encoded.clone();
+            longer.push(0);
+            assert!(PreparedDelivery::decode(&longer).is_none());
+            let mut unknown = encoded;
+            unknown[40] = 2;
+            assert!(PreparedDelivery::decode(&unknown).is_none());
+        }
     }
 
     /// What a signer keeps for its deliveries one at a time survives a
@@ -866,6 +928,7 @@ mod tests {
         let delivery = |tx: u8, prepared_at: u64| PreparedDelivery {
             tx_id: [tx; 32],
             prepared_at,
+            failure_reported: false,
         };
         let directory = tempfile::tempdir().unwrap();
         let url = Url::parse("http://127.0.0.1:9/prepared-deliveries").unwrap();
@@ -954,6 +1017,26 @@ mod tests {
             );
             // The other signer's is kept apart.
             assert_eq!(client.prepared_deliveries(&[6; 32]).unwrap().len(), 1);
+            // A failure is noted only on the transaction it is of.
+            client
+                .report_prepared_failure(&[1; 32], H256::from_low_u64_be(2), [9; 32])
+                .unwrap();
+            client
+                .report_prepared_failure(&[1; 32], H256::from_low_u64_be(3), [1; 32])
+                .unwrap();
+            client
+                .report_prepared_failure(&[1; 32], H256::from_low_u64_be(8), [1; 32])
+                .unwrap();
+            let reported = |message: u64| {
+                client
+                    .prepared_delivery(&[1; 32], H256::from_low_u64_be(message))
+                    .unwrap()
+                    .map(|delivery| delivery.failure_reported)
+            };
+            assert_eq!(
+                [reported(2), reported(3), reported(8)],
+                [Some(false), Some(true), None]
+            );
             // A transaction is forgotten for room only while it is still the
             // one kept for its message.
             assert!(!client

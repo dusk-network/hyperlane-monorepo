@@ -564,7 +564,7 @@ impl DuskMailbox {
         let key = signer_key(signer);
         if let Some(prepared) = self.rues.prepared_delivery(&key, message)? {
             if let Some(outcome) = self.follow_prepared(&key, message, &prepared).await? {
-                return Ok(outcome);
+                return self.reported(&key, message, outcome);
             }
         }
         self.room_for_prepared(&key, message).await?;
@@ -581,6 +581,7 @@ impl DuskMailbox {
             let prepared = PreparedDelivery {
                 tx_id,
                 prepared_at: unix_millis(),
+                failure_reported: false,
             };
             self.rues
                 .keep_prepared_delivery(&key, message, &prepared, self.limits.prepared)
@@ -634,7 +635,29 @@ impl DuskMailbox {
             }
             Err(error) => return Err(error.into()),
         };
-        self.outcome_of(&tx_id).await
+        let outcome = self.outcome_of(&tx_id).await?;
+        self.reported(&key, message, outcome)
+    }
+
+    /// `outcome`, of the transaction kept for `message`, as `process`
+    /// reports it to the relayer, which charges the gas it spent to the
+    /// message. A failure is noted on the kept transaction first, so that
+    /// it is reported once: a submission of the message again then sends
+    /// another transaction once that one's block is final, instead of
+    /// reporting it again (`follow_prepared`). Fails, reporting nothing,
+    /// when it cannot be noted; the next submission reports it.
+    fn reported(
+        &self,
+        key: &[u8; 32],
+        message: H256,
+        outcome: TxOutcome,
+    ) -> ChainResult<TxOutcome> {
+        if !outcome.executed {
+            let mut tx_id = [0u8; 32];
+            tx_id.copy_from_slice(&outcome.transaction_id.as_bytes()[32..]);
+            self.rues.report_prepared_failure(key, message, tx_id)?;
+        }
+        Ok(outcome)
     }
 
     /// Make room to keep a transaction for `message`: a signer keeps those
@@ -712,9 +735,14 @@ impl DuskMailbox {
     ///
     /// - In a block, executed: it is the delivery's outcome, and the
     ///   relayer's confirmation goes on from it.
-    /// - In a block, failed: it spent its nonce and delivered nothing; the
-    ///   delivery goes again once that block is final, since until then a
-    ///   rollback can run the transaction again.
+    /// - In a block, failed, and not reported yet, as when it failed after
+    ///   the submission that prepared it returned: it is the delivery's
+    ///   outcome, so that the relayer charges the gas it spent to the
+    ///   message, and decides by its gas payment policy whether to try
+    ///   again. No other transaction is sent meanwhile.
+    /// - In a block, failed, and reported: it spent its nonce and delivered
+    ///   nothing; the delivery goes again once that block is final, since
+    ///   until then a rollback can run the transaction again.
     /// - In the mempool: it is followed to its block, as an unknown outcome
     ///   is.
     /// - In neither, prepared less than `SubmissionLimits::drop_grace` ago:
@@ -737,6 +765,16 @@ impl DuskMailbox {
                         %tx_id,
                         block_height,
                         "Dusk delivery's earlier transaction is in a block; following it instead of sending another"
+                    );
+                    return Ok(Some(self.outcome_from(&tx_id, &receipt)?));
+                }
+                if !prepared.failure_reported {
+                    warn!(
+                        message_id = ?message,
+                        %tx_id,
+                        block_height,
+                        gas_spent = receipt.gas_spent,
+                        "Dusk delivery's earlier transaction failed in a block after its submission returned; reporting it instead of sending another"
                     );
                     return Ok(Some(self.outcome_from(&tx_id, &receipt)?));
                 }
@@ -815,7 +853,7 @@ impl DuskMailbox {
     /// Make the next `keeps` keeps and `forgets` forgets of the
     /// transactions kept for deliveries one at a time fail, as they do when
     /// the event store cannot be written, for tests of what such a failure
-    /// does.
+    /// does. Noting that a failure was reported is a keep.
     #[doc(hidden)]
     pub fn fail_prepared_writes(&self, keeps: usize, forgets: usize) {
         self.rues.fail_prepared_writes(keeps, forgets);

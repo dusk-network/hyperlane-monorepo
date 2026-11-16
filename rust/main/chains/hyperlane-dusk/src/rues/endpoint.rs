@@ -434,6 +434,23 @@ impl Endpoint {
         kept
     }
 
+    /// Note that the failure of `tx_id`, kept for `message`, was reported,
+    /// if that transaction is still the one kept for it.
+    pub(crate) fn report_prepared_failure(
+        &self,
+        signer: &[u8; 32],
+        message: H256,
+        tx_id: [u8; 32],
+    ) {
+        if let Some(delivery) = self
+            .prepared()
+            .get_mut(&(*signer, message))
+            .filter(|delivery| delivery.tx_id == tx_id)
+        {
+            delivery.failure_reported = true;
+        }
+    }
+
     /// Held while a change to the transactions kept in an event store for
     /// deliveries depends on what it holds, so that no other changes them
     /// in between.

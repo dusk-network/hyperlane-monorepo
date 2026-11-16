@@ -1713,3 +1713,66 @@ async fn a_dusk_tx_build_sends_only_on_the_agents_word() {
     assert_eq!(mailbox.prepared_transaction(message.id()).unwrap(), None);
     std::env::remove_var("DUSK_TX_BIN");
 }
+
+/// A delivery's transaction that fails in a block after its submission
+/// returned, its outcome unknown, is the delivery's outcome when the
+/// relayer submits it again: a failure, with the transaction and the gas it
+/// spent, and no other transaction is sent in that call. The relayer then
+/// charges that gas to the message before its gas payment policy decides on
+/// another attempt. The transaction used to be forgotten once its block was
+/// final, and another sent at once, so the first one's gas was never
+/// reported and the message's payment paid for more attempts.
+#[tokio::test]
+async fn a_transaction_that_failed_after_its_submission_returned_is_reported_with_its_gas() {
+    let _env = HELPER_ENV.lock().await;
+    // Finality moves only by hand.
+    let node = Node::start_with(false, None);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    // The helper waits 200 ms for a block, the Mailbox 600 ms.
+    node.helper_waits(10);
+    let mailbox = node.mailbox(false).with_submission_limits(patient(64));
+    let delivery = delivery(0);
+    let (message, metadata, gas_limit) = &delivery;
+    // The chain takes no transaction for longer than either waits.
+    node.pause(true);
+    let error = mailbox
+        .process(message, metadata, *gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("to be included"), "{error}");
+    let first = node.model().mempool[&1].id.clone();
+    // Another relayer's delivery lands first, so ours fails in its block,
+    // which becomes final; then that delivery does not count after all.
+    node.deliver_elsewhere(&delivery);
+    node.pause(false);
+    node.wait_until("the first transaction is in a block", |model| {
+        model.included(&first).is_some()
+    })
+    .await;
+    let height = node.height();
+    node.finalize_to(height);
+    node.expire_block_pair().await;
+    node.undeliver(&delivery);
+    // Submitted again, the delivery reports that failure and sends nothing.
+    let calls = node.invocations().len();
+    let outcome = mailbox
+        .process(message, metadata, *gas_limit)
+        .await
+        .unwrap();
+    assert!(!outcome.executed);
+    assert_eq!(outcome.gas_used, U256::from(GAS_LIMIT));
+    assert_eq!(hex::encode(&outcome.transaction_id.as_bytes()[32..]), first);
+    assert_eq!(node.invocations().len(), calls);
+    assert_eq!(node.propagated(), [1]);
+    // Submitted again, as the relayer does while the message's payment
+    // covers another attempt, it goes with the next nonce; the failure is
+    // not reported twice.
+    let outcome = mailbox
+        .process(message, metadata, *gas_limit)
+        .await
+        .unwrap();
+    assert!(outcome.executed);
+    assert_eq!(node.propagated(), [1, 2]);
+    std::env::remove_var("DUSK_TX_BIN");
+}
