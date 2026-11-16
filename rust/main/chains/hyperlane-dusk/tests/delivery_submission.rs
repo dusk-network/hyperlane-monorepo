@@ -1636,8 +1636,9 @@ async fn a_signer_at_its_bound_of_kept_transactions_forgets_only_final_ones() {
     assert!(error.contains("may still land"), "{error}");
     assert_eq!(node.invocations().len(), calls);
     // Once the landed one's block is final, its transaction is forgotten
-    // for room, and so is the lost one, whose nonce is now used for good:
-    // the delivery goes.
+    // for room and the delivery goes. The lost one stays: its nonce is used
+    // in a final block now, but a second reading must show it used too, 10
+    // minutes after the first.
     let height = node.height();
     node.finalize_to(height);
     node.expire_block_pair().await;
@@ -1649,7 +1650,7 @@ async fn a_signer_at_its_bound_of_kept_transactions_forgets_only_final_ones() {
             .executed
     );
     assert_eq!(node.propagated(), [1, 2]);
-    assert_eq!(mailbox.prepared_transaction(lost.0.id()).unwrap(), None);
+    assert!(mailbox.prepared_transaction(lost.0.id()).unwrap().is_some());
     assert_eq!(
         mailbox.prepared_transaction(deliveries[0].0.id()).unwrap(),
         None
@@ -1981,23 +1982,25 @@ async fn deliver(
 
 /// The review's scenario. Transactions of messages the relayer gave up on,
 /// which never landed, fill the bound, while the signer's account uses
-/// their nonces. Once those nonces are used in final blocks, the
-/// transactions can never execute: they are forgotten for room, and
-/// deliveries go again. A nonce used only in a block that is not final is
-/// not enough, since a rollback could free it, and a transaction kept
-/// without its nonce, by a dusk-tx from before it named it, stays until it
-/// is in a final block. They used to stay for good, and no delivery could
-/// be signed again.
+/// their nonces. Once two readings, the gap apart, show those nonces used,
+/// the first at a final block, the transactions can never execute: they are
+/// forgotten for room, and deliveries go again. A nonce used only in a
+/// block that is not final is not enough, since a rollback could free it,
+/// nor is a single reading; and a transaction kept without its nonce, by a
+/// dusk-tx from before it named it, stays until it is in a final block.
+/// They used to stay for good, and no delivery could be signed again.
 #[tokio::test]
 async fn abandoned_transactions_go_for_room_once_their_nonces_are_used_for_good() {
     let _env = HELPER_ENV.lock().await;
     // Finality moves only by hand.
     let node = Node::start_with(false, None);
     std::env::set_var("DUSK_TX_BIN", node.helper());
+    let gap = Duration::from_secs(3);
     let mailbox = node
         .mailbox(false)
         .with_submission_limits(SubmissionLimits {
             prepared: 3,
+            nonce_gap: gap,
             ..patient(64)
         });
     let abandoned: Vec<_> = (7..10).map(delivery).collect();
@@ -2030,10 +2033,21 @@ async fn abandoned_transactions_go_for_room_once_their_nonces_are_used_for_good(
         tokio::time::sleep(BLOCK_TIME * 3).await;
     }
     assert_eq!(node.invocations().len(), calls);
-    // Once those blocks are final, the transactions with nonces 1 and 2 go,
-    // and the delivery goes; the one kept without its nonce stays.
+    // Once those blocks are final, the reading is proven, but a single
+    // reading does not count: the delivery still waits.
     let height = node.height();
     node.finalize_to(height);
+    let error = mailbox
+        .process(&message, &metadata, gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("the most it keeps"), "{error}");
+    assert_eq!(node.invocations().len(), calls);
+    // The gap later, a second reading shows nonces 1 and 2 used too: those
+    // transactions go, and the delivery goes; the one kept without its
+    // nonce stays.
+    tokio::time::sleep(gap).await;
     let outcome = mailbox
         .process(&message, &metadata, gas_limit)
         .await
@@ -2066,20 +2080,270 @@ async fn deliveries_sweep_abandoned_transactions_whose_nonces_are_used_for_good(
         .mailbox(false)
         .with_submission_limits(SubmissionLimits {
             sweep: Duration::ZERO,
+            nonce_gap: Duration::from_secs(1),
             ..patient(64)
         });
     let abandoned = delivery(9);
     lose(&node, &mailbox, &abandoned, 1).await;
-    // Deliveries go on, the first using nonce 1, and each sweeps.
-    for nonce in 0..3 {
-        deliver(&mailbox, &delivery(nonce)).await;
+    // Deliveries go on, the first using nonce 1, and each sweeps: once two
+    // readings the gap apart show nonce 1 used, the abandoned one goes.
+    let mut delivered = 0;
+    while mailbox
+        .prepared_transaction(abandoned.0.id())
+        .unwrap()
+        .is_some()
+    {
+        assert!(delivered < 12, "the abandoned transaction was never swept");
+        deliver(&mailbox, &delivery(delivered)).await;
+        delivered += 1;
         tokio::time::sleep(BLOCK_TIME * 3).await;
     }
     assert_eq!(
-        mailbox.prepared_transaction(abandoned.0.id()).unwrap(),
-        None
+        node.propagated(),
+        (1..=u64::from(delivered)).collect::<Vec<_>>()
     );
-    assert_eq!(node.propagated(), [1, 2, 3]);
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+/// A Mailbox that submits one at a time, on a node whose blocks come, and
+/// become final, only by hand, with kept transactions forgotten once two
+/// readings of the account, `gap` apart, show their nonces used; and the
+/// delivery whose transaction T, signed with nonce 1, it keeps while T
+/// waits in the mempool.
+async fn keep_one_in_the_mempool(
+    gap: Duration,
+) -> (
+    Node,
+    hyperlane_dusk::DuskMailbox,
+    (
+        hyperlane_core::HyperlaneMessage,
+        hyperlane_core::Metadata,
+        Option<U256>,
+    ),
+) {
+    let node = Node::start_with(false, None);
+    node.freeze(true);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    node.helper_waits(10);
+    let mailbox = node
+        .mailbox(false)
+        .with_submission_limits(SubmissionLimits {
+            nonce_gap: gap,
+            ..patient(64)
+        });
+    let kept = delivery(9);
+    let (message, metadata, gas_limit) = &kept;
+    let error = mailbox
+        .process(message, metadata, *gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("to be included"), "{error}");
+    assert_eq!(mailbox.prepared_nonce(message.id()).unwrap(), Some(1));
+    assert_eq!(
+        node.model().mempool.keys().copied().collect::<Vec<_>>(),
+        [1]
+    );
+    (node, mailbox, kept)
+}
+
+/// Look the signer's kept transactions up, as a delivery's sweep does,
+/// while the node's chain goes from its tip P to a child C and back to P
+/// around the reading of the account: the first read of the tip returns P;
+/// C comes, with what the mempool held at P, and makes P final; the account
+/// read shows C's transactions; C is rolled back, they go back into the
+/// mempool, and `then` runs; and the second read of the tip returns P
+/// again. How many kept transactions were forgotten.
+async fn reclaim_across_a_rolled_back_block(
+    node: &Node,
+    mailbox: &hyperlane_dusk::DuskMailbox,
+    then: impl FnOnce(&Node),
+) -> usize {
+    let parent = node.height();
+    let account = std::sync::Arc::new(Gate::default());
+    node.inject(Route::AccountStatus, None, Fault::Hold(account.clone()));
+    let reclaim = tokio::spawn({
+        let mailbox = mailbox.clone();
+        async move { mailbox.reclaim_kept_transactions().await }
+    });
+    node.wait_until("the account read reaches the node", |_| {
+        account.waiting.load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+    let tip = std::sync::Arc::new(Gate::default());
+    node.inject(Route::Graphql, None, Fault::Hold(tip.clone()));
+    node.produce_block();
+    node.finalize_to(parent);
+    account.open();
+    node.wait_until("the second read of the tip reaches the node", |_| {
+        tip.waiting.load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+    node.rollback_to(parent);
+    then(node);
+    tip.open();
+    reclaim.await.unwrap().unwrap()
+}
+
+/// The review's sequence (w14). While the agent reads the signer's account
+/// between two reads of the tip, block C, child of the tip P, comes with
+/// the kept transaction T at nonce 1 and makes P final; the account read
+/// shows nonce 1; C is rolled back, and T goes back into the mempool; the
+/// second read of the tip returns P again. Nonce 1 was taken for P's,
+/// final, and T's record went while T could still land: a delivery sent
+/// again would then have paid for a second, failing transaction. T now
+/// stays: one reading never counts, and a transaction in the mempool
+/// always stays, even once two readings the gap apart, each across such a
+/// rollback, show its nonce used. T then lands, its record goes once its
+/// block is final, and nothing else was ever signed.
+#[tokio::test]
+async fn a_kept_transaction_a_rollback_puts_back_stays_despite_matching_tips() {
+    let _env = HELPER_ENV.lock().await;
+    let gap = Duration::from_secs(1);
+    let (node, mailbox, (message, _, _)) = keep_one_in_the_mempool(gap).await;
+    let kept = node.model().mempool[&1].id.clone();
+    let calls = node.invocations().len();
+    // P, the block C will follow.
+    node.produce_block();
+    assert_eq!(
+        reclaim_across_a_rolled_back_block(&node, &mailbox, |_| {}).await,
+        0
+    );
+    assert!(mailbox
+        .prepared_transaction(message.id())
+        .unwrap()
+        .is_some());
+    assert_eq!(node.model().mempool[&1].id, kept);
+    // The gap later, the same again: two readings show nonce 1 used, and T,
+    // in the mempool, stays.
+    tokio::time::sleep(gap).await;
+    assert_eq!(
+        reclaim_across_a_rolled_back_block(&node, &mailbox, |_| {}).await,
+        0
+    );
+    assert!(mailbox
+        .prepared_transaction(message.id())
+        .unwrap()
+        .is_some());
+    // T lands, and once its block is final its record goes; nothing else
+    // was signed.
+    node.finality_lag(Some(1));
+    node.freeze(false);
+    node.wait_until_final(1).await;
+    assert_eq!(mailbox.reclaim_kept_transactions().await.unwrap(), 1);
+    assert_eq!(node.included()[0].tx.id, kept);
+    assert_eq!(node.invocations().len(), calls);
+    assert_eq!(node.propagated(), [1]);
+    node.settle(1).await;
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+/// One reading of the signer's account never counts. As in the review's
+/// sequence, a block holding the kept transaction T at nonce 1 is rolled
+/// back around a reading, which takes nonce 1 for its final parent's; then
+/// the node drops T, now in neither its mempool nor a block. Nonce 1 is
+/// free, and T, which peers may hold, could still land: it stays, also the
+/// gap later, when the account, read again, shows nonce 1 unused. Once
+/// another transaction uses nonce 1 for good, two readings the gap apart
+/// show it, and T goes.
+#[tokio::test]
+async fn a_single_reading_of_the_account_never_forgets_a_kept_transaction() {
+    let _env = HELPER_ENV.lock().await;
+    let gap = Duration::from_secs(1);
+    let (node, mailbox, (message, _, _)) = keep_one_in_the_mempool(gap).await;
+    node.produce_block();
+    assert_eq!(
+        reclaim_across_a_rolled_back_block(&node, &mailbox, |node| node.evict_from(1)).await,
+        0
+    );
+    assert!(node.model().mempool.is_empty());
+    assert!(mailbox
+        .prepared_transaction(message.id())
+        .unwrap()
+        .is_some());
+    // The chain goes on without nonce 1: the gap later, the account read
+    // again shows it unused, and T stays.
+    node.produce_block();
+    assert_eq!(mailbox.reclaim_kept_transactions().await.unwrap(), 0);
+    tokio::time::sleep(gap).await;
+    assert_eq!(mailbox.reclaim_kept_transactions().await.unwrap(), 0);
+    assert!(mailbox
+        .prepared_transaction(message.id())
+        .unwrap()
+        .is_some());
+    // Another transaction uses nonce 1 in a block made final: T goes once
+    // two readings the gap apart show it.
+    node.send_foreign(1).unwrap();
+    node.produce_block();
+    node.produce_block();
+    node.finalize_to(node.height());
+    let deadline = std::time::Instant::now() + gap * 5;
+    while mailbox
+        .prepared_transaction(message.id())
+        .unwrap()
+        .is_some()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "T was never forgotten"
+        );
+        mailbox.reclaim_kept_transactions().await.unwrap();
+        tokio::time::sleep(gap / 4).await;
+    }
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+/// A reading whose block was replaced before its height became final does
+/// not count: its nonce came from a block the chain left. Here another
+/// transaction uses nonce 1 in a block a reading reads; that block is
+/// rolled back, the node drops the transaction, and a block that does not
+/// use nonce 1 takes its place and becomes final. A block at the tip then
+/// uses nonce 1 again, and the account, read the gap later, shows it. The
+/// transaction kept with nonce 1, lost before it was sent, stays: nonce 1
+/// is used only in a block that is not final, and once that one is rolled
+/// back too, the kept one could still execute.
+#[tokio::test]
+async fn a_reading_whose_block_was_replaced_never_counts() {
+    let _env = HELPER_ENV.lock().await;
+    // Finality moves only by hand.
+    let node = Node::start_with(false, None);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let gap = Duration::from_secs(1);
+    let mailbox = node
+        .mailbox(false)
+        .with_submission_limits(SubmissionLimits {
+            nonce_gap: gap,
+            ..patient(64)
+        });
+    let kept = delivery(9);
+    lose(&node, &mailbox, &kept, 1).await;
+    node.freeze(true);
+    // Another transaction uses nonce 1 in block B, which a reading reads
+    // while B is not final.
+    node.send_foreign(1).unwrap();
+    node.produce_block();
+    node.produce_block();
+    let height = node.height();
+    assert_eq!(node.model().nonce, 1);
+    assert_eq!(mailbox.reclaim_kept_transactions().await.unwrap(), 0);
+    // B is rolled back, the node drops that transaction, and a block that
+    // does not use nonce 1 takes B's place and becomes final.
+    node.rollback_to(height - 1);
+    node.evict_from(1);
+    node.produce_block();
+    node.finalize_to(height);
+    assert_eq!(node.model().nonce, 0);
+    // Nonce 1 is used again at the tip, and the gap later the account
+    // shows it: the kept transaction stays.
+    node.send_foreign(1).unwrap();
+    node.produce_block();
+    node.produce_block();
+    tokio::time::sleep(gap).await;
+    assert_eq!(mailbox.reclaim_kept_transactions().await.unwrap(), 0);
+    assert!(mailbox.prepared_transaction(kept.0.id()).unwrap().is_some());
+    // That block is rolled back too, and nonce 1 is free for it again.
+    node.rollback_to(height);
+    assert_eq!(node.model().nonce, 0);
     std::env::remove_var("DUSK_TX_BIN");
 }
 

@@ -76,23 +76,67 @@ const PREPARED_SWEEP: Duration = Duration::from_secs(300);
 /// remembers (`DuskMailbox::wait_for_signer`).
 const MAX_SETTLED: usize = 1024;
 
+/// How long after a proven reading of the signer's account a second
+/// reading must show its nonce too before kept transactions it shows unable
+/// to execute are forgotten (`DuskMailbox::nonce_evidence`).
+const NONCE_GAP: Duration = Duration::from_secs(600);
+
 /// A reading of the signer's account at the node's tip block: the block,
-/// and the account's nonce there (`DuskMailbox::proved_final_nonce`).
+/// the account's nonce there, and when it was taken
+/// (`DuskMailbox::nonce_evidence`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Reading {
     height: u64,
     hash: H256,
     nonce: u64,
+    taken_at: std::time::Instant,
 }
 
-/// What readings of the signer's account show of its nonce at the last
-/// final block.
+/// A reading proven: its block was final, and still the node's block at its
+/// height. Its nonce is the account's nonce at a final block, as far as the
+/// reading is right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Proven {
+    nonce: u64,
+    taken_at: std::time::Instant,
+}
+
+/// What readings of the signer's account show of the nonces it has used
+/// for good.
 #[derive(Debug, Default)]
 struct FinalNonce {
-    /// The account's nonce at a block now final, at least.
-    proved: Option<u64>,
     /// A reading whose block is not final yet.
     waiting: Option<Reading>,
+    /// The proven reading a second one confirms, once it is
+    /// `SubmissionLimits::nonce_gap` old.
+    older: Option<Proven>,
+    /// The next proven reading, which takes the older one's place once it
+    /// is that old too.
+    newer: Option<Proven>,
+}
+
+impl FinalNonce {
+    fn prove(&mut self, reading: &Reading) {
+        let proven = Proven {
+            nonce: reading.nonce,
+            taken_at: reading.taken_at,
+        };
+        if self.older.is_none() {
+            self.older = Some(proven);
+        } else if self.newer.is_none() {
+            self.newer = Some(proven);
+        }
+    }
+
+    /// The proven reading taken at least `gap` before `at`, after the newer
+    /// one takes the older one's place once it is that old.
+    fn aged(&mut self, gap: Duration, at: std::time::Instant) -> Option<Proven> {
+        let aged = |proven: &Proven| at.saturating_duration_since(proven.taken_at) >= gap;
+        if self.newer.as_ref().is_some_and(aged) {
+            self.older = self.newer.take();
+        }
+        self.older.filter(aged)
+    }
 }
 
 /// What a delivery check found.
@@ -243,6 +287,10 @@ pub struct SubmissionLimits {
     /// How often a delivery looks kept transactions of other messages up,
     /// to forget those that can no longer land (`DuskMailbox::sweep_prepared`).
     pub sweep: Duration,
+    /// How long after the first of two readings of the signer's account the
+    /// second is taken, at least, before kept transactions whose nonce both
+    /// show used are forgotten (`DuskMailbox::nonce_evidence`).
+    pub nonce_gap: Duration,
 }
 
 impl Default for SubmissionLimits {
@@ -256,6 +304,7 @@ impl Default for SubmissionLimits {
             outstanding: MAX_OUTSTANDING_DELIVERIES,
             prepared: crate::rues::MAX_PREPARED_DELIVERIES,
             sweep: PREPARED_SWEEP,
+            nonce_gap: NONCE_GAP,
         }
     }
 }
@@ -798,7 +847,7 @@ impl DuskMailbox {
         if kept < limit {
             return Ok(());
         }
-        let (looked, freed) = self.reclaim_prepared(key, signer, message).await?;
+        let (looked, freed) = self.reclaim_prepared(key, signer, Some(message)).await?;
         if kept - freed < limit {
             return Ok(());
         }
@@ -825,28 +874,29 @@ impl DuskMailbox {
     ///   with its failure reported. One that failed before its failure was
     ///   reported is kept: its message's next submission reports it, and
     ///   its gas would otherwise never be charged.
-    /// - In no block, signed with a nonce the account has used at a final
-    ///   block (`proved_final_nonce`, read before the transaction): a
-    ///   transaction with that nonce is final, so this one can never
-    ///   execute. It does not matter whether a mempool still holds it.
+    /// - In no block and not in the node's mempool, signed with a nonce two
+    ///   readings of the account show used: one proven at a final block, and
+    ///   one taken now, at least `SubmissionLimits::nonce_gap` after it
+    ///   (`nonce_evidence`), before the transaction is looked up.
     ///
-    /// Everything else is kept: a transaction in a block that is not final,
-    /// one in no block whose nonce the account may still use, and one kept
-    /// without its nonce (by a dusk-tx from before it named it), which can
-    /// only go once it is in a final block. A record that does not decode
-    /// cannot be looked up, and stays.
+    /// Everything else is kept: a transaction in a block that is not final;
+    /// one in the mempool, whatever the readings show, since a rollback puts
+    /// a transaction back there; one in neither whose nonce the readings do
+    /// not both show used; and one kept without its nonce (by a dusk-tx from
+    /// before it named it), which can only go once it is in a final block. A
+    /// record that does not decode cannot be looked up, and stays.
     async fn reclaim_prepared(
         &self,
         key: &[u8; 32],
         signer: &DuskSigner,
-        message: H256,
+        message: Option<H256>,
     ) -> ChainResult<(usize, usize)> {
         // One that does not decode cannot be looked up.
         let mut candidates: Vec<(u64, H256, PreparedDelivery)> = self
             .rues
             .prepared_deliveries(key)?
             .into_iter()
-            .filter(|(other, _)| *other != message)
+            .filter(|(other, _)| Some(*other) != message)
             .filter_map(|(other, delivery)| {
                 delivery.map(|delivery| (delivery.prepared_at, other, delivery))
             })
@@ -862,7 +912,7 @@ impl DuskMailbox {
         let start = after.map_or(0, |after| {
             candidates.partition_point(|(prepared_at, other, _)| (*prepared_at, *other) <= after)
         });
-        let (used, finalized) = self.proved_final_nonce(signer).await?;
+        let (used, finalized) = self.nonce_evidence(signer).await?;
         let mut freed = 0;
         let looked = candidates.len().min(PREPARED_LOOKUPS);
         for (prepared_at, other, delivery) in candidates.iter().cycle().skip(start).take(looked) {
@@ -879,7 +929,9 @@ impl DuskMailbox {
                     block_height > finalized
                         || (receipt.error.is_some() && !delivery.failure_reported)
                 }
-                TransactionStatus::Pending | TransactionStatus::Unknown => {
+                // A rollback puts a transaction back into the mempool.
+                TransactionStatus::Pending => true,
+                TransactionStatus::Unknown => {
                     !matches!((delivery.nonce, used), (Some(nonce), Some(used)) if nonce <= used)
                 }
             };
@@ -916,7 +968,7 @@ impl DuskMailbox {
             }
             *last = Some(std::time::Instant::now());
         }
-        match self.reclaim_prepared(key, signer, message).await {
+        match self.reclaim_prepared(key, signer, Some(message)).await {
             Ok((_, 0)) => {}
             Ok((looked, freed)) => debug!(
                 looked,
@@ -929,20 +981,24 @@ impl DuskMailbox {
         }
     }
 
-    /// The nonce the signer's account has at the node's last final block,
-    /// at least, as far as readings of the account show, and the last final
-    /// block, read first.
+    /// The nonce up to which two readings of the signer's account show its
+    /// nonces used, if they do, and the last final block, read first.
     ///
     /// Rusk reads an account at its tip only. A reading is the account
-    /// between two reads of the tip that agree: Rusk accepts a block, and
-    /// commits it as its tip, under the write lock of its VM, which an
-    /// account read waits for, so the account read is the account at that
-    /// tip block. Once that block is final, and still the node's block at
-    /// its height, the account's final nonce is at least the reading's. A
-    /// reading waits for that, and each call proves the one waiting and
-    /// takes another when none waits; a tip that changes during the reading
-    /// gives none. The proved nonce only grows, and lives for the process.
-    async fn proved_final_nonce(&self, signer: &DuskSigner) -> ChainResult<(Option<u64>, u64)> {
+    /// between two reads of the tip that agree, taken as the account at that
+    /// tip block. Once its height is final, the reading is proven if that
+    /// block is still the node's block there; one whose block was replaced
+    /// is dropped, since its nonce came from a block the chain left. A
+    /// proven reading can still be wrong: a block can be accepted and rolled
+    /// back between the two tip reads, and the account read meanwhile shows
+    /// that block's transactions. So a proven reading only counts with a
+    /// second one, the account read now, asked for at least
+    /// `SubmissionLimits::nonce_gap` after the first was taken and after it
+    /// was proven: the nonce returned is the smaller of the two. Only blocks
+    /// rolled back around both readings could make both wrong. Each call
+    /// proves the reading that waits, and takes a new one while one could be
+    /// kept; a tip that changes during a reading gives none.
+    async fn nonce_evidence(&self, signer: &DuskSigner) -> ChainResult<(Option<u64>, u64)> {
         let pair = self.rues.fresh_block_pair().await?;
         let finalized = pair.finalized();
         let waiting = self
@@ -961,19 +1017,25 @@ impl DuskMailbox {
                 if state.waiting == Some(reading) {
                     state.waiting = None;
                     if on_chain {
-                        state.proved = state.proved.max(Some(reading.nonce));
+                        state.prove(&reading);
                     }
                 }
             }
         }
-        let waits = self
-            .final_nonce
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .waiting
-            .is_some();
-        if !waits {
+        let reads = {
+            let state = self
+                .final_nonce
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            state.waiting.is_none() && state.newer.is_none()
+        };
+        // The account read now, and when it was asked for: the second
+        // reading counts from then.
+        let mut now = None;
+        if reads {
+            let asked = std::time::Instant::now();
             let account = self.rues.account_status(&signer.address_string()).await?;
+            now = Some((account.nonce, asked));
             let after = self.rues.fresh_block_pair().await?;
             if after.tip() == pair.tip() {
                 let (height, hash) = pair.tip();
@@ -981,24 +1043,53 @@ impl DuskMailbox {
                     height,
                     hash,
                     nonce: account.nonce,
+                    taken_at: std::time::Instant::now(),
                 };
                 let mut state = self
                     .final_nonce
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
                 if height <= after.finalized() {
-                    state.proved = state.proved.max(Some(account.nonce));
+                    state.prove(&reading);
                 } else if state.waiting.is_none() {
                     state.waiting = Some(reading);
                 }
             }
         }
-        let proved = self
+        let at = now.map_or_else(std::time::Instant::now, |(_, asked)| asked);
+        let older = self
             .final_nonce
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .proved;
-        Ok((proved, finalized))
+            .aged(self.limits.nonce_gap, at);
+        let Some(older) = older else {
+            return Ok((None, finalized));
+        };
+        let now = match now {
+            Some((nonce, _)) => nonce,
+            None => {
+                self.rues
+                    .account_status(&signer.address_string())
+                    .await?
+                    .nonce
+            }
+        };
+        Ok((Some(older.nonce.min(now)), finalized))
+    }
+
+    /// Look kept transactions up and forget those no longer needed, as a
+    /// delivery's sweep does (`reclaim_prepared`), for tests. How many it
+    /// forgot.
+    #[doc(hidden)]
+    pub async fn reclaim_kept_transactions(&self) -> ChainResult<usize> {
+        let signer = self
+            .signer
+            .as_ref()
+            .ok_or(HyperlaneDuskError::SignerUnavailable)?;
+        let (_, freed) = self
+            .reclaim_prepared(&signer_key(signer), signer, None)
+            .await?;
+        Ok(freed)
     }
 
     /// What the transaction prepared for an earlier submission of

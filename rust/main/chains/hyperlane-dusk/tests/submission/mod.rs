@@ -228,6 +228,8 @@ pub struct Model {
     pub requests: Vec<String>,
     /// Blocks hold no transaction while set.
     pub paused: bool,
+    /// No block comes on its own while set (`Node::produce_block`).
+    pub frozen: bool,
 }
 
 impl Model {
@@ -249,6 +251,7 @@ impl Model {
             events: Vec::new(),
             requests: Vec::new(),
             paused: false,
+            frozen: false,
         };
         model.publish();
         model
@@ -839,7 +842,7 @@ impl Node {
                     let now = Instant::now();
                     let mut model = state.lock().unwrap();
                     model.retry_queue(now);
-                    if now >= next_block {
+                    if now >= next_block && !model.frozen {
                         model.produce();
                         next_block = now + BLOCK_TIME;
                     }
@@ -957,6 +960,17 @@ impl Node {
 
     pub fn pause(&self, paused: bool) {
         self.model().paused = paused;
+    }
+
+    /// Stop blocks coming on their own, or let them come again: while
+    /// frozen, a block comes only with `produce_block`.
+    pub fn freeze(&self, frozen: bool) {
+        self.model().frozen = frozen;
+    }
+
+    /// The next block, now.
+    pub fn produce_block(&self) {
+        self.model().produce();
     }
 
     pub fn evict_from(&self, nonce: u64) {

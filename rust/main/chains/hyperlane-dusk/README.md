@@ -266,11 +266,16 @@ how to run the local bridge.
   hash; a `dusk-tx` from before names none. The hash stays until the relayer
   confirms the message delivered, or until it can no longer land and is not
   owed a report: in a final block, executed or failed with its failure
-  reported; or in no block, signed with a nonce the signer's account has
-  used at a final block, so that it can never execute, whether a mempool
-  holds it or not. Rusk reads an account at its tip only, so the agent reads
-  the account between two reads of the tip that agree, and counts that nonce
-  as final once that tip block is final and still the node's. A kept
+  reported; or in neither a block nor the node's mempool, signed with a
+  nonce two readings of the signer's account, at least 10 minutes apart,
+  both show used, so that it can never execute (but see the known issue of
+  kept transactions below). Rusk reads an account at its tip only, so a
+  reading is the account between two reads of the tip that agree; the first
+  counts once that tip block is final and still the node's block at its
+  height, and the second is the account read again, at least 10 minutes
+  after the first and after its block is final, right before the transaction
+  is looked up. One in the mempool always stays, whatever the readings show:
+  a rollback puts a transaction back there, and it can land again. A kept
   transaction without its nonce goes only once it is in a final block. A
   signer keeps those of at most 1,024 deliveries: at the bound, a delivery
   looks kept transactions up, the oldest first and on later tries on from
@@ -279,11 +284,11 @@ how to run the local bridge.
   other messages, so that those of messages the relayer gave up on do not
   pile up to the bound; it reads nothing while nothing else is kept. One
   that may still land, in the mempool, in a block that is not final, or in
-  neither with its nonce not yet used for good, is never forgotten, and
-  neither is one that failed in a final block before its failure was
-  reported, whose gas would then never be charged: while none can go,
-  deliveries fail without being signed, and the relayer tries them again
-  once kept transactions settle. A delivery submitted again looks its
+  neither with its nonce not yet shown used by both readings, is never
+  forgotten, and neither is one that failed in a final block before its
+  failure was reported, whose gas would then never be charged: while none
+  can go, deliveries fail without being signed, and the relayer tries them
+  again once kept transactions settle. A delivery submitted again looks its
   transaction up first: in a block and executed, it is the delivery's
   outcome, and the relayer's confirmation goes on from it; failed in a
   block, and not reported yet, as when it failed after the submission that
@@ -334,6 +339,37 @@ how to run the local bridge.
   (the pipelined path's reservations, once their own known issues are
   fixed), or a Rusk transaction expiry that lets a dropped transaction be
   waited out for good.
+- **Known issue of kept transactions: forgetting one on its nonce rests on
+  two readings of the account.** Rusk serves an account at its tip only,
+  and does not say which block it read it at, so a reading pairs the
+  account with the tips read before and after it. A block accepted and
+  rolled back between those two reads shows in the account read between
+  them: with the tip at P, a block C holding the kept transaction T at
+  nonce n comes, the account read shows n, C is rolled back, which puts T
+  back into the mempool, and the tip is P again, so the reading takes n for
+  P's. One such reading used to be enough, and T's record went while T
+  could still land. T now goes on its nonce only when it is in neither the
+  node's mempool nor a block and two readings at least 10 minutes apart,
+  the first at a block that is final and still the node's, both show n
+  used. Its record can then go while T can still land only when all of
+  these happen:
+  1. both readings, 10 minutes or more apart, are wrong: each is taken
+     while the node's tip is a block that uses n and is rolled back later;
+  2. when T is looked up, after the second reading, it is in neither the
+     node's mempool nor a block, although the rollback of a block holding
+     it puts it back into the mempool: the node dropped it, say, while a
+     peer kept it.
+
+  The agent also assumes its RUES URL is one node, or nodes that agree: a
+  reading pairs the tip one request returns with the account another
+  returns, and a URL in front of several nodes can answer them from
+  different ones, which makes a reading wrong without any rollback. The
+  cost, when it happens: T's message, submitted again, is signed with the
+  next nonce, and one of the two transactions fails, paying its whole gas
+  limit, as in the issue above. The fix, needed before mainnet: an account
+  read tied to the block it was read at, which Rusk does not serve, or
+  forgetting a transaction on its nonce only once a transaction with that
+  nonce is found in a final block.
 - **Known issue of delivery gas accounting: a crash at one point leaves one
   failure uncharged.** The relayer charges a delivery's gas to its message
   at most once, never twice. Before `process` returns a failed outcome, the
