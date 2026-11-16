@@ -254,31 +254,45 @@ how to run the local bridge.
   closes with it. The relayer needs a `dusk-tx` whose `call --help` lists
   `--ack-before-send`, which it asks once per process; with another, it
   refuses to deliver and says which `dusk-tx` it needs: one built from
-  `dusk-network/hyperlane-dusk` at `de7e2a6` or later. The hash stays until
-  the relayer confirms the message delivered. A signer keeps those of at
-  most 1,024 deliveries: at the bound, a delivery looks kept transactions
-  up, the oldest first and on later tries on from where the last look
-  stopped, at most 16 at a time, and forgets those in final blocks. One that
-  may still land, in the mempool, in a block that is not final, or in
-  neither, is never forgotten for room, and neither is one that failed in a
-  final block before its failure was reported, whose gas would then never be
-  charged: while none can go, deliveries fail without being signed, and the
-  relayer tries them again once kept transactions settle. A delivery
-  submitted again looks its transaction up first: in a block and executed,
-  it is the delivery's outcome, and the relayer's confirmation goes on from
-  it; failed in a block, and not reported yet, as when it failed after the
-  submission that prepared it had returned, that failure is the delivery's
-  outcome, with the gas it spent, so that the relayer charges it to the
-  message and its gas payment policy decides on another attempt, and nothing
-  else is sent then; failed and reported, the delivery goes again once that
-  block is final; in the mempool, it is followed to its block; in neither,
-  the delivery goes again only 60 s after the transaction was prepared, as
-  it may still be on its way to the node. A transaction the node refused at
-  preverification is not kept. Otherwise, after a submission whose outcome
-  was unknown, the first transaction could land after the relayer's
-  simulation of the next submission passed and before the helper read the
-  account's nonce: the helper signed the next nonce, and a second
-  transaction landed and failed, paying its whole gas limit.
+  `dusk-network/hyperlane-dusk` at `de7e2a6` or later. The helper also names
+  the nonce it signed with (`Prepared TX <hash>; nonce <N>; ...`, from
+  `dusk-network/hyperlane-dusk` `3c3ce7f`), which the agent keeps with the
+  hash; a `dusk-tx` from before names none. The hash stays until the relayer
+  confirms the message delivered, or until it can no longer land and is not
+  owed a report: in a final block, executed or failed with its failure
+  reported; or in no block, signed with a nonce the signer's account has
+  used at a final block, so that it can never execute, whether a mempool
+  holds it or not. Rusk reads an account at its tip only, so the agent reads
+  the account between two reads of the tip that agree, and counts that nonce
+  as final once that tip block is final and still the node's. A kept
+  transaction without its nonce goes only once it is in a final block. A
+  signer keeps those of at most 1,024 deliveries: at the bound, a delivery
+  looks kept transactions up, the oldest first and on later tries on from
+  where the last look stopped, at most 16 at a time, and forgets those it
+  can. Every 5 minutes a delivery does the same for the kept transactions of
+  other messages, so that those of messages the relayer gave up on do not
+  pile up to the bound; it reads nothing while nothing else is kept. One
+  that may still land, in the mempool, in a block that is not final, or in
+  neither with its nonce not yet used for good, is never forgotten, and
+  neither is one that failed in a final block before its failure was
+  reported, whose gas would then never be charged: while none can go,
+  deliveries fail without being signed, and the relayer tries them again
+  once kept transactions settle. A delivery submitted again looks its
+  transaction up first: in a block and executed, it is the delivery's
+  outcome, and the relayer's confirmation goes on from it; failed in a
+  block, and not reported yet, as when it failed after the submission that
+  prepared it had returned, that failure is the delivery's outcome, with the
+  gas it spent, so that the relayer charges it to the message and its gas
+  payment policy decides on another attempt, and nothing else is sent then;
+  failed and reported, the delivery goes again once that block is final; in
+  the mempool, it is followed to its block; in neither, the delivery goes
+  again only 60 s after the transaction was prepared, as it may still be on
+  its way to the node. A transaction the node refused at preverification is
+  not kept. Otherwise, after a submission whose outcome was unknown, the
+  first transaction could land after the relayer's simulation of the next
+  submission passed and before the helper read the account's nonce: the
+  helper signed the next nonce, and a second transaction landed and failed,
+  paying its whole gas limit.
 - **Known issue of deliveries one at a time: a dropped transaction can
   land after its message went again.** A kept transaction that is in
   neither the node's mempool nor a block 60 s after it was prepared is
@@ -302,19 +316,18 @@ how to run the local bridge.
 
   The node that kept M can then put it in a block, or hand it back to the
   relayer's node: nonce n is now the account's next, so M lands and fails,
-  the message being delivered, and pays its whole gas limit (the
-  delivery's, at most `gasLimit`), which no outcome reports to the
-  relayer. The recipient cannot run twice: the Mailbox delivers a message
-  once. Signing the message again with M's nonce instead would need that
-  nonce, which `dusk-tx` chooses and does not report before it sends, and
-  a transaction for every nonce below it that nothing else fills, or the
-  signer would wait on that gap for good. The fix, needed before mainnet:
-  keep each delivery's nonce and signed transaction until a transaction
-  with that nonce is in a final block, and send that same transaction
-  again when it was dropped, filling any free nonce below it (the
-  pipelined path's reservations, once their own known issues are fixed),
-  or a Rusk transaction expiry that lets a dropped transaction be waited
-  out for good.
+  the message being delivered, and pays its whole gas limit (the delivery's,
+  at most `gasLimit`), which no outcome reports to the relayer. The
+  recipient cannot run twice: the Mailbox delivers a message once. Signing
+  the message again with M's nonce instead, which the agent now keeps, would
+  need a transaction for every nonce below it that nothing else fills, or
+  the signer would wait on that gap for good. The fix, needed before
+  mainnet: keep each delivery's nonce and signed transaction until a
+  transaction with that nonce is in a final block, and send that same
+  transaction again when it was dropped, filling any free nonce below it
+  (the pipelined path's reservations, once their own known issues are
+  fixed), or a Rusk transaction expiry that lets a dropped transaction be
+  waited out for good.
 - **Waiting for a block.** The node builds a block from what its mempool
   holds when the block's round starts, so a transaction it admits is in a
   block 10 to 20 s later on a 10 s chain. `dusk-tx` waits for a delivery

@@ -69,6 +69,28 @@ const MAX_OUTSTANDING_DELIVERIES: usize = 64;
 /// Most kept transactions a delivery looks up to make room for its own
 /// (`DuskMailbox::room_for_prepared`).
 const PREPARED_LOOKUPS: usize = 16;
+/// How often deliveries look kept transactions of other messages up
+/// (`DuskMailbox::sweep_prepared`).
+const PREPARED_SWEEP: Duration = Duration::from_secs(300);
+
+/// A reading of the signer's account at the node's tip block: the block,
+/// and the account's nonce there (`DuskMailbox::proved_final_nonce`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Reading {
+    height: u64,
+    hash: H256,
+    nonce: u64,
+}
+
+/// What readings of the signer's account show of its nonce at the last
+/// final block.
+#[derive(Debug, Default)]
+struct FinalNonce {
+    /// The account's nonce at a block now final, at least.
+    proved: Option<u64>,
+    /// A reading whose block is not final yet.
+    waiting: Option<Reading>,
+}
 
 /// What a delivery check found.
 #[derive(Debug, Clone)]
@@ -215,6 +237,9 @@ pub struct SubmissionLimits {
     /// Most deliveries sent one at a time whose transaction the signer
     /// keeps (`DuskMailbox::room_for_prepared`).
     pub prepared: usize,
+    /// How often a delivery looks kept transactions of other messages up,
+    /// to forget those that can no longer land (`DuskMailbox::sweep_prepared`).
+    pub sweep: Duration,
 }
 
 impl Default for SubmissionLimits {
@@ -227,6 +252,7 @@ impl Default for SubmissionLimits {
             drop_grace: DROP_GRACE,
             outstanding: MAX_OUTSTANDING_DELIVERIES,
             prepared: crate::rues::MAX_PREPARED_DELIVERIES,
+            sweep: PREPARED_SWEEP,
         }
     }
 }
@@ -252,9 +278,13 @@ pub struct DuskMailbox {
     /// arguments, shared by every clone.
     simulations: Arc<StdMutex<HashMap<[u8; 32], std::time::Instant>>>,
     limits: SubmissionLimits,
-    /// Where the last look for room among the transactions kept for
-    /// deliveries stopped: when it was prepared, and its message.
+    /// Where the last look among the transactions kept for deliveries
+    /// stopped: when it was prepared, and its message.
     prepared_scan: Arc<StdMutex<Option<(u64, H256)>>>,
+    /// When kept transactions were last swept (`sweep_prepared`).
+    last_sweep: Arc<StdMutex<Option<std::time::Instant>>>,
+    /// The signer's nonce at the last final block, as far as shown.
+    final_nonce: Arc<StdMutex<FinalNonce>>,
     /// Whether deliveries are pipelined (`ConnectionConf::pipelines_deliveries`).
     /// Otherwise each goes one at a time: `dusk-tx` signs it with the
     /// account's nonce plus one, as the node reports it, and waits for its
@@ -307,6 +337,8 @@ impl DuskMailbox {
             simulations: Arc::default(),
             limits: SubmissionLimits::default(),
             prepared_scan: Arc::default(),
+            last_sweep: Arc::default(),
+            final_nonce: Arc::default(),
             pipelined,
         }
     }
@@ -567,7 +599,8 @@ impl DuskMailbox {
                 return self.reported(&key, message, outcome);
             }
         }
-        self.room_for_prepared(&key, message).await?;
+        self.sweep_prepared(&key, signer, message).await;
+        self.room_for_prepared(&key, signer, message).await?;
         let keep = |tx_id: &str, nonce: Option<u64>| -> Result<(), HyperlaneDuskError> {
             let tx_id = hex::decode(tx_id)
                 .ok()
@@ -663,29 +696,82 @@ impl DuskMailbox {
 
     /// Make room to keep a transaction for `message`: a signer keeps those
     /// of at most `SubmissionLimits::prepared` deliveries. At the bound,
-    /// kept transactions are looked up, at most `PREPARED_LOOKUPS`, the
-    /// oldest first and on later tries on from where the last look
-    /// stopped, and those in final blocks are forgotten: they can neither
-    /// be rolled back nor land again. One that may still land, in the
-    /// mempool, in a block that is not final, or in neither, is never
-    /// forgotten for room, and neither is one that failed in a final block
-    /// before its failure was reported: its gas would never be charged to
-    /// its message. While there is none, the delivery fails, and the
-    /// relayer tries it again later, once kept transactions have settled.
-    async fn room_for_prepared(&self, key: &[u8; 32], message: H256) -> ChainResult<()> {
-        let mut kept = self.rues.prepared_deliveries(key)?;
-        kept.retain(|(other, _)| *other != message);
+    /// kept transactions are looked up, and those whose records are no
+    /// longer needed are forgotten (`reclaim_prepared`). While none can go,
+    /// the delivery fails, and the relayer tries it again later, once kept
+    /// transactions have settled.
+    async fn room_for_prepared(
+        &self,
+        key: &[u8; 32],
+        signer: &DuskSigner,
+        message: H256,
+    ) -> ChainResult<()> {
+        let kept = self
+            .rues
+            .prepared_deliveries(key)?
+            .iter()
+            .filter(|(other, _)| *other != message)
+            .count();
         let limit = self.limits.prepared;
-        if kept.len() < limit {
+        if kept < limit {
             return Ok(());
         }
+        let (looked, freed) = self.reclaim_prepared(key, signer, message).await?;
+        if kept - freed < limit {
+            return Ok(());
+        }
+        warn!(
+            kept,
+            looked,
+            "A Dusk signer keeps the transactions of as many deliveries as it may, and none it looked up can be forgotten yet; the next delivery goes once one can"
+        );
+        Err(HyperlaneDuskError::Other(format!(
+            "The Dusk signer keeps the transactions of {kept} deliveries, the most it keeps, and none of the {looked} it looked up can be forgotten for room yet: each may still land, or failed without its failure reported yet. The delivery of message {message:?} goes once kept transactions settle"
+        ))
+        .into())
+    }
+
+    /// Look kept transactions of the signer up, other than `message`'s, at
+    /// most `PREPARED_LOOKUPS`, the oldest first and on later looks on from
+    /// where the last one stopped, and forget those whose records are no
+    /// longer needed. How many it looked up, and how many it forgot.
+    ///
+    /// A record is no longer needed when its transaction can neither land
+    /// again nor still owes a report:
+    ///
+    /// - In a block at or below the last final block, executed, or failed
+    ///   with its failure reported. One that failed before its failure was
+    ///   reported is kept: its message's next submission reports it, and
+    ///   its gas would otherwise never be charged.
+    /// - In no block, signed with a nonce the account has used at a final
+    ///   block (`proved_final_nonce`, read before the transaction): a
+    ///   transaction with that nonce is final, so this one can never
+    ///   execute. It does not matter whether a mempool still holds it.
+    ///
+    /// Everything else is kept: a transaction in a block that is not final,
+    /// one in no block whose nonce the account may still use, and one kept
+    /// without its nonce (by a dusk-tx from before it named it), which can
+    /// only go once it is in a final block. A record that does not decode
+    /// cannot be looked up, and stays.
+    async fn reclaim_prepared(
+        &self,
+        key: &[u8; 32],
+        signer: &DuskSigner,
+        message: H256,
+    ) -> ChainResult<(usize, usize)> {
         // One that does not decode cannot be looked up.
-        let mut candidates: Vec<(u64, H256, PreparedDelivery)> = kept
-            .iter()
+        let mut candidates: Vec<(u64, H256, PreparedDelivery)> = self
+            .rues
+            .prepared_deliveries(key)?
+            .into_iter()
+            .filter(|(other, _)| *other != message)
             .filter_map(|(other, delivery)| {
-                delivery.map(|delivery| (delivery.prepared_at, *other, delivery))
+                delivery.map(|delivery| (delivery.prepared_at, other, delivery))
             })
             .collect();
+        if candidates.is_empty() {
+            return Ok((0, 0));
+        }
         candidates.sort_by_key(|(prepared_at, other, _)| (*prepared_at, *other));
         let after = *self
             .prepared_scan
@@ -694,7 +780,7 @@ impl DuskMailbox {
         let start = after.map_or(0, |after| {
             candidates.partition_point(|(prepared_at, other, _)| (*prepared_at, *other) <= after)
         });
-        let finalized = self.rues.finalized_block_height().await?;
+        let (used, finalized) = self.proved_final_nonce(signer).await?;
         let mut freed = 0;
         let looked = candidates.len().min(PREPARED_LOOKUPS);
         for (prepared_at, other, delivery) in candidates.iter().cycle().skip(start).take(looked) {
@@ -703,41 +789,134 @@ impl DuskMailbox {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = Some((*prepared_at, *other));
             let tx_id = delivery.tx_id;
-            let status = self.rues.transaction_status(&hex::encode(tx_id)).await?;
-            let TransactionStatus::Included {
-                block_height,
-                receipt,
-            } = status
-            else {
-                continue;
+            let needed = match self.rues.transaction_status(&hex::encode(tx_id)).await? {
+                TransactionStatus::Included {
+                    block_height,
+                    receipt,
+                } => {
+                    block_height > finalized
+                        || (receipt.error.is_some() && !delivery.failure_reported)
+                }
+                TransactionStatus::Pending | TransactionStatus::Unknown => {
+                    !matches!((delivery.nonce, used), (Some(nonce), Some(used)) if nonce <= used)
+                }
             };
-            // A failure not reported yet waits for its message's next
-            // submission, which reports it (`follow_prepared`).
-            if block_height > finalized || (receipt.error.is_some() && !delivery.failure_reported) {
+            if needed {
                 continue;
             }
             if self.rues.forget_prepared_transaction(key, *other, tx_id)? {
                 debug!(
                     message_id = ?other,
                     tx_id = %hex::encode(tx_id),
-                    "Forgot the transaction kept for a Dusk delivery, in a final block, to make room"
+                    nonce = ?delivery.nonce,
+                    "Forgot the transaction kept for a Dusk delivery: it can no longer land"
                 );
                 freed += 1;
             }
         }
-        if kept.len() - freed < limit {
-            return Ok(());
+        Ok((looked, freed))
+    }
+
+    /// Every `SubmissionLimits::sweep`, at a delivery of any message,
+    /// forget kept transactions whose records are no longer needed
+    /// (`reclaim_prepared`), so that those of messages the relayer gave up
+    /// on, which no submission of their own will ever clear, do not pile
+    /// up to the bound. Nothing is read while nothing else is kept. Best
+    /// effort: a failure is logged, and the delivery goes on.
+    async fn sweep_prepared(&self, key: &[u8; 32], signer: &DuskSigner, message: H256) {
+        {
+            let mut last = self
+                .last_sweep
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if last.is_some_and(|at| at.elapsed() < self.limits.sweep) {
+                return;
+            }
+            *last = Some(std::time::Instant::now());
         }
-        warn!(
-            kept = kept.len(),
-            looked,
-            "A Dusk signer keeps the transactions of as many deliveries as it may, and none it looked up can be forgotten yet; the next delivery goes once one can"
-        );
-        Err(HyperlaneDuskError::Other(format!(
-            "The Dusk signer keeps the transactions of {} deliveries, the most it keeps, and none of the {looked} it looked up can be forgotten for room yet: each may still land, or failed without its failure reported yet. The delivery of message {message:?} goes once kept transactions settle",
-            kept.len()
-        ))
-        .into())
+        match self.reclaim_prepared(key, signer, message).await {
+            Ok((_, 0)) => {}
+            Ok((looked, freed)) => debug!(
+                looked,
+                freed, "Dusk delivery records no longer needed were forgotten"
+            ),
+            Err(error) => debug!(
+                error = %bounded_error(&error),
+                "Could not look up kept Dusk delivery transactions; the next sweep tries again"
+            ),
+        }
+    }
+
+    /// The nonce the signer's account has at the node's last final block,
+    /// at least, as far as readings of the account show, and the last final
+    /// block, read first.
+    ///
+    /// Rusk reads an account at its tip only. A reading is the account
+    /// between two reads of the tip that agree: Rusk accepts a block, and
+    /// commits it as its tip, under the write lock of its VM, which an
+    /// account read waits for, so the account read is the account at that
+    /// tip block. Once that block is final, and still the node's block at
+    /// its height, the account's final nonce is at least the reading's. A
+    /// reading waits for that, and each call proves the one waiting and
+    /// takes another when none waits; a tip that changes during the reading
+    /// gives none. The proved nonce only grows, and lives for the process.
+    async fn proved_final_nonce(&self, signer: &DuskSigner) -> ChainResult<(Option<u64>, u64)> {
+        let pair = self.rues.fresh_block_pair().await?;
+        let finalized = pair.finalized();
+        let waiting = self
+            .final_nonce
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .waiting;
+        if let Some(reading) = waiting {
+            if reading.height <= finalized {
+                let on_chain =
+                    self.rues.ledger_block_hash(reading.height).await? == Some(reading.hash);
+                let mut state = self
+                    .final_nonce
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if state.waiting == Some(reading) {
+                    state.waiting = None;
+                    if on_chain {
+                        state.proved = state.proved.max(Some(reading.nonce));
+                    }
+                }
+            }
+        }
+        let waits = self
+            .final_nonce
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .waiting
+            .is_some();
+        if !waits {
+            let account = self.rues.account_status(&signer.address_string()).await?;
+            let after = self.rues.fresh_block_pair().await?;
+            if after.tip() == pair.tip() {
+                let (height, hash) = pair.tip();
+                let reading = Reading {
+                    height,
+                    hash,
+                    nonce: account.nonce,
+                };
+                let mut state = self
+                    .final_nonce
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if height <= after.finalized() {
+                    state.proved = state.proved.max(Some(account.nonce));
+                } else if state.waiting.is_none() {
+                    state.waiting = Some(reading);
+                }
+            }
+        }
+        let proved = self
+            .final_nonce
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .proved;
+        Ok((proved, finalized))
     }
 
     /// What the transaction prepared for an earlier submission of

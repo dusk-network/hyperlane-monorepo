@@ -31,8 +31,8 @@
 //!
 //! The account status (`nonce`, `next_nonce`, and the transfer contract's
 //! `account` query that dusk-tx reads), the `process` simulation,
-//! `lastBlockPair` and the transaction lookups (`mempoolTx`, `tx`) read
-//! this state. Faults can refuse, hold or lose a request at a route, and
+//! `lastBlockPair`, a block's hash by height and the transaction lookups
+//! (`mempoolTx`, `tx`) read this state. Faults can refuse, hold or lose a request at a route, and
 //! the path of every request is logged.
 #![allow(dead_code)]
 
@@ -511,6 +511,17 @@ impl Model {
                 "last_block": [self.height, self.block_hash(self.height)],
                 "last_finalized_block": [self.finalized, self.block_hash(self.finalized)],
             }}});
+        }
+        // A block's hash, as the chain holds it now.
+        if let Some(rest) = query.strip_prefix("query { block(height: ") {
+            let height: u64 = rest
+                .split(')')
+                .next()
+                .and_then(|height| height.parse().ok())
+                .unwrap_or(u64::MAX);
+            let block = (height <= self.height)
+                .then(|| json!({"header": {"hash": self.block_hash(height)}}));
+            return json!({ "block": block });
         }
         let hash = query
             .split_once("hash: \"")

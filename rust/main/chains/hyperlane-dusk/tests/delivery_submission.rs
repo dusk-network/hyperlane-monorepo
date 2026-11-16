@@ -1582,11 +1582,11 @@ async fn deliveries_need_a_helper_that_waits_for_the_word_to_send() {
 }
 
 /// A signer keeps the transactions of at most `SubmissionLimits::prepared`
-/// deliveries. At the bound, the kept ones are looked up, and only those in
-/// final blocks are forgotten for room: one that may still land stays, and
-/// while none can go, deliveries are not signed but fail, and go once kept
-/// transactions settle. The one prepared longest ago used to go, whatever
-/// became of its transaction.
+/// deliveries. At the bound, the kept ones are looked up, and only those
+/// that can no longer land are forgotten for room: one that may still land
+/// stays, and while none can go, deliveries are not signed but fail, and go
+/// once kept transactions settle. The one prepared longest ago used to go,
+/// whatever became of its transaction.
 #[tokio::test]
 async fn a_signer_at_its_bound_of_kept_transactions_forgets_only_final_ones() {
     let _env = HELPER_ENV.lock().await;
@@ -1601,8 +1601,9 @@ async fn a_signer_at_its_bound_of_kept_transactions_forgets_only_final_ones() {
         });
     let lost = delivery(9);
     let deliveries: Vec<_> = (0..2).map(delivery).collect();
-    // The helper names the first transaction but never sends it: for all
-    // the relayer knows, it may still land, and it stays kept.
+    // The helper names the first transaction, with nonce 1, but never
+    // sends it: for all the relayer knows, it may still land, and it stays
+    // kept while nonce 1 may still be free.
     node.next_submission(1, "lose");
     let (message, metadata, gas_limit) = &lost;
     let error = mailbox
@@ -1621,7 +1622,9 @@ async fn a_signer_at_its_bound_of_kept_transactions_forgets_only_final_ones() {
             .executed
     );
     assert_eq!(node.propagated(), [1]);
-    // At the bound, neither kept transaction is in a final block: the next
+    // At the bound, neither kept transaction can go: the landed one is in a
+    // block that is not final, and nonce 1, which the lost one is signed
+    // with, is used only there, so a rollback could free it again. The next
     // delivery is not signed.
     let calls = node.invocations().len();
     let (message, metadata, gas_limit) = &deliveries[1];
@@ -1633,7 +1636,8 @@ async fn a_signer_at_its_bound_of_kept_transactions_forgets_only_final_ones() {
     assert!(error.contains("may still land"), "{error}");
     assert_eq!(node.invocations().len(), calls);
     // Once the landed one's block is final, its transaction is forgotten
-    // for room and the delivery goes; the one that may still land stays.
+    // for room, and so is the lost one, whose nonce is now used for good:
+    // the delivery goes.
     let height = node.height();
     node.finalize_to(height);
     node.expire_block_pair().await;
@@ -1645,7 +1649,7 @@ async fn a_signer_at_its_bound_of_kept_transactions_forgets_only_final_ones() {
             .executed
     );
     assert_eq!(node.propagated(), [1, 2]);
-    assert!(mailbox.prepared_transaction(lost.0.id()).unwrap().is_some());
+    assert_eq!(mailbox.prepared_transaction(lost.0.id()).unwrap(), None);
     assert_eq!(
         mailbox.prepared_transaction(deliveries[0].0.id()).unwrap(),
         None
@@ -1926,6 +1930,153 @@ async fn a_failure_not_reported_yet_is_not_forgotten_for_room() {
     );
     assert_eq!(
         mailbox.prepared_transaction(deliveries[0].0.id()).unwrap(),
+        None
+    );
+    assert_eq!(node.propagated(), [1, 2, 3]);
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+/// Name a transaction for `delivery` with `nonce` and keep it, but have the
+/// helper never send it, as when its propagation is lost: the delivery
+/// fails with its outcome unknown.
+async fn lose(
+    node: &Node,
+    mailbox: &hyperlane_dusk::DuskMailbox,
+    delivery: &(
+        hyperlane_core::HyperlaneMessage,
+        hyperlane_core::Metadata,
+        Option<U256>,
+    ),
+    nonce: u64,
+) {
+    node.next_submission(nonce, "lose");
+    let (message, metadata, gas_limit) = delivery;
+    let error = mailbox
+        .process(message, metadata, *gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("to be included"), "{error}");
+}
+
+/// Deliver `delivery`, and confirm it delivered, as the relayer does.
+async fn deliver(
+    mailbox: &hyperlane_dusk::DuskMailbox,
+    delivery: &(
+        hyperlane_core::HyperlaneMessage,
+        hyperlane_core::Metadata,
+        Option<U256>,
+    ),
+) {
+    let (message, metadata, gas_limit) = delivery;
+    assert!(
+        mailbox
+            .process(message, metadata, *gas_limit)
+            .await
+            .unwrap()
+            .executed
+    );
+    mailbox.on_delivered(message);
+}
+
+/// The review's scenario. Transactions of messages the relayer gave up on,
+/// which never landed, fill the bound, while the signer's account uses
+/// their nonces. Once those nonces are used in final blocks, the
+/// transactions can never execute: they are forgotten for room, and
+/// deliveries go again. A nonce used only in a block that is not final is
+/// not enough, since a rollback could free it, and a transaction kept
+/// without its nonce, by a dusk-tx from before it named it, stays until it
+/// is in a final block. They used to stay for good, and no delivery could
+/// be signed again.
+#[tokio::test]
+async fn abandoned_transactions_go_for_room_once_their_nonces_are_used_for_good() {
+    let _env = HELPER_ENV.lock().await;
+    // Finality moves only by hand.
+    let node = Node::start_with(false, None);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let mailbox = node
+        .mailbox(false)
+        .with_submission_limits(SubmissionLimits {
+            prepared: 3,
+            ..patient(64)
+        });
+    let abandoned: Vec<_> = (7..10).map(delivery).collect();
+    // Two are kept with nonces 1 and 2, which deliveries then use; the
+    // third with nonce 3, by a dusk-tx that names no nonce.
+    lose(&node, &mailbox, &abandoned[0], 1).await;
+    deliver(&mailbox, &delivery(0)).await;
+    lose(&node, &mailbox, &abandoned[1], 2).await;
+    deliver(&mailbox, &delivery(1)).await;
+    node.old_prepared_line(true);
+    lose(&node, &mailbox, &abandoned[2], 3).await;
+    node.old_prepared_line(false);
+    let nonces: Vec<_> = abandoned
+        .iter()
+        .map(|(message, _, _)| mailbox.prepared_nonce(message.id()).unwrap())
+        .collect();
+    assert_eq!(nonces, [Some(1), Some(2), None]);
+    // At the bound, with nonces 1 and 2 used in blocks that are not final,
+    // nothing can go: the next delivery is not signed, also once a reading
+    // of the account has waited a few blocks.
+    let calls = node.invocations().len();
+    let (message, metadata, gas_limit) = delivery(4);
+    for _ in 0..2 {
+        let error = mailbox
+            .process(&message, &metadata, gas_limit)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("the most it keeps"), "{error}");
+        tokio::time::sleep(BLOCK_TIME * 3).await;
+    }
+    assert_eq!(node.invocations().len(), calls);
+    // Once those blocks are final, the transactions with nonces 1 and 2 go,
+    // and the delivery goes; the one kept without its nonce stays.
+    let height = node.height();
+    node.finalize_to(height);
+    let outcome = mailbox
+        .process(&message, &metadata, gas_limit)
+        .await
+        .unwrap();
+    assert!(outcome.executed);
+    assert_eq!(node.propagated(), [1, 2, 3]);
+    let kept: Vec<_> = abandoned
+        .iter()
+        .map(|(message, _, _)| {
+            mailbox
+                .prepared_transaction(message.id())
+                .unwrap()
+                .is_some()
+        })
+        .collect();
+    assert_eq!(kept, [false, false, true]);
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+/// Deliveries of any message sweep the kept transactions of others, well
+/// below the bound: an abandoned one goes once its nonce is used for good,
+/// so that such transactions never pile up to the bound.
+#[tokio::test]
+async fn deliveries_sweep_abandoned_transactions_whose_nonces_are_used_for_good() {
+    let _env = HELPER_ENV.lock().await;
+    // Finality follows the tip one block behind.
+    let node = Node::start(false);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let mailbox = node
+        .mailbox(false)
+        .with_submission_limits(SubmissionLimits {
+            sweep: Duration::ZERO,
+            ..patient(64)
+        });
+    let abandoned = delivery(9);
+    lose(&node, &mailbox, &abandoned, 1).await;
+    // Deliveries go on, the first using nonce 1, and each sweeps.
+    for nonce in 0..3 {
+        deliver(&mailbox, &delivery(nonce)).await;
+        tokio::time::sleep(BLOCK_TIME * 3).await;
+    }
+    assert_eq!(
+        mailbox.prepared_transaction(abandoned.0.id()).unwrap(),
         None
     );
     assert_eq!(node.propagated(), [1, 2, 3]);

@@ -2012,7 +2012,10 @@ impl RuesClient {
 
     /// The hash of the node's ledger block at `height`, or `None` when the
     /// ledger has no block there.
-    async fn ledger_block_hash(&self, height: u64) -> Result<Option<H256>, HyperlaneDuskError> {
+    pub(crate) async fn ledger_block_hash(
+        &self,
+        height: u64,
+    ) -> Result<Option<H256>, HyperlaneDuskError> {
         let data = self
             .graphql_query(&format!(
                 "query {{ block(height: {height}) {{ header {{ hash }} }} }}"
@@ -2440,6 +2443,17 @@ impl RuesClient {
                 )
             })
             .await
+    }
+
+    /// The node's tip and last final block, read now: not the read every
+    /// client of the endpoint shares for a tick (`block_pair`).
+    pub(crate) async fn fresh_block_pair(&self) -> Result<BlockPair, HyperlaneDuskError> {
+        self.ensure_identity().await?;
+        parse_block_pair(
+            &self
+                .graphql_query("query { lastBlockPair { json } }")
+                .await?,
+        )
     }
 
     /// Read the node's tip and last final block again on the next request
@@ -2988,6 +3002,11 @@ impl BlockPair {
     /// The height of the node's last final block.
     pub(crate) fn finalized(&self) -> u64 {
         self.finalized
+    }
+
+    /// The node's tip: its height and hash.
+    pub(crate) fn tip(&self) -> (u64, H256) {
+        (self.latest, self.latest_hash)
     }
 }
 
