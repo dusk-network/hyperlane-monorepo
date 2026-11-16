@@ -2873,3 +2873,76 @@ async fn a_kept_transaction_missed_for_a_moment_is_not_forgotten() {
     assert_eq!(mailbox.prepared_transaction(message.id()).unwrap(), None);
     std::env::remove_var("DUSK_TX_BIN");
 }
+
+/// The review's sequence (w16). A delivery's kept transaction T failed in
+/// block C, which is not final, and its failure was reported. Submitted
+/// again, the delivery looks T up and finds C's failed receipt; before it
+/// read the last final block, C was rolled back, which put T back into the
+/// mempool, and another block took C's height and became final. T counted
+/// as failed in a final block: its record went and the message was signed
+/// again, while T could still land and deliver it. The last final block is
+/// now read before the lookup, when C's height is not final: the delivery
+/// waits, signing nothing, T stays kept, and T then lands and delivers it.
+#[tokio::test]
+async fn a_failure_found_in_a_block_rolled_back_after_the_lookup_is_not_sent_again() {
+    let _env = HELPER_ENV.lock().await;
+    // Finality moves only by hand.
+    let node = Node::start_with(false, None);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let mailbox = node.mailbox(false).with_submission_limits(patient(64));
+    let delivery = delivery(0);
+    let message = &delivery.0;
+    // Another relayer's delivery lands first, so T fails in block C.
+    node.pause(true);
+    let first = tokio::spawn({
+        let mailbox = mailbox.clone();
+        let (message, metadata, gas_limit) = delivery.clone();
+        async move { mailbox.process(&message, &metadata, gas_limit).await }
+    });
+    node.wait_until("T is in the mempool", |model| !model.mempool.is_empty())
+        .await;
+    node.deliver_elsewhere(&delivery);
+    node.pause(false);
+    assert!(!first.await.unwrap().unwrap().executed);
+    let kept = mailbox.prepared_transaction(message.id()).unwrap().unwrap();
+    let height = node.model().included(&kept).unwrap().height;
+    // The other delivery does not count after all, and the relayer submits
+    // ours again; its lookup of T answers with C's failed receipt.
+    node.undeliver(&delivery);
+    node.freeze(true);
+    node.expire_block_pair().await;
+    let calls = node.invocations().len();
+    let lookup = std::sync::Arc::new(Gate::default());
+    node.inject(Route::Graphql, None, Fault::HoldLookupReply(lookup.clone()));
+    let retry = tokio::spawn({
+        let mailbox = mailbox.clone();
+        let (message, metadata, gas_limit) = delivery.clone();
+        async move { mailbox.process(&message, &metadata, gas_limit).await }
+    });
+    node.wait_until("T is looked up", |_| {
+        lookup.waiting.load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+    // Meanwhile C is rolled back, and a block without T takes its height
+    // and becomes final.
+    node.rollback_to(height - 1);
+    node.pause(true);
+    node.produce_block();
+    node.finalize_to(height);
+    node.expire_block_pair().await;
+    assert!(node.model().included(&kept).is_none());
+    lookup.open();
+    let error = retry.await.unwrap().unwrap_err().to_string();
+    assert!(error.contains("not final yet"), "{error}");
+    assert_eq!(node.invocations().len(), calls);
+    assert_eq!(
+        mailbox.prepared_transaction(message.id()).unwrap(),
+        Some(kept.clone())
+    );
+    // T lands again, and delivers the message, once.
+    node.pause(false);
+    node.freeze(false);
+    node.settle(1).await;
+    assert!(node.model().included(&kept).unwrap().error.is_none());
+    std::env::remove_var("DUSK_TX_BIN");
+}

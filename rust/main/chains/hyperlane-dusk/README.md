@@ -308,8 +308,10 @@ how to run the local bridge.
   outcome, with the gas it spent, so that the relayer charges it to the
   message and its gas payment policy decides on another attempt, and nothing
   else is sent then; failed and reported, the delivery goes again once that
-  block is final; in the mempool, it is followed to its block; in neither,
-  the delivery goes again only 60 s after the transaction was prepared, as
+  block is final, by the last final block read before the lookup, as a
+  block rolled back after it can have another, final, take its height; in
+  the mempool, it is followed to its block; in neither, the delivery goes
+  again only 60 s after the transaction was prepared, as
   it may still be on its way to the node, and only if a lookup half a block
   later misses it too. A transaction the node refused at preverification is
   not kept. Otherwise, after a submission whose outcome was unknown, the

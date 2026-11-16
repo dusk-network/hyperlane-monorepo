@@ -618,6 +618,10 @@ pub enum Fault {
     /// Rusk does, one field (`tx` when `ledger_first`) before the gate
     /// opens and the other after; taken by such a lookup only.
     BetweenFields { ledger_first: bool, gate: Arc<Gate> },
+    /// `HoldReply` for a lookup of both `tx` and `mempoolTx`: the node's
+    /// answer is what it held when the lookup came; taken by such a lookup
+    /// only.
+    HoldLookupReply(Arc<Gate>),
 }
 
 /// A gate a held request waits at.
@@ -1233,7 +1237,11 @@ fn take_fault(faults: &Faults, route: Route, nonce: Option<u64>, lookup: bool) -
     let position = faults.iter().position(|(at, of, fault)| {
         *at == route
             && (of.is_none() || nonce.is_none() || *of == nonce)
-            && (lookup || !matches!(fault, Fault::BetweenFields { .. }))
+            && (lookup
+                || !matches!(
+                    fault,
+                    Fault::BetweenFields { .. } | Fault::HoldLookupReply(_)
+                ))
     })?;
     Some(faults.remove(position).2)
 }
@@ -1294,7 +1302,7 @@ fn serve(
         }
         Some(Fault::Drop) => return,
         Some(Fault::Hold(gate)) => gate.wait(),
-        Some(Fault::HoldReply(gate)) => hold_reply = Some(gate),
+        Some(Fault::HoldReply(gate) | Fault::HoldLookupReply(gate)) => hold_reply = Some(gate),
         Some(Fault::LoseReply) => lose_reply = true,
         Some(Fault::AcceptAndDiscard) => return reply(stream, "200 OK", b""),
         Some(Fault::BetweenFields { ledger_first, gate }) => {

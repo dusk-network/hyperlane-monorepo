@@ -1153,8 +1153,9 @@ impl DuskMailbox {
     ///   message, and decides by its gas payment policy whether to try
     ///   again. No other transaction is sent meanwhile.
     /// - In a block, failed, and reported: it spent its nonce and delivered
-    ///   nothing; the delivery goes again once that block is final, since
-    ///   until then a rollback can run the transaction again.
+    ///   nothing; the delivery goes again once that block is final, at or
+    ///   below the last final block read before the lookup, since until
+    ///   then a rollback can run the transaction again.
     /// - In the mempool: it is followed to its block, as an unknown outcome
     ///   is.
     /// - In neither, prepared less than `SubmissionLimits::drop_grace` ago:
@@ -1172,6 +1173,13 @@ impl DuskMailbox {
         let tx_id = hex::encode(prepared.tx_id);
         let mut looked_again = false;
         loop {
+            // The last final block is read before the lookup: a block the
+            // lookup finds the transaction in, at or below it, is that final
+            // block, since a rollback deletes a block's transactions from
+            // the ledger the lookup reads. Read after, it could be final
+            // only for another block at that height, one that took the
+            // place of the transaction's, rolled back in between.
+            let finalized = self.rues.finalized_block_height().await?;
             match self.rues.transaction_status(&tx_id).await? {
                 TransactionStatus::Included {
                     block_height,
@@ -1196,7 +1204,7 @@ impl DuskMailbox {
                         );
                         return Ok(Some(self.outcome_from(&tx_id, &receipt)?));
                     }
-                    if block_height > self.rues.finalized_block_height().await? {
+                    if block_height > finalized {
                         return Err(HyperlaneDuskError::Other(format!(
                             "Dusk delivery of message {message:?}: its earlier transaction {tx_id} failed in block {block_height}, which is not final yet; it goes again once that block is final"
                         ))
