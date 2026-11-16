@@ -884,7 +884,11 @@ impl DuskMailbox {
     /// - In no block and not in the node's mempool, signed with a nonce two
     ///   readings of the account show used: one proven at a final block, and
     ///   one taken now, at least `SubmissionLimits::nonce_gap` after it
-    ///   (`nonce_evidence`), before the transaction is looked up.
+    ///   (`nonce_evidence`), before the transaction is looked up. A lookup
+    ///   can miss a transaction that stays on the node (`transaction_status`
+    ///   says how), so each such transaction is looked up again half a block
+    ///   (`SubmissionLimits::block`) later, after one pause for all of them,
+    ///   and goes only if it is missed again.
     ///
     /// Everything else is kept: a transaction in a block that is not final;
     /// one in the mempool, whatever the readings show, since a rollback puts
@@ -921,41 +925,78 @@ impl DuskMailbox {
         });
         let (used, finalized) = self.nonce_evidence(signer).await?;
         let mut freed = 0;
+        // In neither place, with its nonce used: it goes if it is missed
+        // again after the pause.
+        let mut missed = Vec::new();
         let looked = candidates.len().min(PREPARED_LOOKUPS);
         for (prepared_at, other, delivery) in candidates.iter().cycle().skip(start).take(looked) {
             *self
                 .prepared_scan
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = Some((*prepared_at, *other));
-            let tx_id = delivery.tx_id;
-            let needed = match self.rues.transaction_status(&hex::encode(tx_id)).await? {
+            match self
+                .rues
+                .transaction_status(&hex::encode(delivery.tx_id))
+                .await?
+            {
                 TransactionStatus::Included {
                     block_height,
                     receipt,
                 } => {
-                    block_height > finalized
+                    if block_height > finalized
                         || (receipt.error.is_some() && !delivery.failure_reported)
+                    {
+                        continue;
+                    }
                 }
                 // A rollback puts a transaction back into the mempool.
-                TransactionStatus::Pending => true,
+                TransactionStatus::Pending => continue,
                 TransactionStatus::Unknown => {
-                    !matches!((delivery.nonce, used), (Some(nonce), Some(used)) if nonce <= used)
+                    if matches!((delivery.nonce, used), (Some(nonce), Some(used)) if nonce <= used)
+                    {
+                        missed.push((*other, delivery));
+                    }
+                    continue;
                 }
-            };
-            if needed {
-                continue;
             }
-            if self.rues.forget_prepared_transaction(key, *other, tx_id)? {
-                debug!(
-                    message_id = ?other,
-                    tx_id = %hex::encode(tx_id),
-                    nonce = ?delivery.nonce,
-                    "Forgot the transaction kept for a Dusk delivery: it can no longer land"
-                );
-                freed += 1;
+            freed += usize::from(self.forget_kept(key, *other, delivery)?);
+        }
+        if !missed.is_empty() {
+            tokio::time::sleep(self.limits.block / 2).await;
+            for (other, delivery) in missed {
+                let status = self
+                    .rues
+                    .transaction_status(&hex::encode(delivery.tx_id))
+                    .await?;
+                if status == TransactionStatus::Unknown {
+                    freed += usize::from(self.forget_kept(key, other, delivery)?);
+                }
             }
         }
         Ok((looked, freed))
+    }
+
+    /// Forget the transaction kept for `message`'s delivery, which can no
+    /// longer land (`reclaim_prepared`), unless another has taken its place.
+    /// Whether it was forgotten.
+    fn forget_kept(
+        &self,
+        key: &[u8; 32],
+        message: H256,
+        delivery: &PreparedDelivery,
+    ) -> ChainResult<bool> {
+        let forgot = self
+            .rues
+            .forget_prepared_transaction(key, message, delivery.tx_id)?;
+        if forgot {
+            debug!(
+                message_id = ?message,
+                tx_id = %hex::encode(delivery.tx_id),
+                nonce = ?delivery.nonce,
+                "Forgot the transaction kept for a Dusk delivery: it can no longer land"
+            );
+        }
+        Ok(forgot)
     }
 
     /// Every `SubmissionLimits::sweep`, at a delivery of any message,
@@ -1117,7 +1158,11 @@ impl DuskMailbox {
     /// - In the mempool: it is followed to its block, as an unknown outcome
     ///   is.
     /// - In neither, prepared less than `SubmissionLimits::drop_grace` ago:
-    ///   it may still be on its way to the node. Past that, it was dropped.
+    ///   it may still be on its way to the node. Past that, it was dropped,
+    ///   if a second lookup half a block (`SubmissionLimits::block`) later
+    ///   misses it too: a lookup can miss a transaction that stays on the
+    ///   node (`transaction_status`). What that lookup finds otherwise is
+    ///   followed as above.
     async fn follow_prepared(
         &self,
         key: &[u8; 32],
@@ -1125,65 +1170,76 @@ impl DuskMailbox {
         prepared: &PreparedDelivery,
     ) -> ChainResult<Option<TxOutcome>> {
         let tx_id = hex::encode(prepared.tx_id);
-        match self.rues.transaction_status(&tx_id).await? {
-            TransactionStatus::Included {
-                block_height,
-                receipt,
-            } => {
-                if receipt.error.is_none() {
+        let mut looked_again = false;
+        loop {
+            match self.rues.transaction_status(&tx_id).await? {
+                TransactionStatus::Included {
+                    block_height,
+                    receipt,
+                } => {
+                    if receipt.error.is_none() {
+                        info!(
+                            message_id = ?message,
+                            %tx_id,
+                            block_height,
+                            "Dusk delivery's earlier transaction is in a block; following it instead of sending another"
+                        );
+                        return Ok(Some(self.outcome_from(&tx_id, &receipt)?));
+                    }
+                    if !prepared.failure_reported {
+                        warn!(
+                            message_id = ?message,
+                            %tx_id,
+                            block_height,
+                            gas_spent = receipt.gas_spent,
+                            "Dusk delivery's earlier transaction failed in a block after its submission returned; reporting it instead of sending another"
+                        );
+                        return Ok(Some(self.outcome_from(&tx_id, &receipt)?));
+                    }
+                    if block_height > self.rues.finalized_block_height().await? {
+                        return Err(HyperlaneDuskError::Other(format!(
+                            "Dusk delivery of message {message:?}: its earlier transaction {tx_id} failed in block {block_height}, which is not final yet; it goes again once that block is final"
+                        ))
+                        .into());
+                    }
+                    debug!(
+                        message_id = ?message,
+                        %tx_id,
+                        block_height,
+                        "Dusk delivery's earlier transaction failed in a final block; sending it again"
+                    );
+                }
+                TransactionStatus::Pending => {
                     info!(
                         message_id = ?message,
                         %tx_id,
-                        block_height,
-                        "Dusk delivery's earlier transaction is in a block; following it instead of sending another"
+                        "Dusk delivery's earlier transaction is in the mempool; following it instead of sending another"
                     );
-                    return Ok(Some(self.outcome_from(&tx_id, &receipt)?));
+                    return self.outcome_of(&tx_id).await.map(Some);
                 }
-                if !prepared.failure_reported {
-                    warn!(
+                TransactionStatus::Unknown => {
+                    let grace =
+                        u64::try_from(self.limits.drop_grace.as_millis()).unwrap_or(u64::MAX);
+                    if unix_millis() < prepared.prepared_at.saturating_add(grace) {
+                        return Err(HyperlaneDuskError::Other(format!(
+                            "Dusk delivery of message {message:?}: its earlier transaction {tx_id} is in neither the mempool nor a block, but may still reach the node; it goes again once it cannot"
+                        ))
+                        .into());
+                    }
+                    // Dropped only if missed again half a block later.
+                    if !looked_again {
+                        looked_again = true;
+                        tokio::time::sleep(self.limits.block / 2).await;
+                        continue;
+                    }
+                    debug!(
                         message_id = ?message,
                         %tx_id,
-                        block_height,
-                        gas_spent = receipt.gas_spent,
-                        "Dusk delivery's earlier transaction failed in a block after its submission returned; reporting it instead of sending another"
+                        "Dusk delivery's earlier transaction was dropped; sending it again"
                     );
-                    return Ok(Some(self.outcome_from(&tx_id, &receipt)?));
                 }
-                if block_height > self.rues.finalized_block_height().await? {
-                    return Err(HyperlaneDuskError::Other(format!(
-                        "Dusk delivery of message {message:?}: its earlier transaction {tx_id} failed in block {block_height}, which is not final yet; it goes again once that block is final"
-                    ))
-                    .into());
-                }
-                debug!(
-                    message_id = ?message,
-                    %tx_id,
-                    block_height,
-                    "Dusk delivery's earlier transaction failed in a final block; sending it again"
-                );
             }
-            TransactionStatus::Pending => {
-                info!(
-                    message_id = ?message,
-                    %tx_id,
-                    "Dusk delivery's earlier transaction is in the mempool; following it instead of sending another"
-                );
-                return self.outcome_of(&tx_id).await.map(Some);
-            }
-            TransactionStatus::Unknown => {
-                let grace = u64::try_from(self.limits.drop_grace.as_millis()).unwrap_or(u64::MAX);
-                if unix_millis() < prepared.prepared_at.saturating_add(grace) {
-                    return Err(HyperlaneDuskError::Other(format!(
-                        "Dusk delivery of message {message:?}: its earlier transaction {tx_id} is in neither the mempool nor a block, but may still reach the node; it goes again once it cannot"
-                    ))
-                    .into());
-                }
-                debug!(
-                    message_id = ?message,
-                    %tx_id,
-                    "Dusk delivery's earlier transaction was dropped; sending it again"
-                );
-            }
+            break;
         }
         self.rues.forget_prepared_delivery(key, message)?;
         Ok(None)

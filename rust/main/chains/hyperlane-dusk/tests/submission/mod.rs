@@ -32,8 +32,10 @@
 //! The account status (`nonce`, `next_nonce`, and the transfer contract's
 //! `account` query that dusk-tx reads), the `process` simulation,
 //! `lastBlockPair`, a block's hash by height and the transaction lookups
-//! (`mempoolTx`, `tx`) read this state. Faults can refuse, hold or lose a request at a route, and
-//! the path of every request is logged.
+//! (`mempoolTx`, `tx`) read this state. Faults can refuse, hold or lose a
+//! request at a route, or resolve a lookup's two fields from separate
+//! reads, as Rusk does, with a gate between them. A transaction can be
+//! hidden from lookups for a moment. The path of every request is logged.
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -230,6 +232,9 @@ pub struct Model {
     pub paused: bool,
     /// No block comes on its own while set (`Node::produce_block`).
     pub frozen: bool,
+    /// The transaction lookups miss (`Node::hide_for`): its ID, for how
+    /// long, and since the first lookup that missed it.
+    hidden: Option<(String, Duration, Option<Instant>)>,
 }
 
 impl Model {
@@ -252,6 +257,7 @@ impl Model {
             requests: Vec::new(),
             paused: false,
             frozen: false,
+            hidden: None,
         };
         model.publish();
         model
@@ -508,7 +514,38 @@ impl Model {
         std::fs::write(self.dir.join("included"), included).unwrap();
     }
 
-    fn graphql(&self, query: &str) -> Value {
+    /// Whether lookups of transaction `hash` miss it now
+    /// (`Node::hide_for`).
+    fn hides(&mut self, hash: &str) -> bool {
+        let Some((id, window, since)) = &mut self.hidden else {
+            return false;
+        };
+        id == hash && since.get_or_insert_with(Instant::now).elapsed() < *window
+    }
+
+    /// The `mempoolTx` field of a lookup of transaction `hash`, read now.
+    fn mempool_field(&mut self, hash: &str) -> Value {
+        if self.hides(hash) || !self.mempool.values().any(|tx| tx.id == hash) {
+            return Value::Null;
+        }
+        json!({ "id": hash })
+    }
+
+    /// The `tx` field of a lookup of transaction `hash`, read now.
+    fn ledger_field(&mut self, hash: &str) -> Value {
+        if self.hides(hash) {
+            return Value::Null;
+        }
+        self.ledger.get(hash).map_or(Value::Null, |included| {
+            json!({
+                "blockHeight": included.height,
+                "gasSpent": included.gas_spent,
+                "err": included.error,
+            })
+        })
+    }
+
+    fn graphql(&mut self, query: &str) -> Value {
         if query == "query { lastBlockPair { json } }" {
             return json!({"lastBlockPair": {"json": {
                 "last_block": [self.height, self.block_hash(self.height)],
@@ -526,34 +563,29 @@ impl Model {
                 .then(|| json!({"header": {"hash": self.block_hash(height)}}));
             return json!({ "block": block });
         }
-        let hash = query
-            .split_once("hash: \"")
-            .and_then(|(_, rest)| rest.split('"').next())
-            .unwrap_or_default();
+        let hash = looked_up(query);
         let mut reply = serde_json::Map::new();
         if query.contains("mempoolTx(") {
-            let held = self.mempool.values().any(|tx| tx.id == hash);
-            reply.insert(
-                "mempoolTx".into(),
-                if held {
-                    json!({"id": hash})
-                } else {
-                    Value::Null
-                },
-            );
+            reply.insert("mempoolTx".into(), self.mempool_field(hash));
         }
         if query.contains(" tx(") {
-            let tx = self.ledger.get(hash).map(|included| {
-                json!({
-                    "blockHeight": included.height,
-                    "gasSpent": included.gas_spent,
-                    "err": included.error,
-                })
-            });
-            reply.insert("tx".into(), tx.unwrap_or(Value::Null));
+            reply.insert("tx".into(), self.ledger_field(hash));
         }
         Value::Object(reply)
     }
+}
+
+/// The transaction a lookup asks for.
+fn looked_up(query: &str) -> &str {
+    query
+        .split_once("hash: \"")
+        .and_then(|(_, rest)| rest.split('"').next())
+        .unwrap_or_default()
+}
+
+/// Whether `query` looks a transaction up in both places at once.
+fn looks_up_both(query: &str) -> bool {
+    query.contains("mempoolTx(") && query.contains(" tx(")
 }
 
 /// A route of the node's HTTP API that faults apply to.
@@ -582,6 +614,10 @@ pub enum Fault {
     /// Answer `200`, but admit nothing, as Rusk's mempool does when the
     /// transaction it routed fails its admission there.
     AcceptAndDiscard,
+    /// Resolve a lookup of both `tx` and `mempoolTx` from two reads, as
+    /// Rusk does, one field (`tx` when `ledger_first`) before the gate
+    /// opens and the other after; taken by such a lookup only.
+    BetweenFields { ledger_first: bool, gate: Arc<Gate> },
 }
 
 /// A gate a held request waits at.
@@ -973,6 +1009,14 @@ impl Node {
         self.model().produce();
     }
 
+    /// Make lookups of transaction `tx_id` miss it, in neither the mempool
+    /// nor a block, for `window` from the first such lookup: as when a
+    /// block holding it is accepted and rolled back between a lookup's
+    /// reads, or the node drops it and a peer hands it back.
+    pub fn hide_for(&self, tx_id: &str, window: Duration) {
+        self.model().hidden = Some((tx_id.to_owned(), window, None));
+    }
+
     pub fn evict_from(&self, nonce: u64) {
         self.model().evict_from(nonce);
     }
@@ -1184,10 +1228,12 @@ impl Drop for Node {
     }
 }
 
-fn take_fault(faults: &Faults, route: Route, nonce: Option<u64>) -> Option<Fault> {
+fn take_fault(faults: &Faults, route: Route, nonce: Option<u64>, lookup: bool) -> Option<Fault> {
     let mut faults = faults.lock().unwrap();
-    let position = faults.iter().position(|(at, of, _)| {
-        *at == route && (of.is_none() || nonce.is_none() || *of == nonce)
+    let position = faults.iter().position(|(at, of, fault)| {
+        *at == route
+            && (of.is_none() || nonce.is_none() || *of == nonce)
+            && (lookup || !matches!(fault, Fault::BetweenFields { .. }))
     })?;
     Some(faults.remove(position).2)
 }
@@ -1232,9 +1278,11 @@ fn serve(
         return reply(stream, "404 Not Found", b"not served");
     };
     let tx = Tx::parse(&body);
+    let query = String::from_utf8_lossy(&body).into_owned();
+    let lookup = route == Route::Graphql && looks_up_both(&query);
     let mut lose_reply = false;
     let mut hold_reply = None;
-    match take_fault(faults, route, tx.as_ref().map(|tx| tx.nonce)) {
+    match take_fault(faults, route, tx.as_ref().map(|tx| tx.nonce), lookup) {
         Some(Fault::Refuse(reason)) => {
             if let Some(tx) = &tx {
                 state.lock().unwrap().events.push(Event::Refused(
@@ -1249,6 +1297,27 @@ fn serve(
         Some(Fault::HoldReply(gate)) => hold_reply = Some(gate),
         Some(Fault::LoseReply) => lose_reply = true,
         Some(Fault::AcceptAndDiscard) => return reply(stream, "200 OK", b""),
+        Some(Fault::BetweenFields { ledger_first, gate }) => {
+            let hash = looked_up(&query);
+            let read = |ledger: bool| {
+                let mut model = state.lock().unwrap();
+                if ledger {
+                    model.ledger_field(hash)
+                } else {
+                    model.mempool_field(hash)
+                }
+            };
+            let first = read(ledger_first);
+            gate.wait();
+            let second = read(!ledger_first);
+            let (ledger, mempool) = if ledger_first {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            let answer = json!({ "mempoolTx": mempool, "tx": ledger });
+            return reply(stream, "200 OK", answer.to_string().as_bytes());
+        }
         None => {}
     }
     let (status, answer): (&str, Vec<u8>) = {
@@ -1282,13 +1351,7 @@ fn serve(
                 .to_string()
                 .into_bytes(),
             ),
-            Route::Graphql => (
-                "200 OK",
-                model
-                    .graphql(&String::from_utf8_lossy(&body))
-                    .to_string()
-                    .into_bytes(),
-            ),
+            Route::Graphql => ("200 OK", model.graphql(&query).to_string().into_bytes()),
             Route::Simulation => {
                 if model.reverting.contains(&hex::encode(&body)) {
                     (

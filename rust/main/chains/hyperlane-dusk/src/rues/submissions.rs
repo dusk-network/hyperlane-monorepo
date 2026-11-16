@@ -712,32 +712,46 @@ impl RuesClient {
 
     /// Where transaction `tx_id` is: in a block of the node's chain, with
     /// its receipt, in its mempool, or in neither.
+    ///
+    /// One query asks for both, which is all a lookup costs while the
+    /// transaction is found. Its two fields share no read, though: Rusk
+    /// 1.7.3 resolves `tx` and `mempoolTx` each from its own database view
+    /// (`tx_by_hash` and `mempool_by_hash` in
+    /// `rusk/src/lib/http/chain/graphql/tx.rs`), in either order. In Rusk
+    /// 1.7.3 a transaction moves between the two in steps a single read
+    /// never sees it missing from both: a rollback deletes a block and puts
+    /// its transactions back into the mempool in one `db.update`, one
+    /// RocksDB transaction, committed at once, over the one database that
+    /// holds the ledger and the mempool (`Acceptor::try_revert`); a block's
+    /// acceptance stores it with its transactions in one `db.update`, and
+    /// only a later one deletes them from the mempool
+    /// (`Acceptor::accept_block`), so a transaction is in both meanwhile.
+    /// The query can still miss it: its mempool read before a rollback and
+    /// its ledger read after, or its ledger read before an acceptance and
+    /// its mempool read after that acceptance's clean-up. So "neither" is
+    /// read again, one place at a time, the ledger, the mempool, then the
+    /// ledger again, and stands only if all three miss it too: a
+    /// transaction that stays on the node is then missed only if a block
+    /// holding it is accepted, and taken out of the mempool, after the
+    /// first ledger read and rolled back before the second.
     pub(crate) async fn transaction_status(
         &self,
         tx_id: &str,
     ) -> Result<TransactionStatus, HyperlaneDuskError> {
         validate_transaction_id(tx_id)?;
-        let query = format!(
-            r#"query {{ mempoolTx(hash: "{tx_id}") {{ id }} tx(hash: "{tx_id}") {{ blockHeight gasSpent err }} }}"#
-        );
-        let data = self.graphql_query(&query).await?;
-        if let Some(transaction) = data.get("tx").filter(|value| !value.is_null()) {
-            let block_height = transaction
-                .get("blockHeight")
-                .and_then(JsonValue::as_u64)
-                .ok_or_else(|| {
-                    HyperlaneDuskError::Other(format!(
-                        "Ledger transaction {tx_id} is missing numeric blockHeight: {}",
-                        bounded_json(transaction)
-                    ))
-                })?;
-            return Ok(TransactionStatus::Included {
-                block_height,
-                receipt: parse_confirmed_transaction(tx_id, transaction)?,
-            });
+        let ledger = format!(r#"tx(hash: "{tx_id}") {{ blockHeight gasSpent err }}"#);
+        let mempool = format!(r#"mempoolTx(hash: "{tx_id}") {{ id }}"#);
+        let data = self
+            .graphql_query(&format!("query {{ {mempool} {ledger} }}"))
+            .await?;
+        if let Some(status) = found(tx_id, &data)? {
+            return Ok(status);
         }
-        if data.get("mempoolTx").is_some_and(|value| !value.is_null()) {
-            return Ok(TransactionStatus::Pending);
+        for field in [&ledger, &mempool, &ledger] {
+            let data = self.graphql_query(&format!("query {{ {field} }}")).await?;
+            if let Some(status) = found(tx_id, &data)? {
+                return Ok(status);
+            }
         }
         Ok(TransactionStatus::Unknown)
     }
@@ -828,6 +842,31 @@ impl RuesClient {
 /// (`TxAcceptanceError::MissingIntermediateNonce`). Propagation queues
 /// such a transaction.
 const MISSING_INTERMEDIATE_NONCE: &str = "Missing intermediate nonce";
+
+/// Where a lookup of transaction `tx_id` that answered `data` found it: in
+/// a block (`tx`), in the mempool (`mempoolTx`), or, `None`, in neither of
+/// the fields it asked for.
+fn found(tx_id: &str, data: &JsonValue) -> Result<Option<TransactionStatus>, HyperlaneDuskError> {
+    if let Some(transaction) = data.get("tx").filter(|value| !value.is_null()) {
+        let block_height = transaction
+            .get("blockHeight")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| {
+                HyperlaneDuskError::Other(format!(
+                    "Ledger transaction {tx_id} is missing numeric blockHeight: {}",
+                    bounded_json(transaction)
+                ))
+            })?;
+        return Ok(Some(TransactionStatus::Included {
+            block_height,
+            receipt: parse_confirmed_transaction(tx_id, transaction)?,
+        }));
+    }
+    if data.get("mempoolTx").is_some_and(|value| !value.is_null()) {
+        return Ok(Some(TransactionStatus::Pending));
+    }
+    Ok(None)
+}
 
 /// Write options that reach the disk before the write returns.
 fn synced() -> WriteOptions {

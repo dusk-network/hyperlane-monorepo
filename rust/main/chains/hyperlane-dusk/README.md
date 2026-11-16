@@ -277,42 +277,53 @@ how to run the local bridge.
   height, and the second is the account read again, at least 10 minutes
   after the first and after its block is final, right before the transaction
   is looked up. One in the mempool always stays, whatever the readings show:
-  a rollback puts a transaction back there, and it can land again. A kept
-  transaction without its nonce goes only once it is in a final block. A
-  signer keeps those of at most 1,024 deliveries: at the bound, a delivery
-  looks kept transactions up, the oldest first and on later tries on from
-  where the last look stopped, at most 16 at a time, and forgets those it
-  can. Every 5 minutes a delivery does the same for the kept transactions of
-  other messages, so that those of messages the relayer gave up on do not
-  pile up to the bound; it reads nothing while nothing else is kept. One
-  that may still land, in the mempool, in a block that is not final, or in
-  neither with its nonce not yet shown used by both readings, is never
-  forgotten, and neither is one that failed in a final block before its
-  failure was reported, whose gas would then never be charged: while none
-  can go, deliveries fail without being signed, and the relayer tries them
-  again once kept transactions settle. A delivery submitted again looks its
-  transaction up first: in a block and executed, it is the delivery's
-  outcome, and the relayer's confirmation goes on from it; failed in a
-  block, and not reported yet, as when it failed after the submission that
-  prepared it had returned, that failure is the delivery's outcome, with the
-  gas it spent, so that the relayer charges it to the message and its gas
-  payment policy decides on another attempt, and nothing else is sent then;
-  failed and reported, the delivery goes again once that block is final; in
-  the mempool, it is followed to its block; in neither, the delivery goes
-  again only 60 s after the transaction was prepared, as it may still be on
-  its way to the node. A transaction the node refused at preverification is
+  a rollback puts a transaction back there, and it can land again. A lookup
+  finds a transaction in neither place only when every read of it misses
+  it: Rusk answers the query that asks for both from two separate reads, so
+  a transaction that query misses is read again, in the ledger, the mempool
+  and the ledger, one after the other, and one that every read misses is
+  looked up again half a block (5 s) later, and goes only if it is missed
+  again. A kept transaction without its nonce goes only once it is in a
+  final block. A signer keeps those of at most 1,024 deliveries: at the
+  bound, a delivery looks kept transactions up, the oldest first and on
+  later tries on from where the last look stopped, at most 16 at a time,
+  and forgets those it can. Every 5 minutes a delivery does the same for
+  the kept transactions of other messages, so that those of messages the
+  relayer gave up on do not pile up to the bound; it reads nothing while
+  nothing else is kept. A transaction whose nonce is used goes 10 minutes
+  after the first reading that shows it, at the earliest; a reading taken
+  shortly before, which does not show it, keeps the next one from being
+  taken until it is 10 minutes old itself, so it can take about 20 minutes,
+  plus the wait for the next look: a delivery's next try at the bound, or
+  the next 5-minute sweep. One that may still land, in the mempool, in a
+  block that is not final, or in neither with its nonce not yet shown used
+  by both readings, is never forgotten, and neither is one that failed in a
+  final block before its failure was reported, whose gas would then never be
+  charged: while none can go, deliveries fail without being signed, and the
+  relayer tries them again once kept transactions settle. A delivery
+  submitted again looks its transaction up first: in a block and executed,
+  it is the delivery's outcome, and the relayer's confirmation goes on from
+  it; failed in a block, and not reported yet, as when it failed after the
+  submission that prepared it had returned, that failure is the delivery's
+  outcome, with the gas it spent, so that the relayer charges it to the
+  message and its gas payment policy decides on another attempt, and nothing
+  else is sent then; failed and reported, the delivery goes again once that
+  block is final; in the mempool, it is followed to its block; in neither,
+  the delivery goes again only 60 s after the transaction was prepared, as
+  it may still be on its way to the node, and only if a lookup half a block
+  later misses it too. A transaction the node refused at preverification is
   not kept. Otherwise, after a submission whose outcome was unknown, the
   first transaction could land after the relayer's simulation of the next
   submission passed and before the helper read the account's nonce: the
   helper signed the next nonce, and a second transaction landed and failed,
   paying its whole gas limit.
-- **Known issue of deliveries one at a time: a dropped transaction can
-  land after its message went again.** A kept transaction that is in
-  neither the node's mempool nor a block 60 s after it was prepared is
-  forgotten, and the next submission has `dusk-tx` sign the message again
-  with the account's nonce plus one. A signed Moonlight transaction does
-  not expire, though, so this can cost one failed transaction when all of
-  these happen:
+- **Known issue of deliveries one at a time: a dropped transaction can land
+  after its message went again.** A kept transaction that is in neither the
+  node's mempool nor a block 60 s after it was prepared, as two lookups half
+  a block apart find, is forgotten, and the next submission has `dusk-tx`
+  sign the message again with the account's nonce plus one. A signed
+  Moonlight transaction does not expire, though, so this can cost one failed
+  transaction when all of these happen:
   1. a delivery's transaction M, with nonce n, reached the network while
      another transaction of the relayer's key, A with nonce n−1, was in a
      block that was not final yet;
@@ -349,17 +360,27 @@ how to run the local bridge.
   them: with the tip at P, a block C holding the kept transaction T at
   nonce n comes, the account read shows n, C is rolled back, which puts T
   back into the mempool, and the tip is P again, so the reading takes n for
-  P's. One such reading used to be enough, and T's record went while T
-  could still land. T now goes on its nonce only when it is in neither the
-  node's mempool nor a block and two readings at least 10 minutes apart,
-  the first at a block that is final and still the node's, both show n
-  used. Its record can then go while T can still land only when all of
-  these happen:
+  P's. One such reading used to be enough, and T's record went while T could
+  still land. T now goes on its nonce only when two readings at least 10
+  minutes apart, the first at a block that is final and still the node's,
+  both show n used, and the lookups after them miss T in both the node's
+  mempool and its blocks. Its record can then go while T can still land only
+  when all of these happen:
   1. both readings, 10 minutes or more apart, are wrong: each is taken
      while the node's tip is a block that uses n and is rolled back later;
-  2. when T is looked up, after the second reading, it is in neither the
-     node's mempool nor a block, although the rollback of a block holding
-     it puts it back into the mempool: the node dropped it, say, while a
+  2. every read of T after the second reading misses it: the lookup's
+     query, which Rusk answers from two separate reads, then reads of the
+     ledger, the mempool and the ledger, one after the other, and all of
+     that again half a block later. In Rusk 1.7.3 a rollback deletes a
+     block and puts its transactions back into the mempool in one database
+     commit, and an acceptance stores a block before a later commit takes
+     its transactions out of the mempool, so a transaction is never missing
+     from both for a single read (checked in Rusk 1.7.3's source; a Rusk
+     that moved it in two commits would leave a moment for that). Reads
+     like these then miss a T that stays on the node only if, both times, a
+     block holding it is accepted, and its transactions taken out of the
+     mempool, after the first ledger read and rolled back before the
+     second; otherwise T is gone from the node: it dropped T, say, while a
      peer kept it.
 
   The agent also assumes its RUES URL is one node, or nodes that agree: a

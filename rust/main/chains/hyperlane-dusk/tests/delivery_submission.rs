@@ -2515,3 +2515,361 @@ async fn the_signer_wait_ends_at_its_deadline_while_a_lookup_goes_unanswered() {
     node.settle(2).await;
     std::env::remove_var("DUSK_TX_BIN");
 }
+
+/// Keep a first delivery's transaction T, signed with nonce 1, waiting in
+/// the mempool of a node whose blocks come, and become final, only by
+/// hand, through `mailbox`, which then returns without its outcome. T's ID.
+async fn keep_in_the_mempool(
+    node: &Node,
+    mailbox: &hyperlane_dusk::DuskMailbox,
+    delivery: &(
+        hyperlane_core::HyperlaneMessage,
+        hyperlane_core::Metadata,
+        Option<U256>,
+    ),
+) -> String {
+    node.pause(true);
+    let (message, metadata, gas_limit) = delivery;
+    let error = mailbox
+        .process(message, metadata, *gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("to be included"), "{error}");
+    node.freeze(true);
+    node.pause(false);
+    let kept = node.model().mempool[&1].id.clone();
+    kept
+}
+
+/// The review's race (w15). Rusk resolves a lookup's `mempoolTx` and `tx`
+/// from separate reads: its mempool read finds the kept transaction T in no
+/// mempool, as T is in block C, then C is rolled back, putting T back, and
+/// its ledger read finds T in no block. The delivery, submitted again past
+/// the drop grace, took T for dropped and sent the message again, signing
+/// nonce 1 while T held it. T's other reads, one place at a time, find it
+/// in the mempool: it is followed to its block, and nothing is signed.
+#[tokio::test]
+async fn a_rollback_between_a_lookups_two_reads_does_not_send_a_delivery_again() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start_with(false, None);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    node.helper_waits(10);
+    let mailbox = node.mailbox(false).with_submission_limits(patient(64));
+    let (message, metadata, gas_limit) = delivery(0);
+    let kept = keep_in_the_mempool(
+        &node,
+        &mailbox,
+        &(message.clone(), metadata.clone(), gas_limit),
+    )
+    .await;
+    let calls = node.invocations().len();
+    // Past the drop grace, and the 2 s a passed simulation stands for.
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    let simulation = std::sync::Arc::new(Gate::default());
+    node.inject(
+        Route::Simulation,
+        None,
+        Fault::HoldReply(simulation.clone()),
+    );
+    let fields = std::sync::Arc::new(Gate::default());
+    node.inject(
+        Route::Graphql,
+        None,
+        Fault::BetweenFields {
+            ledger_first: false,
+            gate: fields.clone(),
+        },
+    );
+    let retry = tokio::spawn({
+        let mailbox = mailbox.clone();
+        let (message, metadata) = (message.clone(), metadata.clone());
+        async move { mailbox.process(&message, &metadata, gas_limit).await }
+    });
+    // The simulation passes while T is in the mempool; T then lands in C.
+    node.wait_until("the simulation is answered", |_| {
+        simulation.waiting.load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+    let parent = node.height();
+    node.produce_block();
+    assert!(node.model().included(&kept).is_some());
+    simulation.open();
+    // The lookup's mempool read misses T; C is rolled back before its
+    // ledger read.
+    node.wait_until("the lookup's mempool read is made", |_| {
+        fields.waiting.load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+    node.rollback_to(parent);
+    fields.open();
+    node.freeze(false);
+    let outcome = retry.await.unwrap().unwrap();
+    assert!(outcome.executed);
+    assert_eq!(hex::encode(&outcome.transaction_id.as_bytes()[32..]), kept);
+    assert_eq!(node.invocations().len(), calls);
+    assert_eq!(node.propagated(), [1]);
+    node.settle(1).await;
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+/// The same race at a lookup of kept transactions for room: two readings
+/// of the account, the gap apart, show nonce 1 used, and the lookup of the
+/// kept transaction T misses it, as block C holding T is rolled back
+/// between its two reads. T, in neither place as far as that lookup saw,
+/// went, while the rollback had put it back into the mempool. Its other
+/// reads find it there, and it stays.
+#[tokio::test]
+async fn a_rollback_between_a_lookups_two_reads_does_not_forget_a_kept_transaction() {
+    let _env = HELPER_ENV.lock().await;
+    let gap = Duration::from_secs(1);
+    let (node, mailbox, (message, _, _)) = keep_one_in_the_mempool(gap).await;
+    // A first reading shows nonce 1 used, at block P, now final.
+    node.produce_block();
+    assert_eq!(
+        reclaim_across_a_rolled_back_block(&node, &mailbox, |_| {}).await,
+        0
+    );
+    tokio::time::sleep(gap).await;
+    // The gap later, block C holds T: the account shows nonce 1 used again.
+    let parent = node.height();
+    node.produce_block();
+    let fields = std::sync::Arc::new(Gate::default());
+    node.inject(
+        Route::Graphql,
+        None,
+        Fault::BetweenFields {
+            ledger_first: false,
+            gate: fields.clone(),
+        },
+    );
+    let reclaim = tokio::spawn({
+        let mailbox = mailbox.clone();
+        async move { mailbox.reclaim_kept_transactions().await }
+    });
+    node.wait_until("the lookup's mempool read is made", |_| {
+        fields.waiting.load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+    node.rollback_to(parent);
+    fields.open();
+    assert_eq!(reclaim.await.unwrap().unwrap(), 0);
+    assert!(mailbox
+        .prepared_transaction(message.id())
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        node.model().mempool.keys().copied().collect::<Vec<_>>(),
+        [1]
+    );
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+/// A lookup whose two reads miss the transaction around a rollback looks
+/// again, one place at a time, and finds it in the mempool: a delivery
+/// waiting for the signer's transaction in flight goes on waiting for it,
+/// signing nothing, and goes once it has landed. Taken for gone, it was
+/// signed with the nonce that transaction held and refused.
+#[tokio::test]
+async fn a_lookup_racing_a_rollback_still_finds_the_transaction_in_the_mempool() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start_with(false, None);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    node.helper_waits(10);
+    let mailbox = node.mailbox(false).with_submission_limits(patient(64));
+    let kept = keep_in_the_mempool(&node, &mailbox, &delivery(0)).await;
+    let calls = node.invocations().len();
+    // T lands in block C, and the next delivery waits for it.
+    let parent = node.height();
+    node.produce_block();
+    assert!(node.model().included(&kept).is_some());
+    let fields = std::sync::Arc::new(Gate::default());
+    node.inject(
+        Route::Graphql,
+        None,
+        Fault::BetweenFields {
+            ledger_first: false,
+            gate: fields.clone(),
+        },
+    );
+    let waiting = mailbox.clone().with_submission_limits(SubmissionLimits {
+        receipt: Duration::from_secs(5),
+        ..patient(64)
+    });
+    let next = tokio::spawn(async move {
+        let (message, metadata, gas_limit) = delivery(1);
+        waiting.process(&message, &metadata, gas_limit).await
+    });
+    node.wait_until("the lookup's mempool read is made", |_| {
+        fields.waiting.load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+    node.rollback_to(parent);
+    fields.open();
+    tokio::time::sleep(BLOCK_TIME * 2).await;
+    assert_eq!(node.invocations().len(), calls);
+    node.freeze(false);
+    assert!(next.await.unwrap().unwrap().executed);
+    assert!(node.refusals().is_empty(), "{:?}", node.refusals());
+    assert_eq!(node.propagated(), [1, 2]);
+    node.settle(2).await;
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+/// A lookup whose two reads miss the transaction around its block's
+/// acceptance, the ledger read before and the mempool read after, looks
+/// again and finds it in a block: within the drop grace, the delivery
+/// submitted again reports that block's outcome, where it failed as if the
+/// transaction could still be on its way.
+#[tokio::test]
+async fn a_lookup_racing_an_acceptance_still_finds_the_transaction_in_its_block() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start_with(false, None);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    node.helper_waits(10);
+    let mailbox = node
+        .mailbox(false)
+        .with_submission_limits(SubmissionLimits {
+            drop_grace: Duration::from_secs(60),
+            ..patient(64)
+        });
+    let (message, metadata, gas_limit) = delivery(0);
+    let kept = keep_in_the_mempool(
+        &node,
+        &mailbox,
+        &(message.clone(), metadata.clone(), gas_limit),
+    )
+    .await;
+    let calls = node.invocations().len();
+    let fields = std::sync::Arc::new(Gate::default());
+    node.inject(
+        Route::Graphql,
+        None,
+        Fault::BetweenFields {
+            ledger_first: true,
+            gate: fields.clone(),
+        },
+    );
+    let retry = tokio::spawn({
+        let mailbox = mailbox.clone();
+        let (message, metadata) = (message.clone(), metadata.clone());
+        async move { mailbox.process(&message, &metadata, gas_limit).await }
+    });
+    node.wait_until("the lookup's ledger read is made", |_| {
+        fields.waiting.load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+    node.produce_block();
+    assert!(node.model().included(&kept).is_some());
+    fields.open();
+    let outcome = retry.await.unwrap().unwrap();
+    assert!(outcome.executed);
+    assert_eq!(hex::encode(&outcome.transaction_id.as_bytes()[32..]), kept);
+    assert_eq!(node.invocations().len(), calls);
+    node.freeze(false);
+    node.settle(1).await;
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+/// A kept transaction past the drop grace that every read of one lookup
+/// misses, as when a block holding it is accepted and rolled back between
+/// them, is looked up again half a block later: found in the mempool then,
+/// it is followed, and nothing is signed. One the node has really dropped
+/// is missed again, and its delivery goes again, only after that pause.
+#[tokio::test]
+async fn a_kept_transaction_missed_for_a_moment_is_not_sent_again() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start(false);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    node.helper_waits(10);
+    let block = Duration::from_secs(1);
+    let mailbox = node.mailbox(false).with_submission_limits(patient(64));
+    let (message, metadata, gas_limit) = delivery(0);
+    node.pause(true);
+    let error = mailbox
+        .process(&message, &metadata, gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("to be included"), "{error}");
+    let kept = node.model().mempool[&1].id.clone();
+    let calls = node.invocations().len();
+    let mailbox = mailbox.with_submission_limits(SubmissionLimits {
+        block,
+        receipt: Duration::from_millis(1_500),
+        ..patient(64)
+    });
+    // Missed for less than half a block.
+    node.hide_for(&kept, block / 4);
+    assert!(mailbox
+        .process(&message, &metadata, gas_limit)
+        .await
+        .is_err());
+    assert_eq!(
+        mailbox.prepared_transaction(message.id()).unwrap(),
+        Some(kept)
+    );
+    assert_eq!(node.invocations().len(), calls);
+    // Dropped for good: the delivery goes again, after the pause.
+    node.evict_from(1);
+    node.pause(false);
+    let started = std::time::Instant::now();
+    let outcome = mailbox
+        .process(&message, &metadata, gas_limit)
+        .await
+        .unwrap();
+    assert!(started.elapsed() >= block / 2);
+    assert!(outcome.executed);
+    assert_eq!(node.invocations().len(), calls + 1);
+    assert_eq!(node.propagated(), [1, 1]);
+    node.settle(1).await;
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+/// Kept transactions for room likewise: with two readings the gap apart
+/// showing nonce 1 used, a kept transaction every read of one lookup
+/// misses is looked up again half a block later, and found in the mempool
+/// then, stays. One the node has really dropped, with nonce 1 used for
+/// good, is missed again and goes, only after that pause.
+#[tokio::test]
+async fn a_kept_transaction_missed_for_a_moment_is_not_forgotten() {
+    let _env = HELPER_ENV.lock().await;
+    let gap = Duration::from_secs(1);
+    let block = Duration::from_secs(1);
+    let (node, mailbox, (message, _, _)) = keep_one_in_the_mempool(gap).await;
+    let mailbox = mailbox.with_submission_limits(SubmissionLimits {
+        nonce_gap: gap,
+        block,
+        ..patient(64)
+    });
+    let kept = node.model().mempool[&1].id.clone();
+    // Two readings the gap apart show nonce 1 used, as in the review's
+    // sequence, and the lookup after the second misses T.
+    node.produce_block();
+    assert_eq!(
+        reclaim_across_a_rolled_back_block(&node, &mailbox, |_| {}).await,
+        0
+    );
+    tokio::time::sleep(gap).await;
+    node.hide_for(&kept, block / 4);
+    assert_eq!(
+        reclaim_across_a_rolled_back_block(&node, &mailbox, |_| {}).await,
+        0
+    );
+    assert!(mailbox
+        .prepared_transaction(message.id())
+        .unwrap()
+        .is_some());
+    // Dropped for good, with nonce 1 used by another transaction in a
+    // final block: T goes, after the pause.
+    node.evict_from(1);
+    node.send_foreign(1).unwrap();
+    node.produce_block();
+    node.produce_block();
+    node.finalize_to(node.height());
+    let started = std::time::Instant::now();
+    assert_eq!(mailbox.reclaim_kept_transactions().await.unwrap(), 1);
+    assert!(started.elapsed() >= block / 2);
+    assert_eq!(mailbox.prepared_transaction(message.id()).unwrap(), None);
+    std::env::remove_var("DUSK_TX_BIN");
+}
