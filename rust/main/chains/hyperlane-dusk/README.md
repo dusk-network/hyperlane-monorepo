@@ -281,31 +281,29 @@ how to run the local bridge.
   64, those in blocks that are not final included, so that a rollback
   cannot put more than 64 back into the mempool. Going again and filling
   need no room under that bound, so the signer never stalls behind a gap.
-  A nonce sent 8 times and dropped each time is not sent again, with a
-  critical error. Deliveries the previous version kept in flight, one
+  A nonce whose 8 different transactions the node all dropped is not sent
+  again, with a critical error. Deliveries the previous version kept in flight, one
   record per message, are waited out as below.
 - **Switching pipelining off.** Turning `pipelineDeliveries` off after a
-  pipelined run needs no manual step, and the reservations that run left
-  in `eventCursorDir` must not be deleted by hand. Before a delivery goes
-  one at a time, the relayer looks for them, and for the records the
-  previous version kept; with none, it reads nothing from the node, and
-  they never change how a delivery is signed. It reconciles them as
-  above, under the signer's lock. One whose transaction is in a final
-  block is released, and so is one whose transactions are in neither the
-  mempool nor a block while the account has used its nonce, or after 60 s
-  with its nonce unused and not held by the mempool: nothing of it can be
-  admitted any more. One whose
-  transaction is in a block that is not final yet is kept until it is,
-  and holds nothing up: dusk-tx signs above its nonce, and a rollback
-  puts it back into the mempool, where the node refuses another
-  transaction of its nonce. While one may still be admitted ahead of a
-  delivery (its transaction is in the mempool, it was sent less than 60 s
-  ago, the mempool holds its nonce for a transaction it does not name, or
-  it cannot be looked up), every delivery fails and the relayer tries it
-  again later, usually for a block or two. The relayer waits these out
-  rather than refusing to start: the records drain only while a relayer
-  runs, and only the ones that could still land ahead of a delivery sent
-  one at a time hold anything up.
+  pipelined run needs no manual step, and the reservations that run left in
+  `eventCursorDir` must not be deleted by hand. Before a delivery goes one
+  at a time, the relayer looks for them, and for the records the previous
+  version kept; with none, it reads nothing from the node, and they never
+  change how a delivery is signed. It reconciles them as above, under the
+  signer's lock. One whose transaction is in a final block is released, and
+  so is one whose transactions are in neither the mempool nor a block while
+  the account has used its nonce, or after 60 s with its nonce unused and
+  not held by the mempool: nothing of it can be admitted any more. One whose
+  transaction is in a block that is not final yet is kept until it is, and
+  holds nothing up: dusk-tx signs above its nonce, and a rollback puts it
+  back into the mempool, where the node refuses another transaction of its
+  nonce. While one may still be admitted ahead of a delivery (its
+  transaction is in the mempool, it was sent less than 60 s ago, the mempool
+  holds its nonce for a transaction it does not name, or it cannot be looked
+  up), every delivery fails and the relayer tries it again later, usually
+  for a block or two. The relayer waits these out rather than refusing to
+  start: the records drain only while a relayer runs, and only the ones that
+  could still land ahead of a delivery sent one at a time hold anything up.
 - **Delivery simulation.** Dusk charges a failed transaction its whole gas
   limit. Before submitting `process`, the relayer runs it as an unsigned
   contract query, which Rusk executes in a throwaway session. If the query
