@@ -1776,3 +1776,54 @@ async fn a_transaction_that_failed_after_its_submission_returned_is_reported_wit
     assert_eq!(node.propagated(), [1, 2]);
     std::env::remove_var("DUSK_TX_BIN");
 }
+
+/// When the node refuses a delivery at preverification, the Mailbox forgets
+/// the transaction it kept for it. When that fails, the delivery still
+/// fails with the helper's error, not the event store's, since 72981977cb:
+/// the transaction stays kept, and holds the next submission back only for
+/// the drop grace.
+#[tokio::test]
+async fn a_refused_delivery_keeps_the_helpers_error_when_its_transaction_cannot_be_forgotten() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start(false);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let mailbox = node.mailbox(false).with_submission_limits(patient(64));
+    let (message, metadata, gas_limit) = delivery(0);
+    node.inject(
+        Route::Preverify,
+        None,
+        Fault::Refuse("insufficient balance".into()),
+    );
+    mailbox.fail_prepared_writes(0, 1);
+    let error = mailbox
+        .process(&message, &metadata, gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("Preverify rejected before propagation"),
+        "{error}"
+    );
+    assert!(error.contains("insufficient balance"), "{error}");
+    assert!(!error.contains("eventCursorDir"), "{error}");
+    assert!(node.propagated().is_empty());
+    assert!(mailbox
+        .prepared_transaction(message.id())
+        .unwrap()
+        .is_some());
+    let error = mailbox
+        .process(&message, &metadata, gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("may still reach the node"), "{error}");
+    tokio::time::sleep(PAST_DROP_GRACE).await;
+    let outcome = mailbox
+        .process(&message, &metadata, gas_limit)
+        .await
+        .unwrap();
+    assert!(outcome.executed);
+    assert_eq!(node.propagated(), [1]);
+    node.settle(1).await;
+    std::env::remove_var("DUSK_TX_BIN");
+}
