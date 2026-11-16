@@ -194,6 +194,9 @@ fn unix_millis() -> u64 {
 pub struct SubmissionLimits {
     /// For a sent transaction to be in a block.
     pub receipt: Duration,
+    /// How long a block takes: a sent transaction is looked up as often as
+    /// a block can bring it (`RuesClient::wait_for_tx`).
+    pub block: Duration,
     /// For the node to hold a pipelined transaction before the next is
     /// sent.
     pub held: Duration,
@@ -211,6 +214,7 @@ impl Default for SubmissionLimits {
     fn default() -> Self {
         Self {
             receipt: TX_CONFIRMATION_TIMEOUT,
+            block: crate::rues::BLOCK_TIME,
             held: HELD_TIMEOUT,
             batch: BATCH_SEND_TIMEOUT,
             drop_grace: DROP_GRACE,
@@ -568,7 +572,10 @@ impl DuskMailbox {
     /// within `SubmissionLimits::receipt`.
     async fn outcome_of(&self, tx_id: &str) -> ChainResult<TxOutcome> {
         let transaction_id = crate::tx_sender::dusk_tx_id_to_h512(tx_id)?;
-        let confirmed = self.rues.wait_for_tx(tx_id, self.limits.receipt).await?;
+        let confirmed = self
+            .rues
+            .wait_for_tx_in_blocks_of(tx_id, self.limits.receipt, self.limits.block)
+            .await?;
         let executed = confirmed.error.is_none();
         if let Some(error) = &confirmed.error {
             let error = bounded_text(error);

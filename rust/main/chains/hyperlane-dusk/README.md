@@ -239,6 +239,20 @@ how to run the local bridge.
   agent follows the transaction it prepared by its exact hash. A relayer
   key delivers about one message every two blocks this way: the next one
   reaches the node after the next block's round has started.
+- **Waiting for a block.** The node builds a block from what its mempool
+  holds when the block's round starts, so a transaction it admits is in a
+  block 10 to 20 s later on a 10 s chain. `dusk-tx` waits for a delivery
+  sent one at a time itself: it looks the transaction up right after
+  propagating it and every 3 s after that, for up to 60 s, about 6 `tx`
+  reads a delivery. Where the agent waits itself, for the receipt once
+  `dusk-tx` has returned, which it finds at once, for a transaction whose
+  outcome is unknown, and for pipelined deliveries, it looks the
+  transaction up at once, again one block (10 s) later, then every 2.5 s
+  until 20 s have passed, and after that every quarter of the time waited,
+  at most every 10 s: 17 lookups over its 120 s wait, where one every 2 s
+  made 61, and at most 6 for a transaction in a block 10 to 20 s after it
+  was sent, found at most 2.5 s after its block, where the pipelined
+  deliveries the benchmark measured took 9.3.
 - **Pipelined deliveries (experimental, off by default).** Only a chain
   that sets `pipelineDeliveries: true` and a `maxBatchSize` above 1, with a
   helper that takes `call --nonce <N> --no-wait` (found from its

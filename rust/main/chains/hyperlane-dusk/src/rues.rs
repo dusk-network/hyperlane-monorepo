@@ -56,7 +56,10 @@ const MERKLE_TREE_HOOK_STATE_VERSION: u32 = 2;
 /// The ValidatorAnnounce state version this agent reads: location hashes,
 /// with the locations in `ValidatorAnnouncement` events.
 const VALIDATOR_ANNOUNCE_STATE_VERSION: u32 = 2;
-const TX_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// How long a Dusk block takes: about 10 s on mainnet and testnet. The node
+/// builds a block from what its mempool holds when the block's round starts,
+/// so a transaction it admits is in a block 10 to 20 s later.
+pub(crate) const BLOCK_TIME: Duration = Duration::from_secs(10);
 /// How often `wait_until_held` asks whether the node holds a transaction.
 const HELD_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// How many times a request the endpoint refuses for its rate limit is sent
@@ -2714,25 +2717,31 @@ impl RuesClient {
     /// Propagation only acknowledges admission to the mempool. Hyperlane must not
     /// report a transaction as executed until Rusk exposes its spent transaction
     /// record, which also contains the actual gas use and any execution error.
+    ///
+    /// It is looked up as often as a block can bring it (`next_tx_lookup`):
+    /// at once, then one block later, every quarter of a block until two
+    /// blocks have passed, and less and less often after that.
     pub async fn wait_for_tx(
         &self,
         tx_id: &str,
         timeout: Duration,
     ) -> Result<ConfirmedTransaction, HyperlaneDuskError> {
-        self.wait_for_tx_with_poll_interval(tx_id, timeout, TX_POLL_INTERVAL)
+        self.wait_for_tx_in_blocks_of(tx_id, timeout, BLOCK_TIME)
             .await
     }
 
-    async fn wait_for_tx_with_poll_interval(
+    /// `wait_for_tx` on a chain whose blocks take `block_time`.
+    pub(crate) async fn wait_for_tx_in_blocks_of(
         &self,
         tx_id: &str,
         timeout: Duration,
-        poll_interval: Duration,
+        block_time: Duration,
     ) -> Result<ConfirmedTransaction, HyperlaneDuskError> {
         validate_transaction_id(tx_id)?;
 
         let query = transaction_query(tx_id);
-        let deadline = tokio::time::Instant::now() + timeout;
+        let started = tokio::time::Instant::now();
+        let deadline = started + timeout;
         let mut last_observation_error = None;
 
         loop {
@@ -2766,8 +2775,11 @@ impl RuesClient {
                 }
             }
 
-            tokio::time::sleep_until((tokio::time::Instant::now() + poll_interval).min(deadline))
-                .await;
+            let waited = started.elapsed();
+            tokio::time::sleep_until(
+                (started + waited + next_tx_lookup(waited, block_time)).min(deadline),
+            )
+            .await;
         }
     }
 
@@ -3320,6 +3332,26 @@ fn transaction_query(tx_id: &str) -> String {
     format!(r#"query {{ tx(hash: "{tx_id}") {{ gasSpent err }} }}"#)
 }
 
+/// How long after a lookup made `waited` into a wait for a transaction the
+/// next one goes, on a chain whose blocks take `block_time`. The first,
+/// made at once, finds a transaction that a caller has seen in a block. A
+/// transaction just sent waits for the next block's round to start, so the
+/// next lookup goes one block after the first; then every quarter of a
+/// block until two blocks have passed, by when a transaction the node took
+/// is in a block; then after a quarter of the time waited, at most a block.
+/// Over a 10 s chain's 120 s that is 17 lookups, where one every 2 s made
+/// 61, and a transaction in a block 10 to 20 s after it was sent is found
+/// at most 2.5 s later.
+fn next_tx_lookup(waited: Duration, block_time: Duration) -> Duration {
+    if waited < block_time {
+        block_time - waited
+    } else if waited < block_time * 2 {
+        block_time / 4
+    } else {
+        (waited / 4).clamp(block_time / 4, block_time)
+    }
+}
+
 fn graphql_errors_present(errors: &JsonValue) -> bool {
     match errors {
         JsonValue::Null => false,
@@ -3861,11 +3893,7 @@ mod tests {
         let client = RuesClient::new(url).unwrap();
         let tx_id = "ab".repeat(32);
         let confirmed = client
-            .wait_for_tx_with_poll_interval(
-                &tx_id,
-                Duration::from_secs(2),
-                Duration::from_millis(1),
-            )
+            .wait_for_tx_in_blocks_of(&tx_id, Duration::from_secs(2), Duration::from_millis(1))
             .await
             .unwrap();
         assert_eq!(confirmed.gas_spent, 42);
@@ -3944,14 +3972,58 @@ mod tests {
         let client = RuesClient::new(url).unwrap();
         let tx_id = "ab".repeat(32);
         let error = client
-            .wait_for_tx_with_poll_interval(
-                &tx_id,
-                Duration::from_secs(2),
-                Duration::from_millis(1),
-            )
+            .wait_for_tx_in_blocks_of(&tx_id, Duration::from_secs(2), Duration::from_millis(1))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("missing numeric gasSpent"));
+    }
+
+    /// When `wait_for_tx` looks a transaction up on a 10 s chain, from the
+    /// start of its wait, up to `until`.
+    fn tx_lookups(until: Duration) -> Vec<Duration> {
+        let mut lookups = vec![Duration::ZERO];
+        loop {
+            let last = lookups[lookups.len() - 1];
+            let next = last + next_tx_lookup(last, BLOCK_TIME);
+            if next > until {
+                return lookups;
+            }
+            lookups.push(next);
+        }
+    }
+
+    #[test]
+    fn transactions_are_looked_up_as_often_as_blocks_can_bring_them() {
+        let seconds: Vec<f64> = tx_lookups(Duration::from_secs(40))
+            .iter()
+            .map(Duration::as_secs_f64)
+            .collect();
+        assert_eq!(
+            seconds,
+            [0.0, 10.0, 12.5, 15.0, 17.5, 20.0, 25.0, 31.25, 39.0625]
+        );
+        // Over the 120 s a delivery waits for its block: 17 lookups, where
+        // one every 2 s made 61, and then one a block.
+        let lookups = tx_lookups(Duration::from_secs(120));
+        assert_eq!(lookups.len(), 17);
+        assert_eq!(
+            next_tx_lookup(Duration::from_secs(600), BLOCK_TIME),
+            BLOCK_TIME
+        );
+        // Rusk puts a transaction in a block 10 to 20 s after it was sent:
+        // it is found at most a quarter of a block later, by at most 6
+        // lookups, where one every 2 s took up to 11.
+        for tenths in 100..=200u64 {
+            let included = Duration::from_millis(tenths * 100);
+            let found = lookups
+                .iter()
+                .position(|lookup| *lookup >= included)
+                .unwrap();
+            assert!(lookups[found] - included <= BLOCK_TIME / 4, "{included:?}");
+            assert!(found < 6, "{included:?}");
+            let every_two_seconds = included.as_millis().div_ceil(2_000) + 1;
+            assert!((found as u128 + 1) < every_two_seconds, "{included:?}");
+        }
     }
 
     #[tokio::test]

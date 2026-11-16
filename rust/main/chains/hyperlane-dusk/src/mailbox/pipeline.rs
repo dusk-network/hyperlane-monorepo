@@ -377,7 +377,11 @@ impl DuskMailbox {
         let mut executed = true;
         for tx_id in &txs {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            match self.rues.wait_for_tx(tx_id, remaining).await {
+            match self
+                .rues
+                .wait_for_tx_in_blocks_of(tx_id, remaining, self.limits.block)
+                .await
+            {
                 Ok(receipt) => {
                     gas_spent = gas_spent.saturating_add(receipt.gas_spent);
                     if let Some(error) = &receipt.error {

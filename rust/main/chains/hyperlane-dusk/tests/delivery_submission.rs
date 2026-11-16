@@ -241,13 +241,14 @@ async fn an_unknown_outcome_is_followed_by_the_prepared_hash() {
     let _env = HELPER_ENV.lock().await;
     let node = Node::start(false);
     std::env::set_var("DUSK_TX_BIN", node.helper());
-    // The Mailbox looks a transaction up every 2 s: one in the next block
-    // is found by the second look.
+    // The Mailbox looks a transaction up at once, then a block later and
+    // every quarter of a block after that: one in the next block is found
+    // within a few looks.
     let mailbox = node
         .mailbox(false)
         .with_submission_limits(SubmissionLimits {
             receipt: Duration::from_millis(2_500),
-            ..SubmissionLimits::default()
+            ..limits()
         });
     let deliveries: Vec<_> = (0..2).map(delivery).collect();
 
@@ -390,7 +391,7 @@ async fn a_batch_sends_no_delivery_after_its_deadline() {
     }
     let mailbox = node.mailbox(true).with_submission_limits(SubmissionLimits {
         batch: Duration::from_secs(1),
-        ..SubmissionLimits::default()
+        ..limits()
     });
     let batch = mailbox
         .process_deliveries(&(0..10).map(delivery).collect::<Vec<_>>())
@@ -666,7 +667,7 @@ async fn deliveries_the_mempool_dropped_hold_up_one_at_a_time_delivery_only_brie
     let limits = SubmissionLimits {
         receipt: Duration::from_millis(100),
         drop_grace: Duration::from_secs(1),
-        ..SubmissionLimits::default()
+        ..limits()
     };
     node.pause(true);
     let pipelined = node

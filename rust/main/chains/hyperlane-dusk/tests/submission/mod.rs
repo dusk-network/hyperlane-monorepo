@@ -1166,6 +1166,7 @@ pub fn mailbox(rues: Arc<RuesClient>, url: &Url, directory: &Path, pipelined: bo
         Some(DuskSigner::new(H256::repeat_byte(1)).unwrap()),
         connection(url, directory, pipelined),
     )
+    .with_submission_limits(limits())
 }
 
 /// Delivery `nonce`: its message, metadata and the relayer's gas limit.
@@ -1198,6 +1199,15 @@ pub fn process_args_hex(delivery: &(HyperlaneMessage, Metadata, Option<U256>)) -
     hex::encode(rkyv::to_bytes::<_, 256>(&(metadata.to_vec(), encoded)).unwrap())
 }
 
+/// The Mailbox's limits on this chain: the default ones, with its block
+/// time.
+pub fn limits() -> SubmissionLimits {
+    SubmissionLimits {
+        block: BLOCK_TIME,
+        ..SubmissionLimits::default()
+    }
+}
+
 /// Limits that suit a chain that holds transactions back for a while: a
 /// delivery waits 600 ms for its block, and a transaction in neither the
 /// mempool nor a block counts as dropped after 300 ms.
@@ -1206,7 +1216,7 @@ pub fn patient(outstanding: usize) -> SubmissionLimits {
         receipt: Duration::from_millis(600),
         drop_grace: Duration::from_millis(300),
         outstanding,
-        ..SubmissionLimits::default()
+        ..limits()
     }
 }
 
