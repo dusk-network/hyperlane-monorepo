@@ -1387,13 +1387,15 @@ mod tests {
             .await
             .unwrap();
         assert!(!sent.exists());
-        let Word::Withheld(why) = &run.word else {
-            panic!("{:?}", run.word);
+        let why = match &run.word {
+            Word::Withheld(why) => why,
+            other => unreachable!("{other:?}"),
         };
         assert!(why.contains("the event store is gone"), "{why}");
         let error = withheld("process", &run, why);
-        let HyperlaneDuskError::NotSubmitted(detail) = &error else {
-            panic!("{error:?}");
+        let detail = match &error {
+            HyperlaneDuskError::NotSubmitted(detail) => detail,
+            other => unreachable!("{other:?}"),
         };
         assert!(detail.contains(&tx_id), "{detail}");
         assert!(
