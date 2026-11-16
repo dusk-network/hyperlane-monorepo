@@ -505,7 +505,7 @@ async fn a_delivery_whose_submission_outcome_is_unknown_is_reconciled_before_it_
     let deliveries: Vec<_> = (0..4).map(delivery).collect();
     // The node takes nonce 2's transaction, but its answer is lost: the
     // batch sends no later nonce.
-    node.next_submission(2, "unknown");
+    node.inject(Route::Propagate, Some(2), Fault::LoseReply);
     let batch = mailbox.process_deliveries(&deliveries[..3]).await.unwrap();
     assert_eq!(batch.failed_indexes, [2]);
     assert_eq!(node.propagated(), [1, 2]);
@@ -517,10 +517,10 @@ async fn a_delivery_whose_submission_outcome_is_unknown_is_reconciled_before_it_
     assert_eq!(node.propagated(), [1, 2, 3]);
     node.settle(3).await;
 
-    // A submission whose hash the helper printed, but that never reached
-    // the node: once past the drop grace, it goes again with its own nonce.
+    // A transaction whose propagation never reached the node: once past
+    // the drop grace, it goes again with its own nonce.
     node.pause(true);
-    node.next_submission(4, "lose");
+    node.inject(Route::Propagate, Some(4), Fault::Drop);
     let lost = mailbox.process_deliveries(&deliveries[3..]).await.unwrap();
     assert!(!lost.outcome.unwrap().executed);
     assert_eq!(node.propagated(), [1, 2, 3]);
@@ -579,6 +579,8 @@ async fn a_signer_keeps_a_bounded_number_of_deliveries_outstanding() {
     assert_eq!(node.propagated(), [1, 2, 3, 4]);
     // Once they are in final blocks, the next ones go.
     node.settle(4).await;
+    node.wait_until_final(4).await;
+    node.expire_block_pair().await;
     let batch = mailbox.process_deliveries(&deliveries[4..]).await.unwrap();
     assert!(batch.failed_indexes.is_empty());
     assert_eq!(node.propagated(), [1, 2, 3, 4, 5, 6, 7, 8]);
@@ -770,5 +772,330 @@ async fn a_pipelined_delivery_in_a_block_that_is_not_final_holds_nothing_up() {
     node.settle(3).await;
     drop(relayer);
     node.restart(store.path());
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+// Regressions of the pipelining review. Each would fail against the
+// pipelined deliveries of 841b494e9d.
+
+/// The transaction of `nonce` in a block, if any.
+fn included_at(node: &Node, nonce: u64) -> Option<Included> {
+    node.included().into_iter().find(|tx| tx.tx.nonce == nonce)
+}
+
+#[tokio::test]
+async fn a_dropped_delivery_keeps_its_nonce_and_no_delivery_vanishes_from_a_batch() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start(true);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let mailbox = node.mailbox(true).with_submission_limits(patient(64));
+    let deliveries: Vec<_> = (0..2).map(delivery).collect();
+    node.pause(true);
+    // The first goes with nonce 1, and the node drops it.
+    mailbox.process_deliveries(&deliveries[..1]).await.unwrap();
+    node.evict_from(1);
+    tokio::time::sleep(PAST_DROP_GRACE).await;
+    // A new delivery on its own used to take nonce 1 as well. The first
+    // keeps it now, and goes again with it so that the new one, with the
+    // next nonce, can land.
+    let (message, metadata, gas_limit) = &deliveries[1];
+    let _ = mailbox.process(message, metadata, *gas_limit).await;
+    assert_eq!(node.propagated(), [1, 1, 2]);
+    // The node drops both. Submitted again together, both go, each with
+    // its own nonce: the first used to vanish from the batch, neither sent
+    // nor left out, and the relayer dropped it.
+    node.evict_from(1);
+    tokio::time::sleep(PAST_DROP_GRACE).await;
+    let batch = mailbox.process_deliveries(&deliveries).await.unwrap();
+    assert!(
+        batch.failed_indexes.is_empty(),
+        "{:?}",
+        batch.failed_indexes
+    );
+    assert!(batch.outcome.is_some());
+    assert_eq!(node.propagated(), [1, 1, 2, 1, 2]);
+    node.settle(2).await;
+    assert_eq!(node.deliveries_included().len(), 2);
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+#[tokio::test]
+async fn deliveries_the_previous_version_left_with_one_nonce_are_waited_out() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start(true);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let mailbox = node.mailbox(true).with_submission_limits(patient(64));
+    let deliveries: Vec<_> = (0..3).map(delivery).collect();
+    // The previous version gave two messages nonce 1, the first with a
+    // transaction the node never saw, the second with none named.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    mailbox
+        .record_legacy_delivery(deliveries[0].0.id(), 1, Some([0xaa; 32]), now)
+        .unwrap();
+    mailbox
+        .record_legacy_delivery(deliveries[1].0.id(), 1, None, now)
+        .unwrap();
+    // While they may still be admitted, nothing is sent, and every
+    // delivery of the batch is left out.
+    let batch = mailbox.process_deliveries(&deliveries).await.unwrap();
+    assert!(batch.outcome.is_none());
+    assert_eq!(batch.failed_indexes, [0, 1, 2]);
+    let (message, metadata, gas_limit) = &deliveries[2];
+    assert!(mailbox
+        .process(message, metadata, *gas_limit)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("previous version"));
+    assert!(node.propagated().is_empty());
+    // Past the drop grace they can no longer be admitted: they are
+    // forgotten, and the batch takes consecutive nonces.
+    tokio::time::sleep(PAST_DROP_GRACE).await;
+    let batch = mailbox.process_deliveries(&deliveries).await.unwrap();
+    assert!(batch.failed_indexes.is_empty());
+    assert_eq!(node.propagated(), [1, 2, 3]);
+    assert_eq!(mailbox.legacy_in_flight().unwrap(), 0);
+    node.settle(3).await;
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+#[tokio::test]
+async fn a_signer_at_its_bound_fills_a_nonce_whose_message_another_relayer_delivered() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start(true);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let mailbox = node.mailbox(true).with_submission_limits(patient(4));
+    let deliveries: Vec<_> = (0..5).map(delivery).collect();
+    node.pause(true);
+    let batch = mailbox.process_deliveries(&deliveries[..4]).await.unwrap();
+    assert!(batch.failed_indexes.is_empty());
+    // Another relayer delivers the first message, and the node drops all
+    // four transactions: the first, and the later ones with it.
+    node.deliver_elsewhere(&deliveries[0]);
+    node.evict_from(1);
+    tokio::time::sleep(PAST_DROP_GRACE).await;
+    // At the bound, the signer used to stall for good. Its first nonce
+    // now gets a filler, since that delivery would fail, and the others go
+    // again with their nonces; the new delivery waits for room.
+    let batch = mailbox.process_deliveries(&deliveries[1..]).await.unwrap();
+    assert_eq!(batch.failed_indexes, [3]);
+    assert_eq!(node.propagated(), [1, 2, 3, 4, 1, 2, 3, 4]);
+    node.settle(4).await;
+    assert_eq!(included_at(&node, 1).unwrap().tx.function, "state_version");
+    for nonce in 2..=4 {
+        assert_eq!(included_at(&node, nonce).unwrap().tx.function, "process");
+        assert!(included_at(&node, nonce).unwrap().error.is_none());
+    }
+    // Once they are final, the new one goes.
+    node.wait_until_final(4).await;
+    node.expire_block_pair().await;
+    let batch = mailbox.process_deliveries(&deliveries[4..]).await.unwrap();
+    assert!(batch.failed_indexes.is_empty());
+    assert_eq!(node.propagated(), [1, 2, 3, 4, 1, 2, 3, 4, 5]);
+    node.settle(5).await;
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+#[tokio::test]
+async fn a_dropped_delivery_outside_the_batch_goes_again_as_it_was_signed() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start(true);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let mailbox = node.mailbox(true).with_submission_limits(patient(64));
+    let deliveries: Vec<_> = (0..2).map(delivery).collect();
+    node.pause(true);
+    mailbox.process_deliveries(&deliveries).await.unwrap();
+    node.evict_from(1);
+    tokio::time::sleep(PAST_DROP_GRACE).await;
+    // Only the second is submitted again: the first goes again too, with
+    // the arguments it was signed with, so that the second can land.
+    let batch = mailbox.process_deliveries(&deliveries[1..]).await.unwrap();
+    assert!(batch.failed_indexes.is_empty());
+    assert_eq!(node.propagated(), [1, 2, 1, 2]);
+    node.settle(2).await;
+    assert_eq!(node.deliveries_included().len(), 2);
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+#[tokio::test]
+async fn a_transaction_is_named_before_it_is_sent_and_outlives_a_crash_and_a_rollback() {
+    let _env = HELPER_ENV.lock().await;
+    // Finality moves only by hand.
+    let node = Node::start_with(true, None);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let store = tempfile::tempdir().unwrap();
+    let deliveries: Vec<_> = (0..3).map(delivery).collect();
+    let start = node.height();
+    // The node holds the propagation of nonce 1 until the gate opens.
+    let gate = std::sync::Arc::new(Gate::default());
+    node.inject(Route::Propagate, Some(1), Fault::Hold(gate.clone()));
+    let relayer = node
+        .durable_mailbox(store.path(), true)
+        .with_submission_limits(patient(64));
+    let batch = {
+        let relayer = relayer.clone();
+        let deliveries = deliveries.clone();
+        tokio::spawn(async move { relayer.process_deliveries(&deliveries[..1]).await })
+    };
+    node.wait_until("the propagation reaches the node", |_| {
+        gate.waiting.load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+    // Before the node took it, its hash was kept with its nonce.
+    let reservations = relayer.nonce_reservations().unwrap();
+    assert_eq!(reservations.len(), 1);
+    assert_eq!(reservations[0].0, 1);
+    assert_eq!(reservations[0].1.len(), 1);
+    let tx_id = reservations[0].1[0].clone();
+    // The relayer stops while the node takes the transaction, which lands
+    // in a block that is not final.
+    batch.abort();
+    let _ = batch.await;
+    gate.open();
+    node.wait_until("the transaction is in a block", |model| model.nonce == 1)
+        .await;
+    drop(relayer);
+    node.restart(store.path());
+
+    // Restarted, the relayer keeps that nonce although the account has
+    // used it, since its block is not final: the next delivery takes the
+    // nonce after it. It used to forget it, its hash never kept.
+    let relayer = node
+        .durable_mailbox(store.path(), true)
+        .with_submission_limits(patient(64));
+    let batch = relayer.process_deliveries(&deliveries[1..2]).await.unwrap();
+    assert!(batch.failed_indexes.is_empty());
+    assert_eq!(node.propagated(), [1, 2]);
+    let held: Vec<u64> = relayer
+        .nonce_reservations()
+        .unwrap()
+        .iter()
+        .map(|(nonce, _)| *nonce)
+        .collect();
+    assert_eq!(held, [1, 2]);
+    node.wait_until("both are in blocks", |model| model.nonce == 2)
+        .await;
+    // A rollback puts them back into the mempool, and the first message
+    // is undelivered at the tip. Submitted again, it follows its
+    // transaction instead of taking another nonce.
+    node.pause(true);
+    node.rollback_to(start);
+    let again = relayer.process_deliveries(&deliveries[..1]).await.unwrap();
+    assert!(again.failed_indexes.is_empty());
+    assert_eq!(
+        &again.outcome.unwrap().transaction_id.as_bytes()[32..],
+        &hex::decode(&tx_id).unwrap()[..]
+    );
+    assert_eq!(node.propagated(), [1, 2]);
+    node.settle(2).await;
+    // Once their blocks are final, their nonces are released.
+    let height = node.height();
+    node.finalize_to(height);
+    node.expire_block_pair().await;
+    let batch = relayer.process_deliveries(&deliveries[2..]).await.unwrap();
+    assert!(batch.failed_indexes.is_empty());
+    assert_eq!(node.propagated(), [1, 2, 3]);
+    let held: Vec<u64> = relayer
+        .nonce_reservations()
+        .unwrap()
+        .iter()
+        .map(|(nonce, _)| *nonce)
+        .collect();
+    assert_eq!(held, [3]);
+    node.settle(3).await;
+    drop(relayer);
+    node.restart(store.path());
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+#[tokio::test]
+async fn deliveries_in_blocks_that_are_not_final_count_toward_the_bound_through_a_rollback() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start_with(true, None);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let mailbox = node.mailbox(true).with_submission_limits(patient(2));
+    let deliveries: Vec<_> = (0..3).map(delivery).collect();
+    let start = node.height();
+    let batch = mailbox.process_deliveries(&deliveries[..2]).await.unwrap();
+    assert!(batch.failed_indexes.is_empty());
+    node.wait_until("both are in blocks", |model| model.nonce == 2)
+        .await;
+    // In blocks that are not final, they still count: no third is sent,
+    // in a batch or on its own.
+    let batch = mailbox.process_deliveries(&deliveries[2..]).await.unwrap();
+    assert!(batch.outcome.is_none());
+    let (message, metadata, gas_limit) = &deliveries[2];
+    let error = mailbox
+        .process(message, metadata, *gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("outstanding"), "{error}");
+    // A rollback puts both back into the mempool: never more than the
+    // bound is in flight.
+    node.rollback_to(start);
+    let batch = mailbox.process_deliveries(&deliveries[2..]).await.unwrap();
+    assert!(batch.outcome.is_none());
+    assert_eq!(node.propagated(), [1, 2]);
+    // Once they are final, the third goes.
+    node.wait_until("both are in blocks again", |model| model.nonce == 2)
+        .await;
+    let height = node.height();
+    node.finalize_to(height);
+    node.expire_block_pair().await;
+    let batch = mailbox.process_deliveries(&deliveries[2..]).await.unwrap();
+    assert!(batch.failed_indexes.is_empty());
+    assert_eq!(node.propagated(), [1, 2, 3]);
+    node.settle(3).await;
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+#[tokio::test]
+async fn a_batch_sends_nothing_past_its_deadline_whatever_the_helper_or_the_node_do() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start(true);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let mailbox = node.mailbox(true).with_submission_limits(SubmissionLimits {
+        batch: Duration::from_secs(1),
+        ..patient(64)
+    });
+    let deliveries: Vec<_> = (0..2).map(delivery).collect();
+    // The helper takes 5 s to sign: it is stopped at the batch's deadline,
+    // nothing is sent, and the nonce it would have used is free again.
+    node.next_submission(1, "hang 5");
+    let started = std::time::Instant::now();
+    let batch = mailbox.process_deliveries(&deliveries).await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(batch.outcome.is_none());
+    assert_eq!(batch.failed_indexes, [0, 1]);
+    assert!(node.propagated().is_empty());
+    assert_eq!(mailbox.deliveries_in_flight().unwrap(), 0);
+
+    // The node does not answer the account read that reconciliation needs:
+    // the batch fails by its deadline, before anything is sent.
+    let gate = std::sync::Arc::new(Gate::default());
+    node.inject(Route::AccountStatus, None, Fault::Hold(gate.clone()));
+    let started = std::time::Instant::now();
+    assert!(mailbox.process_deliveries(&deliveries).await.is_err());
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(node.propagated().is_empty());
+    gate.open();
+
+    // Then the batch goes.
+    let batch = mailbox.process_deliveries(&deliveries).await.unwrap();
+    assert!(batch.failed_indexes.is_empty());
+    assert_eq!(node.propagated(), [1, 2]);
+    node.settle(2).await;
     std::env::remove_var("DUSK_TX_BIN");
 }

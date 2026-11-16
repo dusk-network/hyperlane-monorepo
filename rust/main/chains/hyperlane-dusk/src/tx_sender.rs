@@ -7,6 +7,7 @@
 //! This module invokes it as a subprocess.
 
 use std::process::Stdio;
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -16,6 +17,7 @@ use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
 use hyperlane_core::H512;
+use url::Url;
 
 use crate::rues::{bounded_error, bounded_text, rkyv_serialize};
 use crate::{ConnectionConf, DuskSigner, HyperlaneDuskError};
@@ -52,10 +54,47 @@ pub async fn dusk_tx_call(
     .await
 }
 
-/// Send a contract call signed with Moonlight nonce `nonce`, and return once
-/// the node has accepted the transaction, without waiting for its block.
-/// Needs a `dusk-tx` with `--nonce` and `--no-wait` (`helper_pipelines`).
-pub(crate) async fn dusk_tx_send_with_nonce(
+/// A transaction the helper signed, which nothing has sent yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SignedTransaction {
+    /// Its hash, lowercase hex.
+    pub tx_id: String,
+    /// Its bytes, as the helper would propagate them.
+    pub bytes: Vec<u8>,
+}
+
+/// The transfer contract's `chain_id` query, as the helper sends it.
+const CHAIN_ID_ROUTE: &str =
+    "/on/contracts:0100000000000000000000000000000000000000000000000000000000000000/chain_id";
+/// How long one request to the capture endpoint may take.
+const CAPTURE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Most bytes of a request's head the capture endpoint reads.
+const MAX_CAPTURE_HEAD_BYTES: usize = 16 * 1024;
+/// Most bytes of a request's body the capture endpoint reads: a Moonlight
+/// transaction is at most 64 KiB of arguments and its envelope.
+const MAX_CAPTURE_BODY_BYTES: usize = 256 * 1024;
+
+/// What the helper sent the capture endpoint.
+#[derive(Debug, Default)]
+struct Captured {
+    preverified: Option<Vec<u8>>,
+    propagated: Option<Vec<u8>>,
+}
+
+/// Have the helper sign a contract call with Moonlight nonce `nonce`,
+/// without sending it. The helper is given the URL of an endpoint of this
+/// process on the loopback interface, under a path it cannot guess: it
+/// answers the helper's chain ID query with the configured chain ID (the
+/// agent checks the node's own before it sends anything) and keeps the
+/// transaction the helper then preverifies and propagates there. The
+/// caller keeps the transaction's hash before it sends it
+/// (`RuesClient::submit_transaction`), so no transaction of a pipelined
+/// delivery reaches the node unnamed, whenever the agent stops. Needs a
+/// `dusk-tx` with `--nonce` and `--no-wait` (`helper_pipelines`). Ends by
+/// `deadline`, killing the helper if it must; nothing reaches the node
+/// whatever happens.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn dusk_tx_sign(
     conn: &ConnectionConf,
     signer: &DuskSigner,
     contract_id: &[u8; 32],
@@ -63,13 +102,41 @@ pub(crate) async fn dusk_tx_send_with_nonce(
     args_bytes: &[u8],
     gas_limit: u64,
     nonce: u64,
-) -> Result<Value, HyperlaneDuskError> {
+    deadline: tokio::time::Instant,
+) -> Result<SignedTransaction, HyperlaneDuskError> {
+    let unsent = |detail: String| {
+        HyperlaneDuskError::Other(format!(
+            "dusk-tx did not sign {fn_name} with nonce {nonce}, and nothing was sent: {detail}"
+        ))
+    };
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .map_err(|error| unsent(format!("no loopback port for the helper: {error}")))?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| unsent(format!("no loopback port for the helper: {error}")))?
+        .port();
+    let prefix = format!("/{}", capture_token());
+    let url = Url::parse(&format!("http://127.0.0.1:{port}{prefix}"))
+        .map_err(|error| unsent(format!("invalid capture URL: {error}")))?;
+    let captured = Arc::new(StdMutex::new(Captured::default()));
+    // Stops serving when this returns or is dropped.
+    let server = AbortOnDrop(tokio::spawn(serve_capture(
+        listener,
+        prefix,
+        conn.chain_id,
+        captured.clone(),
+    )));
+    let timeout = deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .min(DUSK_TX_HELPER_TIMEOUT);
     let extra = [
         "--nonce".to_owned(),
         nonce.to_string(),
         "--no-wait".to_owned(),
     ];
-    run_dusk_tx(
+    let result = run_dusk_tx_at(
+        &url,
         conn,
         signer,
         contract_id,
@@ -77,8 +144,174 @@ pub(crate) async fn dusk_tx_send_with_nonce(
         args_bytes,
         Some(gas_limit),
         &extra,
+        timeout,
     )
-    .await
+    .await;
+    drop(server);
+    let json = result.map_err(|error| unsent(bounded_error(&error)))?;
+    let tx_id = json
+        .get("tx_id")
+        .and_then(Value::as_str)
+        .filter(|tx_id| tx_id.len() == 64 && tx_id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| unsent("the helper named no transaction".into()))?
+        .to_ascii_lowercase();
+    let captured = std::mem::take(&mut *captured.lock().unwrap_or_else(PoisonError::into_inner));
+    let bytes = captured
+        .propagated
+        .ok_or_else(|| unsent("the helper propagated no transaction".into()))?;
+    if captured
+        .preverified
+        .as_ref()
+        .is_some_and(|preverified| *preverified != bytes)
+    {
+        return Err(unsent(
+            "the helper preverified one transaction and propagated another".into(),
+        ));
+    }
+    Ok(SignedTransaction { tx_id, bytes })
+}
+
+/// A task aborted when this is dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// A path component no other local process can guess: 128 bits from the
+/// process's random hasher keys and the clock.
+fn capture_token() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let state = std::collections::hash_map::RandomState::new();
+    let mut first = state.build_hasher();
+    first.write_u128(nanos);
+    let first = first.finish();
+    let mut second = std::collections::hash_map::RandomState::new().build_hasher();
+    second.write_u64(first);
+    second.write_u128(nanos);
+    format!("{first:016x}{:016x}", second.finish())
+}
+
+/// Answer the helper's requests at `listener`, one at a time, until
+/// aborted.
+async fn serve_capture(
+    listener: tokio::net::TcpListener,
+    prefix: String,
+    chain_id: u8,
+    captured: Arc<StdMutex<Captured>>,
+) {
+    while let Ok((mut stream, _)) = listener.accept().await {
+        let _ = tokio::time::timeout(
+            CAPTURE_REQUEST_TIMEOUT,
+            answer_capture(&mut stream, &prefix, chain_id, &captured),
+        )
+        .await;
+    }
+}
+
+/// Answer one request at the capture endpoint: the chain ID query, and the
+/// transaction the helper preverifies and propagates, which is kept and
+/// sent nowhere.
+async fn answer_capture(
+    stream: &mut tokio::net::TcpStream,
+    prefix: &str,
+    chain_id: u8,
+    captured: &StdMutex<Captured>,
+) -> std::io::Result<()> {
+    let Some((path, body)) = read_http_request(stream).await? else {
+        return respond(stream, "400 Bad Request", b"").await;
+    };
+    let route = path.strip_prefix(prefix).unwrap_or_default();
+    let captured = || captured.lock().unwrap_or_else(PoisonError::into_inner);
+    match route {
+        CHAIN_ID_ROUTE => respond(stream, "200 OK", &[chain_id]).await,
+        "/on/transactions/preverify" => {
+            captured().preverified = Some(body);
+            respond(stream, "200 OK", b"").await
+        }
+        "/on/transactions/propagate" => {
+            captured().propagated = Some(body);
+            respond(stream, "200 OK", b"").await
+        }
+        _ => respond(stream, "404 Not Found", b"").await,
+    }
+}
+
+/// Read one HTTP/1.1 request with a `Content-Length` body: its path and
+/// body. `None` for a request this endpoint does not take.
+async fn read_http_request(
+    stream: &mut tokio::net::TcpStream,
+) -> std::io::Result<Option<(String, Vec<u8>)>> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let head_end = loop {
+        if let Some(end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            break end;
+        }
+        if buffer.len() > MAX_CAPTURE_HEAD_BYTES {
+            return Ok(None);
+        }
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(None);
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    };
+    let head = String::from_utf8_lossy(&buffer[..head_end]).into_owned();
+    let mut lines = head.split("\r\n");
+    let mut request = lines.next().unwrap_or_default().split(' ');
+    let (Some("POST"), Some(path)) = (request.next(), request.next()) else {
+        return Ok(None);
+    };
+    let mut length: Option<usize> = None;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        match name.trim().to_ascii_lowercase().as_str() {
+            "content-length" => match value.trim().parse::<usize>() {
+                Ok(parsed) => length = Some(parsed),
+                Err(_) => return Ok(None),
+            },
+            "transfer-encoding" => return Ok(None),
+            _ => {}
+        }
+    }
+    // Without a length or a transfer encoding, a request has no body, as
+    // reqwest sends an empty one.
+    let length = length.unwrap_or(0);
+    if length > MAX_CAPTURE_BODY_BYTES {
+        return Ok(None);
+    }
+    let mut body = buffer.split_off(head_end + 4);
+    while body.len() < length {
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(None);
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+    body.truncate(length);
+    Ok(Some((path.to_owned(), body)))
+}
+
+async fn respond(
+    stream: &mut tokio::net::TcpStream,
+    status: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(body).await?;
+    stream.shutdown().await
 }
 
 /// How long the `call --help` probe of a helper may take.
@@ -135,12 +368,40 @@ async fn run_dusk_tx(
     gas_limit: Option<u64>,
     extra_args: &[String],
 ) -> Result<Value, HyperlaneDuskError> {
+    run_dusk_tx_at(
+        &conn.url,
+        conn,
+        signer,
+        contract_id,
+        fn_name,
+        args_bytes,
+        gas_limit,
+        extra_args,
+        DUSK_TX_HELPER_TIMEOUT,
+    )
+    .await
+}
+
+/// Run the helper's `call` against the RUES endpoint at `url`, for at most
+/// `timeout`.
+#[allow(clippy::too_many_arguments)]
+async fn run_dusk_tx_at(
+    url: &Url,
+    conn: &ConnectionConf,
+    signer: &DuskSigner,
+    contract_id: &[u8; 32],
+    fn_name: &str,
+    args_bytes: &[u8],
+    gas_limit: Option<u64>,
+    extra_args: &[String],
+    timeout: Duration,
+) -> Result<Value, HyperlaneDuskError> {
     if args_bytes.len() > MAX_DUSK_TX_ARGS_BYTES {
         return Err(HyperlaneDuskError::Other(format!(
             "dusk-tx arguments for {fn_name} exceed the {MAX_DUSK_TX_ARGS_BYTES}-byte helper transport limit"
         )));
     }
-    if conn.url.as_str().len() + 1 > MAX_RUES_URL_STDIN_BYTES {
+    if url.as_str().len() + 1 > MAX_RUES_URL_STDIN_BYTES {
         return Err(HyperlaneDuskError::Other(
             "Dusk RUES URL exceeds the helper's 8192-byte stdin line limit".into(),
         ));
@@ -191,8 +452,8 @@ async fn run_dusk_tx(
     // Keep both the authenticated URL and signing key out of process arguments.
     // The helper consumes the URL line first, then the key after chain validation.
     if let Some(mut stdin) = child.stdin.take() {
-        let input = format!("{}\n{secret_key_hex}\n", conn.url.as_str());
-        tokio::time::timeout(DUSK_TX_HELPER_TIMEOUT, stdin.write_all(input.as_bytes()))
+        let input = format!("{}\n{secret_key_hex}\n", url.as_str());
+        tokio::time::timeout(timeout, stdin.write_all(input.as_bytes()))
             .await
             .map_err(|_| {
                 HyperlaneDuskError::Other("dusk-tx stdin write exceeded its deadline".into())
@@ -202,8 +463,7 @@ async fn run_dusk_tx(
             })?;
     }
 
-    let (output, prepared_tx_id) =
-        wait_for_child_output(child, fn_name, DUSK_TX_HELPER_TIMEOUT).await?;
+    let (output, prepared_tx_id) = wait_for_child_output(child, fn_name, timeout).await?;
     let json = helper_result(fn_name, &output, prepared_tx_id.as_deref())?;
 
     let tx_id = json
@@ -670,6 +930,66 @@ mod tests {
             hex::encode(dusk_id)
         );
         assert!(h512_to_dusk_tx_id(&H512::from([1u8; 64])).is_err());
+    }
+
+    /// The endpoint the helper signs against answers what `dusk-tx` asks
+    /// with reqwest, keeps the transaction it preverifies and propagates,
+    /// and serves nothing outside its secret path.
+    #[tokio::test]
+    async fn the_capture_endpoint_keeps_the_helpers_transaction_and_sends_it_nowhere() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = Arc::new(StdMutex::new(Captured::default()));
+        let server = AbortOnDrop(tokio::spawn(serve_capture(
+            listener,
+            "/secret".into(),
+            7,
+            captured.clone(),
+        )));
+        let client = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{port}/secret");
+        let chain_id = client
+            .post(format!("{base}{CHAIN_ID_ROUTE}"))
+            .header("Content-Type", "application/octet-stream")
+            .body(Vec::new())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(chain_id.status(), 200);
+        assert_eq!(chain_id.bytes().await.unwrap().as_ref(), [7]);
+        // A transaction longer than one read.
+        let transaction: Vec<u8> = (0..70_000).map(|byte| byte as u8).collect();
+        for route in ["/on/transactions/preverify", "/on/transactions/propagate"] {
+            let reply = client
+                .post(format!("{base}{route}"))
+                .header("Content-Type", "application/octet-stream")
+                .body(transaction.clone())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(reply.status(), 200);
+        }
+        for url in [
+            format!("http://127.0.0.1:{port}/on/transactions/propagate"),
+            format!("{base}/on/transactions/other"),
+        ] {
+            let reply = client.post(url).body(vec![9]).send().await.unwrap();
+            assert_eq!(reply.status(), 404);
+        }
+        let captured = std::mem::take(&mut *captured.lock().unwrap());
+        assert_eq!(captured.preverified.as_deref(), Some(&transaction[..]));
+        assert_eq!(captured.propagated.as_deref(), Some(&transaction[..]));
+        // Dropped, it stops serving.
+        drop(server);
+        tokio::task::yield_now().await;
+        assert!(client
+            .post(format!("{base}{CHAIN_ID_ROUTE}"))
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            .is_err());
     }
 
     #[cfg(unix)]

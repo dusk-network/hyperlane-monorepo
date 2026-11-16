@@ -971,6 +971,13 @@ impl Node {
         mailbox(rues, &self.url, store, pipelined)
     }
 
+    /// Deliver `delivery`'s message at the tip by another relayer: its
+    /// simulation fails from now on, and a transaction of ours that
+    /// delivers it fails.
+    pub fn deliver_elsewhere(&self, delivery: &(HyperlaneMessage, Metadata, Option<U256>)) {
+        self.model().delivered.insert(process_args_hex(delivery));
+    }
+
     /// Make the agent read the tip and the last final block again at its
     /// next request, as if a tick had passed.
     pub async fn expire_block_pair(&self) {
@@ -1159,6 +1166,22 @@ pub fn delivery(nonce: u32) -> (HyperlaneMessage, Metadata, Option<U256>) {
         body: vec![nonce as u8],
     };
     (message, Metadata::new(vec![]), Some(U256::from(GAS_LIMIT)))
+}
+
+/// The hex of `delivery`'s `process` arguments, as the Mailbox sends
+/// them.
+pub fn process_args_hex(delivery: &(HyperlaneMessage, Metadata, Option<U256>)) -> String {
+    let (message, metadata, _) = delivery;
+    let encoded = hyperlane_dusk_types::message::encode(
+        message.version,
+        message.nonce,
+        message.origin,
+        message.sender.into(),
+        message.destination,
+        message.recipient.into(),
+        &message.body,
+    );
+    hex::encode(rkyv::to_bytes::<_, 256>(&(metadata.to_vec(), encoded)).unwrap())
 }
 
 /// Limits that suit a chain that holds transactions back for a while: a

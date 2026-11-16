@@ -1,22 +1,39 @@
-//! The deliveries a signer has sent that have not settled.
+//! What a signer that pipelines deliveries has in flight, and how the agent
+//! sends the transactions it signed.
 //!
-//! Each owns the Moonlight nonce its transactions are signed with, and
-//! names the last transaction sent, once the helper has. A Mailbox
-//! reconciles them with the node before it sends a delivery again, so that
-//! no message's transactions with different nonces could both be in a
-//! block. They live in the event store, when the client keeps one, so
+//! Every pipelined transaction is signed with a nonce of the signer's
+//! account that a reservation holds: for a delivery, kept with its
+//! arguments, or for a filler, a call that only uses the nonce so that the
+//! later ones can land. A reservation lists every transaction signed with
+//! its nonce that may have reached the node, each kept before it is sent,
+//! and is released only once one of them is in a final block, or when it
+//! never sent one. Reservations are keyed by their nonce, so no two can
+//! hold one. They live in the event store, when the client keeps one, so
 //! that they survive restarts, and otherwise in the endpoint, for the
 //! process.
+//!
+//! The previous version kept one record per message instead
+//! (`dusk-sent-delivery-v1:`): its nonce and its last transaction. Such
+//! records are only read, to wait them out, and forgotten once nothing of
+//! them can be admitted any more.
 
 use super::*;
 
-/// The prefix of the sent deliveries in the event store.
+/// The prefix of the previous version's deliveries in flight.
 const SENT_DELIVERY_PREFIX: &[u8] = b"dusk-sent-delivery-v1:";
 /// Bytes of an encoded sent delivery: its nonce, when it was sent, whether
 /// it names a transaction, and the transaction.
 const SENT_DELIVERY_BYTES: usize = 8 + 8 + 1 + 32;
+/// The prefix of the nonce reservations in the event store.
+const RESERVATION_PREFIX: &[u8] = b"dusk-nonce-reservation-v2:";
+/// Most transactions a reservation lists. Each one past the first was
+/// signed after every earlier one was dropped by the node.
+pub(crate) const MAX_RESERVATION_TXS: usize = 8;
+/// Most bytes of arguments a reservation keeps: a delivery's are at most
+/// the helper's 60 KiB.
+const MAX_RESERVATION_ARGS: usize = 64 * 1024;
 
-/// One delivery a signer sent that has not settled.
+/// One delivery the previous version sent that has not settled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SentDelivery {
     /// The Moonlight nonce every transaction of the delivery is signed
@@ -61,6 +78,136 @@ impl SentDelivery {
     }
 }
 
+/// What holds a nonce of the signer's account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Holder {
+    /// A delivery of `message`, with the `process` arguments and gas limit
+    /// it was last signed with, so that it can go again on its own.
+    Delivery {
+        message: H256,
+        gas_limit: u64,
+        args: Vec<u8>,
+    },
+    /// A call that only uses the nonce, so that the later ones can land.
+    Filler,
+}
+
+impl Holder {
+    /// The message it delivers, if it is a delivery.
+    pub(crate) fn message(&self) -> Option<H256> {
+        match self {
+            Self::Delivery { message, .. } => Some(*message),
+            Self::Filler => None,
+        }
+    }
+}
+
+/// A nonce of the signer's account, held for a delivery or a filler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Reservation {
+    pub nonce: u64,
+    pub holder: Holder,
+    /// Every transaction signed with the nonce that may have reached the
+    /// node, oldest first: a transaction's hash is kept before it is sent.
+    pub txs: Vec<[u8; 32]>,
+    /// When the last of them was sent, in milliseconds since the Unix
+    /// epoch.
+    pub sent_at: u64,
+}
+
+/// Reads an encoded value field by field.
+struct Fields<'a>(&'a [u8]);
+
+impl<'a> Fields<'a> {
+    fn take(&mut self, length: usize) -> Option<&'a [u8]> {
+        if self.0.len() < length {
+            return None;
+        }
+        let (taken, rest) = self.0.split_at(length);
+        self.0 = rest;
+        Some(taken)
+    }
+
+    fn byte(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_be_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_be_bytes(self.take(8)?.try_into().ok()?))
+    }
+
+    fn hash(&mut self) -> Option<[u8; 32]> {
+        self.take(32)?.try_into().ok()
+    }
+}
+
+impl Reservation {
+    fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&self.sent_at.to_be_bytes());
+        bytes.push(u8::try_from(self.txs.len()).unwrap_or(u8::MAX));
+        for tx in &self.txs {
+            bytes.extend_from_slice(tx);
+        }
+        match &self.holder {
+            Holder::Filler => bytes.push(0),
+            Holder::Delivery {
+                message,
+                gas_limit,
+                args,
+            } => {
+                bytes.push(1);
+                bytes.extend_from_slice(message.as_bytes());
+                bytes.extend_from_slice(&gas_limit.to_be_bytes());
+                bytes.extend_from_slice(
+                    &u32::try_from(args.len()).unwrap_or(u32::MAX).to_be_bytes(),
+                );
+                bytes.extend_from_slice(args);
+            }
+        }
+        bytes
+    }
+
+    fn decode(nonce: u64, bytes: &[u8]) -> Option<Self> {
+        let mut fields = Fields(bytes);
+        let sent_at = fields.u64()?;
+        let count = usize::from(fields.byte()?);
+        if count > MAX_RESERVATION_TXS {
+            return None;
+        }
+        let txs = (0..count)
+            .map(|_| fields.hash())
+            .collect::<Option<Vec<_>>>()?;
+        let holder = match fields.byte()? {
+            0 => Holder::Filler,
+            1 => {
+                let message = H256::from(fields.hash()?);
+                let gas_limit = fields.u64()?;
+                let length = usize::try_from(fields.u32()?).ok()?;
+                if length > MAX_RESERVATION_ARGS {
+                    return None;
+                }
+                Holder::Delivery {
+                    message,
+                    gas_limit,
+                    args: fields.take(length)?.to_vec(),
+                }
+            }
+            _ => return None,
+        };
+        fields.0.is_empty().then_some(Self {
+            nonce,
+            holder,
+            txs,
+            sent_at,
+        })
+    }
+}
+
 /// Where a transaction is, as the node sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TransactionStatus {
@@ -75,6 +222,18 @@ pub(crate) enum TransactionStatus {
     Unknown,
 }
 
+/// What became of a signed transaction the agent sent the node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Submission {
+    /// The node took it at propagation.
+    Propagated,
+    /// It was not propagated: the node refused it at preverification, or
+    /// preverification could not be asked; why.
+    Refused(String),
+    /// It was propagated, but whether the node took it is unknown; why.
+    Unknown(String),
+}
+
 fn sent_delivery_prefix(signer: &[u8; 32]) -> Vec<u8> {
     let mut key = SENT_DELIVERY_PREFIX.to_vec();
     key.extend_from_slice(signer);
@@ -87,7 +246,19 @@ fn sent_delivery_key(signer: &[u8; 32], message: H256) -> Vec<u8> {
     key
 }
 
-fn sent_delivery_error(error: impl fmt::Display) -> HyperlaneDuskError {
+fn reservation_prefix(signer: &[u8; 32]) -> Vec<u8> {
+    let mut key = RESERVATION_PREFIX.to_vec();
+    key.extend_from_slice(signer);
+    key
+}
+
+fn reservation_key(signer: &[u8; 32], nonce: u64) -> Vec<u8> {
+    let mut key = reservation_prefix(signer);
+    key.extend_from_slice(&nonce.to_be_bytes());
+    key
+}
+
+fn in_flight_error(error: impl fmt::Display) -> HyperlaneDuskError {
     HyperlaneDuskError::Other(format!(
         "Failed to use the Dusk deliveries in flight in eventCursorDir: {error}"
     ))
@@ -101,9 +272,9 @@ impl RuesClient {
         self.endpoint.submission_lock(signer)
     }
 
-    /// The deliveries `signer` sent that have not settled, by message.
-    /// Fails on one the event store holds that does not decode: its nonce
-    /// is unknown, and nothing may be sent until it is looked at.
+    /// The deliveries the previous version kept in flight for `signer`, by
+    /// message. Fails on one the event store holds that does not decode:
+    /// its nonce is unknown, and nothing may be sent until it is looked at.
     pub(crate) fn sent_deliveries(
         &self,
         signer: &[u8; 32],
@@ -114,7 +285,7 @@ impl RuesClient {
         let prefix = sent_delivery_prefix(signer);
         let mut sent = Vec::new();
         for item in store.iterator(IteratorMode::From(&prefix, Direction::Forward)) {
-            let (key, value) = item.map_err(sent_delivery_error)?;
+            let (key, value) = item.map_err(in_flight_error)?;
             if !key.starts_with(&prefix) {
                 break;
             }
@@ -125,7 +296,7 @@ impl RuesClient {
             match (message, SentDelivery::decode(&value)) {
                 (Some(message), Some(delivery)) => sent.push((message, delivery)),
                 _ => {
-                    return Err(sent_delivery_error(
+                    return Err(in_flight_error(
                         "a delivery in flight there is corrupt; remove eventCursorDir only once the signer's transactions have settled",
                     ))
                 }
@@ -134,7 +305,8 @@ impl RuesClient {
         Ok(sent)
     }
 
-    /// Keep that `signer` sent `message` as `delivery`, durably.
+    /// Keep that `signer` sent `message` as `delivery`, as the previous
+    /// version did, for tests of what it left.
     pub(crate) fn record_sent_delivery(
         &self,
         signer: &[u8; 32],
@@ -146,18 +318,16 @@ impl RuesClient {
                 .record_sent_delivery(signer, message, *delivery);
             return Ok(());
         };
-        let mut write_options = WriteOptions::default();
-        write_options.set_sync(true);
         store
             .put_opt(
                 sent_delivery_key(signer, message),
                 delivery.encode(),
-                &write_options,
+                &synced(),
             )
-            .map_err(sent_delivery_error)
+            .map_err(in_flight_error)
     }
 
-    /// Forget `signer`'s delivery of `message`: it settled.
+    /// Forget the previous version's delivery of `message` by `signer`.
     pub(crate) fn forget_sent_delivery(
         &self,
         signer: &[u8; 32],
@@ -167,11 +337,84 @@ impl RuesClient {
             self.endpoint.forget_sent_delivery(signer, message);
             return Ok(());
         };
-        let mut write_options = WriteOptions::default();
-        write_options.set_sync(true);
         store
-            .delete_opt(sent_delivery_key(signer, message), &write_options)
-            .map_err(sent_delivery_error)
+            .delete_opt(sent_delivery_key(signer, message), &synced())
+            .map_err(in_flight_error)
+    }
+
+    /// The nonces `signer` holds, in nonce order. Fails on one the event
+    /// store holds that does not decode: its transactions are unknown, and
+    /// nothing may be sent until it is looked at.
+    pub(crate) fn reservations(
+        &self,
+        signer: &[u8; 32],
+    ) -> Result<Vec<Reservation>, HyperlaneDuskError> {
+        let Some(store) = &self.event_store else {
+            return Ok(self.endpoint.reservations(signer));
+        };
+        let prefix = reservation_prefix(signer);
+        let mut reservations = Vec::new();
+        for item in store.iterator(IteratorMode::From(&prefix, Direction::Forward)) {
+            let (key, value) = item.map_err(in_flight_error)?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let nonce = key
+                .get(prefix.len()..)
+                .and_then(|nonce| <[u8; 8]>::try_from(nonce).ok())
+                .map(u64::from_be_bytes);
+            match nonce.and_then(|nonce| Reservation::decode(nonce, &value)) {
+                Some(reservation) => reservations.push(reservation),
+                None => {
+                    return Err(in_flight_error(
+                        "a nonce reservation there is corrupt; remove eventCursorDir only once the signer's transactions have settled",
+                    ))
+                }
+            }
+        }
+        Ok(reservations)
+    }
+
+    /// Keep `reservation` of `signer`, durably, before anything is signed
+    /// or sent with its nonce.
+    pub(crate) fn keep_reservation(
+        &self,
+        signer: &[u8; 32],
+        reservation: &Reservation,
+    ) -> Result<(), HyperlaneDuskError> {
+        if reservation.txs.len() > MAX_RESERVATION_TXS {
+            return Err(in_flight_error(format!(
+                "nonce {} would list more than {MAX_RESERVATION_TXS} transactions",
+                reservation.nonce
+            )));
+        }
+        let Some(store) = &self.event_store else {
+            self.endpoint.keep_reservation(signer, reservation.clone());
+            return Ok(());
+        };
+        store
+            .put_opt(
+                reservation_key(signer, reservation.nonce),
+                reservation.encode(),
+                &synced(),
+            )
+            .map_err(in_flight_error)
+    }
+
+    /// Release `signer`'s reservation of `nonce`: one of its transactions
+    /// is in a final block, or it never sent one.
+    pub(crate) fn release_reservation(
+        &self,
+        signer: &[u8; 32],
+        nonce: u64,
+    ) -> Result<(), HyperlaneDuskError> {
+        let Some(store) = &self.event_store else {
+            self.endpoint.release_reservation(signer, nonce);
+            return Ok(());
+        };
+        store
+            .delete_opt(reservation_key(signer, nonce), &synced())
+            .map_err(in_flight_error)
     }
 
     /// Where transaction `tx_id` is: in a block of the node's chain, with
@@ -205,6 +448,99 @@ impl RuesClient {
         }
         Ok(TransactionStatus::Unknown)
     }
+
+    /// Send signed transaction `tx` to the node by `deadline`, as the
+    /// helper would: preverify it, then propagate it. Preverification
+    /// changes nothing at the node, so a transaction it refuses, or whose
+    /// preverification fails or runs past the deadline, was not
+    /// propagated. One refused only because its nonce is ahead of the
+    /// account's next one goes on to propagation, which queues it until the
+    /// nonces before it arrive. A propagation that fails, is refused or
+    /// runs past the deadline leaves it unknown whether the node took it.
+    pub(crate) async fn submit_transaction(
+        &self,
+        tx: &[u8],
+        deadline: tokio::time::Instant,
+    ) -> Submission {
+        let preverified = tokio::time::timeout_at(deadline, async {
+            self.ensure_identity().await?;
+            self.post_and_read(
+                self.endpoint("/on/transactions/preverify"),
+                tx,
+                "transaction preverification",
+            )
+            .await
+        })
+        .await;
+        match preverified {
+            Err(_) => {
+                return Submission::Refused(
+                    "preverification did not answer before the deadline".into(),
+                )
+            }
+            Ok(Err(error)) => {
+                return Submission::Refused(format!(
+                    "preverification failed: {}",
+                    bounded_error(&error)
+                ))
+            }
+            Ok(Ok((status, body))) if !status.is_success() => {
+                if !String::from_utf8_lossy(&body).contains(MISSING_INTERMEDIATE_NONCE) {
+                    return Submission::Refused(format!(
+                        "preverification refused it ({status}): {}",
+                        bounded_body(&body)
+                    ));
+                }
+            }
+            Ok(Ok(_)) => {}
+        }
+        let propagated = tokio::time::timeout_at(
+            deadline,
+            self.post_and_read(
+                self.endpoint("/on/transactions/propagate"),
+                tx,
+                "transaction propagation",
+            ),
+        )
+        .await;
+        match propagated {
+            Err(_) => Submission::Unknown("propagation did not answer before the deadline".into()),
+            Ok(Err(error)) => {
+                Submission::Unknown(format!("propagation failed: {}", bounded_error(&error)))
+            }
+            Ok(Ok((status, body))) if !status.is_success() => Submission::Unknown(format!(
+                "propagation answered {status}: {}",
+                bounded_body(&body)
+            )),
+            Ok(Ok(_)) => Submission::Propagated,
+        }
+    }
+
+    /// POST `body` to `url`, a route of the `Other` class, and read the
+    /// reply.
+    async fn post_and_read(
+        &self,
+        url: Url,
+        body: &[u8],
+        context: &'static str,
+    ) -> Result<(StatusCode, Vec<u8>), HyperlaneDuskError> {
+        let response = self.send(RequestClass::Other, url, body.to_vec()).await?;
+        let status = response.status();
+        Ok((status, read_bounded_body(response, context).await?))
+    }
+}
+
+/// How Rusk 1.7.3 refuses a Moonlight transaction whose nonce is ahead of
+/// the account's next one, with a nonce between missing from the mempool
+/// (`TxAcceptanceError::MissingIntermediateNonce`). Propagation queues
+/// such a transaction.
+const MISSING_INTERMEDIATE_NONCE: &str = "Missing intermediate nonce";
+
+/// Write options that reach the disk before the write returns.
+fn synced() -> WriteOptions {
+    let mut options = WriteOptions::default();
+    options.set_sync(true);
+    options
 }
 
 #[cfg(test)]
@@ -239,13 +575,63 @@ mod tests {
     }
 
     #[test]
-    fn sent_deliveries_survive_a_restart_and_stay_with_their_signer() {
+    fn reservations_round_trip_and_reject_corruption() {
+        for reservation in [
+            Reservation {
+                nonce: 7,
+                holder: Holder::Filler,
+                txs: vec![],
+                sent_at: 0,
+            },
+            Reservation {
+                nonce: u64::MAX,
+                holder: Holder::Delivery {
+                    message: H256::repeat_byte(3),
+                    gas_limit: 5_000_000,
+                    args: vec![1, 2, 3],
+                },
+                txs: vec![[4; 32], [5; 32]],
+                sent_at: 1_700_000_000_000,
+            },
+        ] {
+            let encoded = reservation.encode();
+            assert_eq!(
+                Reservation::decode(reservation.nonce, &encoded),
+                Some(reservation.clone())
+            );
+            // Cut short, or with a byte too many.
+            assert!(
+                Reservation::decode(reservation.nonce, &encoded[..encoded.len() - 1]).is_none()
+            );
+            let mut longer = encoded.clone();
+            longer.push(0);
+            assert!(Reservation::decode(reservation.nonce, &longer).is_none());
+        }
+        // More transactions than a reservation lists, or an unknown holder.
+        let mut too_many = vec![0; 8];
+        too_many.push(u8::try_from(MAX_RESERVATION_TXS + 1).unwrap());
+        too_many.extend(std::iter::repeat_n(0, 32 * (MAX_RESERVATION_TXS + 1)));
+        too_many.push(0);
+        assert!(Reservation::decode(1, &too_many).is_none());
+        let mut unknown = vec![0; 9];
+        unknown.push(2);
+        assert!(Reservation::decode(1, &unknown).is_none());
+    }
+
+    #[test]
+    fn deliveries_in_flight_survive_a_restart_and_stay_with_their_signer() {
         let directory = tempfile::tempdir().unwrap();
         let url = Url::parse("http://127.0.0.1:9/sent-deliveries").unwrap();
         let delivery = SentDelivery {
             nonce: 3,
             tx_id: Some([4; 32]),
             sent_at: 5,
+        };
+        let reservation = Reservation {
+            nonce: 9,
+            holder: Holder::Filler,
+            txs: vec![[7; 32]],
+            sent_at: 8,
         };
         {
             let client =
@@ -256,6 +642,17 @@ mod tests {
             client
                 .record_sent_delivery(&[6; 32], H256::repeat_byte(2), &delivery)
                 .unwrap();
+            client.keep_reservation(&[1; 32], &reservation).unwrap();
+            client
+                .keep_reservation(
+                    &[1; 32],
+                    &Reservation {
+                        nonce: 2,
+                        ..reservation.clone()
+                    },
+                )
+                .unwrap();
+            client.keep_reservation(&[6; 32], &reservation).unwrap();
         }
         let client = super::super::tests::test_client_with_event_store(url, directory.path());
         assert_eq!(
@@ -267,5 +664,16 @@ mod tests {
             .unwrap();
         assert!(client.sent_deliveries(&[1; 32]).unwrap().is_empty());
         assert_eq!(client.sent_deliveries(&[6; 32]).unwrap().len(), 1);
+        // In nonce order, and the signer's own.
+        let nonces: Vec<u64> = client
+            .reservations(&[1; 32])
+            .unwrap()
+            .iter()
+            .map(|reservation| reservation.nonce)
+            .collect();
+        assert_eq!(nonces, [2, 9]);
+        client.release_reservation(&[1; 32], 9).unwrap();
+        assert_eq!(client.reservations(&[1; 32]).unwrap().len(), 1);
+        assert_eq!(client.reservations(&[6; 32]).unwrap(), [reservation]);
     }
 }

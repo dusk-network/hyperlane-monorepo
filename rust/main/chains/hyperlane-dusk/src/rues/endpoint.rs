@@ -36,7 +36,7 @@ use url::Url;
 use hyperlane_core::H256;
 
 use super::batch::Multicall;
-use super::submissions::SentDelivery;
+use super::submissions::{Reservation, SentDelivery};
 use super::{BlockPair, DeploymentIdentity, IdentityGate};
 use crate::final_records::FinalRecords;
 
@@ -195,9 +195,12 @@ pub(crate) struct Endpoint {
     /// The lock each signer's submissions hold while they use its nonces,
     /// by the signer's address.
     submission_locks: StdMutex<HashMap<[u8; 32], Arc<tokio::sync::Mutex<()>>>>,
-    /// The deliveries signers sent that have not settled, by signer and
+    /// The deliveries the previous version kept in flight, by signer and
     /// message, for clients that keep no event store.
     sent_deliveries: StdMutex<BTreeMap<([u8; 32], H256), SentDelivery>>,
+    /// The nonces signers hold, by signer and nonce, for clients that keep
+    /// no event store.
+    reservations: StdMutex<BTreeMap<([u8; 32], u64), Reservation>>,
 }
 
 type Endpoints = HashMap<String, Weak<Endpoint>>;
@@ -233,6 +236,7 @@ impl Endpoint {
             multicalls: StdMutex::new(HashMap::new()),
             submission_locks: StdMutex::new(HashMap::new()),
             sent_deliveries: StdMutex::new(BTreeMap::new()),
+            reservations: StdMutex::new(BTreeMap::new()),
         });
         endpoints.insert(key, Arc::downgrade(&endpoint));
         endpoint
@@ -321,6 +325,29 @@ impl Endpoint {
 
     pub(crate) fn forget_sent_delivery(&self, signer: &[u8; 32], message: H256) {
         self.sent().remove(&(*signer, message));
+    }
+
+    fn held(&self) -> std::sync::MutexGuard<'_, BTreeMap<([u8; 32], u64), Reservation>> {
+        self.reservations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The nonces `signer` holds, in nonce order.
+    pub(crate) fn reservations(&self, signer: &[u8; 32]) -> Vec<Reservation> {
+        self.held()
+            .range((*signer, 0)..=(*signer, u64::MAX))
+            .map(|(_, reservation)| reservation.clone())
+            .collect()
+    }
+
+    pub(crate) fn keep_reservation(&self, signer: &[u8; 32], reservation: Reservation) {
+        self.held()
+            .insert((*signer, reservation.nonce), reservation);
+    }
+
+    pub(crate) fn release_reservation(&self, signer: &[u8; 32], nonce: u64) {
+        self.held().remove(&(*signer, nonce));
     }
 
     /// Forget the last read of the tip and last final block, as if a tick
