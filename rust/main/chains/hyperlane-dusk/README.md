@@ -286,10 +286,12 @@ how to run the local bridge.
   again. A kept transaction without its nonce goes only once it is in a
   final block. A signer keeps those of at most 1,024 deliveries: at the
   bound, a delivery looks kept transactions up, the oldest first and on
-  later tries on from where the last look stopped, at most 16 at a time,
-  and forgets those it can, within the 120 s receipt wait: a look that
-  runs out keeps what it found, the transactions it missed included, and
-  the next looks those up again before anything else. Every 5 minutes a
+  later tries on from where the last look stopped, at most 16 new ones at
+  a time, plus second looks at up to 16 earlier misses before them and
+  again at the end (at most 48 lookups in all), and forgets those it can,
+  within the 120 s receipt wait: a look that runs out keeps what it found,
+  the transactions it missed included, and the next looks those up again
+  before anything else. Every 5 minutes a
   delivery does the same for the kept transactions of other messages, so
   that those of messages the
   relayer gave up on do not pile up to the bound; it reads nothing while

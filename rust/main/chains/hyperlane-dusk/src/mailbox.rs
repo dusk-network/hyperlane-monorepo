@@ -891,9 +891,12 @@ impl DuskMailbox {
     }
 
     /// Look kept transactions of the signer up, other than `message`'s, at
-    /// most `PREPARED_LOOKUPS`, the oldest first and on later looks on from
-    /// where the last one stopped, and forget those whose records are no
-    /// longer needed. How many it looked up, and how many it forgot.
+    /// most `PREPARED_LOOKUPS` new ones, the oldest first and on later looks
+    /// on from where the last one stopped, and forget those whose records
+    /// are no longer needed. Second looks at earlier misses come on top, at
+    /// most `PREPARED_LOOKUPS` before the new ones and again after them: at
+    /// most three times `PREPARED_LOOKUPS` lookups a look, all within its
+    /// deadline. How many it looked up, and how many it forgot.
     ///
     /// A record is no longer needed when its transaction can neither land
     /// again nor still owes a report:
