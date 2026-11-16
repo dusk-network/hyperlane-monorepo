@@ -268,9 +268,10 @@ how to run the local bridge.
   made 61, and at most 6 for a transaction in a block 10 to 20 s after it
   was sent, found at most 2.5 s after its block, where the pipelined
   deliveries the benchmark measured took 9.3.
-- **Pipelined deliveries (experimental, off by default).** Only a chain
-  that sets `pipelineDeliveries: true` and a `maxBatchSize` above 1, with a
-  helper that takes `call --nonce <N> --no-wait` (found from its
+- **Pipelined deliveries (experimental, off by default, not for public
+  networks until their known issues, listed below, are fixed).** Only a
+  chain that sets `pipelineDeliveries: true` and a `maxBatchSize` above 1,
+  with a helper that takes `call --nonce <N> --no-wait` (found from its
   `call --help`, once per process), pipelines: the relayer submits a batch
   of deliveries as consecutive transactions of its account, each once the
   node holds the one before, and they share a block. A configuration that
@@ -345,6 +346,52 @@ how to run the local bridge.
   for a block or two. The relayer waits these out rather than refusing to
   start: the records drain only while a relayer runs, and only the ones that
   could still land ahead of a delivery sent one at a time hold anything up.
+- **Known issues of pipelined deliveries.** The last review of the
+  pipelined path found six faults that are not fixed. **Do not enable
+  `pipelineDeliveries` on a public network until they are.** The default,
+  one delivery at a time, has none of them.
+  1. *Switching pipelining off forgets transactions that can still land.*
+     A reservation whose transactions are in neither the mempool nor a
+     block, past the 60 s drop grace and with its nonce unused, is
+     released, and the previous version's records alike. A signed Moonlight
+     transaction does not expire, though: anyone who kept it, a peer node
+     included, can send it again later. When its message went meanwhile in
+     another transaction, with another nonce, the old one can still land
+     and fail, paying its whole gas limit. Its nonce range has to be used
+     up (with fillers where needed) and final before it is forgotten.
+  2. *Proxy settings reach the loopback signer.* The helper inherits the
+     agent's environment, and its HTTP client uses `HTTP_PROXY` and
+     `ALL_PROXY` for every URL `NO_PROXY` does not exempt, the loopback
+     capture endpoint's included. A proxy then answers the chain ID query
+     and receives the signed transaction at preverification, before the
+     agent keeps its hash; the agent captured nothing, releases the
+     reservation, and the proxy holds a transaction it can send. The
+     helper's capture runs need to bypass every proxy.
+  3. *A filler loses the message it replaced.* A dropped delivery whose
+     simulation fails while it is sent again, a transport error included,
+     is turned into a filler for good, and its message is forgotten while
+     its signed delivery stays valid. When the message's next simulation
+     passes, it is planned as a new delivery with another nonce, and the
+     old transaction can land first, so the new one fails and pays its
+     whole gas limit. The reservation has to keep its message until the
+     nonce is final, and a transport failure has to defer the recovery.
+  4. *Recovered deliveries escape gas accounting.* A dropped delivery that
+     a later batch sends again, outside that batch's own messages, gets no
+     outcome, so its gas is never reported to the relayer. The relayer
+     charges a message's gas payment only with the outcomes reported for
+     it, so that message's payment stays unspent and pays for another
+     attempt. A filler's gas is never reported either.
+  5. *Fillers bypass the bound of 64.* Only new deliveries count against
+     the 64 deliveries a signer keeps outstanding; a filler adds a
+     reservation past it. A gap below 64 held nonces (another wallet's
+     transaction left pending, say) ends with 65 reservations or more, so
+     a rollback can put more than 64 back into the mempool, which the bound
+     is there to prevent. Recovery has to fill gaps within the bound.
+  6. *Simulations run past the batch's deadline.* The `process` simulations
+     that prepare a batch, and those of dropped deliveries sent again under
+     the signer's lock, are not bounded by the batch's 60 s: a stalled one
+     waits out the HTTP client's 30 s timeout, so 64 of them can take about
+     32 minutes. They have to stop at the deadline.
 - **Delivery simulation.** Dusk charges a failed transaction its whole gas
   limit. Before submitting `process`, the relayer runs it as an unsigned
   contract query, which Rusk executes in a throwaway session. If the query
@@ -490,7 +537,9 @@ deliveries together, as consecutive transactions (see Pipelined
 deliveries); otherwise every delivery goes one at a time, whatever
 `maxBatchSize` says. **A pipelining relayer must be the only process that
 signs with its key on the chain**: give every relayer and validator its
-own key.
+own key. Pipelined deliveries have known issues that are not fixed (see
+Known issues of pipelined deliveries): **do not set `pipelineDeliveries`
+on a public network until they are.**
 
 The `duskKey` signer takes exactly one of `keyFile` (a regular file with no
 group or world permissions), `keyEnv` (an environment variable name) or `key`
