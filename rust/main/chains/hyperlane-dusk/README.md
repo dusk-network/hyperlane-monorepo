@@ -69,7 +69,11 @@ how to run the local bridge.
   whatever the history: the IGP's used to read every payment's height
   again, about 100 a Dusk to EVM message after 100 payments and 295 after
   10,000 through the multicall, and 8,100 for a restart with 40 of 100
-  messages waiting, which now reads each payment's height once.
+  messages waiting, which now reads each payment's height once. A search
+  whose reads contradict each other, the kept heights or the last one
+  searched is not used: the kept heights are forgotten and every record's
+  height is read again, and when those contradict each other too, the
+  search fails instead of answering.
 - **Batched reads.** A chain whose `batchContractAddress` names Multicall
   for Dusk sends reads that do not depend on each other as one `aggregate`
   query, which answers them all at one state; an aggregate is one request to

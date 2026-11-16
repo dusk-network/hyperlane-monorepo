@@ -32,6 +32,14 @@
 //! contract's history. Without a kept record below the height, its search
 //! starts at the first record; without one above it, at the boundary.
 //!
+//! Only an endpoint that answers inconsistently shows heights that
+//! decrease along the records, or a search whose reads disagree with what
+//! it found or with the boundary. Such a search may rest on a wrong reply,
+//! its own or one a kept height came from, so its answer is not used: the
+//! kept heights are forgotten, and a search of every record, reading each
+//! height again, decides. When that one contradicts itself too, the search
+//! fails rather than guess, and nothing it read is kept.
+//!
 //! Through a multicall, one read takes the heights of up to 256 records at
 //! once: a search then reads the heights of every record in its range when
 //! there are that few, and otherwise of 256 spread evenly over it, each
@@ -129,28 +137,38 @@ impl Known {
     /// Keep what a search for `height`, which started from boundary
     /// `before`, found: `found` records at or below it, having read the
     /// heights in `reads`. Every one of them at or below a final height is
-    /// kept, unless it contradicts what the search found or what is kept.
+    /// kept. Keeps nothing, forgets every kept height and returns false when
+    /// the search contradicts itself, the boundary or what is kept: a read
+    /// that disagrees with what the search found, a count on the wrong side
+    /// of the boundary's, or heights that decrease along the records. What
+    /// the search found may then rest on a wrong reply, now or before.
     fn remember(
         &mut self,
         height: u64,
         found: u32,
         before: Option<Boundary>,
         reads: Vec<(u32, u64)>,
-    ) {
+    ) -> bool {
         let final_height = before.map_or(height, |before| before.height.max(height));
-        let mut consistent = true;
+        let mut consistent = before.is_none_or(|before| match height.cmp(&before.height) {
+            std::cmp::Ordering::Less => found <= before.count,
+            std::cmp::Ordering::Equal => found == before.count,
+            std::cmp::Ordering::Greater => found >= before.count,
+        });
         for (index, record_height) in reads {
-            let agrees = (index < found) == (record_height <= height);
-            if agrees && record_height <= final_height {
+            if (index < found) != (record_height <= height) {
+                consistent = false;
+            } else if record_height <= final_height {
                 consistent &= self.keep(index, record_height);
             }
         }
         if !consistent {
             warn!(
                 final_height,
-                "Dusk endpoint reports record heights that contradict ones it reported before; forgetting the kept heights"
+                "Dusk endpoint reports record heights that contradict each other or ones it reported before; forgetting the kept heights"
             );
             self.heights.clear();
+            return false;
         }
         match self.boundary {
             Some(boundary) if height < boundary.height => {}
@@ -164,6 +182,7 @@ impl Known {
         while self.heights.len() > self.capacity {
             self.heights.pop_first();
         }
+        true
     }
 }
 
@@ -275,9 +294,34 @@ impl FinalRecords {
                 first_above_batched(0, high, height, probes, &mut reads).await?
             }
         };
-        let seen = reads.seen;
-        known.remember(height, found, before, seen);
-        Ok(found)
+        if known.remember(height, found, before, reads.seen) {
+            return Ok(found);
+        }
+        // The endpoint contradicted itself, so what this search found may
+        // rest on a wrong reply, its own or one a kept height came from. It
+        // is not used: the kept heights are gone, and a search of every
+        // record, reading each height again, decides.
+        let mut reads = Reads {
+            heights_of: &mut heights_of,
+            seen: Vec::new(),
+        };
+        let found = match probes {
+            0 | 1 => first_above(0, count, height, &mut reads).await?,
+            _ => first_above_batched(0, count, height, probes, &mut reads).await?,
+        };
+        if known.remember(height, found, before, reads.seen) {
+            return Ok(found);
+        }
+        // Read again, the endpoint still contradicts itself, or the
+        // boundary: nothing it reported is kept, and the next search reads
+        // every record.
+        *known = Known {
+            capacity: known.capacity,
+            ..Known::default()
+        };
+        Err(ChainCommunicationError::from_other_str(&format!(
+            "Dusk endpoint reports heights of records at or below block {height} that contradict each other, also when read again; the next search reads every record again"
+        )))
     }
 }
 
@@ -824,9 +868,109 @@ mod tests {
             count: 30,
             height: 120,
         });
-        known.remember(105, 13, known.boundary, vec![(13, 101), (12, 104)]);
+        assert!(!known.remember(105, 13, known.boundary, vec![(13, 101), (12, 104)]));
         assert!(known.heights.is_empty());
         assert_eq!(known.boundary.map(|boundary| boundary.height), Some(120));
+    }
+
+    /// The search of `contract` through `height`, reading up to `probes`
+    /// heights at once, to which the endpoint answers `wrong` for the next
+    /// reads of record `index`, and then the record's height.
+    async fn search_with_wrong_replies(
+        contract: &Contract,
+        records: &FinalRecords,
+        height: u64,
+        probes: usize,
+        index: u32,
+        wrong: Vec<u64>,
+    ) -> ChainResult<u32> {
+        let wrong = RefCell::new(std::collections::VecDeque::from(wrong));
+        records
+            .count_at_or_below(
+                height,
+                || async { Ok(contract.count()) },
+                probes,
+                |indices: Vec<u32>| {
+                    let heights: Vec<u64> = indices
+                        .iter()
+                        .map(|read| {
+                            let reply = if *read == index {
+                                wrong.borrow_mut().pop_front()
+                            } else {
+                                None
+                            };
+                            reply.unwrap_or(contract.heights[*read as usize])
+                        })
+                        .collect();
+                    async move { Ok(heights) }
+                },
+            )
+            .await
+    }
+
+    /// A search that a wrong reply contradicts is not used: the kept heights
+    /// go, and a search of every record, reading each height again,
+    /// decides. The review's counterexample: records at heights 10, 20, ...,
+    /// 80; a search through 80 keeps those of records 4, 6 and 7; a search
+    /// through 59, narrowed to record 5, gets 40 for its height, which
+    /// contradicts record 4's 50. It used to answer 6 instead of 5, so that
+    /// block 60 seemed to hold no record and its payment was skipped.
+    #[tokio::test]
+    async fn a_search_a_wrong_reply_contradicts_reads_every_record_again() {
+        let contract = Contract::new((1..=8).map(|block| block * 10).collect());
+        let records = FinalRecords::default();
+        assert_eq!(contract.search(&records, 80).await, 8);
+        let kept: Vec<(u64, (u32, u32))> = records
+            .known
+            .lock()
+            .await
+            .heights
+            .iter()
+            .map(|(height, indices)| (*height, *indices))
+            .collect();
+        assert_eq!(kept, [(50, (4, 4)), (70, (6, 6)), (80, (7, 7))]);
+        let found = search_with_wrong_replies(&contract, &records, 59, 1, 5, vec![40])
+            .await
+            .unwrap();
+        assert_eq!(found, 5);
+        // Block 60 holds record 5, as `payment_range_at_block` sees it.
+        assert_eq!(contract.search(&records, 60).await, 6);
+        assert_eq!(contract.search(&records, 59).await, 5);
+        // Batched alike, from a boundary through 80 that read every record.
+        let records = FinalRecords::default();
+        assert_eq!(contract.search_with(&records, 80, 256).await, 8);
+        records
+            .known
+            .lock()
+            .await
+            .heights
+            .retain(|height, _| *height != 60);
+        let found = search_with_wrong_replies(&contract, &records, 59, 256, 5, vec![40])
+            .await
+            .unwrap();
+        assert_eq!(found, 5);
+    }
+
+    /// A contradiction that persists when every height is read again fails
+    /// the search instead of answering a guess, and leaves nothing kept: the
+    /// next search reads every record again.
+    #[tokio::test]
+    async fn a_contradiction_read_again_fails_the_search() {
+        let contract = Contract::new((1..=8).map(|block| block * 10).collect());
+        let records = FinalRecords::default();
+        assert_eq!(contract.search(&records, 80).await, 8);
+        let error = search_with_wrong_replies(&contract, &records, 59, 1, 5, vec![40, 40])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("contradict"), "{error}");
+        {
+            let known = records.known.lock().await;
+            assert!(known.heights.is_empty());
+            assert_eq!(known.boundary, None);
+        }
+        assert_eq!(contract.search(&records, 59).await, 5);
+        assert_eq!(contract.counts.get(), 1);
+        assert!(contract.reads.get() >= 3, "{}", contract.reads.get());
     }
 
     #[tokio::test]
