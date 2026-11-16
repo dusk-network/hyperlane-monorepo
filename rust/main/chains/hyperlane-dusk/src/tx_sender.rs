@@ -37,7 +37,8 @@ const ACK_BEFORE_SEND: &str = "--ack-before-send";
 const SEND_WORD: &[u8] = b"send\n";
 /// What a `dusk-tx` that takes `--ack-before-send` is, for the error that
 /// refuses deliveries without one.
-const ACK_HELPER: &str = "dusk-tx from hyperlane-dusk with `call --ack-before-send` (dusk-network/hyperlane-dusk fix/final-review, or later)";
+const ACK_HELPER: &str =
+    "a dusk-tx built from dusk-network/hyperlane-dusk at de7e2a6 or later, whose `call --help` lists `--ack-before-send`";
 /// How the helper starts the stderr line that says it sent nothing.
 const NOT_SUBMITTED: &str = "Not submitted:";
 

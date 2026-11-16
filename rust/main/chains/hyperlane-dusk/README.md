@@ -253,7 +253,8 @@ how to run the local bridge.
   a delivery whose relayer stops or dies before the word: the helper's stdin
   closes with it. The relayer needs a `dusk-tx` whose `call --help` lists
   `--ack-before-send`, which it asks once per process; with another, it
-  refuses to deliver and says which `dusk-tx` it needs. The hash stays until
+  refuses to deliver and says which `dusk-tx` it needs: one built from
+  `dusk-network/hyperlane-dusk` at `de7e2a6` or later. The hash stays until
   the relayer confirms the message delivered. A signer keeps those of at
   most 1,024 deliveries: at the bound, a delivery looks kept transactions
   up, the oldest first and on later tries on from where the last look
