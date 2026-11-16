@@ -5922,7 +5922,7 @@ dependencies = [
 [[package]]
 name = "hyperlane-dusk-types"
 version = "0.1.0"
-source = "git+https://github.com/dusk-network/hyperlane-dusk?rev=f6be24a411f2a0a247b8d1b798106c37449f7dcf#f6be24a411f2a0a247b8d1b798106c37449f7dcf"
+source = "git+https://github.com/dusk-network/hyperlane-dusk?rev=ae77c887223bd262c109ff054d726aff21b070c7#ae77c887223bd262c109ff054d726aff21b070c7"
 dependencies = [
  "bytecheck",
  "dusk-bytes",
