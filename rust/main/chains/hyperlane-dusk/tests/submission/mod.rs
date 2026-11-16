@@ -550,6 +550,9 @@ pub enum Fault {
     Drop,
     /// Wait until the gate opens, then serve the request as usual.
     Hold(Arc<Gate>),
+    /// Serve the request as usual, but answer it only once the gate opens:
+    /// what the node says is what it held when the request came.
+    HoldReply(Arc<Gate>),
     /// Answer `200`, but admit nothing, as Rusk's mempool does when the
     /// transaction it routed fails its admission there.
     AcceptAndDiscard,
@@ -978,6 +981,12 @@ impl Node {
         self.model().delivered.insert(process_args_hex(delivery));
     }
 
+    /// Take back `deliver_elsewhere`: the message is not delivered at the
+    /// tip, as if that delivery had not counted.
+    pub fn undeliver(&self, delivery: &(HyperlaneMessage, Metadata, Option<U256>)) {
+        self.model().delivered.remove(&process_args_hex(delivery));
+    }
+
     /// Have another process that signs with the agent's key send a
     /// transaction with `nonce`, as the node would take it.
     pub fn send_foreign(&self, nonce: u64) -> Result<(), Refusal> {
@@ -1057,6 +1066,7 @@ fn serve(
     };
     let tx = Tx::parse(&body);
     let mut lose_reply = false;
+    let mut hold_reply = None;
     match take_fault(faults, route, tx.as_ref().map(|tx| tx.nonce)) {
         Some(Fault::Refuse(reason)) => {
             if let Some(tx) = &tx {
@@ -1069,6 +1079,7 @@ fn serve(
         }
         Some(Fault::Drop) => return,
         Some(Fault::Hold(gate)) => gate.wait(),
+        Some(Fault::HoldReply(gate)) => hold_reply = Some(gate),
         Some(Fault::LoseReply) => lose_reply = true,
         Some(Fault::AcceptAndDiscard) => return reply(stream, "200 OK", b""),
         None => {}
@@ -1121,6 +1132,9 @@ fn serve(
             }
         }
     };
+    if let Some(gate) = hold_reply {
+        gate.wait();
+    }
     if !lose_reply {
         reply(stream, status, &answer);
     }

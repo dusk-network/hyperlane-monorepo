@@ -60,6 +60,11 @@ pub enum HyperlaneDuskError {
         /// Original helper diagnostic.
         detail: String,
     },
+    /// The helper did not propagate the transaction it prepared: the node
+    /// refused it at preverification, or preverification could not be
+    /// asked. Nothing of it reached the node.
+    #[error("{0}")]
+    NotSubmitted(String),
     /// The helper observed an included execution failure. Reconcile its exact
     /// receipt so callers can account for gas despite unsuccessful execution.
     #[error("Dusk transaction {tx_id} execution failed: {detail}")]

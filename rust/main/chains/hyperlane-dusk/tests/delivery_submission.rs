@@ -183,7 +183,7 @@ async fn deliveries_go_one_at_a_time_unless_pipelining_is_opted_in() {
 }
 
 #[tokio::test]
-async fn a_delivery_sent_again_while_its_transaction_waits_is_refused() {
+async fn a_delivery_sent_again_while_its_transaction_waits_follows_that_transaction() {
     let _env = HELPER_ENV.lock().await;
     let node = Node::start(false);
     std::env::set_var("DUSK_TX_BIN", node.helper());
@@ -202,20 +202,19 @@ async fn a_delivery_sent_again_while_its_transaction_waits_is_refused() {
     assert!(error.contains("to be included"), "{error}");
     assert_eq!(node.propagated(), [1]);
 
-    // The relayer sends it again: dusk-tx signs with the account's nonce
-    // plus one again, which the mempool holds for the first transaction, so
-    // preverification refuses it before propagation.
+    // The relayer sends it again: the Mailbox finds the first transaction
+    // in the mempool and follows it, without running the helper, which
+    // would sign the account's nonce plus one again for the node to refuse.
+    let calls = node.invocations().len();
     let error = mailbox
         .process(&message, &metadata, gas_limit)
         .await
         .unwrap_err()
         .to_string();
-    assert!(
-        error.contains("Preverify rejected before propagation"),
-        "{error}"
-    );
+    assert!(error.contains("to be included"), "{error}");
+    assert_eq!(node.invocations().len(), calls);
     assert_eq!(node.propagated(), [1]);
-    assert_eq!(node.refusals(), [(1, Refusal::NonceHeld)]);
+    assert!(node.refusals().is_empty(), "{:?}", node.refusals());
     assert!(!chose_a_nonce(&node));
 
     // Once the chain takes the first, the message is delivered once, and
@@ -269,9 +268,15 @@ async fn an_unknown_outcome_is_followed_by_the_prepared_hash() {
     );
 
     // The helper prints its hash but never sends: nothing is found by it,
-    // and the delivery fails; sent again, it goes with the same nonce.
+    // and the delivery fails. Sent again while its transaction may still
+    // be on its way to the node, it is not sent; once it cannot be, it goes
+    // with the same nonce.
     node.next_submission(2, "lose");
     let (message, metadata, gas_limit) = &deliveries[1];
+    let mailbox = mailbox.with_submission_limits(SubmissionLimits {
+        drop_grace: Duration::from_secs(60),
+        ..patient(64)
+    });
     let error = mailbox
         .process(message, metadata, *gas_limit)
         .await
@@ -279,6 +284,16 @@ async fn an_unknown_outcome_is_followed_by_the_prepared_hash() {
         .to_string();
     assert!(error.contains("to be included"), "{error}");
     assert_eq!(node.propagated(), [1]);
+    let calls = node.invocations().len();
+    let error = mailbox
+        .process(message, metadata, *gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("may still reach the node"), "{error}");
+    assert_eq!(node.invocations().len(), calls);
+    let mailbox = mailbox.with_submission_limits(patient(64));
+    tokio::time::sleep(PAST_DROP_GRACE).await;
     let outcome = mailbox
         .process(message, metadata, *gas_limit)
         .await
@@ -287,6 +302,194 @@ async fn an_unknown_outcome_is_followed_by_the_prepared_hash() {
     assert_eq!(node.propagated(), [1, 2]);
     node.settle(2).await;
     assert!(!chose_a_nonce(&node));
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+/// The inherited race of deliveries sent one at a time: the relayer
+/// submits a delivery again after its first transaction's outcome was
+/// unknown and the wait for its block ended; the simulation passes, and the
+/// first transaction lands before `dusk-tx` reads the account's nonce. The
+/// helper then signed the next nonce, and a second transaction landed and
+/// failed, paying its whole gas limit. The Mailbox kept the first
+/// transaction's hash, and looks it up before it runs the helper again.
+#[tokio::test]
+async fn a_delivery_whose_first_transaction_lands_during_its_retry_is_not_sent_again() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start(false);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    // The helper waits 200 ms for a block, the Mailbox 600 ms.
+    node.helper_waits(10);
+    let mailbox = node.mailbox(false).with_submission_limits(patient(64));
+    let (message, metadata, gas_limit) = delivery(0);
+    node.pause(true);
+    let error = mailbox
+        .process(&message, &metadata, gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("to be included"), "{error}");
+    assert_eq!(node.propagated(), [1]);
+    let first = node.model().mempool[&1].id.clone();
+
+    // Submitted again past the 2 s a passed simulation stands for: the
+    // simulation passes, and its answer comes once the first transaction is
+    // in a block.
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    let gate = std::sync::Arc::new(Gate::default());
+    node.inject(Route::Simulation, None, Fault::HoldReply(gate.clone()));
+    let retry = tokio::spawn({
+        let mailbox = mailbox.clone();
+        let (message, metadata) = (message.clone(), metadata.clone());
+        async move { mailbox.process(&message, &metadata, gas_limit).await }
+    });
+    node.wait_until("the simulation is answered", |_| {
+        gate.waiting.load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+    node.pause(false);
+    node.wait_until("the first transaction is in a block", |model| {
+        model.included(&first).is_some()
+    })
+    .await;
+    gate.open();
+    // The Mailbox follows the first transaction instead of sending another.
+    let outcome = retry.await.unwrap().unwrap();
+    assert!(outcome.executed);
+    assert_eq!(hex::encode(&outcome.transaction_id.as_bytes()[32..]), first);
+    assert_eq!(node.propagated(), [1]);
+    node.settle(1).await;
+    assert!(!chose_a_nonce(&node));
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+/// A delivery whose kept transaction failed in a block spent that nonce and
+/// delivered nothing: once the block is final, it goes again; before, a
+/// rollback could still run that transaction again.
+#[tokio::test]
+async fn a_delivery_whose_transaction_failed_goes_again_once_its_block_is_final() {
+    let _env = HELPER_ENV.lock().await;
+    // Finality moves only by hand.
+    let node = Node::start_with(false, None);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let mailbox = node.mailbox(false).with_submission_limits(patient(64));
+    let delivery = delivery(0);
+    let (message, metadata, gas_limit) = &delivery;
+    // Another relayer's delivery lands first, so ours fails in its block.
+    node.pause(true);
+    let first = tokio::spawn({
+        let mailbox = mailbox.clone();
+        let (message, metadata, gas_limit) = delivery.clone();
+        async move { mailbox.process(&message, &metadata, gas_limit).await }
+    });
+    node.wait_until("the first transaction is in the mempool", |model| {
+        !model.mempool.is_empty()
+    })
+    .await;
+    node.deliver_elsewhere(&delivery);
+    node.pause(false);
+    let outcome = first.await.unwrap().unwrap();
+    assert!(!outcome.executed);
+    // The other delivery does not count after all, and the relayer
+    // submits ours again: its failed transaction's block is not final.
+    node.undeliver(&delivery);
+    let calls = node.invocations().len();
+    let error = mailbox
+        .process(message, metadata, *gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not final yet"), "{error}");
+    assert_eq!(node.invocations().len(), calls);
+    // Once it is, the delivery goes again, with the next nonce.
+    let height = node.height();
+    node.finalize_to(height);
+    node.expire_block_pair().await;
+    let outcome = mailbox
+        .process(message, metadata, *gas_limit)
+        .await
+        .unwrap();
+    assert!(outcome.executed);
+    assert_eq!(node.propagated(), [1, 2]);
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+/// A delivery refused before propagation reached nothing: it leaves no
+/// transaction to follow, and goes again at once.
+#[tokio::test]
+async fn a_delivery_refused_before_propagation_goes_again_at_once() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start(false);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let mailbox = node.mailbox(false).with_submission_limits(patient(64));
+    let (message, metadata, gas_limit) = delivery(0);
+    node.inject(
+        Route::Preverify,
+        None,
+        Fault::Refuse("insufficient balance".into()),
+    );
+    let error = mailbox
+        .process(&message, &metadata, gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("Preverify rejected before propagation"),
+        "{error}"
+    );
+    assert!(node.propagated().is_empty());
+    assert_eq!(mailbox.prepared_transaction(message.id()).unwrap(), None);
+    let outcome = mailbox
+        .process(&message, &metadata, gas_limit)
+        .await
+        .unwrap();
+    assert!(outcome.executed);
+    assert_eq!(node.propagated(), [1]);
+    // The relayer confirms the delivery, and the kept transaction goes.
+    assert!(mailbox
+        .prepared_transaction(message.id())
+        .unwrap()
+        .is_some());
+    mailbox.on_delivered(&message);
+    assert_eq!(mailbox.prepared_transaction(message.id()).unwrap(), None);
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+/// The transaction kept for a delivery survives a restart: submitted again
+/// by the new process while that transaction waits in the mempool, the
+/// delivery follows it.
+#[tokio::test]
+async fn a_delivery_kept_in_flight_is_followed_after_a_restart() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start(false);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    node.helper_waits(10);
+    let store = tempfile::tempdir().unwrap();
+    let (message, metadata, gas_limit) = delivery(0);
+    node.pause(true);
+    let mailbox = node
+        .durable_mailbox(store.path(), false)
+        .with_submission_limits(patient(64));
+    let error = mailbox
+        .process(&message, &metadata, gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("to be included"), "{error}");
+    drop(mailbox);
+    node.restart(store.path());
+    let mailbox = node
+        .durable_mailbox(store.path(), false)
+        .with_submission_limits(patient(64));
+    let calls = node.invocations().len();
+    let error = mailbox
+        .process(&message, &metadata, gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("to be included"), "{error}");
+    assert_eq!(node.invocations().len(), calls);
+    assert!(node.refusals().is_empty(), "{:?}", node.refusals());
+    node.settle(1).await;
     std::env::remove_var("DUSK_TX_BIN");
 }
 

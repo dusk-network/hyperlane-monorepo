@@ -19,8 +19,9 @@ use hyperlane_dusk_types::merkle::{IncrementalMerkle as HookTree, TREE_DEPTH};
 use crate::final_records::FinalRecords;
 use crate::rues::{
     bounded_body, bounded_error, bounded_json, bounded_text, fits_one_aggregate, list_reply,
-    rkyv_deserialize, rkyv_serialize, BlockPair, CheckHold, LogLookup, Read, SentDelivery,
-    BOOL_REPLY, ID_REPLY, U32_REPLY, U64_REPLY,
+    rkyv_deserialize, rkyv_serialize, BlockPair, CheckHold, ConfirmedTransaction, LogLookup,
+    PreparedDelivery, Read, SentDelivery, TransactionStatus, BOOL_REPLY, ID_REPLY, U32_REPLY,
+    U64_REPLY,
 };
 use crate::{ConnectionConf, DuskProvider, DuskSigner, HyperlaneDuskError, RuesClient};
 
@@ -523,28 +524,63 @@ impl DuskMailbox {
         )?)
     }
 
-    /// Submit one delivery, one at a time, as Dusk relayers always have:
-    /// `dusk-tx` signs it with the account's nonce plus one, as the node
-    /// reports it, sends it and waits for its block. No nonce is chosen or
-    /// kept here. While an earlier transaction of the signer is in the
-    /// mempool, the node refuses another with its nonce at preverification,
-    /// so a delivery submitted again while its first transaction waits is
-    /// refused, and at most one of them can be in a block. When the
-    /// helper's outcome is unknown, the transaction it prepared is followed
-    /// by its exact hash.
+    /// Submit one delivery of `message`, one at a time, as Dusk relayers
+    /// always have: `dusk-tx` signs it with the account's nonce plus one, as
+    /// the node reports it, sends it and waits for its block. No nonce is
+    /// chosen or kept here. While an earlier transaction of the signer is
+    /// in the mempool, the node refuses another with its nonce at
+    /// preverification, so a delivery submitted again while its first
+    /// transaction waits is refused, and at most one of them can be in a
+    /// block. When the helper's outcome is unknown, the transaction it
+    /// prepared is followed by its exact hash.
+    ///
+    /// That hash is kept for the message as soon as the helper prints it,
+    /// before it propagates the transaction, and a delivery submitted again
+    /// looks the transaction up first (`follow_prepared`). Otherwise the
+    /// first transaction could land after the relayer's simulation passed
+    /// and before the helper read the account's nonce: the helper would
+    /// sign the next nonce, and a second transaction would land and fail,
+    /// paying its whole gas limit.
     async fn process_one(
         &self,
         signer: &DuskSigner,
+        message: H256,
         args: &[u8],
         gas_limit: u64,
     ) -> ChainResult<TxOutcome> {
-        let call_result = crate::tx_sender::dusk_tx_call(
+        let key = signer_key(signer);
+        if let Some(prepared) = self.rues.prepared_delivery(&key, message)? {
+            if let Some(outcome) = self.follow_prepared(&key, message, &prepared).await? {
+                return Ok(outcome);
+            }
+        }
+        let keep = |tx_id: &str| {
+            let Some(tx_id) = hex::decode(tx_id)
+                .ok()
+                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+            else {
+                return;
+            };
+            let prepared = PreparedDelivery {
+                tx_id,
+                prepared_at: unix_millis(),
+            };
+            if let Err(error) = self.rues.keep_prepared_delivery(&key, message, &prepared) {
+                warn!(
+                    message_id = ?message,
+                    error = %bounded_error(&error),
+                    "Failed to keep the transaction prepared for a Dusk delivery; submitted again, the delivery cannot look it up first"
+                );
+            }
+        };
+        let call_result = crate::tx_sender::dusk_tx_call_naming(
             &self.conn,
             signer,
             &self.mailbox_id,
             "process",
             args,
             Some(gas_limit),
+            &keep,
         )
         .await;
         let tx_id = match call_result {
@@ -563,19 +599,111 @@ impl DuskMailbox {
                 warn!(%tx_id, %detail, "Reconciling Dusk submission receipt by exact hash");
                 tx_id
             }
+            Err(error @ HyperlaneDuskError::NotSubmitted(_)) => {
+                // Nothing of it reached the node, so there is nothing to
+                // follow.
+                self.rues.forget_prepared_delivery(&key, message)?;
+                return Err(error.into());
+            }
             Err(error) => return Err(error.into()),
         };
         self.outcome_of(&tx_id).await
     }
 
+    /// What the transaction prepared for an earlier submission of
+    /// `message` one at a time says about submitting it again: an outcome
+    /// to report instead, `None` to send it again (that transaction is then
+    /// forgotten), or an error while that transaction may still land.
+    ///
+    /// - In a block, executed: it is the delivery's outcome, and the
+    ///   relayer's confirmation goes on from it.
+    /// - In a block, failed: it spent its nonce and delivered nothing; the
+    ///   delivery goes again once that block is final, since until then a
+    ///   rollback can run the transaction again.
+    /// - In the mempool: it is followed to its block, as an unknown outcome
+    ///   is.
+    /// - In neither, prepared less than `SubmissionLimits::drop_grace` ago:
+    ///   it may still be on its way to the node. Past that, it was dropped.
+    async fn follow_prepared(
+        &self,
+        key: &[u8; 32],
+        message: H256,
+        prepared: &PreparedDelivery,
+    ) -> ChainResult<Option<TxOutcome>> {
+        let tx_id = hex::encode(prepared.tx_id);
+        match self.rues.transaction_status(&tx_id).await? {
+            TransactionStatus::Included {
+                block_height,
+                receipt,
+            } => {
+                if receipt.error.is_none() {
+                    info!(
+                        message_id = ?message,
+                        %tx_id,
+                        block_height,
+                        "Dusk delivery's earlier transaction is in a block; following it instead of sending another"
+                    );
+                    return Ok(Some(self.outcome_from(&tx_id, &receipt)?));
+                }
+                if block_height > self.rues.finalized_block_height().await? {
+                    return Err(HyperlaneDuskError::Other(format!(
+                        "Dusk delivery of message {message:?}: its earlier transaction {tx_id} failed in block {block_height}, which is not final yet; it goes again once that block is final"
+                    ))
+                    .into());
+                }
+                debug!(
+                    message_id = ?message,
+                    %tx_id,
+                    block_height,
+                    "Dusk delivery's earlier transaction failed in a final block; sending it again"
+                );
+            }
+            TransactionStatus::Pending => {
+                info!(
+                    message_id = ?message,
+                    %tx_id,
+                    "Dusk delivery's earlier transaction is in the mempool; following it instead of sending another"
+                );
+                return self.outcome_of(&tx_id).await.map(Some);
+            }
+            TransactionStatus::Unknown => {
+                let grace = u64::try_from(self.limits.drop_grace.as_millis()).unwrap_or(u64::MAX);
+                if unix_millis() < prepared.prepared_at.saturating_add(grace) {
+                    return Err(HyperlaneDuskError::Other(format!(
+                        "Dusk delivery of message {message:?}: its earlier transaction {tx_id} is in neither the mempool nor a block, but may still reach the node; it goes again once it cannot"
+                    ))
+                    .into());
+                }
+                debug!(
+                    message_id = ?message,
+                    %tx_id,
+                    "Dusk delivery's earlier transaction was dropped; sending it again"
+                );
+            }
+        }
+        self.rues.forget_prepared_delivery(key, message)?;
+        Ok(None)
+    }
+
     /// The outcome of delivery transaction `tx_id`, once it is in a block
     /// within `SubmissionLimits::receipt`.
     async fn outcome_of(&self, tx_id: &str) -> ChainResult<TxOutcome> {
-        let transaction_id = crate::tx_sender::dusk_tx_id_to_h512(tx_id)?;
+        crate::tx_sender::dusk_tx_id_to_h512(tx_id)?;
         let confirmed = self
             .rues
             .wait_for_tx_in_blocks_of(tx_id, self.limits.receipt, self.limits.block)
             .await?;
+        self.outcome_from(tx_id, &confirmed)
+    }
+
+    /// The outcome of delivery transaction `tx_id`, which is in a block with
+    /// receipt `confirmed`.
+    fn outcome_from(
+        &self,
+        tx_id: &str,
+        confirmed: &ConfirmedTransaction,
+    ) -> ChainResult<TxOutcome> {
+        let transaction_id = crate::tx_sender::dusk_tx_id_to_h512(tx_id)?;
         let executed = confirmed.error.is_none();
         if let Some(error) = &confirmed.error {
             let error = bounded_text(error);
@@ -587,6 +715,19 @@ impl DuskMailbox {
             gas_used: U256::from(confirmed.gas_spent),
             gas_price: FixedPointNumber::from(self.conn.gas_price),
         })
+    }
+
+    /// The transaction kept for the last submission of `message` one at a
+    /// time, for tests.
+    #[doc(hidden)]
+    pub fn prepared_transaction(&self, message: H256) -> ChainResult<Option<String>> {
+        let Some(signer) = &self.signer else {
+            return Ok(None);
+        };
+        Ok(self
+            .rues
+            .prepared_delivery(&signer_key(signer), message)?
+            .map(|prepared| hex::encode(prepared.tx_id)))
     }
 
     /// One delivery check of message `id`, whose state is read after
@@ -1281,7 +1422,8 @@ impl Mailbox for DuskMailbox {
                 .await;
         }
         self.wait_out_pipelined(signer).await?;
-        self.process_one(signer, &args, gas_limit).await
+        self.process_one(signer, message.id(), &args, gas_limit)
+            .await
     }
 
     /// Batches are sent as consecutive transactions of the signer's
@@ -1348,6 +1490,24 @@ impl Mailbox for DuskMailbox {
     fn delivered_calldata(&self, message_id: H256) -> ChainResult<Option<Vec<u8>>> {
         let id_bytes: [u8; 32] = message_id.into();
         Ok(Some(rkyv_serialize(&(id_bytes,))?))
+    }
+
+    /// The relayer confirmed `message` delivered: the transaction kept for
+    /// its last submission one at a time is no longer needed.
+    fn on_delivered(&self, message: &HyperlaneMessage) {
+        let Some(signer) = &self.signer else {
+            return;
+        };
+        if let Err(error) = self
+            .rues
+            .forget_prepared_delivery(&signer_key(signer), message.id())
+        {
+            debug!(
+                message_id = ?message.id(),
+                error = %bounded_error(&error),
+                "Failed to forget the transaction kept for a delivered Dusk message"
+            );
+        }
     }
 }
 

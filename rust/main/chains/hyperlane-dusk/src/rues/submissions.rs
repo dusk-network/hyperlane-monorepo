@@ -16,8 +16,53 @@
 //! (`dusk-sent-delivery-v1:`): its nonce and its last transaction. Such
 //! records are only read, to wait them out, and forgotten once nothing of
 //! them can be admitted any more.
+//!
+//! A delivery sent one at a time keeps the transaction `dusk-tx` prepared
+//! for it (`dusk-prepared-delivery-v1:`), by the hash the helper prints
+//! before it propagates it, so that the delivery is not sent again while
+//! that transaction may still land.
 
 use super::*;
+
+/// The prefix of the transactions prepared for deliveries sent one at a
+/// time.
+const PREPARED_DELIVERY_PREFIX: &[u8] = b"dusk-prepared-delivery-v1:";
+/// Bytes of an encoded prepared delivery: when it was prepared, and its
+/// transaction.
+const PREPARED_DELIVERY_BYTES: usize = 8 + 32;
+/// Most deliveries sent one at a time whose transaction a signer keeps:
+/// past it, the one prepared longest ago is forgotten.
+pub(crate) const MAX_PREPARED_DELIVERIES: usize = 1_024;
+
+/// The transaction `dusk-tx` prepared for the last submission of a
+/// delivery sent one at a time: the hash it printed before it propagated
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PreparedDelivery {
+    pub tx_id: [u8; 32],
+    /// When the helper named it, in milliseconds since the Unix epoch.
+    pub prepared_at: u64,
+}
+
+impl PreparedDelivery {
+    fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(PREPARED_DELIVERY_BYTES);
+        bytes.extend_from_slice(&self.prepared_at.to_be_bytes());
+        bytes.extend_from_slice(&self.tx_id);
+        bytes
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != PREPARED_DELIVERY_BYTES {
+            return None;
+        }
+        let mut fields = Fields(bytes);
+        Some(Self {
+            prepared_at: fields.u64()?,
+            tx_id: fields.hash()?,
+        })
+    }
+}
 
 /// The prefix of the previous version's deliveries in flight.
 const SENT_DELIVERY_PREFIX: &[u8] = b"dusk-sent-delivery-v1:";
@@ -246,6 +291,18 @@ fn sent_delivery_key(signer: &[u8; 32], message: H256) -> Vec<u8> {
     key
 }
 
+fn prepared_delivery_prefix(signer: &[u8; 32]) -> Vec<u8> {
+    let mut key = PREPARED_DELIVERY_PREFIX.to_vec();
+    key.extend_from_slice(signer);
+    key
+}
+
+fn prepared_delivery_key(signer: &[u8; 32], message: H256) -> Vec<u8> {
+    let mut key = prepared_delivery_prefix(signer);
+    key.extend_from_slice(message.as_bytes());
+    key
+}
+
 fn reservation_prefix(signer: &[u8; 32]) -> Vec<u8> {
     let mut key = RESERVATION_PREFIX.to_vec();
     key.extend_from_slice(signer);
@@ -351,6 +408,91 @@ impl RuesClient {
         store
             .delete_opt(sent_delivery_key(signer, message), &synced())
             .map_err(in_flight_error)
+    }
+
+    /// The transaction `signer` prepared for the last submission of
+    /// `message` sent one at a time, if one is kept. Fails on one the event
+    /// store holds that does not decode: the delivery may not be sent again
+    /// until it is looked at.
+    pub(crate) fn prepared_delivery(
+        &self,
+        signer: &[u8; 32],
+        message: H256,
+    ) -> Result<Option<PreparedDelivery>, HyperlaneDuskError> {
+        let Some(store) = &self.event_store else {
+            return Ok(self.endpoint.prepared_delivery(signer, message));
+        };
+        let Some(bytes) = store
+            .get(prepared_delivery_key(signer, message))
+            .map_err(in_flight_error)?
+        else {
+            return Ok(None);
+        };
+        PreparedDelivery::decode(&bytes).map(Some).ok_or_else(|| {
+            in_flight_error(format!(
+                "the transaction kept for the delivery of message {message:?} is corrupt; remove it only once the signer's transactions have settled"
+            ))
+        })
+    }
+
+    /// Keep that `signer` prepared `delivery` for `message`, durably,
+    /// instead of the one kept before. A signer keeps at most
+    /// `MAX_PREPARED_DELIVERIES`: past it, the one prepared longest ago,
+    /// or one that does not decode, is forgotten.
+    pub(crate) fn keep_prepared_delivery(
+        &self,
+        signer: &[u8; 32],
+        message: H256,
+        delivery: &PreparedDelivery,
+    ) -> Result<(), HyperlaneDuskError> {
+        let Some(store) = &self.event_store else {
+            self.endpoint
+                .keep_prepared_delivery(signer, message, *delivery);
+            return Ok(());
+        };
+        let key = prepared_delivery_key(signer, message);
+        let prefix = prepared_delivery_prefix(signer);
+        let mut others = Vec::new();
+        for item in store.iterator(IteratorMode::From(&prefix, Direction::Forward)) {
+            let (other, value) = item.map_err(in_flight_error)?;
+            if !other.starts_with(&prefix) {
+                break;
+            }
+            if *other != *key {
+                let prepared_at =
+                    PreparedDelivery::decode(&value).map_or(0, |delivery| delivery.prepared_at);
+                others.push((prepared_at, other));
+            }
+        }
+        if others.len() >= MAX_PREPARED_DELIVERIES {
+            others.sort();
+            for (_, other) in &others[..=others.len() - MAX_PREPARED_DELIVERIES] {
+                store
+                    .delete_opt(other, &synced())
+                    .map_err(in_flight_error)?;
+            }
+        }
+        store
+            .put_opt(key, delivery.encode(), &synced())
+            .map_err(in_flight_error)
+    }
+
+    /// Forget the transaction `signer` prepared for `message`, if one is
+    /// kept.
+    pub(crate) fn forget_prepared_delivery(
+        &self,
+        signer: &[u8; 32],
+        message: H256,
+    ) -> Result<(), HyperlaneDuskError> {
+        let Some(store) = &self.event_store else {
+            self.endpoint.forget_prepared_delivery(signer, message);
+            return Ok(());
+        };
+        let key = prepared_delivery_key(signer, message);
+        if store.get(&key).map_err(in_flight_error)?.is_none() {
+            return Ok(());
+        }
+        store.delete_opt(key, &synced()).map_err(in_flight_error)
     }
 
     /// The nonces `signer` holds, in nonce order. Fails on one the event
@@ -627,6 +769,118 @@ mod tests {
         let mut unknown = vec![0; 9];
         unknown.push(2);
         assert!(Reservation::decode(1, &unknown).is_none());
+    }
+
+    #[test]
+    fn prepared_deliveries_round_trip_and_reject_corruption() {
+        let delivery = PreparedDelivery {
+            tx_id: [7; 32],
+            prepared_at: 1_700_000_000_000,
+        };
+        assert_eq!(PreparedDelivery::decode(&delivery.encode()), Some(delivery));
+        let encoded = delivery.encode();
+        assert!(PreparedDelivery::decode(&encoded[1..]).is_none());
+        let mut longer = encoded;
+        longer.push(0);
+        assert!(PreparedDelivery::decode(&longer).is_none());
+    }
+
+    /// What a signer keeps for its deliveries one at a time survives a
+    /// restart, stays with the signer and the message, and is bounded,
+    /// in the event store and in memory alike.
+    #[test]
+    fn prepared_deliveries_survive_a_restart_and_are_bounded() {
+        let delivery = |tx: u8, prepared_at: u64| PreparedDelivery {
+            tx_id: [tx; 32],
+            prepared_at,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let url = Url::parse("http://127.0.0.1:9/prepared-deliveries").unwrap();
+        {
+            let client =
+                super::super::tests::test_client_with_event_store(url.clone(), directory.path());
+            client
+                .keep_prepared_delivery(&[1; 32], H256::repeat_byte(2), &delivery(3, 4))
+                .unwrap();
+            client
+                .keep_prepared_delivery(&[6; 32], H256::repeat_byte(2), &delivery(5, 4))
+                .unwrap();
+            // Kept again, the newer one replaces it.
+            client
+                .keep_prepared_delivery(&[1; 32], H256::repeat_byte(2), &delivery(8, 9))
+                .unwrap();
+        }
+        let durable = super::super::tests::test_client_with_event_store(url, directory.path());
+        let in_memory =
+            RuesClient::new(Url::parse("http://127.0.0.1:9/prepared-in-memory").unwrap()).unwrap();
+        in_memory
+            .keep_prepared_delivery(&[1; 32], H256::repeat_byte(2), &delivery(8, 9))
+            .unwrap();
+        in_memory
+            .keep_prepared_delivery(&[6; 32], H256::repeat_byte(2), &delivery(5, 4))
+            .unwrap();
+        for client in [&durable, &in_memory] {
+            assert_eq!(
+                client
+                    .prepared_delivery(&[1; 32], H256::repeat_byte(2))
+                    .unwrap(),
+                Some(delivery(8, 9))
+            );
+            assert_eq!(
+                client
+                    .prepared_delivery(&[1; 32], H256::repeat_byte(3))
+                    .unwrap(),
+                None
+            );
+            client
+                .forget_prepared_delivery(&[1; 32], H256::repeat_byte(2))
+                .unwrap();
+            // Forgetting one that is not kept changes nothing.
+            client
+                .forget_prepared_delivery(&[1; 32], H256::repeat_byte(2))
+                .unwrap();
+            assert_eq!(
+                client
+                    .prepared_delivery(&[1; 32], H256::repeat_byte(2))
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                client
+                    .prepared_delivery(&[6; 32], H256::repeat_byte(2))
+                    .unwrap(),
+                Some(delivery(5, 4))
+            );
+            // Past the bound, the one prepared longest ago goes, whatever
+            // its message: here the messages come in falling order.
+            let messages = MAX_PREPARED_DELIVERIES as u64 + 2;
+            for prepared_at in 0..messages {
+                client
+                    .keep_prepared_delivery(
+                        &[1; 32],
+                        H256::from_low_u64_be(messages - prepared_at),
+                        &delivery(1, prepared_at),
+                    )
+                    .unwrap();
+            }
+            let kept: Vec<u64> = (1..=messages)
+                .filter(|message| {
+                    client
+                        .prepared_delivery(&[1; 32], H256::from_low_u64_be(*message))
+                        .unwrap()
+                        .is_some()
+                })
+                .collect();
+            assert_eq!(kept.len(), MAX_PREPARED_DELIVERIES);
+            // The two prepared first went.
+            assert_eq!(kept.first(), Some(&1));
+            assert_eq!(kept.last(), Some(&(messages - 2)));
+            // The other signer's is still there.
+            assert!(client
+                .prepared_delivery(&[6; 32], H256::repeat_byte(2))
+                .unwrap()
+                .is_some());
+        }
     }
 
     #[test]

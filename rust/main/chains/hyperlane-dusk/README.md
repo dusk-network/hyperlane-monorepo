@@ -231,14 +231,29 @@ how to run the local bridge.
 - **Deliveries go one at a time by default.** The helper signs each
   delivery with the account's nonce plus one, as the node reports it,
   sends it and returns once it is in a block; the next delivery goes after
-  that. The agent chooses no nonce and keeps none. The node refuses a
-  transaction whose nonce its mempool holds for another one at
-  preverification, before propagation, so a delivery submitted again while
-  its first transaction still waits in the mempool is refused, and at most
-  one of them can be in a block. When the helper's outcome is unknown, the
-  agent follows the transaction it prepared by its exact hash. A relayer
-  key delivers about one message every two blocks this way: the next one
-  reaches the node after the next block's round has started.
+  that. The agent chooses no nonce. The node refuses a transaction whose
+  nonce its mempool holds for another one at preverification, before
+  propagation, so at most one transaction of a nonce can be in a block.
+  When the helper's outcome is unknown, the agent follows the transaction
+  it prepared by its exact hash. A relayer key delivers about one message
+  every two blocks this way: the next one reaches the node after the next
+  block's round has started.
+- **A delivery's transaction is kept until the delivery is done.** The
+  helper prints the hash of the transaction it prepared before it
+  propagates it, and the agent keeps that hash for the message in
+  `eventCursorDir` (in memory without one) at once, until the relayer
+  confirms the message delivered, at most 1,024 a signer. A delivery
+  submitted again looks its transaction up first: in a block and executed,
+  it is the delivery's outcome, and the relayer's confirmation goes on from
+  it; failed in a block, the delivery goes again once that block is final;
+  in the mempool, it is followed to its block; in neither, the delivery
+  goes again only 60 s after the transaction was prepared, as it may still
+  be on its way to the node. A transaction the node refused at
+  preverification is not kept. Otherwise, after a submission whose outcome
+  was unknown, the first transaction could land after the relayer's
+  simulation of the next submission passed and before the helper read the
+  account's nonce: the helper signed the next nonce, and a second
+  transaction landed and failed, paying its whole gas limit.
 - **Waiting for a block.** The node builds a block from what its mempool
   holds when the block's round starts, so a transaction it admits is in a
   block 10 to 20 s later on a 10 s chain. `dusk-tx` waits for a delivery
@@ -500,10 +515,11 @@ sequences, read their own log again instead of halting. To recover:
 2. Stop the agent.
 3. Reset its database (the store its contract sync indexed deliveries
    into, such as the scraper's) and its `eventCursorDir`, so that both
-   index the archive afresh. A pipelining relayer's `eventCursorDir` also
-   holds the nonces of its deliveries in flight (see Nonces in flight):
-   reset it only once the signer's transactions are in final blocks, or a
-   delivery still in the mempool could be sent again with another nonce.
+   index the archive afresh. A relayer's `eventCursorDir` also holds the
+   transactions of its deliveries in flight, and a pipelining relayer's
+   their nonces (see Nonces in flight): reset it only once the signer's
+   transactions are in final blocks, or a delivery still in the mempool
+   could be sent again with another nonce.
 4. Start the agent again.
 
 An archive that only numbers its rows differently, or changes blocks whose

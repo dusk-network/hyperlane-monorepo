@@ -42,7 +42,33 @@ pub async fn dusk_tx_call(
     args_bytes: &[u8],
     gas_limit: Option<u64>,
 ) -> Result<Value, HyperlaneDuskError> {
-    run_dusk_tx(
+    dusk_tx_call_naming(
+        conn,
+        signer,
+        contract_id,
+        fn_name,
+        args_bytes,
+        gas_limit,
+        &|_| {},
+    )
+    .await
+}
+
+/// `dusk_tx_call`, which calls `named` with the hash of the transaction
+/// the helper prepared as soon as the helper names it, while it runs: the
+/// helper prints `Prepared TX <hash>;` before it propagates the
+/// transaction. `named` is called at most once.
+pub(crate) async fn dusk_tx_call_naming(
+    conn: &ConnectionConf,
+    signer: &DuskSigner,
+    contract_id: &[u8; 32],
+    fn_name: &str,
+    args_bytes: &[u8],
+    gas_limit: Option<u64>,
+    named: &(dyn Fn(&str) + Sync),
+) -> Result<Value, HyperlaneDuskError> {
+    run_dusk_tx_at(
+        &conn.url,
         conn,
         signer,
         contract_id,
@@ -50,6 +76,8 @@ pub async fn dusk_tx_call(
         args_bytes,
         gas_limit,
         &[],
+        DUSK_TX_HELPER_TIMEOUT,
+        named,
     )
     .await
 }
@@ -145,6 +173,7 @@ pub(crate) async fn dusk_tx_sign(
         Some(gas_limit),
         &extra,
         timeout,
+        &|_| {},
     )
     .await;
     drop(server);
@@ -359,31 +388,9 @@ pub(crate) async fn helper_pipelines() -> bool {
     pipelines
 }
 
-async fn run_dusk_tx(
-    conn: &ConnectionConf,
-    signer: &DuskSigner,
-    contract_id: &[u8; 32],
-    fn_name: &str,
-    args_bytes: &[u8],
-    gas_limit: Option<u64>,
-    extra_args: &[String],
-) -> Result<Value, HyperlaneDuskError> {
-    run_dusk_tx_at(
-        &conn.url,
-        conn,
-        signer,
-        contract_id,
-        fn_name,
-        args_bytes,
-        gas_limit,
-        extra_args,
-        DUSK_TX_HELPER_TIMEOUT,
-    )
-    .await
-}
-
 /// Run the helper's `call` against the RUES endpoint at `url`, for at most
-/// `timeout`.
+/// `timeout`, calling `named` with the hash of the transaction it prepared
+/// as soon as it names it.
 #[allow(clippy::too_many_arguments)]
 async fn run_dusk_tx_at(
     url: &Url,
@@ -395,6 +402,7 @@ async fn run_dusk_tx_at(
     gas_limit: Option<u64>,
     extra_args: &[String],
     timeout: Duration,
+    named: &(dyn Fn(&str) + Sync),
 ) -> Result<Value, HyperlaneDuskError> {
     if args_bytes.len() > MAX_DUSK_TX_ARGS_BYTES {
         return Err(HyperlaneDuskError::Other(format!(
@@ -463,7 +471,7 @@ async fn run_dusk_tx_at(
             })?;
     }
 
-    let (output, prepared_tx_id) = wait_for_child_output(child, fn_name, timeout).await?;
+    let (output, prepared_tx_id) = wait_for_child_output(child, fn_name, timeout, named).await?;
     let json = helper_result(fn_name, &output, prepared_tx_id.as_deref())?;
 
     let tx_id = json
@@ -531,7 +539,7 @@ fn helper_result(
                 let detail = format!("dusk-tx call {fn_name} failed: {detail}");
                 // A complete preverify diagnostic proves propagation never ran.
                 if before_propagation_error(err) {
-                    return Err(HyperlaneDuskError::Other(detail));
+                    return Err(HyperlaneDuskError::NotSubmitted(detail));
                 }
                 return Err(helper_failure(prepared_tx_id, detail));
             }
@@ -571,10 +579,15 @@ fn helper_result(
     Ok(json)
 }
 
+/// The helper's output and the transaction it named, once it exits, or
+/// `timeout`'s error. `named` hears of that transaction as soon as the
+/// helper names it, which it does before it propagates it and waits for a
+/// block, so a caller can keep the hash before the outcome is known.
 async fn wait_for_child_output(
     mut child: tokio::process::Child,
     fn_name: &str,
     timeout: Duration,
+    named: &(dyn Fn(&str) + Sync),
 ) -> Result<(std::process::Output, Option<String>), HyperlaneDuskError> {
     let stdout = child.stdout.take().ok_or_else(|| {
         HyperlaneDuskError::Other("dusk-tx stdout pipe was not configured".into())
@@ -590,8 +603,24 @@ async fn wait_for_child_output(
         Some(prepared_tx_sender),
     ));
 
-    let status = tokio::time::timeout(timeout, child.wait())
-        .await
+    let mut prepared_tx_id: Option<String> = None;
+    let waited = tokio::time::timeout(timeout, async {
+        let mut naming = true;
+        loop {
+            tokio::select! {
+                status = child.wait() => return status,
+                tx_id = &mut prepared_tx_receiver, if naming => {
+                    naming = false;
+                    if let Ok(tx_id) = tx_id {
+                        named(&tx_id);
+                        prepared_tx_id = Some(tx_id);
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    let status = waited
         .map_err(|_| {
             format!(
                 "dusk-tx call {fn_name} exceeded the {}s helper deadline",
@@ -609,10 +638,9 @@ async fn wait_for_child_output(
             let _ = child.kill().await;
             let _ = child.wait().await;
             drain_timed_out_readers(&mut stdout_task, &mut stderr_task).await;
-            return Err(helper_failure(
-                prepared_tx_receiver.try_recv().ok().as_deref(),
-                detail,
-            ));
+            let prepared_tx_id =
+                prepared_tx_id.or_else(|| named_late(&mut prepared_tx_receiver, named));
+            return Err(helper_failure(prepared_tx_id.as_deref(), detail));
         }
     };
 
@@ -620,7 +648,7 @@ async fn wait_for_child_output(
     // A normal or signaled exit can interrupt the helper after propagation just
     // as a timeout can; the prepared hash remains authoritative in every case.
     let (stdout, stderr) = tokio::join!(stdout_task, stderr_task);
-    let prepared_tx_id = prepared_tx_receiver.try_recv().ok();
+    let prepared_tx_id = prepared_tx_id.or_else(|| named_late(&mut prepared_tx_receiver, named));
     let stdout = stdout
         .map_err(|error| {
             helper_failure(
@@ -645,6 +673,17 @@ async fn wait_for_child_output(
         },
         prepared_tx_id,
     ))
+}
+
+/// The transaction the stderr reader found after the helper stopped, if
+/// any, of which `named` then hears.
+fn named_late(
+    receiver: &mut oneshot::Receiver<String>,
+    named: &(dyn Fn(&str) + Sync),
+) -> Option<String> {
+    let tx_id = receiver.try_recv().ok()?;
+    named(&tx_id);
+    Some(tx_id)
 }
 
 fn helper_failure(prepared_tx_id: Option<&str>, detail: String) -> HyperlaneDuskError {
@@ -1004,7 +1043,7 @@ mod tests {
             .stderr(Stdio::piped());
         let child = command.spawn().unwrap();
         let started = tokio::time::Instant::now();
-        let error = wait_for_child_output(child, "test", Duration::from_millis(20))
+        let error = wait_for_child_output(child, "test", Duration::from_millis(20), &|_| {})
             .await
             .unwrap_err();
         assert!(error.to_string().contains("helper deadline"));
@@ -1025,14 +1064,62 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let child = command.spawn().unwrap();
-        let error = wait_for_child_output(child, "process", Duration::from_millis(200))
-            .await
-            .unwrap_err();
+        let named = StdMutex::new(Vec::new());
+        let error = wait_for_child_output(
+            child,
+            "process",
+            Duration::from_millis(200),
+            &|tx_id: &str| named.lock().unwrap().push(tx_id.to_owned()),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(
             error,
             HyperlaneDuskError::SubmissionOutcomeUnknown { tx_id: observed, .. }
                 if observed == tx_id
         ));
+        assert_eq!(*named.lock().unwrap(), [tx_id]);
+    }
+
+    /// The helper names its transaction before it propagates it, then waits
+    /// for its block: the caller hears of the hash at once, not when the
+    /// helper is done.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_prepared_transaction_is_named_while_the_helper_runs() {
+        let tx_id = "cd".repeat(32);
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!(
+                "printf '  Prepared TX {tx_id}; reconcile this exact hash before retrying if submission is interrupted\\n' >&2; sleep 1; printf '{{}}'"
+            ))
+            .kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = command.spawn().unwrap();
+        let started = std::time::Instant::now();
+        let named = StdMutex::new(Vec::new());
+        let (_, prepared) =
+            wait_for_child_output(child, "process", Duration::from_secs(5), &|tx_id: &str| {
+                named
+                    .lock()
+                    .unwrap()
+                    .push((tx_id.to_owned(), started.elapsed()))
+            })
+            .await
+            .unwrap();
+        let finished = started.elapsed();
+        assert_eq!(prepared.as_deref(), Some(tx_id.as_str()));
+        let named = named.into_inner().unwrap();
+        assert_eq!(named.len(), 1);
+        assert_eq!(named[0].0, tx_id);
+        // Named about a second before the helper was done.
+        assert!(
+            named[0].1 + Duration::from_millis(500) < finished,
+            "{:?} {finished:?}",
+            named[0].1
+        );
     }
 
     #[tokio::test]
@@ -1152,9 +1239,10 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let child = command.spawn().unwrap();
-        let (output, prepared) = wait_for_child_output(child, "process", Duration::from_secs(5))
-            .await
-            .unwrap();
+        let (output, prepared) =
+            wait_for_child_output(child, "process", Duration::from_secs(5), &|_| {})
+                .await
+                .unwrap();
         assert_eq!(output.stderr.len(), 900_000);
         let error = helper_result("process", &output, prepared.as_deref())
             .unwrap_err()
@@ -1182,7 +1270,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let child = command.spawn().unwrap();
-        let error = wait_for_child_output(child, "test", Duration::from_secs(2))
+        let error = wait_for_child_output(child, "test", Duration::from_secs(2), &|_| {})
             .await
             .unwrap_err();
         assert!(error.to_string().contains("stdout exceeds"));

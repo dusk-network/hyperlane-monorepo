@@ -36,7 +36,7 @@ use url::Url;
 use hyperlane_core::H256;
 
 use super::batch::Multicall;
-use super::submissions::{Reservation, SentDelivery};
+use super::submissions::{PreparedDelivery, Reservation, SentDelivery, MAX_PREPARED_DELIVERIES};
 use super::{BlockPair, DeploymentIdentity, IdentityGate};
 use crate::final_records::FinalRecords;
 
@@ -201,6 +201,9 @@ pub(crate) struct Endpoint {
     /// The nonces signers hold, by signer and nonce, for clients that keep
     /// no event store.
     reservations: StdMutex<BTreeMap<([u8; 32], u64), Reservation>>,
+    /// The transactions prepared for deliveries sent one at a time, by
+    /// signer and message, for clients that keep no event store.
+    prepared: StdMutex<BTreeMap<([u8; 32], H256), PreparedDelivery>>,
     /// The signers whose deliveries this process no longer pipelines:
     /// another sender used their nonces.
     stopped: StdMutex<HashSet<[u8; 32]>>,
@@ -240,6 +243,7 @@ impl Endpoint {
             submission_locks: StdMutex::new(HashMap::new()),
             sent_deliveries: StdMutex::new(BTreeMap::new()),
             reservations: StdMutex::new(BTreeMap::new()),
+            prepared: StdMutex::new(BTreeMap::new()),
             stopped: StdMutex::new(HashSet::new()),
         });
         endpoints.insert(key, Arc::downgrade(&endpoint));
@@ -352,6 +356,46 @@ impl Endpoint {
 
     pub(crate) fn release_reservation(&self, signer: &[u8; 32], nonce: u64) {
         self.held().remove(&(*signer, nonce));
+    }
+
+    fn prepared(&self) -> std::sync::MutexGuard<'_, BTreeMap<([u8; 32], H256), PreparedDelivery>> {
+        self.prepared.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn prepared_delivery(
+        &self,
+        signer: &[u8; 32],
+        message: H256,
+    ) -> Option<PreparedDelivery> {
+        self.prepared().get(&(*signer, message)).copied()
+    }
+
+    /// Keep `delivery`, and at most `MAX_PREPARED_DELIVERIES` of the
+    /// signer's, forgetting the one prepared longest ago past it.
+    pub(crate) fn keep_prepared_delivery(
+        &self,
+        signer: &[u8; 32],
+        message: H256,
+        delivery: PreparedDelivery,
+    ) {
+        let mut prepared = self.prepared();
+        prepared.remove(&(*signer, message));
+        let range = (*signer, H256::zero())..=(*signer, H256::repeat_byte(0xff));
+        while prepared.range(range.clone()).count() >= MAX_PREPARED_DELIVERIES {
+            let oldest = prepared
+                .range(range.clone())
+                .min_by_key(|(_, kept)| kept.prepared_at)
+                .map(|(key, _)| *key);
+            match oldest {
+                Some(oldest) => prepared.remove(&oldest),
+                None => break,
+            };
+        }
+        prepared.insert((*signer, message), delivery);
+    }
+
+    pub(crate) fn forget_prepared_delivery(&self, signer: &[u8; 32], message: H256) {
+        self.prepared().remove(&(*signer, message));
     }
 
     /// Stop pipelining `signer`'s deliveries in this process.
