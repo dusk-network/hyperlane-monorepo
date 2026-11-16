@@ -235,6 +235,8 @@ pub struct Model {
     /// The transaction lookups miss (`Node::hide_for`): its ID, for how
     /// long, and since the first lookup that missed it.
     hidden: Option<(String, Duration, Option<Instant>)>,
+    /// How long each lookup of a transaction takes (`Node::slow_lookups`).
+    lookup_delay: Option<Duration>,
 }
 
 impl Model {
@@ -258,6 +260,7 @@ impl Model {
             paused: false,
             frozen: false,
             hidden: None,
+            lookup_delay: None,
         };
         model.publish();
         model
@@ -1021,6 +1024,12 @@ impl Node {
         self.model().hidden = Some((tx_id.to_owned(), window, None));
     }
 
+    /// Answer every lookup of a transaction (`tx`, `mempoolTx`) only
+    /// `delay` after it comes, as a slow node does, or at once again.
+    pub fn slow_lookups(&self, delay: Option<Duration>) {
+        self.model().lookup_delay = delay;
+    }
+
     pub fn evict_from(&self, nonce: u64) {
         self.model().evict_from(nonce);
     }
@@ -1327,6 +1336,12 @@ fn serve(
             return reply(stream, "200 OK", answer.to_string().as_bytes());
         }
         None => {}
+    }
+    if route == Route::Graphql && !looked_up(&query).is_empty() {
+        let delay = state.lock().unwrap().lookup_delay;
+        if let Some(delay) = delay {
+            thread::sleep(delay);
+        }
     }
     let (status, answer): (&str, Vec<u8>) = {
         let mut model = state.lock().unwrap();

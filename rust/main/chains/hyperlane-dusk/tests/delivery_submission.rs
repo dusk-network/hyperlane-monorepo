@@ -2152,8 +2152,10 @@ async fn keep_one_in_the_mempool(
 /// around the reading of the account: the first read of the tip returns P;
 /// C comes, with what the mempool held at P, and makes P final; the account
 /// read shows C's transactions; C is rolled back, they go back into the
-/// mempool, and `then` runs; and the second read of the tip returns P
-/// again. How many kept transactions were forgotten.
+/// mempool, and `then` runs; and the node's next GraphQL read after the
+/// account read is answered only then: the second read of the tip, which
+/// returns P again, or, when the look takes no reading, its first lookup.
+/// How many kept transactions were forgotten.
 async fn reclaim_across_a_rolled_back_block(
     node: &Node,
     mailbox: &hyperlane_dusk::DuskMailbox,
@@ -2837,9 +2839,11 @@ async fn a_kept_transaction_missed_for_a_moment_is_not_forgotten() {
     let gap = Duration::from_secs(1);
     let block = Duration::from_secs(1);
     let (node, mailbox, (message, _, _)) = keep_one_in_the_mempool(gap).await;
+    // Room for a look's pause within its deadline.
     let mailbox = mailbox.with_submission_limits(SubmissionLimits {
         nonce_gap: gap,
         block,
+        receipt: Duration::from_secs(3),
         ..patient(64)
     });
     let kept = node.model().mempool[&1].id.clone();
@@ -2985,5 +2989,130 @@ async fn a_look_at_kept_transactions_for_room_ends_within_the_receipt_wait() {
     assert!(took < budget * 2, "took {took:?}");
     assert_eq!(node.invocations().len(), calls);
     assert!(mailbox.prepared_transaction(lost.0.id()).unwrap().is_some());
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+/// The review's starvation (w17). Each look for room ends within the
+/// receipt wait, and the node answers so slowly that no look reaches its
+/// pause: it misses an abandoned transaction whose nonce is used for good,
+/// and is cut short before its second lookup. That miss used to be lost
+/// with the look, and every look after was cut short the same way, so the
+/// signer stayed at its bound with transactions it could forget. A miss is
+/// now kept across looks, and the next look looks it up again first: the
+/// abandoned transactions go, the one kept without its nonce stays.
+#[tokio::test]
+async fn looks_for_room_cut_short_by_their_deadline_still_free_it() {
+    let _env = HELPER_ENV.lock().await;
+    // Finality follows the tip one block behind.
+    let node = Node::start(false);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let gap = Duration::from_secs(1);
+    let limits = SubmissionLimits {
+        prepared: 3,
+        nonce_gap: gap,
+        ..patient(64)
+    };
+    let mailbox = node.mailbox(false).with_submission_limits(limits);
+    let abandoned: Vec<_> = (7..10).map(delivery).collect();
+    // Two are kept with nonces 1 and 2, which deliveries then use; the
+    // third by a dusk-tx that names no nonce.
+    lose(&node, &mailbox, &abandoned[0], 1).await;
+    deliver(&mailbox, &delivery(0)).await;
+    lose(&node, &mailbox, &abandoned[1], 2).await;
+    deliver(&mailbox, &delivery(1)).await;
+    node.old_prepared_line(true);
+    lose(&node, &mailbox, &abandoned[2], 3).await;
+    node.old_prepared_line(false);
+    // Two readings the gap apart come to show nonces 1 and 2 used.
+    assert_eq!(mailbox.reclaim_kept_transactions().await.unwrap(), 0);
+    tokio::time::sleep(BLOCK_TIME * 3).await;
+    assert_eq!(mailbox.reclaim_kept_transactions().await.unwrap(), 0);
+    tokio::time::sleep(gap).await;
+    // A lookup that misses a transaction now takes 800 ms, and a look ends
+    // within 1.2 s: one lookup at most per look.
+    node.slow_lookups(Some(Duration::from_millis(200)));
+    let slow = mailbox.clone().with_submission_limits(SubmissionLimits {
+        receipt: Duration::from_millis(1_200),
+        ..limits
+    });
+    let gone = |delivery: &(
+        hyperlane_core::HyperlaneMessage,
+        hyperlane_core::Metadata,
+        Option<U256>,
+    )| {
+        mailbox
+            .prepared_transaction(delivery.0.id())
+            .unwrap()
+            .is_none()
+    };
+    let mut looks = 0;
+    while !(gone(&abandoned[0]) && gone(&abandoned[1])) {
+        assert!(looks < 8, "room was never freed");
+        slow.reclaim_kept_transactions().await.unwrap();
+        looks += 1;
+    }
+    assert!(!gone(&abandoned[2]));
+    node.slow_lookups(None);
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+/// A miss a look for room left, its pause cut short by its deadline, is
+/// looked up again first by the next look, which forgets it only if it
+/// misses it again. Found in the mempool, or in a block, it stays.
+#[tokio::test]
+async fn a_kept_transaction_found_on_its_second_look_stays() {
+    let _env = HELPER_ENV.lock().await;
+    let gap = Duration::from_secs(1);
+    let (node, mailbox, (message, _, _)) = keep_one_in_the_mempool(gap).await;
+    let kept = node.model().mempool[&1].id.clone();
+    // Looks whose pause, half a block, outlasts their deadline.
+    let block = Duration::from_secs(4);
+    let short = mailbox.clone().with_submission_limits(SubmissionLimits {
+        nonce_gap: gap,
+        block,
+        receipt: Duration::from_secs(1),
+        ..patient(64)
+    });
+    // A first reading shows nonce 1 used, at block P, now final.
+    node.produce_block();
+    assert_eq!(
+        reclaim_across_a_rolled_back_block(&node, &mailbox, |_| {}).await,
+        0
+    );
+    tokio::time::sleep(gap).await;
+    // The gap later, a look reads nonce 1 used again, misses T for a
+    // moment, and runs out in its pause.
+    node.hide_for(&kept, Duration::from_millis(500));
+    assert_eq!(
+        reclaim_across_a_rolled_back_block(&node, &short, |_| {}).await,
+        0
+    );
+    // Half a block later, the next look, which reads nonce 1 used too,
+    // finds T in the mempool: it stays.
+    tokio::time::sleep(block / 2).await;
+    assert_eq!(
+        reclaim_across_a_rolled_back_block(&node, &short, |_| {}).await,
+        0
+    );
+    assert!(mailbox
+        .prepared_transaction(message.id())
+        .unwrap()
+        .is_some());
+    // Missed again, it is found in a block by the next look: it stays.
+    node.hide_for(&kept, Duration::from_millis(500));
+    assert_eq!(
+        reclaim_across_a_rolled_back_block(&node, &short, |_| {}).await,
+        0
+    );
+    tokio::time::sleep(block / 2).await;
+    assert_eq!(
+        reclaim_across_a_rolled_back_block(&node, &short, |node| node.produce_block()).await,
+        0
+    );
+    assert!(node.model().included(&kept).is_some());
+    assert!(mailbox
+        .prepared_transaction(message.id())
+        .unwrap()
+        .is_some());
     std::env::remove_var("DUSK_TX_BIN");
 }

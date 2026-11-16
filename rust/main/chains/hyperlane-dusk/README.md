@@ -288,9 +288,10 @@ how to run the local bridge.
   bound, a delivery looks kept transactions up, the oldest first and on
   later tries on from where the last look stopped, at most 16 at a time,
   and forgets those it can, within the 120 s receipt wait: a look that
-  runs out keeps what it found, and the next goes on from there. Every 5
-  minutes a delivery does the same for the kept transactions of other
-  messages, so that those of messages the
+  runs out keeps what it found, the transactions it missed included, and
+  the next looks those up again before anything else. Every 5 minutes a
+  delivery does the same for the kept transactions of other messages, so
+  that those of messages the
   relayer gave up on do not pile up to the bound; it reads nothing while
   nothing else is kept. A transaction whose nonce is used goes 10 minutes
   after the first reading that shows it, at the earliest; a reading taken

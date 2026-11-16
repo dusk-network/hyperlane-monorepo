@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::Duration;
@@ -137,6 +137,22 @@ impl FinalNonce {
         }
         self.older.filter(aged)
     }
+}
+
+/// A kept transaction a lookup for room missed, in neither the mempool nor
+/// a block, with its nonce shown used, until a second lookup
+/// (`DuskMailbox::reclaim_prepared`): which transaction, and when it was
+/// missed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Missed {
+    tx_id: [u8; 32],
+    at: std::time::Instant,
+}
+
+/// Whether two readings of the account show nonce `nonce` used, up to
+/// `used` (`DuskMailbox::nonce_evidence`).
+fn nonce_used(nonce: Option<u64>, used: Option<u64>) -> bool {
+    matches!((nonce, used), (Some(nonce), Some(used)) if nonce <= used)
 }
 
 /// What a delivery check found.
@@ -337,6 +353,10 @@ pub struct DuskMailbox {
     last_sweep: Arc<StdMutex<Option<std::time::Instant>>>,
     /// The signer's nonce at the last final block, as far as shown.
     final_nonce: Arc<StdMutex<FinalNonce>>,
+    /// The kept transactions a lookup for room missed, by message, until
+    /// they are looked up again (`reclaim_prepared`): kept across looks, so
+    /// that a look cut short by its deadline loses none.
+    missed: Arc<StdMutex<BTreeMap<H256, Missed>>>,
     /// Kept transactions known to have left the mempool
     /// (`wait_for_signer`).
     settled: Arc<StdMutex<std::collections::HashSet<[u8; 32]>>>,
@@ -394,6 +414,7 @@ impl DuskMailbox {
             prepared_scan: Arc::default(),
             last_sweep: Arc::default(),
             final_nonce: Arc::default(),
+            missed: Arc::default(),
             settled: Arc::default(),
             pipelined,
         }
@@ -886,9 +907,13 @@ impl DuskMailbox {
     ///   one taken now, at least `SubmissionLimits::nonce_gap` after it
     ///   (`nonce_evidence`), before the transaction is looked up. A lookup
     ///   can miss a transaction that stays on the node (`transaction_status`
-    ///   says how), so each such transaction is looked up again half a block
-    ///   (`SubmissionLimits::block`) later, after one pause for all of them,
-    ///   and goes only if it is missed again.
+    ///   says how), so each such transaction is noted as missed, looked up
+    ///   again at least half a block (`SubmissionLimits::block`) later, and
+    ///   goes only if it is missed again, its nonce still shown used. A look
+    ///   looks earlier misses up again first, and at its end waits once
+    ///   until all of them are half a block old, its own included, and looks
+    ///   those up again; a later look does it for those a look cut short
+    ///   left.
     ///
     /// Everything else is kept: a transaction in a block that is not final;
     /// one in the mempool, whatever the readings show, since a rollback puts
@@ -898,8 +923,9 @@ impl DuskMailbox {
     /// record that does not decode cannot be looked up, and stays.
     ///
     /// A pass ends within `SubmissionLimits::receipt`: one that runs out,
-    /// its requests slow, keeps what it forgot so far, the cursor where it
-    /// stopped, and counts only what it looked up.
+    /// its requests slow, keeps what it forgot so far, the transactions it
+    /// missed and the cursor where it stopped, and counts only what it
+    /// looked up.
     async fn reclaim_prepared(
         &self,
         key: &[u8; 32],
@@ -939,6 +965,16 @@ impl DuskMailbox {
                 delivery.map(|delivery| (delivery.prepared_at, other, delivery))
             })
             .collect();
+        // A miss whose record has gone, or holds another transaction now, is
+        // dropped.
+        self.missed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|other, missed| {
+                candidates
+                    .iter()
+                    .any(|(_, kept, delivery)| kept == other && delivery.tx_id == missed.tx_id)
+            });
         if candidates.is_empty() {
             return Ok(());
         }
@@ -951,15 +987,24 @@ impl DuskMailbox {
             candidates.partition_point(|(prepared_at, other, _)| (*prepared_at, *other) <= after)
         });
         let (used, finalized) = self.nonce_evidence(signer).await?;
-        // In neither place, with its nonce used: it goes if it is missed
-        // again after the pause.
-        let mut missed = Vec::new();
+        // Earlier misses first, so that looks cut short by their deadline
+        // still get on.
+        self.look_again(key, &candidates, used, tally).await?;
         let batch = candidates.len().min(PREPARED_LOOKUPS);
         for (prepared_at, other, delivery) in candidates.iter().cycle().skip(start).take(batch) {
             *self
                 .prepared_scan
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = Some((*prepared_at, *other));
+            // A miss waits for its second lookup.
+            if self
+                .missed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(other)
+            {
+                continue;
+            }
             let status = self
                 .rues
                 .transaction_status(&hex::encode(delivery.tx_id))
@@ -979,25 +1024,87 @@ impl DuskMailbox {
                 // A rollback puts a transaction back into the mempool.
                 TransactionStatus::Pending => continue,
                 TransactionStatus::Unknown => {
-                    if matches!((delivery.nonce, used), (Some(nonce), Some(used)) if nonce <= used)
-                    {
-                        missed.push((*other, delivery));
+                    if nonce_used(delivery.nonce, used) {
+                        let mut missed = self.missed.lock().unwrap_or_else(PoisonError::into_inner);
+                        if missed.len() < self.limits.prepared {
+                            missed.insert(
+                                *other,
+                                Missed {
+                                    tx_id: delivery.tx_id,
+                                    at: std::time::Instant::now(),
+                                },
+                            );
+                        }
                     }
                     continue;
                 }
             }
             tally.1 += usize::from(self.forget_kept(key, *other, delivery)?);
         }
-        if !missed.is_empty() {
-            tokio::time::sleep(self.limits.block / 2).await;
-            for (other, delivery) in missed {
-                let status = self
-                    .rues
-                    .transaction_status(&hex::encode(delivery.tx_id))
-                    .await?;
-                if status == TransactionStatus::Unknown {
-                    tally.1 += usize::from(self.forget_kept(key, other, delivery)?);
-                }
+        // Misses not half a block old yet, this look's or an earlier one's,
+        // are looked up again once they all are, if the look has the time.
+        let due = self
+            .missed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .map(|missed| missed.at + self.limits.block / 2)
+            .max();
+        if let Some(due) = due {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
+            self.look_again(key, &candidates, used, tally).await?;
+        }
+        Ok(())
+    }
+
+    /// Look the kept transactions a lookup for room missed at least half a
+    /// block (`SubmissionLimits::block`) ago up again, at most
+    /// `PREPARED_LOOKUPS`, the earliest missed first, and forget those
+    /// missed again whose nonce `used`, from this look's readings, still
+    /// covers. A miss is dropped once looked up again, whatever that finds,
+    /// and so is one whose record that nonce no longer covers.
+    async fn look_again(
+        &self,
+        key: &[u8; 32],
+        candidates: &[(u64, H256, PreparedDelivery)],
+        used: Option<u64>,
+        tally: &mut (usize, usize),
+    ) -> ChainResult<()> {
+        let due: Vec<(H256, Missed)> = {
+            let missed = self.missed.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut due: Vec<_> = missed
+                .iter()
+                .filter(|(_, missed)| missed.at.elapsed() >= self.limits.block / 2)
+                .map(|(other, missed)| (*other, *missed))
+                .collect();
+            due.sort_by_key(|(other, missed)| (missed.at, *other));
+            due.truncate(PREPARED_LOOKUPS);
+            due
+        };
+        for (other, missed) in due {
+            let kept = candidates
+                .iter()
+                .find(|(_, kept, delivery)| *kept == other && delivery.tx_id == missed.tx_id)
+                .map(|(_, _, delivery)| delivery)
+                .filter(|delivery| nonce_used(delivery.nonce, used));
+            let Some(delivery) = kept else {
+                self.missed
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&other);
+                continue;
+            };
+            let status = self
+                .rues
+                .transaction_status(&hex::encode(missed.tx_id))
+                .await?;
+            tally.0 += 1;
+            self.missed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&other);
+            if status == TransactionStatus::Unknown {
+                tally.1 += usize::from(self.forget_kept(key, other, delivery)?);
             }
         }
         Ok(())
