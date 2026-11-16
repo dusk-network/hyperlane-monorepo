@@ -978,6 +978,20 @@ impl Node {
         self.model().delivered.insert(process_args_hex(delivery));
     }
 
+    /// Have another process that signs with the agent's key send a
+    /// transaction with `nonce`, as the node would take it.
+    pub fn send_foreign(&self, nonce: u64) -> Result<(), Refusal> {
+        let tx = Tx {
+            id: format!("{:032x}{:032x}", nonce, u64::MAX),
+            nonce,
+            gas_price: 1,
+            gas_limit: GAS_LIMIT,
+            function: "transfer".into(),
+            args: String::new(),
+        };
+        self.model().propagate(tx)
+    }
+
     /// Make the agent read the tip and the last final block again at its
     /// next request, as if a tick had passed.
     pub async fn expire_block_pair(&self) {

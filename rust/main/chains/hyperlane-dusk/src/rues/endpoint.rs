@@ -23,7 +23,7 @@
 //! nothing new costs that one read.
 
 use std::collections::hash_map::RandomState;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, PoisonError, Weak};
@@ -201,6 +201,9 @@ pub(crate) struct Endpoint {
     /// The nonces signers hold, by signer and nonce, for clients that keep
     /// no event store.
     reservations: StdMutex<BTreeMap<([u8; 32], u64), Reservation>>,
+    /// The signers whose deliveries this process no longer pipelines:
+    /// another sender used their nonces.
+    stopped: StdMutex<HashSet<[u8; 32]>>,
 }
 
 type Endpoints = HashMap<String, Weak<Endpoint>>;
@@ -237,6 +240,7 @@ impl Endpoint {
             submission_locks: StdMutex::new(HashMap::new()),
             sent_deliveries: StdMutex::new(BTreeMap::new()),
             reservations: StdMutex::new(BTreeMap::new()),
+            stopped: StdMutex::new(HashSet::new()),
         });
         endpoints.insert(key, Arc::downgrade(&endpoint));
         endpoint
@@ -348,6 +352,23 @@ impl Endpoint {
 
     pub(crate) fn release_reservation(&self, signer: &[u8; 32], nonce: u64) {
         self.held().remove(&(*signer, nonce));
+    }
+
+    /// Stop pipelining `signer`'s deliveries in this process.
+    pub(crate) fn stop_pipelining(&self, signer: [u8; 32]) {
+        self.stopped
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(signer);
+    }
+
+    /// Whether `signer`'s deliveries are no longer pipelined in this
+    /// process.
+    pub(crate) fn pipelining_stopped(&self, signer: &[u8; 32]) -> bool {
+        self.stopped
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(signer)
     }
 
     /// Forget the last read of the tip and last final block, as if a tick

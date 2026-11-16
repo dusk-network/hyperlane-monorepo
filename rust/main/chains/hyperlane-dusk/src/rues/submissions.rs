@@ -272,6 +272,17 @@ impl RuesClient {
         self.endpoint.submission_lock(signer)
     }
 
+    /// Stop pipelining the deliveries of `signer` in this process: another
+    /// sender uses its nonces.
+    pub(crate) fn stop_pipelining(&self, signer: [u8; 32]) {
+        self.endpoint.stop_pipelining(signer);
+    }
+
+    /// Whether pipelining stopped for `signer` in this process.
+    pub(crate) fn pipelining_stopped(&self, signer: &[u8; 32]) -> bool {
+        self.endpoint.pipelining_stopped(signer)
+    }
+
     /// The deliveries the previous version kept in flight for `signer`, by
     /// message. Fails on one the event store holds that does not decode:
     /// its nonce is unknown, and nothing may be sent until it is looked at.

@@ -1282,7 +1282,11 @@ impl Mailbox for DuskMailbox {
     /// (`ConnectionConf::pipelines_deliveries`). Otherwise the relayer
     /// submits every delivery on its own, through `process`.
     fn supports_batching(&self) -> bool {
-        self.signer.is_some() && self.pipelined
+        self.pipelined
+            && self
+                .signer
+                .as_ref()
+                .is_some_and(|signer| !self.rues.pipelining_stopped(&signer_key(signer)))
     }
 
     async fn process_batch<'a>(&self, ops: Vec<&'a QueueOperation>) -> ChainResult<BatchResult> {

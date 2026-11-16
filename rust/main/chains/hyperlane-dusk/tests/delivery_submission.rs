@@ -1054,6 +1054,42 @@ async fn deliveries_in_blocks_that_are_not_final_count_toward_the_bound_through_
 }
 
 #[tokio::test]
+async fn another_sender_of_the_key_stops_pipelining() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start(true);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let mailbox = node.mailbox(true).with_submission_limits(patient(64));
+    let deliveries: Vec<_> = (0..2).map(delivery).collect();
+    node.pause(true);
+    mailbox.process_deliveries(&deliveries).await.unwrap();
+    // The node drops both, and another process that signs with the key
+    // takes nonce 1.
+    node.evict_from(1);
+    node.send_foreign(1).unwrap();
+    node.pause(false);
+    node.wait_until("the other sender's transaction is in a block", |model| {
+        model.nonce == 1
+    })
+    .await;
+    tokio::time::sleep(PAST_DROP_GRACE).await;
+    // The relayer finds a nonce it holds used by a transaction it did not
+    // sign: it stops pipelining, and sends nothing.
+    assert!(mailbox.supports_batching());
+    let batch = mailbox.process_deliveries(&deliveries).await.unwrap();
+    assert!(batch.outcome.is_none());
+    assert_eq!(batch.failed_indexes, [0, 1]);
+    assert!(!mailbox.supports_batching());
+    // Deliveries go one at a time from then on, signed by dusk-tx.
+    let calls = node.invocations().len();
+    one_by_one(&mailbox, &deliveries).await;
+    assert!(!chose_a_nonce_since(&node, calls));
+    assert_eq!(node.propagated(), [1, 2, 1, 2, 3]);
+    assert_eq!(mailbox.deliveries_in_flight().unwrap(), 0);
+    node.settle(3).await;
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+#[tokio::test]
 async fn a_batch_sends_nothing_past_its_deadline_whatever_the_helper_or_the_node_do() {
     let _env = HELPER_ENV.lock().await;
     let node = Node::start(true);

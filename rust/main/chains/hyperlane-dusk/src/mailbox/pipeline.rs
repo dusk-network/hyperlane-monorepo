@@ -28,7 +28,8 @@
 //!   gets a filler. Neither needs room under the bound, so the signer
 //!   never stalls behind a gap.
 //! - When the account has used a held nonce for none of its transactions,
-//!   another process signs with the key: nothing is sent.
+//!   another process signs with the key: pipelining stops in this process
+//!   with a critical error, and deliveries go one at a time.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
@@ -245,10 +246,13 @@ fn tx_bytes(tx_id: &str) -> Option<[u8; 32]> {
 }
 
 impl DuskMailbox {
-    /// Whether deliveries are pipelined now: the chain opted in, and the
-    /// helper can sign with a given nonce.
-    pub(super) async fn pipelines_now(&self, _signer: &DuskSigner) -> bool {
-        self.pipelined && crate::tx_sender::helper_pipelines().await
+    /// Whether deliveries are pipelined now: the chain opted in, the
+    /// helper can sign with a given nonce, and no other sender was found
+    /// using the signer's nonces in this process.
+    pub(super) async fn pipelines_now(&self, signer: &DuskSigner) -> bool {
+        self.pipelined
+            && !self.rues.pipelining_stopped(&signer_key(signer))
+            && crate::tx_sender::helper_pipelines().await
     }
 
     /// Submit `deliveries`, each a message, its metadata and the relayer's
@@ -497,12 +501,15 @@ impl DuskMailbox {
             .map(|(nonce, _)| *nonce)
             .collect();
         if !taken.is_empty() {
+            self.rues.stop_pipelining(key);
             error!(
                 nonces = ?taken,
                 signer = %signer.address_string(),
-                "Another sender used nonces of the Dusk signer that this relayer's pipelined deliveries hold; nothing is sent"
+                "CRITICAL: another sender used nonces of the Dusk signer that this relayer's pipelined deliveries hold. Only one process may sign with a key while it pipelines deliveries: check every relayer and validator configured with this key. This process no longer pipelines this signer's deliveries and sends them one at a time"
             );
-            return Ok(left_out("another sender used the signer's nonces".into()));
+            return Ok(left_out(
+                "another sender used the signer's nonces, and deliveries go one at a time".into(),
+            ));
         }
         let (steps, mut fates) = plan(&survey, ready, self.limits.outstanding);
         let mut held = survey.held;

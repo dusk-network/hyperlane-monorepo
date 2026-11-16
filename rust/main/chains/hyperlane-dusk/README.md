@@ -236,7 +236,9 @@ how to run the local bridge.
   only sets `maxBatchSize`, as the deploy scripts write it, delivers one at
   a time. The agent logs the mode once at startup. **While it pipelines, a
   relayer must be the only process that signs with its key on that chain:
-  no other relayer, validator or wallet may use the key.** The
+  no other relayer, validator or wallet may use the key.** One that finds a
+  nonce it holds used by a transaction it did not sign logs a critical
+  error and delivers one at a time from then on, until restarted. The
   helper signs each pipelined transaction without sending it: the agent
   gives it the URL of an endpoint of its own on the loopback interface,
   under a path no other process can guess, which answers its chain ID query
