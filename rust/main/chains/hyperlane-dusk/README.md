@@ -232,16 +232,22 @@ how to run the local bridge.
   sender paid for, but at most `gasLimit` and Rusk's block gas limit of
   3,000,000,000: the mempool keeps a transaction over the block gas limit
   without any block taking it, and a failed transaction pays its whole limit.
-- **Deliveries go one at a time by default.** The helper signs each
-  delivery with the account's nonce plus one, as the node reports it,
-  sends it and returns once it is in a block; the next delivery goes after
-  that. The agent chooses no nonce. The node refuses a transaction whose
-  nonce its mempool holds for another one at preverification, before
-  propagation, so at most one transaction of a nonce can be in a block.
-  When the helper's outcome is unknown, the agent follows the transaction
-  it prepared by its exact hash. A relayer key delivers about one message
-  every two blocks this way: the next one reaches the node after the next
-  block's round has started.
+- **Deliveries go one at a time by default.** The helper signs each delivery
+  with the account's nonce plus one, as the node reports it, sends it and
+  returns once it is in a block; the next delivery goes after that. The
+  agent chooses no nonce. The node refuses a transaction whose nonce its
+  mempool holds for another one at preverification, before propagation, so
+  at most one transaction of a nonce can be in a block. When the helper's
+  outcome is unknown, the agent follows the transaction it prepared by its
+  exact hash. A relayer key delivers about one message every two blocks this
+  way: the next one reaches the node after the next block's round has
+  started. Before a delivery is simulated and signed, it waits for the
+  transaction kept for the signer's latest delivery of another message to
+  leave the mempool, for at most the 120 s receipt wait, signing nothing
+  meanwhile: that transaction holds the nonce the helper would sign with,
+  and a relayer restarted while one waited there used to sign every other
+  ready message with it, each refused at preverification with an error. Only
+  that transaction is looked up, and only until its outcome is known.
 - **A delivery's transaction is kept before it is sent, until the delivery
   is done.** The helper signs the transaction, prints its hash, and waits
   for the agent's word before it preverifies and propagates it

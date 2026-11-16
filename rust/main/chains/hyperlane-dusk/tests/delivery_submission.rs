@@ -2082,3 +2082,63 @@ async fn deliveries_sweep_abandoned_transactions_whose_nonces_are_used_for_good(
     assert_eq!(node.propagated(), [1, 2, 3]);
     std::env::remove_var("DUSK_TX_BIN");
 }
+
+/// The E2E's restart backlog: the relayer restarts while a delivery's
+/// transaction waits in the mempool, and submits other ready messages
+/// first. Each used to be simulated, signed at the account's nonce plus
+/// one, which that transaction holds, and refused at preverification, one
+/// error each. They now wait for that transaction to leave the mempool,
+/// without being signed, and then go, each once.
+#[tokio::test]
+async fn deliveries_wait_for_the_signers_transaction_in_flight_after_a_restart() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start(false);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    // The helper waits 200 ms for a block.
+    node.helper_waits(10);
+    let store = tempfile::tempdir().unwrap();
+    let deliveries: Vec<_> = (0..4).map(delivery).collect();
+    // The first delivery's transaction waits in the mempool when the
+    // relayer stops.
+    node.pause(true);
+    let relayer = node
+        .durable_mailbox(store.path(), false)
+        .with_submission_limits(patient(64));
+    let (message, metadata, gas_limit) = &deliveries[0];
+    let error = relayer
+        .process(message, metadata, *gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("to be included"), "{error}");
+    drop(relayer);
+    node.restart(store.path());
+    // Restarted, the relayer submits the others first: they wait.
+    let relayer = node
+        .durable_mailbox(store.path(), false)
+        .with_submission_limits(SubmissionLimits {
+            receipt: Duration::from_secs(10),
+            ..patient(64)
+        });
+    let calls = node.invocations().len();
+    let others = tokio::spawn({
+        let relayer = relayer.clone();
+        let deliveries = deliveries.clone();
+        async move {
+            for (message, metadata, gas_limit) in &deliveries[1..] {
+                relayer.process(message, metadata, *gas_limit).await?;
+            }
+            Ok::<_, ChainCommunicationError>(())
+        }
+    });
+    tokio::time::sleep(BLOCK_TIME * 3).await;
+    assert_eq!(node.invocations().len(), calls);
+    node.pause(false);
+    others.await.unwrap().unwrap();
+    assert!(node.refusals().is_empty(), "{:?}", node.refusals());
+    assert_eq!(node.propagated(), [1, 2, 3, 4]);
+    node.settle(4).await;
+    drop(relayer);
+    node.restart(store.path());
+    std::env::remove_var("DUSK_TX_BIN");
+}

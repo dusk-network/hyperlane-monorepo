@@ -72,6 +72,9 @@ const PREPARED_LOOKUPS: usize = 16;
 /// How often deliveries look kept transactions of other messages up
 /// (`DuskMailbox::sweep_prepared`).
 const PREPARED_SWEEP: Duration = Duration::from_secs(300);
+/// Most kept transactions known to have left the mempool that a Mailbox
+/// remembers (`DuskMailbox::wait_for_signer`).
+const MAX_SETTLED: usize = 1024;
 
 /// A reading of the signer's account at the node's tip block: the block,
 /// and the account's nonce there (`DuskMailbox::proved_final_nonce`).
@@ -285,6 +288,9 @@ pub struct DuskMailbox {
     last_sweep: Arc<StdMutex<Option<std::time::Instant>>>,
     /// The signer's nonce at the last final block, as far as shown.
     final_nonce: Arc<StdMutex<FinalNonce>>,
+    /// Kept transactions known to have left the mempool
+    /// (`wait_for_signer`).
+    settled: Arc<StdMutex<std::collections::HashSet<[u8; 32]>>>,
     /// Whether deliveries are pipelined (`ConnectionConf::pipelines_deliveries`).
     /// Otherwise each goes one at a time: `dusk-tx` signs it with the
     /// account's nonce plus one, as the node reports it, and waits for its
@@ -339,6 +345,7 @@ impl DuskMailbox {
             prepared_scan: Arc::default(),
             last_sweep: Arc::default(),
             final_nonce: Arc::default(),
+            settled: Arc::default(),
             pipelined,
         }
     }
@@ -679,19 +686,94 @@ impl DuskMailbox {
     /// it is reported once: a submission of the message again then sends
     /// another transaction once that one's block is final, instead of
     /// reporting it again (`follow_prepared`). Fails, reporting nothing,
-    /// when it cannot be noted; the next submission reports it.
+    /// when it cannot be noted; the next submission reports it. Either way
+    /// the transaction is in a block, out of the mempool (`wait_for_signer`).
     fn reported(
         &self,
         key: &[u8; 32],
         message: H256,
         outcome: TxOutcome,
     ) -> ChainResult<TxOutcome> {
+        let mut tx_id = [0u8; 32];
+        tx_id.copy_from_slice(&outcome.transaction_id.as_bytes()[32..]);
+        self.settle(tx_id);
         if !outcome.executed {
-            let mut tx_id = [0u8; 32];
-            tx_id.copy_from_slice(&outcome.transaction_id.as_bytes()[32..]);
             self.rues.report_prepared_failure(key, message, tx_id)?;
         }
         Ok(outcome)
+    }
+
+    /// Note that kept transaction `tx_id` has left the mempool, so that
+    /// `wait_for_signer` does not look it up again.
+    fn settle(&self, tx_id: [u8; 32]) {
+        let mut settled = self.settled.lock().unwrap_or_else(PoisonError::into_inner);
+        if settled.len() >= MAX_SETTLED {
+            settled.clear();
+        }
+        settled.insert(tx_id);
+    }
+
+    /// Wait until the transaction kept for the signer's latest delivery of
+    /// another message has left the mempool, before this delivery is
+    /// simulated and signed one at a time.
+    ///
+    /// `dusk-tx` signs a delivery with the account's nonce plus one, which a
+    /// transaction of the account in the mempool holds: the node refuses the
+    /// delivery at preverification. A relayer restarted while a delivery's
+    /// transaction waits in the mempool used to submit every other ready
+    /// message first, each signed and refused, one error each. Only the
+    /// latest kept transaction is looked up: one at a time, a delivery is
+    /// signed only once the one before has left the mempool, so the latest
+    /// is the one that may still be in it. It is looked up once: a
+    /// transaction whose outcome was reported, or found out of the mempool,
+    /// is not looked up again. Waits at most `SubmissionLimits::receipt`,
+    /// then fails, signing nothing, and the relayer tries again later.
+    async fn wait_for_signer(&self, signer: &DuskSigner, message: H256) -> ChainResult<()> {
+        let key = signer_key(signer);
+        let latest = self
+            .rues
+            .prepared_deliveries(&key)?
+            .into_iter()
+            .filter(|(other, _)| *other != message)
+            .filter_map(|(other, delivery)| delivery.map(|delivery| (other, delivery)))
+            .max_by_key(|(other, delivery)| (delivery.prepared_at, *other));
+        let Some((other, delivery)) = latest else {
+            return Ok(());
+        };
+        if self
+            .settled
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&delivery.tx_id)
+        {
+            return Ok(());
+        }
+        let tx_id = hex::encode(delivery.tx_id);
+        let deadline = tokio::time::Instant::now() + self.limits.receipt;
+        let mut waited = false;
+        loop {
+            if self.rues.transaction_status(&tx_id).await? != TransactionStatus::Pending {
+                self.settle(delivery.tx_id);
+                return Ok(());
+            }
+            if !waited {
+                info!(
+                    message_id = ?message,
+                    other = ?other,
+                    %tx_id,
+                    "Dusk signer's transaction for another delivery is in the mempool; this delivery waits for it before it is signed"
+                );
+                waited = true;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(HyperlaneDuskError::Other(format!(
+                    "The Dusk signer's transaction {tx_id}, kept for message {other:?}, is still in the mempool; the delivery of message {message:?} goes once it has left it"
+                ))
+                .into());
+            }
+            tokio::time::sleep_until((now + self.limits.block / 2).min(deadline)).await;
+        }
     }
 
     /// Make room to keep a transaction for `message`: a signer keeps those
@@ -1749,6 +1831,10 @@ impl Mailbox for DuskMailbox {
         let encoded = Self::encode_message(message);
         let args = crate::tx_sender::process_args(metadata, &encoded)?;
         let gas_limit = self.submission_gas_limit(message, tx_gas_limit);
+        let pipelined = self.pipelines_now(signer).await;
+        if !pipelined {
+            self.wait_for_signer(signer, message.id()).await?;
+        }
 
         // The relayer simulates through process_estimate_costs before calling
         // this, and that simulation stands when it passed moments ago.
@@ -1762,7 +1848,7 @@ impl Mailbox for DuskMailbox {
             "Processing message on Dusk via dusk-tx"
         );
 
-        if self.pipelines_now(signer).await {
+        if pipelined {
             return self
                 .process_pipelined(signer, message.id(), &args, gas_limit)
                 .await;
