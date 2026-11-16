@@ -2946,3 +2946,44 @@ async fn a_failure_found_in_a_block_rolled_back_after_the_lookup_is_not_sent_aga
     assert!(node.model().included(&kept).unwrap().error.is_none());
     std::env::remove_var("DUSK_TX_BIN");
 }
+
+/// A look at kept transactions for room ends within the receipt wait.
+/// Behind a node that does not answer it, the delivery at the bound fails
+/// as usual once the wait is out, signing nothing and keeping every
+/// record. It used to wait as long as the node did, and every later
+/// delivery to Dusk with it.
+#[tokio::test]
+async fn a_look_at_kept_transactions_for_room_ends_within_the_receipt_wait() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start(false);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let budget = Duration::from_secs(1);
+    let mailbox = node
+        .mailbox(false)
+        .with_submission_limits(SubmissionLimits {
+            prepared: 1,
+            receipt: budget,
+            ..patient(64)
+        });
+    let lost = delivery(9);
+    lose(&node, &mailbox, &lost, 1).await;
+    let calls = node.invocations().len();
+    // The look's read of the account is answered only once the gate opens.
+    let account = std::sync::Arc::new(Gate::default());
+    node.inject(Route::AccountStatus, None, Fault::Hold(account.clone()));
+    let (message, metadata, gas_limit) = delivery(0);
+    let started = std::time::Instant::now();
+    let result =
+        tokio::time::timeout(budget * 3, mailbox.process(&message, &metadata, gas_limit)).await;
+    let took = started.elapsed();
+    account.open();
+    let error = result
+        .expect("the look for room outlived the receipt wait")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("the most it keeps"), "{error}");
+    assert!(took < budget * 2, "took {took:?}");
+    assert_eq!(node.invocations().len(), calls);
+    assert!(mailbox.prepared_transaction(lost.0.id()).unwrap().is_some());
+    std::env::remove_var("DUSK_TX_BIN");
+}

@@ -896,12 +896,39 @@ impl DuskMailbox {
     /// not both show used; and one kept without its nonce (by a dusk-tx from
     /// before it named it), which can only go once it is in a final block. A
     /// record that does not decode cannot be looked up, and stays.
+    ///
+    /// A pass ends within `SubmissionLimits::receipt`: one that runs out,
+    /// its requests slow, keeps what it forgot so far, the cursor where it
+    /// stopped, and counts only what it looked up.
     async fn reclaim_prepared(
         &self,
         key: &[u8; 32],
         signer: &DuskSigner,
         message: Option<H256>,
     ) -> ChainResult<(usize, usize)> {
+        let mut tally = (0, 0);
+        let deadline = tokio::time::Instant::now() + self.limits.receipt;
+        let pass = self.reclaim_pass(key, signer, message, &mut tally);
+        match tokio::time::timeout_at(deadline, pass).await {
+            Ok(result) => result?,
+            Err(_) => debug!(
+                looked = tally.0,
+                freed = tally.1,
+                "Kept Dusk delivery transactions could not all be looked up within the receipt wait; the next look goes on"
+            ),
+        }
+        Ok(tally)
+    }
+
+    /// One pass of `reclaim_prepared`, which adds to `tally` how many it
+    /// looked up and how many it forgot as it goes.
+    async fn reclaim_pass(
+        &self,
+        key: &[u8; 32],
+        signer: &DuskSigner,
+        message: Option<H256>,
+        tally: &mut (usize, usize),
+    ) -> ChainResult<()> {
         // One that does not decode cannot be looked up.
         let mut candidates: Vec<(u64, H256, PreparedDelivery)> = self
             .rues
@@ -913,7 +940,7 @@ impl DuskMailbox {
             })
             .collect();
         if candidates.is_empty() {
-            return Ok((0, 0));
+            return Ok(());
         }
         candidates.sort_by_key(|(prepared_at, other, _)| (*prepared_at, *other));
         let after = *self
@@ -924,21 +951,21 @@ impl DuskMailbox {
             candidates.partition_point(|(prepared_at, other, _)| (*prepared_at, *other) <= after)
         });
         let (used, finalized) = self.nonce_evidence(signer).await?;
-        let mut freed = 0;
         // In neither place, with its nonce used: it goes if it is missed
         // again after the pause.
         let mut missed = Vec::new();
-        let looked = candidates.len().min(PREPARED_LOOKUPS);
-        for (prepared_at, other, delivery) in candidates.iter().cycle().skip(start).take(looked) {
+        let batch = candidates.len().min(PREPARED_LOOKUPS);
+        for (prepared_at, other, delivery) in candidates.iter().cycle().skip(start).take(batch) {
             *self
                 .prepared_scan
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = Some((*prepared_at, *other));
-            match self
+            let status = self
                 .rues
                 .transaction_status(&hex::encode(delivery.tx_id))
-                .await?
-            {
+                .await?;
+            tally.0 += 1;
+            match status {
                 TransactionStatus::Included {
                     block_height,
                     receipt,
@@ -959,7 +986,7 @@ impl DuskMailbox {
                     continue;
                 }
             }
-            freed += usize::from(self.forget_kept(key, *other, delivery)?);
+            tally.1 += usize::from(self.forget_kept(key, *other, delivery)?);
         }
         if !missed.is_empty() {
             tokio::time::sleep(self.limits.block / 2).await;
@@ -969,11 +996,11 @@ impl DuskMailbox {
                     .transaction_status(&hex::encode(delivery.tx_id))
                     .await?;
                 if status == TransactionStatus::Unknown {
-                    freed += usize::from(self.forget_kept(key, other, delivery)?);
+                    tally.1 += usize::from(self.forget_kept(key, other, delivery)?);
                 }
             }
         }
-        Ok((looked, freed))
+        Ok(())
     }
 
     /// Forget the transaction kept for `message`'s delivery, which can no
