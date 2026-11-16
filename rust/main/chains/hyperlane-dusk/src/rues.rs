@@ -26,6 +26,7 @@ use crate::HyperlaneDuskError;
 mod batch;
 mod endpoint;
 mod event_log;
+mod submissions;
 pub(crate) use batch::{
     fits_one_aggregate, list_reply, Read, BOOL_REPLY, ID_REPLY, U32_REPLY, U64_REPLY, U8_REPLY,
 };
@@ -33,6 +34,7 @@ pub use endpoint::QueryRateLimit;
 use endpoint::{Endpoint, RequestClass};
 use event_log::EventLogLocks;
 pub(crate) use event_log::{CheckHold, EventLog, LogEntry, LogLookup, LogState, BLOCK_LIMITS};
+pub(crate) use submissions::{SentDelivery, TransactionStatus};
 
 const MAX_RUES_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// Rows per `finalizedEvents` page: the most Rusk 1.7.3 returns

@@ -1,8 +1,10 @@
 //! What one agent process shares about each Rusk endpoint it sends requests
 //! to: how fast it sends contract queries, how it waits when the node
 //! refuses requests for its rate limit, the node's last final block, where
-//! each contract's records cross final heights, and what it knows of the
-//! multicall it batches reads through.
+//! each contract's records cross final heights, what it knows of the
+//! multicall it batches reads through, and each signer's submissions: the
+//! lock they hold while they use its nonces, and, for clients that keep no
+//! event store, its deliveries that have not settled.
 //!
 //! Rusk 1.7.3's HTTP policy limits each class of request for all of a
 //! node's clients together. Contract queries get 180 a second, at most 360 in
@@ -21,7 +23,7 @@
 //! nothing new costs that one read.
 
 use std::collections::hash_map::RandomState;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, PoisonError, Weak};
@@ -31,7 +33,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 use url::Url;
 
+use hyperlane_core::H256;
+
 use super::batch::Multicall;
+use super::submissions::SentDelivery;
 use super::{BlockPair, DeploymentIdentity, IdentityGate};
 use crate::final_records::FinalRecords;
 
@@ -187,6 +192,12 @@ pub(crate) struct Endpoint {
     /// What clients know of each multicall they batch reads through, by
     /// contract.
     multicalls: StdMutex<HashMap<[u8; 32], Arc<Multicall>>>,
+    /// The lock each signer's submissions hold while they use its nonces,
+    /// by the signer's address.
+    submission_locks: StdMutex<HashMap<[u8; 32], Arc<tokio::sync::Mutex<()>>>>,
+    /// The deliveries signers sent that have not settled, by signer and
+    /// message, for clients that keep no event store.
+    sent_deliveries: StdMutex<BTreeMap<([u8; 32], H256), SentDelivery>>,
 }
 
 type Endpoints = HashMap<String, Weak<Endpoint>>;
@@ -220,6 +231,8 @@ impl Endpoint {
             final_records: StdMutex::new(HashMap::new()),
             identity_gates: StdMutex::new(HashMap::new()),
             multicalls: StdMutex::new(HashMap::new()),
+            submission_locks: StdMutex::new(HashMap::new()),
+            sent_deliveries: StdMutex::new(BTreeMap::new()),
         });
         endpoints.insert(key, Arc::downgrade(&endpoint));
         endpoint
@@ -270,6 +283,44 @@ impl Endpoint {
             .entry(contract)
             .or_insert_with(|| Arc::new(Multicall::new(contract)))
             .clone()
+    }
+
+    /// The lock the submissions of signer `signer` hold while they use its
+    /// nonces.
+    pub(crate) fn submission_lock(&self, signer: [u8; 32]) -> Arc<tokio::sync::Mutex<()>> {
+        self.submission_locks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(signer)
+            .or_default()
+            .clone()
+    }
+
+    fn sent(&self) -> std::sync::MutexGuard<'_, BTreeMap<([u8; 32], H256), SentDelivery>> {
+        self.sent_deliveries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The deliveries `signer` sent that have not settled.
+    pub(crate) fn sent_deliveries(&self, signer: &[u8; 32]) -> Vec<(H256, SentDelivery)> {
+        self.sent()
+            .range((*signer, H256::zero())..=(*signer, H256::repeat_byte(0xff)))
+            .map(|((_, message), delivery)| (*message, *delivery))
+            .collect()
+    }
+
+    pub(crate) fn record_sent_delivery(
+        &self,
+        signer: &[u8; 32],
+        message: H256,
+        delivery: SentDelivery,
+    ) {
+        self.sent().insert((*signer, message), delivery);
+    }
+
+    pub(crate) fn forget_sent_delivery(&self, signer: &[u8; 32], message: H256) {
+        self.sent().remove(&(*signer, message));
     }
 
     /// Forget the last read of the tip and last final block, as if a tick

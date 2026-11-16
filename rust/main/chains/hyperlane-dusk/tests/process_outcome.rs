@@ -209,18 +209,34 @@ impl Fixture {
                             ("500 Internal Server Error", vec![b'x'; HUGE_ERROR_BYTES])
                         }
                     }
+                } else if path.starts_with("/on/account:") {
+                    // The account a delivery is signed with has sent nothing
+                    // yet; the Mailbox reads it before it sends one.
+                    let reply = serde_json::to_vec(
+                        &serde_json::json!({"balance": 1u64 << 40, "nonce": 0, "next_nonce": 1}),
+                    )
+                    .unwrap();
+                    ("200 OK", reply)
                 } else {
                     assert_eq!(path, "/on/graphql/query");
                     let query = String::from_utf8(body).unwrap();
-                    assert_eq!(
-                        query,
-                        format!("query {{ tx(hash: \"{tx}\") {{ gasSpent err }} }}")
-                    );
-                    worker_queries.fetch_add(1, Ordering::SeqCst);
-                    let reply = serde_json::to_vec(&serde_json::json!({"tx":{
-                        "gasSpent":FULL_GAS,"err":"recipient rejected"}}))
-                    .unwrap();
-                    ("200 OK", reply)
+                    if query == "query { lastBlockPair { json } }" {
+                        let block = serde_json::json!([1, "11".repeat(32)]);
+                        let reply = serde_json::to_vec(&serde_json::json!({"lastBlockPair": {
+                            "json": {"last_block": block, "last_finalized_block": block}}}))
+                        .unwrap();
+                        ("200 OK", reply)
+                    } else {
+                        assert_eq!(
+                            query,
+                            format!("query {{ tx(hash: \"{tx}\") {{ gasSpent err }} }}")
+                        );
+                        worker_queries.fetch_add(1, Ordering::SeqCst);
+                        let reply = serde_json::to_vec(&serde_json::json!({"tx":{
+                            "gasSpent":FULL_GAS,"err":"recipient rejected"}}))
+                        .unwrap();
+                        ("200 OK", reply)
+                    }
                 };
                 write!(
                     stream,

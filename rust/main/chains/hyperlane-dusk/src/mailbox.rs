@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::Duration;
@@ -19,10 +19,12 @@ use hyperlane_dusk_types::merkle::{IncrementalMerkle as HookTree, TREE_DEPTH};
 use crate::final_records::FinalRecords;
 use crate::rues::{
     bounded_body, bounded_error, bounded_json, bounded_text, fits_one_aggregate, list_reply,
-    rkyv_deserialize, rkyv_serialize, BlockPair, CheckHold, LogLookup, Read, BOOL_REPLY, ID_REPLY,
-    U32_REPLY, U64_REPLY,
+    rkyv_deserialize, rkyv_serialize, BlockPair, CheckHold, LogLookup, Read, SentDelivery,
+    TransactionStatus, BOOL_REPLY, ID_REPLY, U32_REPLY, U64_REPLY,
 };
-use crate::{ConnectionConf, DuskProvider, DuskSigner, HyperlaneDuskError, RuesClient};
+use crate::{
+    AccountStatus, ConnectionConf, DuskProvider, DuskSigner, HyperlaneDuskError, RuesClient,
+};
 
 const TX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(120);
 /// Most message IDs one `message_ids` query returns.
@@ -57,6 +59,13 @@ const BATCH_SEND_TIMEOUT: Duration = Duration::from_secs(60);
 /// Rusk 1.7.3 queues at most this many transactions of one account whose
 /// earlier nonces it has not seen yet (`max_moonlight_future_nonce_per_account`).
 const MAX_PIPELINED_DELIVERIES: usize = 64;
+/// How long after it was sent a delivery's transaction may still be on its
+/// way into the node's mempool.
+const DROP_GRACE: Duration = Duration::from_secs(60);
+/// Most deliveries a signer has outstanding: sent, and in no block yet.
+/// Rusk bounds only the transactions it holds back for an earlier nonce,
+/// not those it admitted in nonce order.
+const MAX_OUTSTANDING_DELIVERIES: usize = 64;
 
 /// What a delivery check found.
 #[derive(Debug, Clone)]
@@ -127,9 +136,121 @@ impl DeliveryChecks {
     }
 }
 
-/// How long a Mailbox waits while it submits deliveries.
+/// A delivery ready to be sent: its place in the batch, its message, and
+/// its `process` arguments and gas limit.
+struct Ready {
+    index: usize,
+    message_id: H256,
+    args: Vec<u8>,
+    gas_limit: u64,
+}
+
+/// Where a delivery the signer sent stands, reconciled with the node.
+#[derive(Debug, Clone)]
+enum Standing {
+    /// Its transaction is in a block that is not final yet: no other is
+    /// sent for it, and the transaction is followed.
+    Landed(String),
+    /// Its transaction may still be in a block: no other is sent for it,
+    /// and the transaction, if the helper named it, is followed.
+    InFlight(Option<String>),
+    /// Its transaction is in neither the mempool nor a block, and the nonce
+    /// it owns is unused: it goes again with that nonce, so that at most
+    /// one of its transactions can ever be in a block.
+    Dropped(u64),
+}
+
+/// The signer's account, and its deliveries that have not settled by
+/// message: the nonce each owns, and where it stands.
+struct Owned {
+    account: AccountStatus,
+    standing: HashMap<H256, (u64, Standing)>,
+}
+
+impl Owned {
+    /// The deliveries whose transactions are not in a block: those the
+    /// bound of outstanding deliveries counts.
+    fn outstanding(&self) -> usize {
+        self.standing
+            .values()
+            .filter(|(_, standing)| !matches!(standing, Standing::Landed(_)))
+            .count()
+    }
+
+    /// Whether a delivery in flight owns `nonce`.
+    fn in_flight(&self, nonce: u64) -> bool {
+        self.standing
+            .values()
+            .any(|(owned, standing)| *owned == nonce && matches!(standing, Standing::InFlight(_)))
+    }
+
+    /// The nonce the next new delivery takes: the account's next one, past
+    /// those deliveries in flight own.
+    fn next_free_nonce(&self) -> u64 {
+        let mut nonce = self.account.next_nonce;
+        while self.in_flight(nonce) {
+            nonce = nonce.saturating_add(1);
+        }
+        nonce
+    }
+
+    /// The deliveries to send, each with its nonce and whether it goes
+    /// again, in nonce order: consecutive from the account's next nonce, as
+    /// the node admits them. One the node dropped (`reused`, by the nonce it
+    /// owns) goes with its nonce, a nonce a delivery in flight owns is
+    /// passed over, and new ones (`fresh`) take the other nonces while the
+    /// signer has fewer than `outstanding` deliveries outstanding. The rest
+    /// are left out, and so is one whose nonce comes after a gap: the node
+    /// would hold it back.
+    fn plan(
+        &self,
+        mut reused: BTreeMap<u64, Ready>,
+        mut fresh: VecDeque<Ready>,
+        outstanding: usize,
+        left_out: &mut Vec<usize>,
+    ) -> Vec<(u64, Ready, bool)> {
+        let mut allowed = outstanding.saturating_sub(self.outstanding());
+        let mut plan = Vec::new();
+        let mut nonce = self.account.next_nonce;
+        while plan.len() < MAX_PIPELINED_DELIVERIES {
+            if let Some(delivery) = reused.remove(&nonce) {
+                plan.push((nonce, delivery, true));
+            } else if !self.in_flight(nonce) {
+                if allowed == 0 {
+                    break;
+                }
+                let Some(delivery) = fresh.pop_front() else {
+                    break;
+                };
+                allowed -= 1;
+                plan.push((nonce, delivery, false));
+            }
+            nonce = nonce.saturating_add(1);
+        }
+        left_out.extend(reused.into_values().map(|delivery| delivery.index));
+        left_out.extend(fresh.into_iter().map(|delivery| delivery.index));
+        plan
+    }
+}
+
+/// The key a signer's deliveries are kept under: its address.
+fn signer_key(signer: &DuskSigner) -> [u8; 32] {
+    signer.eth_address().into()
+}
+
+/// Milliseconds since the Unix epoch, by the wall clock.
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// How long a Mailbox waits while it submits deliveries, and how many it
+/// keeps outstanding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SubmissionTimeouts {
+pub struct SubmissionLimits {
     /// For a sent transaction to be in a block.
     pub receipt: Duration,
     /// For the node to hold a pipelined transaction before the next is
@@ -137,14 +258,22 @@ pub struct SubmissionTimeouts {
     pub held: Duration,
     /// For a batch to send its transactions: it sends none after this.
     pub batch: Duration,
+    /// For a sent transaction to reach the node's mempool: one in neither
+    /// the mempool nor a block counts as dropped only after this.
+    pub drop_grace: Duration,
+    /// Most deliveries the signer has outstanding: sent, and in no block
+    /// yet.
+    pub outstanding: usize,
 }
 
-impl Default for SubmissionTimeouts {
+impl Default for SubmissionLimits {
     fn default() -> Self {
         Self {
             receipt: TX_CONFIRMATION_TIMEOUT,
             held: HELD_TIMEOUT,
             batch: BATCH_SEND_TIMEOUT,
+            drop_grace: DROP_GRACE,
+            outstanding: MAX_OUTSTANDING_DELIVERIES,
         }
     }
 }
@@ -169,10 +298,7 @@ pub struct DuskMailbox {
     /// When `process` last passed its simulation, by the keccak256 of its
     /// arguments, shared by every clone.
     simulations: Arc<StdMutex<HashMap<[u8; 32], std::time::Instant>>>,
-    /// Held while a delivery or a batch of them uses the signer's nonces,
-    /// shared by every clone.
-    submissions: Arc<tokio::sync::Mutex<()>>,
-    timeouts: SubmissionTimeouts,
+    limits: SubmissionLimits,
 }
 
 /// The MerkleTreeHook keeps no root per insertion, so checkpoints compute
@@ -214,16 +340,15 @@ impl DuskMailbox {
             merkle: Arc::new(tokio::sync::Mutex::new(MerkleCache::default())),
             delivery_checks: Arc::default(),
             simulations: Arc::default(),
-            submissions: Arc::default(),
-            timeouts: SubmissionTimeouts::default(),
+            limits: SubmissionLimits::default(),
         }
     }
 
-    /// This Mailbox, waiting `timeouts` while it submits deliveries, for
-    /// tests that cannot wait minutes.
+    /// This Mailbox, submitting deliveries within `limits`, for tests that
+    /// cannot wait minutes.
     #[doc(hidden)]
-    pub fn with_submission_timeouts(mut self, timeouts: SubmissionTimeouts) -> Self {
-        self.timeouts = timeouts;
+    pub fn with_submission_limits(mut self, limits: SubmissionLimits) -> Self {
+        self.limits = limits;
         self
     }
 
@@ -312,24 +437,32 @@ impl DuskMailbox {
     /// that several share a block.
     ///
     /// Each delivery is simulated first (`simulate_process`), and one that
-    /// fails is left out. The others are signed with the account's next
-    /// nonces, from the node's `next_nonce`, which counts the account's
-    /// transactions in its mempool, and sent in nonce order, each once the
-    /// node holds the one before: Rusk checks a transaction's nonce against
-    /// its mempool. A delivery the node refuses ends the batch there, and so
-    /// does one whose submission outcome is unknown, so that no later nonce
-    /// waits behind a gap. Then the batch follows every transaction it sent
-    /// to its block, under one deadline.
+    /// fails is left out. Then the signer's deliveries that have not
+    /// settled are reconciled with the node (`reconcile`): a delivery whose
+    /// transaction may still be in a block is not sent again, but followed;
+    /// one the node dropped goes again with the nonce it owns; the others
+    /// take the account's next nonces, from the node's `next_nonce`, which
+    /// counts the account's transactions in its mempool, as long as the
+    /// signer has fewer than `SubmissionLimits::outstanding` deliveries
+    /// sent and in no block yet. They are sent in nonce order, each once the node holds
+    /// the one before: Rusk checks a transaction's nonce against its
+    /// mempool. Each delivery's nonce, and then its transaction, is kept in
+    /// the event store before and after the helper sends it. A delivery
+    /// the node refuses ends the batch there, and so does one whose
+    /// submission outcome is unknown, so that no later nonce waits behind a
+    /// gap. Then the batch follows every transaction it sent or follows to
+    /// its block, under one deadline.
     ///
     /// Returns the deliveries it left out, which the relayer submits one at
-    /// a time through `process`, and, when it sent any, one outcome for all
-    /// of them, as the relayer's batches have: the first transaction's ID,
-    /// the gas they spent together, which the relayer shares out among them,
-    /// and whether every one executed. A delivery whose transaction is in no
-    /// block by the deadline still counts as sent: the relayer checks that
-    /// it was delivered before it gives up on it, and relays it again if
-    /// not. Once one transaction is sent this never fails, so the relayer
-    /// never sends the batch again.
+    /// a time through `process`, and, when it sent or followed any, one
+    /// outcome for all of them, as the relayer's batches have: the first
+    /// transaction's ID, the gas they spent together, which the relayer
+    /// shares out among them, and whether every one executed. A delivery
+    /// whose transaction is in no block by the deadline still counts as
+    /// sent: the relayer checks that it was delivered before it gives up on
+    /// it, and submits it again if not, which follows that transaction
+    /// instead of sending another. Once one transaction is sent this never
+    /// fails, so the relayer never sends the batch again.
     ///
     /// With a helper that cannot sign with a given nonce
     /// (`tx_sender::helper_pipelines`), every delivery is left out.
@@ -364,8 +497,12 @@ impl DuskMailbox {
                 left_out.push(index);
                 continue;
             }
-            let gas_limit = self.submission_gas_limit(message, *gas_limit);
-            ready.push((index, message.id(), args, gas_limit));
+            ready.push(Ready {
+                index,
+                message_id: message.id(),
+                args,
+                gas_limit: self.submission_gas_limit(message, *gas_limit),
+            });
         }
         if ready.is_empty() {
             return Ok(BatchResult {
@@ -374,19 +511,47 @@ impl DuskMailbox {
             });
         }
 
-        let _submission = self.submissions.lock().await;
-        // Nothing is sent before the account's next nonce is known.
+        let key = signer_key(signer);
+        let lock = self.rues.submission_lock(key);
+        let submission = lock.lock().await;
+        // Nothing is sent before the signer's deliveries and the account's
+        // next nonce are known.
         self.rues.ensure_identity().await?;
-        let mut nonce = self
-            .rues
-            .account_status(&signer.address_string())
-            .await?
-            .next_nonce;
+        let owned = self.reconcile(signer).await?;
+        let mut followed = Vec::new();
+        let mut reused = BTreeMap::new();
+        let mut fresh = VecDeque::new();
+        for delivery in ready {
+            match owned.standing.get(&delivery.message_id) {
+                Some((_, Standing::Landed(tx_id) | Standing::InFlight(Some(tx_id)))) => {
+                    info!(
+                        message_id = ?delivery.message_id,
+                        %tx_id,
+                        "Dusk delivery's transaction may still be in a block; following it instead of sending another"
+                    );
+                    followed.push(tx_id.clone());
+                }
+                Some((_, Standing::InFlight(None))) => {
+                    info!(
+                        message_id = ?delivery.message_id,
+                        "Dusk delivery's transaction may still be in a block, and the helper never named it; it is checked again later"
+                    );
+                    left_out.push(delivery.index);
+                }
+                Some((_, Standing::Dropped(nonce))) => {
+                    reused.insert(*nonce, delivery);
+                }
+                None => fresh.push_back(delivery),
+            }
+        }
+        let plan = owned.plan(reused, fresh, self.limits.outstanding, &mut left_out);
+
         let mut sent = Vec::new();
         let mut stopped = false;
         // Every wait of the batch, for the helper or the node, ends by this.
-        let send_deadline = tokio::time::Instant::now() + self.timeouts.batch;
-        for (index, message_id, args, gas_limit) in ready {
+        let send_deadline = tokio::time::Instant::now() + self.limits.batch;
+        for (nonce, delivery, reuse) in plan {
+            let message_id = delivery.message_id;
             if !stopped && tokio::time::Instant::now() >= send_deadline {
                 warn!(
                     ?message_id,
@@ -395,7 +560,12 @@ impl DuskMailbox {
                 stopped = true;
             }
             if stopped {
-                left_out.push(index);
+                left_out.push(delivery.index);
+                continue;
+            }
+            if !reuse && !self.own_nonce(&key, message_id, nonce) {
+                left_out.push(delivery.index);
+                stopped = true;
                 continue;
             }
             let result = crate::tx_sender::dusk_tx_send_with_nonce(
@@ -403,8 +573,8 @@ impl DuskMailbox {
                 signer,
                 &self.mailbox_id,
                 "process",
-                &args,
-                gas_limit,
+                &delivery.args,
+                delivery.gas_limit,
                 nonce,
             )
             .await;
@@ -434,16 +604,21 @@ impl DuskMailbox {
                         %error,
                         "Dusk node refused a pipelined delivery; the batch's later deliveries are sent one at a time"
                     );
-                    left_out.push(index);
+                    // A delivery sent again keeps the nonce its earlier
+                    // transaction may still take.
+                    if !reuse {
+                        self.release_nonce(&key, message_id);
+                    }
+                    left_out.push(delivery.index);
                     stopped = true;
                     continue;
                 }
             };
+            self.name_transaction(&key, message_id, nonce, &tx_id);
             info!(?message_id, %tx_id, nonce, "Dusk delivery sent");
-            nonce = nonce.saturating_add(1);
             if !stopped {
                 let wait = self
-                    .timeouts
+                    .limits
                     .held
                     .min(send_deadline.saturating_duration_since(tokio::time::Instant::now()));
                 let held = self.rues.wait_until_held(&tx_id, wait).await;
@@ -458,7 +633,10 @@ impl DuskMailbox {
             }
             sent.push(tx_id);
         }
+        // Following them needs none of the signer's nonces.
+        drop(submission);
         left_out.sort_unstable();
+        sent.extend(followed);
         let Some(first) = sent.first() else {
             return Ok(BatchResult {
                 outcome: None,
@@ -467,7 +645,7 @@ impl DuskMailbox {
         };
 
         // Follow every sent transaction to its block.
-        let deadline = tokio::time::Instant::now() + self.timeouts.receipt;
+        let deadline = tokio::time::Instant::now() + self.limits.receipt;
         let mut gas_spent = 0u64;
         let mut executed = true;
         for tx_id in &sent {
@@ -499,6 +677,135 @@ impl DuskMailbox {
                 gas_price: FixedPointNumber::from(self.conn.gas_price),
             }),
             failed_indexes: left_out,
+        })
+    }
+
+    /// The signer's account and its deliveries that have not settled, each
+    /// reconciled with the node. Run with the signer's submission lock
+    /// held. A delivery settles, and is forgotten, once its transaction is
+    /// in a final block, whether it executed or not, or once the account
+    /// has used its nonce while the transaction is in no block: then it
+    /// never can be. Until then, one whose transaction is in a block that
+    /// is not final yet has landed, and one stays in flight while its
+    /// transaction is in the mempool, or is too recent to tell, or the
+    /// node's mempool holds its nonce for another transaction; one in
+    /// neither, past `SubmissionLimits::drop_grace`, with its nonce unused,
+    /// was dropped, and goes again with that nonce. A delivery whose
+    /// transaction cannot be looked up stays in flight.
+    async fn reconcile(&self, signer: &DuskSigner) -> ChainResult<Owned> {
+        let key = signer_key(signer);
+        let account = self.rues.account_status(&signer.address_string()).await?;
+        let finalized = self.rues.block_pair().await?.finalized();
+        let now = unix_millis();
+        let grace = u64::try_from(self.limits.drop_grace.as_millis()).unwrap_or(u64::MAX);
+        let mut standing = HashMap::new();
+        for (message_id, sent) in self.rues.sent_deliveries(&key)? {
+            let tx_id = sent.tx_id.map(hex::encode);
+            let status = match &tx_id {
+                Some(tx_id) => match self.rues.transaction_status(tx_id).await {
+                    Ok(status) => Some(status),
+                    Err(error) => {
+                        debug!(?message_id, %tx_id, error = %bounded_error(&error), "Dusk delivery transaction cannot be looked up; it stays in flight");
+                        None
+                    }
+                },
+                None => None,
+            };
+            let state = match status {
+                Some(TransactionStatus::Included { block_height, .. })
+                    if block_height <= finalized =>
+                {
+                    self.release_nonce(&key, message_id);
+                    continue;
+                }
+                Some(TransactionStatus::Included { .. }) => {
+                    Standing::Landed(tx_id.unwrap_or_default())
+                }
+                Some(TransactionStatus::Pending) => Standing::InFlight(tx_id),
+                // Not looked up.
+                None if tx_id.is_some() => Standing::InFlight(tx_id),
+                // In neither the mempool nor a block, or not named.
+                _ if account.nonce >= sent.nonce => {
+                    debug!(
+                        ?message_id,
+                        nonce = sent.nonce,
+                        "Dusk account used a delivery's nonce for another transaction; it settled"
+                    );
+                    self.release_nonce(&key, message_id);
+                    continue;
+                }
+                _ if sent.nonce < account.next_nonce
+                    || now.saturating_sub(sent.sent_at) < grace =>
+                {
+                    Standing::InFlight(tx_id)
+                }
+                _ => Standing::Dropped(sent.nonce),
+            };
+            standing.insert(message_id, (sent.nonce, state));
+        }
+        Ok(Owned { account, standing })
+    }
+
+    /// Keep that `message_id`'s delivery owns `nonce` before a transaction
+    /// is signed with it. Whether it was kept: nothing is sent otherwise.
+    fn own_nonce(&self, key: &[u8; 32], message_id: H256, nonce: u64) -> bool {
+        let sent = SentDelivery {
+            nonce,
+            tx_id: None,
+            sent_at: unix_millis(),
+        };
+        match self.rues.record_sent_delivery(key, message_id, &sent) {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(?message_id, nonce, error = %bounded_error(&error), "Dusk delivery cannot be kept in eventCursorDir; not sending it");
+                false
+            }
+        }
+    }
+
+    /// Keep that `message_id`'s delivery sent `tx_id` with `nonce`. One
+    /// that cannot be kept stays with its nonce, and settles by it.
+    fn name_transaction(&self, key: &[u8; 32], message_id: H256, nonce: u64, tx_id: &str) {
+        let Some(tx) = hex::decode(tx_id)
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        else {
+            warn!(?message_id, tx_id = %bounded_text(tx_id), "Dusk delivery transaction ID is not 32 bytes of hex; the delivery settles by its nonce");
+            return;
+        };
+        let sent = SentDelivery {
+            nonce,
+            tx_id: Some(tx),
+            sent_at: unix_millis(),
+        };
+        if let Err(error) = self.rues.record_sent_delivery(key, message_id, &sent) {
+            warn!(?message_id, %tx_id, error = %bounded_error(&error), "Dusk delivery transaction cannot be kept in eventCursorDir; the delivery settles by its nonce");
+        }
+    }
+
+    /// Forget `message_id`'s delivery: it settled, or its nonce was never
+    /// used.
+    fn release_nonce(&self, key: &[u8; 32], message_id: H256) {
+        if let Err(error) = self.rues.forget_sent_delivery(key, message_id) {
+            warn!(?message_id, error = %bounded_error(&error), "Dusk delivery that settled cannot be forgotten in eventCursorDir");
+        }
+    }
+
+    /// The outcome of delivery transaction `tx_id`, once it is in a block
+    /// within `SubmissionLimits::receipt`.
+    async fn outcome_of(&self, tx_id: &str) -> ChainResult<TxOutcome> {
+        let transaction_id = crate::tx_sender::dusk_tx_id_to_h512(tx_id)?;
+        let confirmed = self.rues.wait_for_tx(tx_id, self.limits.receipt).await?;
+        let executed = confirmed.error.is_none();
+        if let Some(error) = &confirmed.error {
+            let error = bounded_text(error);
+            warn!(tx_id, %error, "Dusk mailbox transaction execution failed");
+        }
+        Ok(TxOutcome {
+            transaction_id,
+            executed,
+            gas_used: U256::from(confirmed.gas_spent),
+            gas_price: FixedPointNumber::from(self.conn.gas_price),
         })
     }
 
@@ -1118,6 +1425,10 @@ impl Mailbox for DuskMailbox {
             Some(delivery) => delivery,
             None => {
                 let delivery = self.check_delivery(id, &pair).await?;
+                if let (Delivery::Final, Some(signer)) = (&delivery, &self.signer) {
+                    // Whoever delivered it, no delivery of it is in flight.
+                    self.release_nonce(&signer_key(signer), id);
+                }
                 let hold = delivery.hold(finalized, || self.rues.event_log_progress(&log));
                 self.delivery_checks
                     .lock()
@@ -1186,20 +1497,89 @@ impl Mailbox for DuskMailbox {
             "Processing message on Dusk via dusk-tx"
         );
 
-        // The helper signs with the account's next nonce: no batch may be
-        // using the account's nonces meanwhile.
-        let _submission = self.submissions.lock().await;
-        let call_result = crate::tx_sender::dusk_tx_call(
-            &self.conn,
-            signer,
-            &self.mailbox_id,
-            "process",
-            &args,
-            Some(gas_limit),
-        )
-        .await;
+        // The helper signs with the account's nonces: no batch may be using
+        // them meanwhile. A delivery follows the rule a batch does: one in
+        // flight is followed, one dropped goes again with its own nonce.
+        let message_id = message.id();
+        let key = signer_key(signer);
+        let lock = self.rues.submission_lock(key);
+        let submission = lock.lock().await;
+        let owned = self.reconcile(signer).await?;
+        let (nonce, reuse) = match owned.standing.get(&message_id) {
+            Some((_, Standing::Landed(tx_id) | Standing::InFlight(Some(tx_id)))) => {
+                let tx_id = tx_id.clone();
+                drop(submission);
+                info!(
+                    ?message_id,
+                    %tx_id,
+                    "Dusk delivery's transaction may still be in a block; following it instead of sending another"
+                );
+                return self.outcome_of(&tx_id).await;
+            }
+            Some((_, Standing::InFlight(None))) => {
+                return Err(HyperlaneDuskError::Other(format!(
+                    "Dusk delivery of message {message_id:?} may still be in a block, and the helper never named its transaction; checking it again later"
+                ))
+                .into());
+            }
+            Some((_, Standing::Dropped(nonce))) => (*nonce, true),
+            None => {
+                if owned.outstanding() >= self.limits.outstanding {
+                    return Err(HyperlaneDuskError::Other(format!(
+                        "The Dusk signer has {} deliveries outstanding, its most; message {message_id:?} goes once they are in blocks",
+                        owned.outstanding()
+                    ))
+                    .into());
+                }
+                (owned.next_free_nonce(), false)
+            }
+        };
+        // The node admits consecutive nonces only, and a helper without
+        // `--nonce` signs with the account's next one.
+        let pipelines = crate::tx_sender::helper_pipelines().await;
+        let next = if pipelines {
+            owned.next_free_nonce()
+        } else {
+            owned.account.nonce.saturating_add(1)
+        };
+        if nonce != next {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Dusk delivery of message {message_id:?} goes with nonce {nonce}, once the signer's transactions before it are in; the next one is {next}"
+            ))
+            .into());
+        }
+        if !reuse && !self.own_nonce(&key, message_id, nonce) {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Dusk delivery of message {message_id:?} cannot be kept in eventCursorDir; not sending it"
+            ))
+            .into());
+        }
+        let call_result = if pipelines {
+            crate::tx_sender::dusk_tx_send_with_nonce(
+                &self.conn,
+                signer,
+                &self.mailbox_id,
+                "process",
+                &args,
+                gas_limit,
+                nonce,
+            )
+            .await
+        } else {
+            crate::tx_sender::dusk_tx_call(
+                &self.conn,
+                signer,
+                &self.mailbox_id,
+                "process",
+                &args,
+                Some(gas_limit),
+            )
+            .await
+        };
 
         let tx_id = match call_result {
+            // The delivery keeps its nonce if the result names no
+            // transaction, and settles by it.
             Ok(response) => response
                 .get("tx_id")
                 .and_then(|value| value.as_str())
@@ -1215,22 +1595,18 @@ impl Mailbox for DuskMailbox {
                 warn!(%tx_id, %detail, "Reconciling Dusk submission receipt by exact hash");
                 tx_id
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                // Nothing was sent; one sent again keeps the nonce its
+                // earlier transaction may still take.
+                if !reuse {
+                    self.release_nonce(&key, message_id);
+                }
+                return Err(error.into());
+            }
         };
-        let transaction_id = crate::tx_sender::dusk_tx_id_to_h512(&tx_id)?;
-        let confirmed = self.rues.wait_for_tx(&tx_id, self.timeouts.receipt).await?;
-        let executed = confirmed.error.is_none();
-        if let Some(error) = &confirmed.error {
-            let error = bounded_text(error);
-            warn!(tx_id, %error, "Dusk mailbox transaction execution failed");
-        }
-
-        Ok(TxOutcome {
-            transaction_id,
-            executed,
-            gas_used: U256::from(confirmed.gas_spent),
-            gas_price: FixedPointNumber::from(self.conn.gas_price),
-        })
+        self.name_transaction(&key, message_id, nonce, &tx_id);
+        drop(submission);
+        self.outcome_of(&tx_id).await
     }
 
     /// Batches are sent as consecutive transactions of the signer's

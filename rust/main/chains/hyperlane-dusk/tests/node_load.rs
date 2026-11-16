@@ -30,7 +30,7 @@ use hyperlane_dusk::multicall::{Aggregate, Call};
 use hyperlane_dusk::{
     ConnectionConf, DeploymentIdentity, DuskDeliveryIndexer, DuskInterchainGasPaymasterIndexer,
     DuskMailbox, DuskMailboxIndexer, DuskMerkleTreeHook, DuskMerkleTreeHookIndexer, DuskProvider,
-    DuskSigner, QueryRateLimit, RuesClient, SubmissionTimeouts,
+    DuskSigner, QueryRateLimit, RuesClient, SubmissionLimits,
 };
 use hyperlane_dusk_types::{events, merkle::IncrementalMerkle, message, GasPaymentRecord};
 use serde_json::{json, Value};
@@ -1239,6 +1239,38 @@ impl TxChain {
         state.included.get(&nonce).map(|(tx, _, _)| tx.clone())
     }
 
+    /// How many transactions in blocks delivered each message, by its
+    /// delivery's arguments.
+    fn deliveries_included(&self) -> BTreeMap<String, usize> {
+        let state = self.state.lock().unwrap();
+        let mut counts = BTreeMap::new();
+        for (tx, _, _) in state.included.values() {
+            let args = state.arguments(tx).unwrap_or_default().to_owned();
+            *counts.entry(args).or_insert(0) += 1;
+        }
+        counts
+    }
+
+    /// Blocks hold no transaction while `paused`.
+    fn pause(&self, paused: bool) {
+        self.state.lock().unwrap().paused = paused;
+    }
+
+    /// The mempool drops the transactions of `nonce` and later, as Rusk's
+    /// does when it evicts one or it expires.
+    fn evict_from(&self, nonce: u64) {
+        let mut state = self.state.lock().unwrap();
+        state.admit(self.directory.path());
+        state.mempool.retain(|held, _| *held < nonce);
+    }
+
+    /// The helper's next submission of `nonce`: `refuse` it before
+    /// propagation, `lose` it after printing its hash without propagating
+    /// it, or propagate it and report the outcome `unknown`.
+    fn next_submission(&self, nonce: u64, mode: &str) {
+        std::fs::write(self.directory.path().join(format!("mode-{nonce}")), mode).unwrap();
+    }
+
     /// Wait until the chain holds `count` transactions in blocks.
     async fn wait_for_included(&self, count: usize) {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1473,12 +1505,10 @@ async fn a_batch_sends_no_delivery_after_its_deadline() {
     let chain = TxChain::start(true, None);
     std::fs::write(chain.directory.path().join("slow"), "0.3").unwrap();
     std::env::set_var("DUSK_TX_BIN", chain.helper());
-    let mailbox = chain
-        .mailbox()
-        .with_submission_timeouts(SubmissionTimeouts {
-            batch: Duration::from_secs(1),
-            ..SubmissionTimeouts::default()
-        });
+    let mailbox = chain.mailbox().with_submission_limits(SubmissionLimits {
+        batch: Duration::from_secs(1),
+        ..SubmissionLimits::default()
+    });
     let batch = mailbox
         .process_deliveries(&(0..10).map(delivery).collect::<Vec<_>>())
         .await
@@ -1489,5 +1519,220 @@ async fn a_batch_sends_no_delivery_after_its_deadline() {
     assert!((1..=5).contains(&sent), "{sent} sent");
     assert_eq!(batch.failed_indexes, (sent..10).collect::<Vec<_>>());
     assert!(batch.outcome.unwrap().executed);
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+/// Limits that suit a chain that holds transactions back for a while: a
+/// batch waits 600 ms for its transactions' blocks, and a transaction in
+/// neither the mempool nor a block counts as dropped after 300 ms.
+fn patient(outstanding: usize) -> SubmissionLimits {
+    SubmissionLimits {
+        receipt: Duration::from_millis(600),
+        drop_grace: Duration::from_millis(300),
+        outstanding,
+        ..SubmissionLimits::default()
+    }
+}
+
+/// Past `patient`'s drop grace.
+const PAST_DROP_GRACE: Duration = Duration::from_millis(400);
+
+impl TxChain {
+    /// Let the chain take transactions again, wait until it holds `count`
+    /// in blocks, and check that no message was delivered twice.
+    async fn resume_and_settle(&self, count: usize) {
+        self.pause(false);
+        self.wait_for_included(count).await;
+        // A transaction sent twice would land in the blocks after.
+        tokio::time::sleep(BLOCK_TIME * 3).await;
+        let included = self.deliveries_included();
+        assert_eq!(included.len(), count, "{included:?}");
+        assert!(
+            included.values().all(|transactions| *transactions == 1),
+            "a message was delivered by more than one transaction: {included:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_batch_still_held_after_its_receipt_wait_is_not_sent_again() {
+    let _env = HELPER_ENV.lock().await;
+    let chain = TxChain::start(true, None);
+    std::env::set_var("DUSK_TX_BIN", chain.helper());
+    let mailbox = chain.mailbox().with_submission_limits(patient(64));
+    // The chain takes no transaction for longer than the batch waits for
+    // their blocks.
+    chain.pause(true);
+    let deliveries: Vec<_> = (0..3).map(delivery).collect();
+    let batch = mailbox.process_deliveries(&deliveries).await.unwrap();
+    assert!(batch.failed_indexes.is_empty());
+    let first = batch.outcome.unwrap();
+    assert!(!first.executed);
+    assert_eq!(first.gas_used, U256::zero());
+    assert_eq!(chain.propagated(), [1, 2, 3]);
+
+    // The relayer finds the messages undelivered and submits them again,
+    // as a batch and one at a time: their transactions are still in the
+    // mempool, so none is sent again, and the batch follows them.
+    tokio::time::sleep(PAST_DROP_GRACE).await;
+    let again = mailbox.process_deliveries(&deliveries).await.unwrap();
+    assert!(again.failed_indexes.is_empty());
+    assert_eq!(again.outcome.unwrap().transaction_id, first.transaction_id);
+    let (message, metadata, gas_limit) = delivery(1);
+    assert!(mailbox
+        .process(&message, &metadata, gas_limit)
+        .await
+        .is_err());
+    assert_eq!(chain.propagated(), [1, 2, 3]);
+
+    // Once the chain takes them, each message is delivered once, and what
+    // the relayer submits again is left out: its simulation fails.
+    chain.resume_and_settle(3).await;
+    let settled = mailbox.process_deliveries(&deliveries).await.unwrap();
+    assert!(settled.outcome.is_none());
+    assert_eq!(chain.propagated(), [1, 2, 3]);
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+#[tokio::test]
+async fn deliveries_the_mempool_dropped_are_sent_again_with_their_own_nonces() {
+    let _env = HELPER_ENV.lock().await;
+    let chain = TxChain::start(true, None);
+    std::env::set_var("DUSK_TX_BIN", chain.helper());
+    let mailbox = chain.mailbox().with_submission_limits(patient(64));
+    chain.pause(true);
+    let deliveries: Vec<_> = (0..4).map(delivery).collect();
+    mailbox.process_deliveries(&deliveries[..3]).await.unwrap();
+    // The mempool drops the transactions of nonces 2 and 3, as Rusk's does
+    // when it evicts one or it expires, and keeps nonce 1's.
+    chain.evict_from(2);
+    tokio::time::sleep(PAST_DROP_GRACE).await;
+    // Submitted again with a new message: the first is in flight and
+    // followed, the dropped ones go with the nonces they own, and the new
+    // one with the next.
+    let again = mailbox.process_deliveries(&deliveries).await.unwrap();
+    assert!(again.failed_indexes.is_empty());
+    assert_eq!(chain.propagated(), [1, 2, 3, 2, 3, 4]);
+    chain.resume_and_settle(4).await;
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+#[tokio::test]
+async fn deliveries_in_flight_are_not_sent_again_after_a_restart() {
+    let _env = HELPER_ENV.lock().await;
+    let chain = TxChain::start(true, None);
+    std::env::set_var("DUSK_TX_BIN", chain.helper());
+    let store = tempfile::tempdir().unwrap();
+    let url = chain.server.url.clone();
+    let durable = || {
+        let rues = Arc::new(
+            RuesClient::new_with_event_cursor_dir(url.clone(), store.path().to_path_buf()).unwrap(),
+        );
+        mailbox(rues, &url, store.path(), true).with_submission_limits(patient(64))
+    };
+    chain.pause(true);
+    let deliveries: Vec<_> = (0..3).map(delivery).collect();
+    let relayer = durable();
+    relayer.process_deliveries(&deliveries).await.unwrap();
+    // The relayer restarts: its event store is closed and opened again.
+    drop(relayer);
+    assert!(RuesClient::forget_shared_client(&url, store.path()));
+    let relayer = durable();
+    tokio::time::sleep(PAST_DROP_GRACE).await;
+    relayer.process_deliveries(&deliveries).await.unwrap();
+    assert_eq!(chain.propagated(), [1, 2, 3]);
+    chain.resume_and_settle(3).await;
+    drop(relayer);
+    RuesClient::forget_shared_client(&url, store.path());
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+#[tokio::test]
+async fn a_delivery_whose_submission_outcome_is_unknown_is_reconciled_before_it_is_sent_again() {
+    let _env = HELPER_ENV.lock().await;
+    let chain = TxChain::start(true, None);
+    std::env::set_var("DUSK_TX_BIN", chain.helper());
+    let mailbox = chain.mailbox().with_submission_limits(patient(64));
+    chain.pause(true);
+    let deliveries: Vec<_> = (0..4).map(delivery).collect();
+    // The node takes nonce 2's transaction, but its answer is lost: the
+    // batch sends no later nonce.
+    chain.next_submission(2, "unknown");
+    let batch = mailbox.process_deliveries(&deliveries[..3]).await.unwrap();
+    assert_eq!(batch.failed_indexes, [2]);
+    assert_eq!(chain.propagated(), [1, 2]);
+    // Submitted again, the delivery in the mempool is followed, not sent
+    // again; the one left out takes the next nonce.
+    tokio::time::sleep(PAST_DROP_GRACE).await;
+    let again = mailbox.process_deliveries(&deliveries[1..3]).await.unwrap();
+    assert!(again.failed_indexes.is_empty());
+    assert_eq!(chain.propagated(), [1, 2, 3]);
+    chain.resume_and_settle(3).await;
+
+    // A submission whose hash the helper printed, but that never reached
+    // the node: once past the drop grace, it goes again with its own nonce.
+    chain.next_submission(4, "lose");
+    let lost = mailbox.process_deliveries(&deliveries[3..]).await.unwrap();
+    assert!(!lost.outcome.unwrap().executed);
+    assert_eq!(chain.propagated(), [1, 2, 3]);
+    tokio::time::sleep(PAST_DROP_GRACE).await;
+    mailbox.process_deliveries(&deliveries[3..]).await.unwrap();
+    assert_eq!(chain.propagated(), [1, 2, 3, 4]);
+    chain.resume_and_settle(4).await;
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+#[tokio::test]
+async fn one_at_a_time_a_dropped_delivery_goes_again_with_its_own_nonce() {
+    let _env = HELPER_ENV.lock().await;
+    let chain = TxChain::start(true, None);
+    std::env::set_var("DUSK_TX_BIN", chain.helper());
+    let mailbox = chain.mailbox().with_submission_limits(patient(64));
+    chain.pause(true);
+    let deliveries: Vec<_> = (0..2).map(delivery).collect();
+    mailbox.process_deliveries(&deliveries).await.unwrap();
+    chain.evict_from(1);
+    tokio::time::sleep(PAST_DROP_GRACE).await;
+    // The relayer sends each again on its own: each with the nonce it owns.
+    for (message, metadata, gas_limit) in &deliveries {
+        assert!(mailbox
+            .process(message, metadata, *gas_limit)
+            .await
+            .is_err());
+    }
+    assert_eq!(chain.propagated(), [1, 2, 1, 2]);
+    chain.resume_and_settle(2).await;
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+#[tokio::test]
+async fn a_signer_keeps_a_bounded_number_of_deliveries_outstanding() {
+    let _env = HELPER_ENV.lock().await;
+    let chain = TxChain::start(true, None);
+    std::env::set_var("DUSK_TX_BIN", chain.helper());
+    let mailbox = chain.mailbox().with_submission_limits(patient(4));
+    chain.pause(true);
+    let deliveries: Vec<_> = (0..8).map(delivery).collect();
+    let batch = mailbox.process_deliveries(&deliveries[..6]).await.unwrap();
+    assert_eq!(batch.failed_indexes, [4, 5]);
+    // While four are outstanding, no other delivery is sent, in a batch or
+    // on its own.
+    let batch = mailbox.process_deliveries(&deliveries[6..]).await.unwrap();
+    assert!(batch.outcome.is_none());
+    assert_eq!(batch.failed_indexes, [0, 1]);
+    let (message, metadata, gas_limit) = &deliveries[6];
+    let error = mailbox
+        .process(message, metadata, *gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("outstanding"), "{error}");
+    assert_eq!(chain.propagated(), [1, 2, 3, 4]);
+    // Once they are in final blocks, the next ones go.
+    chain.resume_and_settle(4).await;
+    let batch = mailbox.process_deliveries(&deliveries[4..]).await.unwrap();
+    assert!(batch.failed_indexes.is_empty());
+    assert_eq!(chain.propagated(), [1, 2, 3, 4, 5, 6, 7, 8]);
+    chain.resume_and_settle(8).await;
     std::env::remove_var("DUSK_TX_BIN");
 }

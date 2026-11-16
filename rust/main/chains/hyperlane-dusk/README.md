@@ -231,9 +231,28 @@ how to run the local bridge.
   and so does the end of the batch's 60 s to send: no delivery is sent
   after it. The batch then follows each transaction to its block; one that is
   in none by then still counts as sent, and the relayer checks that its
-  message was delivered before it relays it again. At most 64 go in a batch,
+  message was delivered before it submits it again, which then follows the
+  same transaction (see Deliveries in flight). At most 64 go in a batch,
   Rusk's queue of an account's future nonces. With another helper, every
   delivery is submitted one at a time.
+- **Deliveries in flight.** Each delivery's nonce, and then its
+  transaction, is kept in `eventCursorDir` (in memory for a client without
+  one) before and after the helper sends it, until the delivery settles:
+  its transaction is in a final block, or the account has used its nonce
+  while the transaction is in no block, which it then never will be.
+  Before it sends a delivery, as a batch or one at a time, also after a
+  restart, the relayer reconciles the signer's deliveries with the node. One
+  whose transaction is in the mempool or a block, was sent less than 60 s
+  ago, or whose nonce the mempool holds for another transaction, is not
+  sent again but followed to its block, however long the chain holds it
+  back; one whose transaction is in neither, with its nonce unused, goes
+  again with that nonce, so that at most one of its transactions can ever
+  be in a block; the others take the account's next nonces. A signer has at
+  most 64 deliveries outstanding, sent and in no block yet: Rusk bounds only
+  the transactions it holds back for an earlier nonce, not those it
+  admitted in nonce order. One that goes again with a nonce after a free
+  one waits until a new delivery takes the free nonce: the node would hold
+  it back.
 - **Delivery simulation.** Dusk charges a failed transaction its whole gas
   limit. Before submitting `process`, the relayer runs it as an unsigned
   contract query, which Rusk executes in a throwaway session. If the query
