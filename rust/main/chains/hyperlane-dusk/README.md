@@ -418,7 +418,10 @@ sequences, read their own log again instead of halting. To recover:
 2. Stop the agent.
 3. Reset its database (the store its contract sync indexed deliveries
    into, such as the scraper's) and its `eventCursorDir`, so that both
-   index the archive afresh.
+   index the archive afresh. A relayer's `eventCursorDir` also holds the
+   nonces of its deliveries in flight (see Deliveries in flight): reset it
+   only once the signer's transactions are in final blocks, or a delivery
+   still in the mempool could be sent again with another nonce.
 4. Start the agent again.
 
 An archive that only numbers its rows differently, or changes blocks whose
