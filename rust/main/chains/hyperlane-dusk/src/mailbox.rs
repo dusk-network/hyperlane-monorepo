@@ -238,6 +238,45 @@ fn signer_key(signer: &DuskSigner) -> [u8; 32] {
     signer.eth_address().into()
 }
 
+/// An endpoint, a Mailbox and a signer whose delivery mode was logged.
+type LoggedMode = (String, H256, [u8; 32]);
+
+/// Say once per process, for each endpoint, Mailbox and signer, how this
+/// agent submits deliveries.
+fn log_delivery_mode(
+    domain: &HyperlaneDomain,
+    mailbox: &H256,
+    signer: &DuskSigner,
+    conn: &ConnectionConf,
+) {
+    static LOGGED: std::sync::OnceLock<StdMutex<std::collections::HashSet<LoggedMode>>> =
+        std::sync::OnceLock::new();
+    let key = (conn.url.as_str().to_owned(), *mailbox, signer_key(signer));
+    let first = LOGGED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(key);
+    if !first {
+        return;
+    }
+    let max_batch_size = conn.op_submission_config.max_batch_size;
+    if conn.pipelines_deliveries() {
+        warn!(
+            domain = %domain.name(),
+            max_batch_size,
+            "Dusk deliveries are pipelined (pipelineDeliveries, experimental): a batch goes as consecutive transactions of the signer, with nonces this agent chooses and keeps in eventCursorDir; no other process may sign with this key"
+        );
+    } else {
+        info!(
+            domain = %domain.name(),
+            max_batch_size,
+            pipeline_deliveries = conn.pipeline_deliveries,
+            "Dusk deliveries go one at a time: dusk-tx signs each with the account's next nonce and waits for its block (pipelined deliveries are off; they need pipelineDeliveries and a maxBatchSize above 1)"
+        );
+    }
+}
+
 /// Milliseconds since the Unix epoch, by the wall clock.
 fn unix_millis() -> u64 {
     std::time::SystemTime::now()
@@ -299,6 +338,11 @@ pub struct DuskMailbox {
     /// arguments, shared by every clone.
     simulations: Arc<StdMutex<HashMap<[u8; 32], std::time::Instant>>>,
     limits: SubmissionLimits,
+    /// Whether deliveries are pipelined (`ConnectionConf::pipelines_deliveries`).
+    /// Otherwise each goes one at a time: `dusk-tx` signs it with the
+    /// account's nonce plus one, as the node reports it, and waits for its
+    /// block.
+    pipelined: bool,
 }
 
 /// The MerkleTreeHook keeps no root per insertion, so checkpoints compute
@@ -328,6 +372,10 @@ impl DuskMailbox {
         signer: Option<DuskSigner>,
         conn: ConnectionConf,
     ) -> Self {
+        let pipelined = conn.pipelines_deliveries();
+        if let Some(signer) = &signer {
+            log_delivery_mode(&domain, &mailbox_id, signer, &conn);
+        }
         Self {
             provider,
             insertions: rues.final_records(merkle_tree_hook_id.into(), "inserted_block_height"),
@@ -341,6 +389,7 @@ impl DuskMailbox {
             delivery_checks: Arc::default(),
             simulations: Arc::default(),
             limits: SubmissionLimits::default(),
+            pipelined,
         }
     }
 
@@ -464,8 +513,10 @@ impl DuskMailbox {
     /// instead of sending another. Once one transaction is sent this never
     /// fails, so the relayer never sends the batch again.
     ///
-    /// With a helper that cannot sign with a given nonce
-    /// (`tx_sender::helper_pipelines`), every delivery is left out.
+    /// Unless deliveries are pipelined (`ConnectionConf::pipelines_deliveries`),
+    /// or with a helper that cannot sign with a given nonce
+    /// (`tx_sender::helper_pipelines`), every delivery is left out, and the
+    /// relayer sends each on its own.
     pub async fn process_deliveries(
         &self,
         deliveries: &[(HyperlaneMessage, Metadata, Option<U256>)],
@@ -474,7 +525,8 @@ impl DuskMailbox {
             .signer
             .as_ref()
             .ok_or(HyperlaneDuskError::SignerUnavailable)?;
-        if !crate::tx_sender::helper_pipelines().await {
+        // Without the opt-in, the relayer sends each one on its own.
+        if !self.pipelined || !crate::tx_sender::helper_pipelines().await {
             return Ok(BatchResult::failed(deliveries.len()));
         }
         let mut left_out = Vec::new();
@@ -789,6 +841,173 @@ impl DuskMailbox {
         if let Err(error) = self.rues.forget_sent_delivery(key, message_id) {
             warn!(?message_id, error = %bounded_error(&error), "Dusk delivery that settled cannot be forgotten in eventCursorDir");
         }
+    }
+
+    /// Submit one delivery, one at a time, as Dusk relayers always have:
+    /// `dusk-tx` signs it with the account's nonce plus one, as the node
+    /// reports it, sends it and waits for its block. No nonce is chosen or
+    /// kept here. While an earlier transaction of the signer is in the
+    /// mempool, the node refuses another with its nonce at preverification,
+    /// so a delivery submitted again while its first transaction waits is
+    /// refused, and at most one of them can be in a block. When the
+    /// helper's outcome is unknown, the transaction it prepared is followed
+    /// by its exact hash.
+    async fn process_one(
+        &self,
+        signer: &DuskSigner,
+        args: &[u8],
+        gas_limit: u64,
+    ) -> ChainResult<TxOutcome> {
+        let call_result = crate::tx_sender::dusk_tx_call(
+            &self.conn,
+            signer,
+            &self.mailbox_id,
+            "process",
+            args,
+            Some(gas_limit),
+        )
+        .await;
+        let tx_id = match call_result {
+            Ok(response) => response
+                .get("tx_id")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    HyperlaneDuskError::Other(format!(
+                        "dusk-tx response is missing string tx_id: {}",
+                        bounded_json(&response)
+                    ))
+                })?
+                .to_owned(),
+            Err(HyperlaneDuskError::SubmissionOutcomeUnknown { tx_id, detail })
+            | Err(HyperlaneDuskError::TransactionExecutionFailed { tx_id, detail }) => {
+                warn!(%tx_id, %detail, "Reconciling Dusk submission receipt by exact hash");
+                tx_id
+            }
+            Err(error) => return Err(error.into()),
+        };
+        self.outcome_of(&tx_id).await
+    }
+
+    /// Submit one delivery when deliveries are pipelined: it follows the
+    /// rule a batch does (`process_deliveries`), under the signer's
+    /// submission lock: one in flight is followed, one dropped goes again
+    /// with its own nonce, and a new one takes the next free nonce.
+    async fn process_pipelined(
+        &self,
+        signer: &DuskSigner,
+        message_id: H256,
+        args: &[u8],
+        gas_limit: u64,
+    ) -> ChainResult<TxOutcome> {
+        // The helper signs with the account's nonces: no batch may be using
+        // them meanwhile. A delivery follows the rule a batch does: one in
+        // flight is followed, one dropped goes again with its own nonce.
+        let key = signer_key(signer);
+        let lock = self.rues.submission_lock(key);
+        let submission = lock.lock().await;
+        let owned = self.reconcile(signer).await?;
+        let (nonce, reuse) = match owned.standing.get(&message_id) {
+            Some((_, Standing::Landed(tx_id) | Standing::InFlight(Some(tx_id)))) => {
+                let tx_id = tx_id.clone();
+                drop(submission);
+                info!(
+                    ?message_id,
+                    %tx_id,
+                    "Dusk delivery's transaction may still be in a block; following it instead of sending another"
+                );
+                return self.outcome_of(&tx_id).await;
+            }
+            Some((_, Standing::InFlight(None))) => {
+                return Err(HyperlaneDuskError::Other(format!(
+                    "Dusk delivery of message {message_id:?} may still be in a block, and the helper never named its transaction; checking it again later"
+                ))
+                .into());
+            }
+            Some((_, Standing::Dropped(nonce))) => (*nonce, true),
+            None => {
+                if owned.outstanding() >= self.limits.outstanding {
+                    return Err(HyperlaneDuskError::Other(format!(
+                        "The Dusk signer has {} deliveries outstanding, its most; message {message_id:?} goes once they are in blocks",
+                        owned.outstanding()
+                    ))
+                    .into());
+                }
+                (owned.next_free_nonce(), false)
+            }
+        };
+        // The node admits consecutive nonces only, and a helper without
+        // `--nonce` signs with the account's next one.
+        let pipelines = crate::tx_sender::helper_pipelines().await;
+        let next = if pipelines {
+            owned.next_free_nonce()
+        } else {
+            owned.account.nonce.saturating_add(1)
+        };
+        if nonce != next {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Dusk delivery of message {message_id:?} goes with nonce {nonce}, once the signer's transactions before it are in; the next one is {next}"
+            ))
+            .into());
+        }
+        if !reuse && !self.own_nonce(&key, message_id, nonce) {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Dusk delivery of message {message_id:?} cannot be kept in eventCursorDir; not sending it"
+            ))
+            .into());
+        }
+        let call_result = if pipelines {
+            crate::tx_sender::dusk_tx_send_with_nonce(
+                &self.conn,
+                signer,
+                &self.mailbox_id,
+                "process",
+                args,
+                gas_limit,
+                nonce,
+            )
+            .await
+        } else {
+            crate::tx_sender::dusk_tx_call(
+                &self.conn,
+                signer,
+                &self.mailbox_id,
+                "process",
+                args,
+                Some(gas_limit),
+            )
+            .await
+        };
+
+        let tx_id = match call_result {
+            // The delivery keeps its nonce if the result names no
+            // transaction, and settles by it.
+            Ok(response) => response
+                .get("tx_id")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    HyperlaneDuskError::Other(format!(
+                        "dusk-tx response is missing string tx_id: {}",
+                        bounded_json(&response)
+                    ))
+                })?
+                .to_owned(),
+            Err(HyperlaneDuskError::SubmissionOutcomeUnknown { tx_id, detail })
+            | Err(HyperlaneDuskError::TransactionExecutionFailed { tx_id, detail }) => {
+                warn!(%tx_id, %detail, "Reconciling Dusk submission receipt by exact hash");
+                tx_id
+            }
+            Err(error) => {
+                // Nothing was sent; one sent again keeps the nonce its
+                // earlier transaction may still take.
+                if !reuse {
+                    self.release_nonce(&key, message_id);
+                }
+                return Err(error.into());
+            }
+        };
+        self.name_transaction(&key, message_id, nonce, &tx_id);
+        drop(submission);
+        self.outcome_of(&tx_id).await
     }
 
     /// The outcome of delivery transaction `tx_id`, once it is in a block
@@ -1425,7 +1644,9 @@ impl Mailbox for DuskMailbox {
             Some(delivery) => delivery,
             None => {
                 let delivery = self.check_delivery(id, &pair).await?;
-                if let (Delivery::Final, Some(signer)) = (&delivery, &self.signer) {
+                if let (Delivery::Final, Some(signer), true) =
+                    (&delivery, &self.signer, self.pipelined)
+                {
                     // Whoever delivered it, no delivery of it is in flight.
                     self.release_nonce(&signer_key(signer), id);
                 }
@@ -1497,125 +1718,28 @@ impl Mailbox for DuskMailbox {
             "Processing message on Dusk via dusk-tx"
         );
 
-        // The helper signs with the account's nonces: no batch may be using
-        // them meanwhile. A delivery follows the rule a batch does: one in
-        // flight is followed, one dropped goes again with its own nonce.
-        let message_id = message.id();
-        let key = signer_key(signer);
-        let lock = self.rues.submission_lock(key);
-        let submission = lock.lock().await;
-        let owned = self.reconcile(signer).await?;
-        let (nonce, reuse) = match owned.standing.get(&message_id) {
-            Some((_, Standing::Landed(tx_id) | Standing::InFlight(Some(tx_id)))) => {
-                let tx_id = tx_id.clone();
-                drop(submission);
-                info!(
-                    ?message_id,
-                    %tx_id,
-                    "Dusk delivery's transaction may still be in a block; following it instead of sending another"
-                );
-                return self.outcome_of(&tx_id).await;
-            }
-            Some((_, Standing::InFlight(None))) => {
-                return Err(HyperlaneDuskError::Other(format!(
-                    "Dusk delivery of message {message_id:?} may still be in a block, and the helper never named its transaction; checking it again later"
-                ))
-                .into());
-            }
-            Some((_, Standing::Dropped(nonce))) => (*nonce, true),
-            None => {
-                if owned.outstanding() >= self.limits.outstanding {
-                    return Err(HyperlaneDuskError::Other(format!(
-                        "The Dusk signer has {} deliveries outstanding, its most; message {message_id:?} goes once they are in blocks",
-                        owned.outstanding()
-                    ))
-                    .into());
-                }
-                (owned.next_free_nonce(), false)
-            }
-        };
-        // The node admits consecutive nonces only, and a helper without
-        // `--nonce` signs with the account's next one.
-        let pipelines = crate::tx_sender::helper_pipelines().await;
-        let next = if pipelines {
-            owned.next_free_nonce()
-        } else {
-            owned.account.nonce.saturating_add(1)
-        };
-        if nonce != next {
-            return Err(HyperlaneDuskError::Other(format!(
-                "Dusk delivery of message {message_id:?} goes with nonce {nonce}, once the signer's transactions before it are in; the next one is {next}"
-            ))
-            .into());
+        if self.pipelined {
+            return self
+                .process_pipelined(signer, message.id(), &args, gas_limit)
+                .await;
         }
-        if !reuse && !self.own_nonce(&key, message_id, nonce) {
-            return Err(HyperlaneDuskError::Other(format!(
-                "Dusk delivery of message {message_id:?} cannot be kept in eventCursorDir; not sending it"
-            ))
-            .into());
-        }
-        let call_result = if pipelines {
-            crate::tx_sender::dusk_tx_send_with_nonce(
-                &self.conn,
-                signer,
-                &self.mailbox_id,
-                "process",
-                &args,
-                gas_limit,
-                nonce,
-            )
-            .await
-        } else {
-            crate::tx_sender::dusk_tx_call(
-                &self.conn,
-                signer,
-                &self.mailbox_id,
-                "process",
-                &args,
-                Some(gas_limit),
-            )
-            .await
-        };
-
-        let tx_id = match call_result {
-            // The delivery keeps its nonce if the result names no
-            // transaction, and settles by it.
-            Ok(response) => response
-                .get("tx_id")
-                .and_then(|value| value.as_str())
-                .ok_or_else(|| {
-                    HyperlaneDuskError::Other(format!(
-                        "dusk-tx response is missing string tx_id: {}",
-                        bounded_json(&response)
-                    ))
-                })?
-                .to_owned(),
-            Err(HyperlaneDuskError::SubmissionOutcomeUnknown { tx_id, detail })
-            | Err(HyperlaneDuskError::TransactionExecutionFailed { tx_id, detail }) => {
-                warn!(%tx_id, %detail, "Reconciling Dusk submission receipt by exact hash");
-                tx_id
-            }
-            Err(error) => {
-                // Nothing was sent; one sent again keeps the nonce its
-                // earlier transaction may still take.
-                if !reuse {
-                    self.release_nonce(&key, message_id);
-                }
-                return Err(error.into());
-            }
-        };
-        self.name_transaction(&key, message_id, nonce, &tx_id);
-        drop(submission);
-        self.outcome_of(&tx_id).await
+        self.process_one(signer, &args, gas_limit).await
     }
 
     /// Batches are sent as consecutive transactions of the signer's
-    /// account (`process_deliveries`), with a helper that can do so.
+    /// account (`process_deliveries`), only when deliveries are pipelined
+    /// (`ConnectionConf::pipelines_deliveries`). Otherwise the relayer
+    /// submits every delivery on its own, through `process`.
     fn supports_batching(&self) -> bool {
-        self.signer.is_some()
+        self.signer.is_some() && self.pipelined
     }
 
     async fn process_batch<'a>(&self, ops: Vec<&'a QueueOperation>) -> ChainResult<BatchResult> {
+        // Without pipelining, every delivery goes on its own, through
+        // `process`.
+        if !self.pipelined {
+            return Ok(BatchResult::failed(ops.len()));
+        }
         let deliveries = ops
             .iter()
             .map(|op| {
@@ -1792,6 +1916,7 @@ mod tests {
                 native_token: NativeToken::default(),
                 op_submission_config: OpSubmissionConfig::default(),
                 query_rate_limit: crate::QueryRateLimit::default(),
+                pipeline_deliveries: false,
             },
         );
         let hook = DuskMerkleTreeHook::new(mailbox.clone());
@@ -1829,6 +1954,7 @@ mod tests {
                     native_token: NativeToken::default(),
                     op_submission_config: OpSubmissionConfig::default(),
                     query_rate_limit: crate::QueryRateLimit::default(),
+                    pipeline_deliveries: false,
                 },
             )
         };

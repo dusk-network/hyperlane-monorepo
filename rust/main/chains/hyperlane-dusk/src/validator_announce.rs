@@ -703,6 +703,7 @@ mod tests {
                 native_token: NativeToken::default(),
                 op_submission_config: OpSubmissionConfig::default(),
                 query_rate_limit: crate::QueryRateLimit::default(),
+                pipeline_deliveries: false,
             },
         );
         (reader, worker, directory)

@@ -468,6 +468,7 @@ impl Fixture {
             native_token: NativeToken::default(),
             op_submission_config: OpSubmissionConfig::default(),
             query_rate_limit: hyperlane_dusk::QueryRateLimit::default(),
+            pipeline_deliveries: false,
         };
         (domain, rues, provider, conf)
     }

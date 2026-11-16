@@ -216,43 +216,57 @@ how to run the local bridge.
   sender paid for, but at most `gasLimit` and Rusk's block gas limit of
   3,000,000,000: the mempool keeps a transaction over the block gas limit
   without any block taking it, and a failed transaction pays its whole limit.
-- **Pipelined deliveries.** The helper signs with the account's next nonce
-  and returns once the transaction is in a block, so deliveries sent one at
-  a time land one every two blocks: the next one reaches the node after the
-  next block's round has started. With `maxBatchSize` above 1 in the chain's
-  config and a helper that takes `call --nonce <N> --no-wait` (found from
-  its `call --help`, once per process), the relayer submits a batch of
-  deliveries as consecutive transactions of its account, from the node's
-  `next_nonce`, each once the node holds the one before, and they share a
-  block. A delivery the node refuses, or whose submission outcome is
-  unknown, ends the batch: the deliveries after it are submitted one at a
-  time. So does a delivery the node does not hold within 5 s, a wait that
-  every query it sends, with its waits for the node's rate limit, ends with,
-  and so does the end of the batch's 60 s to send: no delivery is sent
-  after it. The batch then follows each transaction to its block; one that is
-  in none by then still counts as sent, and the relayer checks that its
-  message was delivered before it submits it again, which then follows the
-  same transaction (see Deliveries in flight). At most 64 go in a batch,
-  Rusk's queue of an account's future nonces. With another helper, every
-  delivery is submitted one at a time.
-- **Deliveries in flight.** Each delivery's nonce, and then its
-  transaction, is kept in `eventCursorDir` (in memory for a client without
-  one) before and after the helper sends it, until the delivery settles:
-  its transaction is in a final block, or the account has used its nonce
-  while the transaction is in no block, which it then never will be.
-  Before it sends a delivery, as a batch or one at a time, also after a
-  restart, the relayer reconciles the signer's deliveries with the node. One
-  whose transaction is in the mempool or a block, was sent less than 60 s
-  ago, or whose nonce the mempool holds for another transaction, is not
-  sent again but followed to its block, however long the chain holds it
-  back; one whose transaction is in neither, with its nonce unused, goes
-  again with that nonce, so that at most one of its transactions can ever
-  be in a block; the others take the account's next nonces. A signer has at
-  most 64 deliveries outstanding, sent and in no block yet: Rusk bounds only
-  the transactions it holds back for an earlier nonce, not those it
-  admitted in nonce order. One that goes again with a nonce after a free
-  one waits until a new delivery takes the free nonce: the node would hold
-  it back.
+- **Deliveries go one at a time by default.** The helper signs each
+  delivery with the account's nonce plus one, as the node reports it,
+  sends it and returns once it is in a block; the next delivery goes after
+  that. The agent chooses no nonce and keeps none. The node refuses a
+  transaction whose nonce its mempool holds for another one at
+  preverification, before propagation, so a delivery submitted again while
+  its first transaction still waits in the mempool is refused, and at most
+  one of them can be in a block. When the helper's outcome is unknown, the
+  agent follows the transaction it prepared by its exact hash. A relayer
+  key delivers about one message every two blocks this way: the next one
+  reaches the node after the next block's round has started.
+- **Pipelined deliveries (experimental, off by default).** Only a chain
+  that sets `pipelineDeliveries: true` and a `maxBatchSize` above 1, with a
+  helper that takes `call --nonce <N> --no-wait` (found from its
+  `call --help`, once per process), pipelines: the relayer submits a batch
+  of deliveries as consecutive transactions of its account, from the
+  node's `next_nonce`, each once the node holds the one before, and they
+  share a block. A configuration that only sets `maxBatchSize`, as the
+  deploy scripts write it, delivers one at a time. The agent logs the mode
+  once at startup. A delivery the node refuses, or whose submission
+  outcome is unknown, ends the batch: the deliveries after it are
+  submitted one at a time. So does a delivery the node does not hold
+  within 5 s, a wait that every query it sends, with its waits for the
+  node's rate limit, ends with, and so does the end of the batch's 60 s to
+  send: no delivery is sent after it. The batch then follows each
+  transaction to its block; one that is in none by then still counts as
+  sent, and the relayer checks that its message was delivered before it
+  submits it again, which then follows the same transaction (see
+  Deliveries in flight). At most 64 go in a batch, Rusk's queue of an
+  account's future nonces. With another helper, every delivery is
+  submitted one at a time. Pipelining needs a single submitting process
+  per signer and chain: no other process, relayer or validator, may sign
+  with the key.
+- **Deliveries in flight (pipelined only).** Each pipelined delivery's
+  nonce, and then its transaction, is kept in `eventCursorDir` (in memory
+  for a client without one) before and after the helper sends it, until
+  the delivery settles: its transaction is in a final block, or the
+  account has used its nonce while the transaction is in no block, which
+  it then never will be. Before it sends a delivery, as a batch or one at
+  a time, also after a restart, the relayer reconciles the signer's
+  deliveries with the node. One whose transaction is in the mempool or a
+  block, was sent less than 60 s ago, or whose nonce the mempool holds for
+  another transaction, is not sent again but followed to its block,
+  however long the chain holds it back; one whose transaction is in
+  neither, with its nonce unused, goes again with that nonce, so that at
+  most one of its transactions can ever be in a block; the others take the
+  account's next nonces. A signer has at most 64 deliveries outstanding,
+  sent and in no block yet: Rusk bounds only the transactions it holds
+  back for an earlier nonce, not those it admitted in nonce order. One that
+  goes again with a nonce after a free one waits until a new delivery
+  takes the free nonce: the node would hold it back.
 - **Delivery simulation.** Dusk charges a failed transaction its whole gas
   limit. Before submitting `process`, the relayer runs it as an unsigned
   contract query, which Rusk executes in a throwaway session. If the query
@@ -359,6 +373,7 @@ how to run the local bridge.
   "contractQueryBurst": 20,
   "batchContractAddress": "0x93de287b7d349d678a0038fe7772e8960e1a84a1b5da2d0b1f62f532616ce1d4",
   "maxBatchSize": 16,
+  "pipelineDeliveries": false,
   "mailbox": "0x<contract id>",
   "interchainGasPaymaster": "0x<contract id>",
   "validatorAnnounce": "0x<contract id>",
@@ -390,10 +405,12 @@ so a local chain that deploys the published Wasm with nonce 0 and the
 published owner gets the same ID. It has no default: without it, every read
 is one query.
 
-`maxBatchSize` (1 by default) is how many prepared deliveries the relayer
-submits together; above 1, with a helper that takes `--nonce` and
-`--no-wait`, they go as consecutive transactions (see Pipelined
-deliveries).
+`pipelineDeliveries` (false by default) opts the chain into pipelined
+deliveries, which are experimental. Only with it and a `maxBatchSize` (1 by
+default) above 1 does the relayer submit up to `maxBatchSize` prepared
+deliveries together, as consecutive transactions (see Pipelined
+deliveries); otherwise every delivery goes one at a time, whatever
+`maxBatchSize` says.
 
 The `duskKey` signer takes exactly one of `keyFile` (a regular file with no
 group or world permissions), `keyEnv` (an environment variable name) or `key`

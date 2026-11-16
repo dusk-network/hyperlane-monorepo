@@ -1133,6 +1133,14 @@ pub fn build_dusk_connection_conf(
         burst: positive("contractQueryBurst", default_limit.burst),
     };
 
+    // Pipelined deliveries are experimental: a relayer sends one delivery
+    // at a time unless this is set and `maxBatchSize` is above 1.
+    let pipeline_deliveries = chain
+        .chain(err)
+        .get_opt_key("pipelineDeliveries")
+        .parse_bool()
+        .unwrap_or(false);
+
     Some(ChainConnectionConf::Dusk(hyperlane_dusk::ConnectionConf {
         url,
         chain_id,
@@ -1142,6 +1150,7 @@ pub fn build_dusk_connection_conf(
         native_token,
         op_submission_config: operation_batch,
         query_rate_limit,
+        pipeline_deliveries,
     }))
 }
 
