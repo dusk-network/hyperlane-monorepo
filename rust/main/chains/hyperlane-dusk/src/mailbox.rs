@@ -533,13 +533,16 @@ impl DuskMailbox {
     /// helper's outcome is unknown, the transaction it prepared is followed
     /// by its exact hash.
     ///
-    /// That hash is kept for the message as soon as the helper prints it,
-    /// before it propagates the transaction, and a delivery submitted again
-    /// looks the transaction up first (`follow_prepared`). Otherwise the
-    /// first transaction could land after the relayer's simulation passed
-    /// and before the helper read the account's nonce: the helper would
-    /// sign the next nonce, and a second transaction would land and fail,
-    /// paying its whole gas limit.
+    /// That hash is kept for the message once the helper prints it, and the
+    /// helper sends the transaction only once it is kept: it waits for the
+    /// agent's word (`dusk_tx_call_kept`). A delivery submitted again looks
+    /// the transaction up first (`follow_prepared`). Otherwise the first
+    /// transaction could land after the relayer's simulation passed and
+    /// before the helper read the account's nonce: the helper would sign the
+    /// next nonce, and a second transaction would land and fail, paying its
+    /// whole gas limit. A hash that cannot be kept leaves the helper without
+    /// the word: it sends nothing, and the delivery fails `NotSubmitted`, so
+    /// that the next submission goes at once.
     async fn process_one(
         &self,
         signer: &DuskSigner,
@@ -553,26 +556,31 @@ impl DuskMailbox {
                 return Ok(outcome);
             }
         }
-        let keep = |tx_id: &str| {
-            let Some(tx_id) = hex::decode(tx_id)
+        let keep = |tx_id: &str| -> Result<(), HyperlaneDuskError> {
+            let tx_id = hex::decode(tx_id)
                 .ok()
                 .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-            else {
-                return;
-            };
+                .ok_or_else(|| {
+                    HyperlaneDuskError::Other(format!(
+                        "dusk-tx named a transaction whose hash is not 32 bytes of hex: {}",
+                        bounded_text(tx_id)
+                    ))
+                })?;
             let prepared = PreparedDelivery {
                 tx_id,
                 prepared_at: unix_millis(),
             };
-            if let Err(error) = self.rues.keep_prepared_delivery(&key, message, &prepared) {
-                warn!(
-                    message_id = ?message,
-                    error = %bounded_error(&error),
-                    "Failed to keep the transaction prepared for a Dusk delivery; submitted again, the delivery cannot look it up first"
-                );
-            }
+            self.rues
+                .keep_prepared_delivery(&key, message, &prepared)
+                .inspect_err(|error| {
+                    warn!(
+                        message_id = ?message,
+                        error = %bounded_error(error),
+                        "Failed to keep the transaction prepared for a Dusk delivery; the helper is not let send it"
+                    );
+                })
         };
-        let call_result = crate::tx_sender::dusk_tx_call_naming(
+        let call_result = crate::tx_sender::dusk_tx_call_kept(
             &self.conn,
             signer,
             &self.mailbox_id,
@@ -601,7 +609,8 @@ impl DuskMailbox {
             Err(error @ HyperlaneDuskError::NotSubmitted(_)) => {
                 // Nothing of it reached the node, so there is nothing to
                 // follow. Kept, it would only hold the next submission back
-                // for the drop grace.
+                // for the drop grace. A helper not let send it, because its
+                // hash could not be kept, left nothing to forget.
                 if let Err(forget) = self.rues.forget_prepared_delivery(&key, message) {
                     debug!(
                         message_id = ?message,
@@ -721,6 +730,15 @@ impl DuskMailbox {
             gas_used: U256::from(confirmed.gas_spent),
             gas_price: FixedPointNumber::from(self.conn.gas_price),
         })
+    }
+
+    /// Make the next `keeps` keeps and `forgets` forgets of the
+    /// transactions kept for deliveries one at a time fail, as they do when
+    /// the event store cannot be written, for tests of what such a failure
+    /// does.
+    #[doc(hidden)]
+    pub fn fail_prepared_writes(&self, keeps: usize, forgets: usize) {
+        self.rues.fail_prepared_writes(keeps, forgets);
     }
 
     /// The transaction kept for the last submission of `message` one at a

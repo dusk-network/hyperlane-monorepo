@@ -30,6 +30,17 @@ const MAX_DUSK_TX_STREAM_BYTES: usize = 1024 * 1024;
 /// (`MAX_CALL_ARGS_BYTES` in the companion repository's `dusk-tx`).
 const MAX_DUSK_TX_ARGS_BYTES: usize = 60 * 1024;
 
+/// The flag of `dusk-tx call` that makes it wait for the agent's word
+/// before it sends the transaction it prepared.
+const ACK_BEFORE_SEND: &str = "--ack-before-send";
+/// The word, a line on the helper's stdin, that lets it send.
+const SEND_WORD: &[u8] = b"send\n";
+/// What a `dusk-tx` that takes `--ack-before-send` is, for the error that
+/// refuses deliveries without one.
+const ACK_HELPER: &str = "dusk-tx from hyperlane-dusk with `call --ack-before-send` (dusk-network/hyperlane-dusk fix/final-review, or later)";
+/// How the helper starts the stderr line that says it sent nothing.
+const NOT_SUBMITTED: &str = "Not submitted:";
+
 /// Send a contract call via the `dusk-tx` CLI binary, which signs it with
 /// the account's next nonce and returns once the transaction is in a block.
 ///
@@ -42,31 +53,6 @@ pub async fn dusk_tx_call(
     args_bytes: &[u8],
     gas_limit: Option<u64>,
 ) -> Result<Value, HyperlaneDuskError> {
-    dusk_tx_call_naming(
-        conn,
-        signer,
-        contract_id,
-        fn_name,
-        args_bytes,
-        gas_limit,
-        &|_| {},
-    )
-    .await
-}
-
-/// `dusk_tx_call`, which calls `named` with the hash of the transaction
-/// the helper prepared as soon as the helper names it, while it runs: the
-/// helper prints `Prepared TX <hash>;` before it propagates the
-/// transaction. `named` is called at most once.
-pub(crate) async fn dusk_tx_call_naming(
-    conn: &ConnectionConf,
-    signer: &DuskSigner,
-    contract_id: &[u8; 32],
-    fn_name: &str,
-    args_bytes: &[u8],
-    gas_limit: Option<u64>,
-    named: &(dyn Fn(&str) + Sync),
-) -> Result<Value, HyperlaneDuskError> {
     run_dusk_tx_at(
         &conn.url,
         conn,
@@ -77,10 +63,64 @@ pub(crate) async fn dusk_tx_call_naming(
         gas_limit,
         &[],
         DUSK_TX_HELPER_TIMEOUT,
-        named,
+        None,
     )
     .await
 }
+
+/// `dusk_tx_call`, whose transaction the helper sends only once `keep` has
+/// kept its hash (`--ack-before-send`). The helper prints
+/// `Prepared TX <hash>;` once it has signed the transaction and waits for
+/// a word on its stdin: `keep` is called with that hash, and only once it
+/// succeeds does the agent write `send`, which lets the helper preverify
+/// and propagate the transaction. When `keep` fails, the agent closes the
+/// helper's stdin instead, so the helper sends nothing and the call fails
+/// `NotSubmitted`; so does a call whose agent stops or dies before it gave
+/// the word, since its end of stdin closes with it. `keep` is called at
+/// most once.
+///
+/// Needs a helper that lists `--ack-before-send` in its `call --help`:
+/// with another, nothing is signed, and the call fails.
+pub(crate) async fn dusk_tx_call_kept(
+    conn: &ConnectionConf,
+    signer: &DuskSigner,
+    contract_id: &[u8; 32],
+    fn_name: &str,
+    args_bytes: &[u8],
+    gas_limit: Option<u64>,
+    keep: &Keep<'_>,
+) -> Result<Value, HyperlaneDuskError> {
+    match helper_flags().await {
+        (_, Some(flags)) if flags.acks => {}
+        (bin, Some(_)) => {
+            return Err(HyperlaneDuskError::Other(format!(
+                "The dusk-tx helper at '{bin}' does not take `call {ACK_BEFORE_SEND}`, so it would send a {fn_name} transaction before the agent kept its hash; nothing was signed. Dusk deliveries need {ACK_HELPER}."
+            )))
+        }
+        (bin, None) => {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Could not read `call --help` of the dusk-tx helper at '{bin}', so nothing was signed: Dusk deliveries need {ACK_HELPER}. Set DUSK_TX_BIN to its path."
+            )))
+        }
+    }
+    run_dusk_tx_at(
+        &conn.url,
+        conn,
+        signer,
+        contract_id,
+        fn_name,
+        args_bytes,
+        gas_limit,
+        &[],
+        DUSK_TX_HELPER_TIMEOUT,
+        Some(keep),
+    )
+    .await
+}
+
+/// What keeps the hash of the transaction the helper prepared, before the
+/// helper may send it.
+pub(crate) type Keep<'a> = dyn Fn(&str) -> Result<(), HyperlaneDuskError> + Sync + 'a;
 
 /// A transaction the helper signed, which nothing has sent yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,7 +213,7 @@ pub(crate) async fn dusk_tx_sign(
         Some(gas_limit),
         &extra,
         timeout,
-        &|_| {},
+        None,
     )
     .await;
     drop(server);
@@ -346,14 +386,25 @@ async fn respond(
 /// How long the `call --help` probe of a helper may take.
 const HELPER_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Whether the configured `dusk-tx` can sign with a given nonce and return
-/// once the node has accepted the transaction (`call --nonce --no-wait`),
-/// which pipelined deliveries need. Asked once per helper path, from its
-/// `call --help`, which reads no key and sends nothing; a helper that fails
-/// the probe is taken not to.
-pub(crate) async fn helper_pipelines() -> bool {
+/// What the configured `dusk-tx` takes, as its `call --help` lists it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HelperFlags {
+    /// It can sign with a given nonce and return once the node has
+    /// accepted the transaction (`--nonce`, `--no-wait`), which pipelined
+    /// deliveries need.
+    pub pipelines: bool,
+    /// It sends the transaction it prepared only once the agent says so
+    /// (`--ack-before-send`), which deliveries one at a time need.
+    pub acks: bool,
+}
+
+/// The configured `dusk-tx`'s path and what it takes, from its
+/// `call --help`, which reads no key and sends nothing: `None` when the
+/// help cannot be read. Asked once per helper path; a probe that cannot
+/// read the help is not kept, so the next call asks again.
+pub(crate) async fn helper_flags() -> (String, Option<HelperFlags>) {
     static PROBES: std::sync::OnceLock<
-        tokio::sync::Mutex<std::collections::HashMap<String, bool>>,
+        tokio::sync::Mutex<std::collections::HashMap<String, HelperFlags>>,
     > = std::sync::OnceLock::new();
     let bin = std::env::var("DUSK_TX_BIN").unwrap_or_else(|_| "dusk-tx".into());
     let mut probes = PROBES
@@ -361,7 +412,7 @@ pub(crate) async fn helper_pipelines() -> bool {
         .lock()
         .await;
     if let Some(known) = probes.get(&bin) {
-        return *known;
+        return (bin, Some(*known));
     }
     let mut command = Command::new(&bin);
     command
@@ -375,22 +426,44 @@ pub(crate) async fn helper_pipelines() -> bool {
         Ok(Ok(output)) if output.status.success() => {
             String::from_utf8_lossy(&output.stdout).into_owned()
         }
-        _ => String::new(),
+        _ => {
+            warn!(
+                bin = %bin,
+                "Could not read the dusk-tx helper's `call --help`; it is asked again at the next submission"
+            );
+            return (bin, None);
+        }
     };
-    let pipelines = help.contains("--nonce") && help.contains("--no-wait");
-    if !pipelines {
+    let flags = HelperFlags {
+        pipelines: help.contains("--nonce") && help.contains("--no-wait"),
+        acks: help.contains(ACK_BEFORE_SEND),
+    };
+    if !flags.acks {
+        warn!(
+            bin = %bin,
+            "The dusk-tx helper does not take `call {ACK_BEFORE_SEND}`: Dusk deliveries are refused until it is replaced with {ACK_HELPER}"
+        );
+    }
+    if !flags.pipelines {
         info!(
             bin = %bin,
             "The dusk-tx helper cannot sign with a given nonce (call --nonce --no-wait); Dusk deliveries are submitted one at a time"
         );
     }
-    probes.insert(bin, pipelines);
-    pipelines
+    probes.insert(bin.clone(), flags);
+    (bin, Some(flags))
+}
+
+/// Whether the configured `dusk-tx` can sign with a given nonce and return
+/// once the node has accepted the transaction (`call --nonce --no-wait`),
+/// which pipelined deliveries need (`helper_flags`).
+pub(crate) async fn helper_pipelines() -> bool {
+    helper_flags().await.1.is_some_and(|flags| flags.pipelines)
 }
 
 /// Run the helper's `call` against the RUES endpoint at `url`, for at most
-/// `timeout`, calling `named` with the hash of the transaction it prepared
-/// as soon as it names it.
+/// `timeout`. With `keep`, the helper sends the transaction it prepared
+/// only once `keep` has kept its hash (`dusk_tx_call_kept`).
 #[allow(clippy::too_many_arguments)]
 async fn run_dusk_tx_at(
     url: &Url,
@@ -402,7 +475,7 @@ async fn run_dusk_tx_at(
     gas_limit: Option<u64>,
     extra_args: &[String],
     timeout: Duration,
-    named: &(dyn Fn(&str) + Sync),
+    keep: Option<&Keep<'_>>,
 ) -> Result<Value, HyperlaneDuskError> {
     if args_bytes.len() > MAX_DUSK_TX_ARGS_BYTES {
         return Err(HyperlaneDuskError::Other(format!(
@@ -446,6 +519,7 @@ async fn run_dusk_tx_at(
         .arg("--gas-price")
         .arg(conn.gas_price.to_string())
         .args(extra_args)
+        .args(keep.map(|_| ACK_BEFORE_SEND))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -459,20 +533,34 @@ async fn run_dusk_tx_at(
 
     // Keep both the authenticated URL and signing key out of process arguments.
     // The helper consumes the URL line first, then the key after chain validation.
-    if let Some(mut stdin) = child.stdin.take() {
-        let input = format!("{}\n{secret_key_hex}\n", url.as_str());
-        tokio::time::timeout(timeout, stdin.write_all(input.as_bytes()))
-            .await
-            .map_err(|_| {
-                HyperlaneDuskError::Other("dusk-tx stdin write exceeded its deadline".into())
-            })?
-            .map_err(|error| {
-                HyperlaneDuskError::Other(format!("Failed to write dusk-tx private stdin: {error}"))
-            })?;
-    }
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| HyperlaneDuskError::Other("dusk-tx stdin pipe was not configured".into()))?;
+    let input = format!("{}\n{secret_key_hex}\n", url.as_str());
+    tokio::time::timeout(timeout, stdin.write_all(input.as_bytes()))
+        .await
+        .map_err(|_| HyperlaneDuskError::Other("dusk-tx stdin write exceeded its deadline".into()))?
+        .map_err(|error| {
+            HyperlaneDuskError::Other(format!("Failed to write dusk-tx private stdin: {error}"))
+        })?;
+    // Without `--ack-before-send` the helper reads nothing more. With it,
+    // stdin stays open for the word that lets it send: dropped, by this
+    // call's end or its cancellation, it closes, and the helper sends
+    // nothing it was not let send.
+    let ack = match keep {
+        Some(keep) => Some(Ack { stdin, keep }),
+        None => {
+            drop(stdin);
+            None
+        }
+    };
 
-    let (output, prepared_tx_id) = wait_for_child_output(child, fn_name, timeout, named).await?;
-    let json = helper_result(fn_name, &output, prepared_tx_id.as_deref())?;
+    let run = wait_for_child_output(child, fn_name, timeout, ack).await?;
+    if let Word::Withheld(why) = &run.word {
+        return Err(withheld(fn_name, &run, why));
+    }
+    let json = helper_result(fn_name, &run.output, run.prepared.as_deref())?;
 
     let tx_id = json
         .get("tx_id")
@@ -537,20 +625,22 @@ fn helper_result(
                     return Err(HyperlaneDuskError::SubmissionOutcomeUnknown { tx_id, detail });
                 }
                 let detail = format!("dusk-tx call {fn_name} failed: {detail}");
-                // A complete preverify diagnostic proves propagation never ran.
-                if before_propagation_error(err) {
+                // A complete preverify diagnostic proves propagation never
+                // ran, and so does the helper's word that it sent nothing.
+                if before_propagation_error(err) || said_not_submitted(&stderr) {
                     return Err(HyperlaneDuskError::NotSubmitted(detail));
                 }
                 return Err(helper_failure(prepared_tx_id, detail));
             }
         }
-        return Err(helper_failure(
-            prepared_tx_id,
-            format!(
-                "dusk-tx call {fn_name} failed (exit code {code}): {}",
-                bounded_text(&stderr)
-            ),
-        ));
+        let detail = format!(
+            "dusk-tx call {fn_name} failed (exit code {code}): {}",
+            bounded_text(&stderr)
+        );
+        if said_not_submitted(&stderr) {
+            return Err(HyperlaneDuskError::NotSubmitted(detail));
+        }
+        return Err(helper_failure(prepared_tx_id, detail));
     }
 
     let json: Value = serde_json::from_str(&stdout).map_err(|e| {
@@ -579,16 +669,69 @@ fn helper_result(
     Ok(json)
 }
 
+/// The agent's side of `--ack-before-send`: the helper's stdin, still open
+/// after the key line, and what keeps the hash of the transaction it
+/// prepared before the word that lets it send goes there.
+struct Ack<'a> {
+    stdin: tokio::process::ChildStdin,
+    keep: &'a Keep<'a>,
+}
+
+/// Whether the helper was let send the transaction it prepared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Word {
+    /// It sends on its own: it was run without `--ack-before-send`.
+    NotAsked,
+    /// The agent kept the transaction's hash and wrote the word: the helper
+    /// may have sent it.
+    Given,
+    /// The agent did not write the word, why. A helper that takes
+    /// `--ack-before-send` then sends nothing.
+    Withheld(String),
+}
+
+/// A helper call that ended.
+#[derive(Debug)]
+struct HelperRun {
+    output: std::process::Output,
+    /// The transaction the helper named as prepared, if it did.
+    prepared: Option<String>,
+    word: Word,
+}
+
+/// Keep `tx_id` with `ack`'s `keep`, and only once that succeeds write the
+/// word that lets the helper send it. What the helper was told.
+async fn answer(ack: Ack<'_>, tx_id: &str) -> Word {
+    let Ack { mut stdin, keep } = ack;
+    if let Err(error) = keep(tx_id) {
+        // Dropping stdin closes it: the helper sends nothing.
+        return Word::Withheld(format!(
+            "its hash could not be kept: {}",
+            bounded_error(&error)
+        ));
+    }
+    match stdin.write_all(SEND_WORD).await {
+        Ok(()) => Word::Given,
+        // The helper closed its stdin, so it stopped before it read the
+        // word: it sent nothing.
+        Err(error) => Word::Withheld(format!(
+            "the helper stopped before it read the word to send it: {error}"
+        )),
+    }
+}
+
 /// The helper's output and the transaction it named, once it exits, or
-/// `timeout`'s error. `named` hears of that transaction as soon as the
-/// helper names it, which it does before it propagates it and waits for a
-/// block, so a caller can keep the hash before the outcome is known.
+/// `timeout`'s error. The helper names the transaction it prepared before
+/// it sends it; with `ack`, that hash is kept as soon as it is named, and
+/// only then is the helper let send it (`answer`). Cancelled, this drops
+/// the helper's stdin and kills the helper, so a helper not yet let send
+/// sends nothing.
 async fn wait_for_child_output(
     mut child: tokio::process::Child,
     fn_name: &str,
     timeout: Duration,
-    named: &(dyn Fn(&str) + Sync),
-) -> Result<(std::process::Output, Option<String>), HyperlaneDuskError> {
+    mut ack: Option<Ack<'_>>,
+) -> Result<HelperRun, HyperlaneDuskError> {
     let stdout = child.stdout.take().ok_or_else(|| {
         HyperlaneDuskError::Other("dusk-tx stdout pipe was not configured".into())
     })?;
@@ -604,6 +747,11 @@ async fn wait_for_child_output(
     ));
 
     let mut prepared_tx_id: Option<String> = None;
+    let mut word = if ack.is_some() {
+        Word::Withheld("the helper named no transaction".into())
+    } else {
+        Word::NotAsked
+    };
     let waited = tokio::time::timeout(timeout, async {
         let mut naming = true;
         loop {
@@ -612,7 +760,9 @@ async fn wait_for_child_output(
                 tx_id = &mut prepared_tx_receiver, if naming => {
                     naming = false;
                     if let Ok(tx_id) = tx_id {
-                        named(&tx_id);
+                        if let Some(ack) = ack.take() {
+                            word = answer(ack, &tx_id).await;
+                        }
                         prepared_tx_id = Some(tx_id);
                     }
                 }
@@ -620,6 +770,8 @@ async fn wait_for_child_output(
         }
     })
     .await;
+    // Not let send by now, the helper never will be.
+    drop(ack);
     let status = waited
         .map_err(|_| {
             format!(
@@ -638,8 +790,12 @@ async fn wait_for_child_output(
             let _ = child.kill().await;
             let _ = child.wait().await;
             drain_timed_out_readers(&mut stdout_task, &mut stderr_task).await;
-            let prepared_tx_id =
-                prepared_tx_id.or_else(|| named_late(&mut prepared_tx_receiver, named));
+            let prepared_tx_id = prepared_tx_id.or_else(|| prepared_tx_receiver.try_recv().ok());
+            if let Word::Withheld(why) = word {
+                return Err(HyperlaneDuskError::NotSubmitted(format!(
+                    "{detail}; it was not let send a transaction ({why}), so it sent none"
+                )));
+            }
             return Err(helper_failure(prepared_tx_id.as_deref(), detail));
         }
     };
@@ -648,7 +804,7 @@ async fn wait_for_child_output(
     // A normal or signaled exit can interrupt the helper after propagation just
     // as a timeout can; the prepared hash remains authoritative in every case.
     let (stdout, stderr) = tokio::join!(stdout_task, stderr_task);
-    let prepared_tx_id = prepared_tx_id.or_else(|| named_late(&mut prepared_tx_receiver, named));
+    let prepared_tx_id = prepared_tx_id.or_else(|| prepared_tx_receiver.try_recv().ok());
     let stdout = stdout
         .map_err(|error| {
             helper_failure(
@@ -665,25 +821,51 @@ async fn wait_for_child_output(
             )
         })?
         .map_err(|error| helper_failure(prepared_tx_id.as_deref(), error.to_string()))?;
-    Ok((
-        std::process::Output {
+    Ok(HelperRun {
+        output: std::process::Output {
             status,
             stdout,
             stderr,
         },
-        prepared_tx_id,
+        prepared: prepared_tx_id,
+        word,
+    })
+}
+
+/// The error of a helper call whose transaction the agent did not let it
+/// send, why: nothing was sent. A helper that named no transaction failed
+/// before it signed one, and says why itself.
+fn withheld(fn_name: &str, run: &HelperRun, why: &str) -> HyperlaneDuskError {
+    let Some(tx_id) = &run.prepared else {
+        return match helper_result(fn_name, &run.output, None) {
+            Err(error) => error,
+            Ok(_) => HyperlaneDuskError::NotSubmitted(format!(
+                "dusk-tx call {fn_name} reported success without naming the transaction it prepared, which it was never let send"
+            )),
+        };
+    };
+    let stderr = String::from_utf8_lossy(&run.output.stderr);
+    let said = stderr
+        .lines()
+        .map(str::trim_start)
+        .find(|line| line.starts_with(NOT_SUBMITTED))
+        .map_or_else(
+            || format!("exit code {}", run.output.status.code().unwrap_or(-1)),
+            bounded_text,
+        );
+    warn!(fn_name, %tx_id, %why, "dusk-tx was not let send the transaction it prepared");
+    HyperlaneDuskError::NotSubmitted(format!(
+        "dusk-tx prepared {fn_name} transaction {tx_id} but was not let send it, since {why}; it sent nothing ({said})"
     ))
 }
 
-/// The transaction the stderr reader found after the helper stopped, if
-/// any, of which `named` then hears.
-fn named_late(
-    receiver: &mut oneshot::Receiver<String>,
-    named: &(dyn Fn(&str) + Sync),
-) -> Option<String> {
-    let tx_id = receiver.try_recv().ok()?;
-    named(&tx_id);
-    Some(tx_id)
+/// Whether the helper said it sent nothing: a line of its stderr starts
+/// with `Not submitted:`, which a helper that takes `--ack-before-send`
+/// prints when it stops without the word to send.
+fn said_not_submitted(stderr: &str) -> bool {
+    stderr
+        .lines()
+        .any(|line| line.trim_start().starts_with(NOT_SUBMITTED))
 }
 
 fn helper_failure(prepared_tx_id: Option<&str>, detail: String) -> HyperlaneDuskError {
@@ -706,7 +888,9 @@ fn before_propagation_error(error: &str) -> bool {
     tx_id.len() == 64
         && tx_id.bytes().all(|byte| byte.is_ascii_hexdigit())
         && (detail.starts_with("Preverify failed before propagation: ")
-            || detail.starts_with("Preverify rejected before propagation ("))
+            || detail.starts_with("Preverify rejected before propagation (")
+            // `--ack-before-send` without the word to send.
+            || detail.starts_with(NOT_SUBMITTED))
 }
 
 type PipeReader = tokio::task::JoinHandle<Result<Vec<u8>, HyperlaneDuskError>>;
@@ -1043,83 +1227,191 @@ mod tests {
             .stderr(Stdio::piped());
         let child = command.spawn().unwrap();
         let started = tokio::time::Instant::now();
-        let error = wait_for_child_output(child, "test", Duration::from_millis(20), &|_| {})
+        let error = wait_for_child_output(child, "test", Duration::from_millis(20), None)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("helper deadline"));
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
+    /// The prepared line, as `dusk-tx` prints it.
+    fn prepared_line(tx_id: &str) -> String {
+        format!("printf '  Prepared TX {tx_id}; reconcile this exact hash before retrying if submission is interrupted\\n' >&2")
+    }
+
+    /// A shell helper running `script`, with a stdin the caller writes.
+    fn shell_helper(script: &str) -> tokio::process::Child {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .kill_on_drop(true)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command.spawn().unwrap()
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn timed_out_helper_preserves_prepared_transaction_for_reconciliation() {
         let tx_id = "ab".repeat(32);
-        let mut command = Command::new("sh");
-        command
-            .arg("-c")
-            .arg(format!(
-                "printf '  Prepared TX {tx_id}; reconcile this exact hash before retrying if submission is interrupted\\n' >&2; exec sleep 10"
-            ))
-            .kill_on_drop(true)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let child = command.spawn().unwrap();
-        let named = StdMutex::new(Vec::new());
-        let error = wait_for_child_output(
-            child,
-            "process",
-            Duration::from_millis(200),
-            &|tx_id: &str| named.lock().unwrap().push(tx_id.to_owned()),
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            HyperlaneDuskError::SubmissionOutcomeUnknown { tx_id: observed, .. }
-                if observed == tx_id
-        ));
-        assert_eq!(*named.lock().unwrap(), [tx_id]);
+        // Sent on its own, or let send: either may have reached the node.
+        for acks in [false, true] {
+            let mut child = shell_helper(&format!(
+                "{}; read -r word; exec sleep 10",
+                prepared_line(&tx_id)
+            ));
+            let kept = StdMutex::new(Vec::new());
+            let keep = |tx_id: &str| {
+                kept.lock().unwrap().push(tx_id.to_owned());
+                Ok(())
+            };
+            let stdin = child.stdin.take().unwrap();
+            let ack = acks.then_some(Ack { stdin, keep: &keep });
+            let error = wait_for_child_output(child, "process", Duration::from_millis(200), ack)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    HyperlaneDuskError::SubmissionOutcomeUnknown { tx_id: observed, .. }
+                        if *observed == tx_id
+                ),
+                "{error}"
+            );
+            assert_eq!(kept.into_inner().unwrap().len(), usize::from(acks));
+        }
     }
 
     /// The helper names its transaction before it propagates it, then waits
-    /// for its block: the caller hears of the hash at once, not when the
-    /// helper is done.
+    /// for its block: the caller keeps the hash at once, not when the helper
+    /// is done, and only then lets the helper send it.
     #[cfg(unix)]
     #[tokio::test]
-    async fn the_prepared_transaction_is_named_while_the_helper_runs() {
+    async fn the_prepared_transaction_is_kept_while_the_helper_runs_and_only_then_sent() {
         let tx_id = "cd".repeat(32);
-        let mut command = Command::new("sh");
-        command
-            .arg("-c")
-            .arg(format!(
-                "printf '  Prepared TX {tx_id}; reconcile this exact hash before retrying if submission is interrupted\\n' >&2; sleep 1; printf '{{}}'"
-            ))
-            .kill_on_drop(true)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let child = command.spawn().unwrap();
+        let mut child = shell_helper(&format!(
+            "{}; IFS= read -r word; sleep 1; printf '{{\"word\":\"%s\"}}' \"$word\"",
+            prepared_line(&tx_id)
+        ));
         let started = std::time::Instant::now();
-        let named = StdMutex::new(Vec::new());
-        let (_, prepared) =
-            wait_for_child_output(child, "process", Duration::from_secs(5), &|tx_id: &str| {
-                named
-                    .lock()
-                    .unwrap()
-                    .push((tx_id.to_owned(), started.elapsed()))
-            })
+        let kept = StdMutex::new(Vec::new());
+        let keep = |tx_id: &str| {
+            kept.lock()
+                .unwrap()
+                .push((tx_id.to_owned(), started.elapsed()));
+            Ok(())
+        };
+        let ack = Ack {
+            stdin: child.stdin.take().unwrap(),
+            keep: &keep,
+        };
+        let run = wait_for_child_output(child, "process", Duration::from_secs(5), Some(ack))
             .await
             .unwrap();
         let finished = started.elapsed();
-        assert_eq!(prepared.as_deref(), Some(tx_id.as_str()));
-        let named = named.into_inner().unwrap();
-        assert_eq!(named.len(), 1);
-        assert_eq!(named[0].0, tx_id);
-        // Named about a second before the helper was done.
+        assert_eq!(run.prepared.as_deref(), Some(tx_id.as_str()));
+        assert_eq!(run.word, Word::Given);
+        assert_eq!(run.output.stdout, br#"{"word":"send"}"#);
+        let kept = kept.into_inner().unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].0, tx_id);
+        // Kept about a second before the helper was done.
         assert!(
-            named[0].1 + Duration::from_millis(500) < finished,
+            kept[0].1 + Duration::from_millis(500) < finished,
             "{:?} {finished:?}",
-            named[0].1
+            kept[0].1
         );
+    }
+
+    /// A transaction whose hash could not be kept is never let go: the
+    /// helper's stdin closes without the word, and it sends nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_helper_whose_transaction_was_not_kept_sends_nothing() {
+        let tx_id = "ef".repeat(32);
+        let directory = tempfile::tempdir().unwrap();
+        let sent = directory.path().join("sent");
+        let mut child = shell_helper(&format!(
+            "{}; if IFS= read -r word && [ \"$word\" = send ]; then : > '{}'; printf '{{}}'; else echo 'Not submitted: the agent did not say send' >&2; exit 1; fi",
+            prepared_line(&tx_id),
+            sent.display()
+        ));
+        let keep = |_: &str| Err(HyperlaneDuskError::Other("the event store is gone".into()));
+        let ack = Ack {
+            stdin: child.stdin.take().unwrap(),
+            keep: &keep,
+        };
+        let run = wait_for_child_output(child, "process", Duration::from_secs(5), Some(ack))
+            .await
+            .unwrap();
+        assert!(!sent.exists());
+        let Word::Withheld(why) = &run.word else {
+            panic!("{:?}", run.word);
+        };
+        assert!(why.contains("the event store is gone"), "{why}");
+        let error = withheld("process", &run, why);
+        let HyperlaneDuskError::NotSubmitted(detail) = &error else {
+            panic!("{error:?}");
+        };
+        assert!(detail.contains(&tx_id), "{detail}");
+        assert!(
+            detail.contains("Not submitted: the agent did not say send"),
+            "{detail}"
+        );
+    }
+
+    /// The helper's word that it sent nothing makes a call `NotSubmitted`,
+    /// but never outweighs an outcome it reports for the transaction.
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_that_says_it_sent_nothing_did_not_submit() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let tx_id = "ab".repeat(32);
+        let output = |stdout: String, stderr: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: stdout.into_bytes(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        let prepared = format!("  Prepared TX {tx_id}; reconcile\n");
+        let reason = "stdin closed before the line \"send\"";
+        let said = format!("{prepared}Not submitted: {reason}\n");
+        // As dusk-tx says it: on stderr, and in its error, after the
+        // transaction's `submission failed: `. Either is enough.
+        let refused = serde_json::json!({ "success": false, "error": format!(
+            "Transaction {tx_id} submission failed: Not submitted: {reason}"
+        ) })
+        .to_string();
+        for (stdout, stderr) in [
+            (refused.clone(), said.as_str()),
+            (refused, prepared.as_str()),
+            (String::new(), said.as_str()),
+            (
+                serde_json::json!({ "success": false, "error": "no word" }).to_string(),
+                said.as_str(),
+            ),
+        ] {
+            assert!(matches!(
+                helper_result("process", &output(stdout, stderr), Some(&tx_id)),
+                Err(HyperlaneDuskError::NotSubmitted(_))
+            ));
+        }
+        // Without that word, a helper that named its transaction may have
+        // sent it.
+        assert!(matches!(
+            helper_result("process", &output(String::new(), &prepared), Some(&tx_id)),
+            Err(HyperlaneDuskError::SubmissionOutcomeUnknown { .. })
+        ));
+        let unknown = serde_json::json!({ "success": false, "error": format!(
+            "Transaction {tx_id} submission failed: Propagation outcome unknown: closed; retain tx_id={tx_id}"
+        ) })
+        .to_string();
+        assert!(matches!(
+            helper_result("process", &output(unknown, &said), Some(&tx_id)),
+            Err(HyperlaneDuskError::SubmissionOutcomeUnknown { .. })
+        ));
     }
 
     #[tokio::test]
@@ -1239,12 +1531,11 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let child = command.spawn().unwrap();
-        let (output, prepared) =
-            wait_for_child_output(child, "process", Duration::from_secs(5), &|_| {})
-                .await
-                .unwrap();
-        assert_eq!(output.stderr.len(), 900_000);
-        let error = helper_result("process", &output, prepared.as_deref())
+        let run = wait_for_child_output(child, "process", Duration::from_secs(5), None)
+            .await
+            .unwrap();
+        assert_eq!(run.output.stderr.len(), 900_000);
+        let error = helper_result("process", &run.output, run.prepared.as_deref())
             .unwrap_err()
             .to_string();
         assert!(error.len() < 2 * 1024, "{} bytes", error.len());
@@ -1270,7 +1561,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let child = command.spawn().unwrap();
-        let error = wait_for_child_output(child, "test", Duration::from_secs(2), &|_| {})
+        let error = wait_for_child_output(child, "test", Duration::from_secs(2), None)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("stdout exceeds"));

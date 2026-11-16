@@ -61,8 +61,9 @@ pub enum HyperlaneDuskError {
         detail: String,
     },
     /// The helper did not propagate the transaction it prepared: the node
-    /// refused it at preverification, or preverification could not be
-    /// asked. Nothing of it reached the node.
+    /// refused it at preverification, preverification could not be asked,
+    /// or the helper was not let send it (`--ack-before-send`). Nothing of
+    /// it reached the node.
     #[error("{0}")]
     NotSubmitted(String),
     /// The helper observed an included execution failure. Reconcile its exact

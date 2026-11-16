@@ -445,6 +445,9 @@ impl RuesClient {
         message: H256,
         delivery: &PreparedDelivery,
     ) -> Result<(), HyperlaneDuskError> {
+        if self.endpoint.prepared_write_fails(true) {
+            return Err(in_flight_error("a failure a test injected"));
+        }
         let Some(store) = &self.event_store else {
             self.endpoint
                 .keep_prepared_delivery(signer, message, *delivery);
@@ -484,6 +487,9 @@ impl RuesClient {
         signer: &[u8; 32],
         message: H256,
     ) -> Result<(), HyperlaneDuskError> {
+        if self.endpoint.prepared_write_fails(false) {
+            return Err(in_flight_error("a failure a test injected"));
+        }
         let Some(store) = &self.event_store else {
             self.endpoint.forget_prepared_delivery(signer, message);
             return Ok(());
@@ -493,6 +499,14 @@ impl RuesClient {
             return Ok(());
         }
         store.delete_opt(key, &synced()).map_err(in_flight_error)
+    }
+
+    /// Make the next `keeps` keeps and `forgets` forgets of the
+    /// transactions kept for deliveries sent one at a time fail, as they
+    /// do when the event store cannot be written, for tests of what such a
+    /// failure does.
+    pub(crate) fn fail_prepared_writes(&self, keeps: usize, forgets: usize) {
+        self.endpoint.fail_prepared_writes(keeps, forgets);
     }
 
     /// The nonces `signer` holds, in nonce order. Fails on one the event

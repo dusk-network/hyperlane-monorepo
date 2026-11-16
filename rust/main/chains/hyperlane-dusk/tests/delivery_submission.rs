@@ -1339,3 +1339,236 @@ async fn a_batch_sends_nothing_past_its_deadline_whatever_the_helper_or_the_node
     node.settle(2).await;
     std::env::remove_var("DUSK_TX_BIN");
 }
+
+// Regressions of the agents' last review: a delivery's transaction is kept
+// before the helper may send it.
+
+/// The stand-in sends its transaction only on the word `send`, which it
+/// reads once it has printed the hash. A relayer that dies leaves it with a
+/// closed stdin, and one that writes anything else gets nothing sent
+/// either: it says so, as dusk-tx does.
+#[test]
+fn the_helper_sends_only_on_the_word_to_send() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Command, Stdio};
+
+    let node = Node::start(false);
+    for (word, sent) in [(None, false), (Some("nope"), false), (Some("send"), true)] {
+        let mut helper = Command::new(node.helper())
+            .args([
+                "call",
+                "--rues-url-stdin",
+                "--expected-chain-id",
+                "0",
+                "--secret-key-stdin",
+                "--contract",
+                &"02".repeat(32),
+                "--fn-name",
+                "process",
+                "--args",
+                "aa",
+                "--gas-limit",
+                "5000000",
+                "--gas-price",
+                "1",
+                "--ack-before-send",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = helper.stdin.take().unwrap();
+        writeln!(stdin, "{}", node.url).unwrap();
+        writeln!(stdin, "{}", "11".repeat(32)).unwrap();
+        let mut stderr = BufReader::new(helper.stderr.take().unwrap());
+        // Its first lines can be bash's warnings about the chain ID's byte.
+        let mut line = String::new();
+        while !line.contains("Prepared TX") {
+            line.clear();
+            assert!(stderr.read_line(&mut line).unwrap() > 0, "no hash printed");
+        }
+        if let Some(word) = word {
+            writeln!(stdin, "{word}").unwrap();
+        }
+        drop(stdin);
+        let mut rest = String::new();
+        std::io::Read::read_to_string(&mut stderr, &mut rest).unwrap();
+        let status = helper.wait().unwrap();
+        assert_eq!(status.success(), sent, "{word:?}: {rest}");
+        assert_eq!(rest.contains("Not submitted:"), !sent, "{word:?}: {rest}");
+        assert_eq!(node.propagated().len(), usize::from(sent), "{word:?}");
+    }
+    assert_eq!(node.words(), ["1 <eof>", "1 nope", "1 send"]);
+}
+
+/// A delivery's transaction is kept before the node sees any of it: when
+/// the helper preverifies it, the Mailbox keeps its hash already, since the
+/// helper was let send it only then. Every delivery goes as before.
+#[tokio::test]
+async fn a_delivery_is_kept_before_the_helper_may_send_it() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start(false);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let mailbox = node.mailbox(false).with_submission_limits(patient(64));
+    let (message, metadata, gas_limit) = delivery(0);
+    let gate = std::sync::Arc::new(Gate::default());
+    node.inject(Route::Preverify, None, Fault::Hold(gate.clone()));
+    let first = tokio::spawn({
+        let mailbox = mailbox.clone();
+        let (message, metadata) = (message.clone(), metadata.clone());
+        async move { mailbox.process(&message, &metadata, gas_limit).await }
+    });
+    node.wait_until("the preverification reaches the node", |_| {
+        gate.waiting.load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+    let kept = mailbox.prepared_transaction(message.id()).unwrap();
+    assert!(kept.is_some());
+    assert_eq!(node.words(), ["1 send"]);
+    gate.open();
+    let outcome = first.await.unwrap().unwrap();
+    assert!(outcome.executed);
+    assert_eq!(
+        Some(hex::encode(&outcome.transaction_id.as_bytes()[32..])),
+        kept
+    );
+    one_by_one(&mailbox, &(1..3).map(delivery).collect::<Vec<_>>()).await;
+    assert_eq!(node.propagated(), [1, 2, 3]);
+    assert_eq!(node.words(), ["1 send", "2 send", "3 send"]);
+    assert!(node
+        .invocations()
+        .iter()
+        .all(|call| call.contains("--ack-before-send")));
+    node.settle(3).await;
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+/// The relayer stops after the helper printed its transaction's hash and
+/// before it was let send it: the helper sends nothing, and since nothing
+/// was kept, the delivery goes again at once. The helper used to send it
+/// on its own, whether the relayer kept its hash or not.
+#[tokio::test]
+async fn a_relayer_that_stops_before_it_lets_the_helper_send_sends_nothing() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start(false);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    // A kept transaction would hold the next submission back for 60 s.
+    let mailbox = node
+        .mailbox(false)
+        .with_submission_limits(SubmissionLimits {
+            drop_grace: Duration::from_secs(60),
+            ..patient(64)
+        });
+    let (message, metadata, gas_limit) = delivery(0);
+    node.next_submission(1, "gate");
+    let submission = tokio::spawn({
+        let mailbox = mailbox.clone();
+        let (message, metadata) = (message.clone(), metadata.clone());
+        async move { mailbox.process(&message, &metadata, gas_limit).await }
+    });
+    node.wait_until("the helper waits at its gate", |_| {
+        node.helper_reached("gated", 1)
+    })
+    .await;
+    // This test's runtime runs on this thread alone, which from here on
+    // runs nothing of the relayer: the helper prints its hash, and the
+    // relayer stops before it reads it.
+    node.open_gate(1);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !node.helper_reached("printed", 1) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the helper never printed its hash"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    submission.abort();
+    assert!(submission.await.unwrap_err().is_cancelled());
+    // Nothing reached the node, nothing was kept, and the helper was never
+    // let send.
+    tokio::time::sleep(BLOCK_TIME * 3).await;
+    assert!(node.propagated().is_empty());
+    assert!(node.refusals().is_empty(), "{:?}", node.refusals());
+    assert!(node.words().iter().all(|word| word != "1 send"));
+    assert_eq!(mailbox.prepared_transaction(message.id()).unwrap(), None);
+    let outcome = mailbox
+        .process(&message, &metadata, gas_limit)
+        .await
+        .unwrap();
+    assert!(outcome.executed);
+    assert_eq!(node.propagated(), [1]);
+    node.settle(1).await;
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+/// A delivery whose transaction's hash cannot be kept is not sent: the
+/// helper is not let send it, and since nothing was kept, the delivery
+/// goes again at once. The helper used to send it all the same.
+#[tokio::test]
+async fn a_delivery_whose_transaction_cannot_be_kept_is_not_sent_and_goes_again_at_once() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start(false);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    // A kept transaction would hold the next submission back for 60 s.
+    let mailbox = node
+        .mailbox(false)
+        .with_submission_limits(SubmissionLimits {
+            drop_grace: Duration::from_secs(60),
+            ..patient(64)
+        });
+    let (message, metadata, gas_limit) = delivery(0);
+    mailbox.fail_prepared_writes(1, 0);
+    let error = mailbox
+        .process(&message, &metadata, gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("was not let send it"), "{error}");
+    assert!(error.contains("Not submitted:"), "{error}");
+    assert!(node.propagated().is_empty());
+    assert!(node.refusals().is_empty(), "{:?}", node.refusals());
+    assert_eq!(node.words(), ["1 <eof>"]);
+    assert_eq!(mailbox.prepared_transaction(message.id()).unwrap(), None);
+    let outcome = mailbox
+        .process(&message, &metadata, gas_limit)
+        .await
+        .unwrap();
+    assert!(outcome.executed);
+    assert_eq!(node.propagated(), [1]);
+    node.settle(1).await;
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+/// A helper that sends on its own, before the agent kept its hash, is not
+/// run: deliveries fail, naming the dusk-tx they need.
+#[tokio::test]
+async fn deliveries_need_a_helper_that_waits_for_the_word_to_send() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start(false);
+    node.without_ack();
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let mailbox = node.mailbox(false);
+    let (message, metadata, gas_limit) = delivery(0);
+    for _ in 0..2 {
+        let error = mailbox
+            .process(&message, &metadata, gas_limit)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--ack-before-send"), "{error}");
+        assert!(error.contains("hyperlane-dusk"), "{error}");
+    }
+    assert!(node.invocations().is_empty());
+    assert!(node.propagated().is_empty());
+    // Nor is a helper whose help cannot be read.
+    std::env::set_var("DUSK_TX_BIN", node.directory.path().join("missing"));
+    let error = mailbox
+        .process(&message, &metadata, gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Could not read `call --help`"), "{error}");
+    assert!(node.propagated().is_empty());
+    std::env::remove_var("DUSK_TX_BIN");
+}

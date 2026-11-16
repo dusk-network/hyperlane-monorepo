@@ -137,13 +137,15 @@ impl Fixture {
         } else {
             format!("exit {code}")
         };
+        // Once it names its transaction, the helper waits for the word to
+        // send it (`--ack-before-send`).
         let prepared = if matches!(helper, Helper::RejectedBeforeSubmission) {
             String::new()
         } else {
-            format!("printf '%s\\n' '  Prepared TX {tx}; reconcile this exact hash before retrying if submission is interrupted' >&2\n")
+            format!("printf '%s\\n' '  Prepared TX {tx}; reconcile this exact hash before retrying if submission is interrupted' >&2\nIFS= read -r fixture_word\n[ \"$fixture_word\" = send ] || {{ echo 'Not submitted: no word to send' >&2; exit 1; }}\n")
         };
         std::fs::write(&helper_path,format!(
-            "#!/bin/sh\n: > \"$0.invoked\"\nIFS= read -r fixture_url\nIFS= read -r fixture_input\n[ -n \"$fixture_url\" ] && [ -n \"$fixture_input\" ] || exit 89\nfor fixture_arg do\n  [ \"$fixture_arg\" != \"$fixture_url\" ] && [ \"$fixture_arg\" != \"$fixture_input\" ] || exit 90\ndone\n{prepared}printf '%s\\n' '{output}'\n{termination}\n")).unwrap();
+            "#!/bin/sh\nif [ \"$1\" = call ] && [ \"$2\" = --help ]; then printf '      --ack-before-send\\n'; exit 0; fi\n: > \"$0.invoked\"\ncase \" $* \" in *\" --ack-before-send \"*) ;; *) exit 91 ;; esac\nIFS= read -r fixture_url\nIFS= read -r fixture_input\n[ -n \"$fixture_url\" ] && [ -n \"$fixture_input\" ] || exit 89\nfor fixture_arg do\n  [ \"$fixture_arg\" != \"$fixture_url\" ] && [ \"$fixture_arg\" != \"$fixture_input\" ] || exit 90\ndone\n{prepared}printf '%s\\n' '{output}'\n{termination}\n")).unwrap();
         std::fs::set_permissions(&helper_path, std::fs::Permissions::from_mode(0o700)).unwrap();
         // This is only the test process environment; live agents are separate.
         std::env::set_var("DUSK_TX_BIN", &helper_path);

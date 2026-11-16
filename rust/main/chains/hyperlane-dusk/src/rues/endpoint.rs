@@ -204,6 +204,9 @@ pub(crate) struct Endpoint {
     /// The transactions prepared for deliveries sent one at a time, by
     /// signer and message, for clients that keep no event store.
     prepared: StdMutex<BTreeMap<([u8; 32], H256), PreparedDelivery>>,
+    /// How many of the next keeps and forgets of those transactions fail,
+    /// as when an event store cannot be written, for tests.
+    prepared_faults: StdMutex<(usize, usize)>,
     /// The signers whose deliveries this process no longer pipelines:
     /// another sender used their nonces.
     stopped: StdMutex<HashSet<[u8; 32]>>,
@@ -244,6 +247,7 @@ impl Endpoint {
             sent_deliveries: StdMutex::new(BTreeMap::new()),
             reservations: StdMutex::new(BTreeMap::new()),
             prepared: StdMutex::new(BTreeMap::new()),
+            prepared_faults: StdMutex::new((0, 0)),
             stopped: StdMutex::new(HashSet::new()),
         });
         endpoints.insert(key, Arc::downgrade(&endpoint));
@@ -396,6 +400,28 @@ impl Endpoint {
 
     pub(crate) fn forget_prepared_delivery(&self, signer: &[u8; 32], message: H256) {
         self.prepared().remove(&(*signer, message));
+    }
+
+    /// Make the next `keeps` keeps and `forgets` forgets of prepared
+    /// deliveries fail, for tests.
+    pub(crate) fn fail_prepared_writes(&self, keeps: usize, forgets: usize) {
+        *self
+            .prepared_faults
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = (keeps, forgets);
+    }
+
+    /// Whether this keep (`keep`) or forget of a prepared delivery fails,
+    /// for tests (`fail_prepared_writes`).
+    pub(crate) fn prepared_write_fails(&self, keep: bool) -> bool {
+        let mut faults = self
+            .prepared_faults
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let left = if keep { &mut faults.0 } else { &mut faults.1 };
+        let fails = *left > 0;
+        *left = left.saturating_sub(1);
+        fails
     }
 
     /// Stop pipelining `signer`'s deliveries in this process.

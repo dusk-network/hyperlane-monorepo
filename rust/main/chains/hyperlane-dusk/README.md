@@ -238,11 +238,20 @@ how to run the local bridge.
   it prepared by its exact hash. A relayer key delivers about one message
   every two blocks this way: the next one reaches the node after the next
   block's round has started.
-- **A delivery's transaction is kept until the delivery is done.** The
-  helper prints the hash of the transaction it prepared before it
-  propagates it, and the agent keeps that hash for the message in
-  `eventCursorDir` (in memory without one) at once, until the relayer
-  confirms the message delivered, at most 1,024 a signer. A delivery
+- **A delivery's transaction is kept before it is sent, until the delivery
+  is done.** The helper signs the transaction, prints its hash, and waits
+  for the agent's word before it preverifies and propagates it
+  (`call --ack-before-send`). The agent keeps that hash for the message in
+  `eventCursorDir` (in memory without one), and only once it is kept
+  writes `send` to the helper's stdin. A hash it cannot keep leaves the
+  helper without the word: the helper sends nothing and says
+  `Not submitted:`, and the delivery fails and goes again at once, since
+  nothing was kept. So does a delivery whose relayer stops or dies before
+  the word: the helper's stdin closes with it. The relayer needs a
+  `dusk-tx` whose `call --help` lists `--ack-before-send`, which it asks
+  once per process; with another, it refuses to deliver and says which
+  `dusk-tx` it needs. The hash stays until the relayer confirms the
+  message delivered, at most 1,024 a signer. A delivery
   submitted again looks its transaction up first: in a block and executed,
   it is the delivery's outcome, and the relayer's confirmation goes on from
   it; failed in a block, the delivery goes again once that block is final;

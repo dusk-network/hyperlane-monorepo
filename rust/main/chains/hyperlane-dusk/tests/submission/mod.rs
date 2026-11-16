@@ -620,22 +620,31 @@ fn reply(stream: &mut TcpStream, status: &str, body: &[u8]) {
 
 type Faults = Arc<Mutex<Vec<(Route, Option<u64>, Fault)>>>;
 
-/// A `dusk-tx` stand-in. `call --help` lists `--nonce` and `--no-wait`
-/// when the `pipelines` file exists. A call reads the URL and the key from
-/// stdin, logs its arguments to `invocations`, asks the endpoint for the
-/// chain ID, signs with `--nonce` or the account's nonce plus one (read
-/// from `committed`, as dusk-tx reads the account), prints `Prepared TX`,
-/// then preverifies and propagates at the URL it was given, and, without
-/// `--no-wait`, waits until a block holds the transaction (`included`),
-/// for `wait-tries` × 20 ms (3 s by default). A preverify refusal for a
-/// missing intermediate nonce does not stop a call with `--nonce`. A
-/// `mode-<nonce>` file changes the next call that signs that nonce:
-/// `lose` reports an unknown outcome without sending, `unknown` sends and
-/// then reports an unknown outcome, and `hang <seconds>` waits that long
-/// after printing the hash.
+/// A `dusk-tx` stand-in. `call --help` lists `--ack-before-send` unless
+/// the `no-ack` file exists, and `--nonce` and `--no-wait` when the
+/// `pipelines` file exists. A call reads the URL and the key from stdin,
+/// logs its arguments to `invocations`, asks the endpoint for the chain ID,
+/// signs with `--nonce` or the account's nonce plus one (read from
+/// `committed`, as dusk-tx reads the account), and prints `Prepared TX`.
+/// With `--ack-before-send` it then reads one more line from stdin, within
+/// 30 s, and logs it to `words` (`<eof>` when stdin closed first): any
+/// line but `send` makes it print `Not submitted:` and stop without
+/// sending. Without that flag it never sends to the node: only a pipelined
+/// call (`--no-wait`), whose URL is the agent's own loopback endpoint,
+/// goes on without the word. It then preverifies and propagates at the URL
+/// it was given, and, without `--no-wait`, waits until a block holds the
+/// transaction (`included`), for `wait-tries` × 20 ms (3 s by default). A
+/// preverify refusal for a missing intermediate nonce does not stop a call
+/// with `--nonce`. A `mode-<nonce>` file changes the next call that signs
+/// that nonce: `lose` reports an unknown outcome without sending,
+/// `unknown` sends and then reports an unknown outcome, `hang <seconds>`
+/// waits that long once it may send, and `gate` writes `gated-<nonce>` and
+/// waits for an `open-<nonce>` file before it prints the hash, and writes
+/// `printed-<nonce>` once it has.
 const HELPER: &str = r#"#!/usr/bin/env bash
 dir="$(cd "$(dirname "$0")" && pwd)"
 if [ "$1" = "call" ] && [ "$2" = "--help" ]; then
+  if [ ! -f "$dir/no-ack" ]; then printf '      --ack-before-send\n'; fi
   if [ -f "$dir/pipelines" ]; then printf '      --nonce <NONCE>\n      --no-wait\n'; fi
   exit 0
 fi
@@ -643,12 +652,13 @@ printf '%s\n' "$*" >> "$dir/invocations"
 IFS= read -r url || exit 89
 IFS= read -r key || exit 89
 [ -n "$url" ] && [ -n "$key" ] || exit 89
-nonce=""; given=""; wait=1; args=""; fn=""; gas_price=1; gas_limit=0
+nonce=""; given=""; wait=1; args=""; fn=""; gas_price=1; gas_limit=0; ack=""
 shift
 while [ $# -gt 0 ]; do
   case "$1" in
     --nonce) nonce="$2"; given=1; shift ;;
     --no-wait) wait="" ;;
+    --ack-before-send) ack=1 ;;
     --args) args="$2"; shift ;;
     --fn-name) fn="$2"; shift ;;
     --gas-price) gas_price="$2"; shift ;;
@@ -681,16 +691,45 @@ post() {
   reply="${reply//$'\r'/}"
   return 0
 }
-fail() { printf '{"success":false,"error":"%s"}\n' "$1"; exit 1; }
+fail() {
+  local message="${1//\\/\\\\}"
+  printf '{"success":false,"error":"%s"}\n' "${message//\"/\\\"}"
+  exit 1
+}
+# Only a pipelined call, to the agent's own endpoint, goes without the word.
+if [ -z "$ack" ] && [ -n "$wait" ]; then
+  fail "fixture: a call that sends to the node needs --ack-before-send"
+fi
 post "/on/contracts:0100000000000000000000000000000000000000000000000000000000000000/chain_id" "" \
   || fail "HTTP error: $reply"
 [ "$status" = 200 ] || fail "Query chain_id failed ($status): $reply"
 if [ -z "$nonce" ]; then nonce=$(( $(cat "$dir/committed") + 1 )); fi
 echo x >> "$dir/calls"
 tx=$(printf '%032x%032x' "$nonce" "$(wc -l < "$dir/calls")")
-printf '  Prepared TX %s; reconcile this exact hash before retrying if submission is interrupted\n' "$tx" >&2
 mode=""
 if [ -f "$dir/mode-$nonce" ]; then mode="$(cat "$dir/mode-$nonce")"; rm -f "$dir/mode-$nonce"; fi
+if [ "$mode" = gate ]; then
+  : > "$dir/gated-$nonce"
+  while [ ! -f "$dir/open-$nonce" ]; do sleep 0.01; done
+fi
+printf '  Prepared TX %s; reconcile this exact hash before retrying if submission is interrupted\n' "$tx" >&2
+if [ "$mode" = gate ]; then : > "$dir/printed-$nonce"; fi
+if [ -n "$ack" ]; then
+  # As dusk-tx: only the line `send` sends.
+  reason=""
+  if IFS= read -r -t 30 word; then
+    [ "$word" = send ] || reason='the line on stdin was not "send"'
+  elif [ $? -gt 128 ]; then
+    word="<timeout>"; reason='no line "send" on stdin within 30s'
+  else
+    word="<eof>"; reason='stdin closed before the line "send"'
+  fi
+  printf '%s %s\n' "$nonce" "$word" >> "$dir/words"
+  if [ -n "$reason" ]; then
+    printf 'Not submitted: %s\n' "$reason" >&2
+    fail "Transaction $tx submission failed: Not submitted: $reason"
+  fi
+fi
 case "$mode" in hang*) sleep "${mode#hang }" ;; esac
 if [ "$mode" = lose ]; then
   fail "Transaction $tx submission failed: Propagation outcome unknown: the connection closed; retain tx_id=$tx"
@@ -744,7 +783,7 @@ impl Node {
     pub fn start_with(pipelines: bool, finality_lag: Option<u64>) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let dir = directory.path().to_path_buf();
-        for file in ["calls", "invocations"] {
+        for file in ["calls", "invocations", "words"] {
             std::fs::write(dir.join(file), "").unwrap();
         }
         if pipelines {
@@ -818,8 +857,8 @@ impl Node {
         self.faults.lock().unwrap().push((route, nonce, fault));
     }
 
-    /// The stand-in's next call that signs `nonce`: `lose`, `unknown` or
-    /// `hang <seconds>`.
+    /// The stand-in's next call that signs `nonce`: `lose`, `unknown`,
+    /// `hang <seconds>` or `gate`.
     pub fn next_submission(&self, nonce: u64, mode: &str) {
         std::fs::write(self.directory.path().join(format!("mode-{nonce}")), mode).unwrap();
     }
@@ -827,6 +866,39 @@ impl Node {
     /// How long the stand-in waits for a block, in tries of 20 ms.
     pub fn helper_waits(&self, tries: u32) {
         std::fs::write(self.directory.path().join("wait-tries"), tries.to_string()).unwrap();
+    }
+
+    /// Make the stand-in's `call --help` leave out `--ack-before-send`, as
+    /// a helper from before it does. The agent asks once per helper.
+    pub fn without_ack(&self) {
+        std::fs::write(self.directory.path().join("no-ack"), "").unwrap();
+    }
+
+    /// The word the stand-in read under `--ack-before-send` at each call,
+    /// after the nonce it signed: `send`, or `<eof>` when stdin closed
+    /// first.
+    pub fn words(&self) -> Vec<String> {
+        std::fs::read_to_string(self.directory.path().join("words"))
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Whether the stand-in's call that signs `nonce` in `gate` mode has
+    /// written `marker`: `gated` once it waits at its gate, `printed` once
+    /// it has printed its hash.
+    pub fn helper_reached(&self, marker: &str, nonce: u64) -> bool {
+        self.directory
+            .path()
+            .join(format!("{marker}-{nonce}"))
+            .exists()
+    }
+
+    /// Let the stand-in's call that signs `nonce` in `gate` mode past its
+    /// gate.
+    pub fn open_gate(&self, nonce: u64) {
+        std::fs::write(self.directory.path().join(format!("open-{nonce}")), "").unwrap();
     }
 
     /// The arguments of every call the stand-in got.
