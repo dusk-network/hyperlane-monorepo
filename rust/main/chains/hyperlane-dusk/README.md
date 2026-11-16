@@ -58,6 +58,18 @@ how to run the local bridge.
   plus about 6 per newly final block, and a validator one a tick plus one,
   whatever the history (48 and 18 a minute on a 10 s chain). Finality is
   seen up to one tick later than a fresh read would see it.
+- **Record heights are kept.** A record's height read at or below a final
+  block is final, so each contract keeps the heights its searches read, of
+  the 4,096 most recent blocks with records they read. A search for an
+  earlier block, such as the block of a transaction that
+  `txIdIndexingEnabled` looks up for each new message's IGP payment and
+  Merkle insertion, looks only between the closest kept records on either
+  side of it, and reads only records no search has read. A message's
+  lookups read no record height once the indexer has read its block,
+  whatever the history: the IGP's used to read every payment's height
+  again, about 100 a Dusk to EVM message after 100 payments and 295 after
+  10,000 through the multicall, and 8,100 for a restart with 40 of 100
+  messages waiting, which now reads each payment's height once.
 - **Batched reads.** A chain whose `batchContractAddress` names Multicall
   for Dusk sends reads that do not depend on each other as one `aggregate`
   query, which answers them all at one state; an aggregate is one request to

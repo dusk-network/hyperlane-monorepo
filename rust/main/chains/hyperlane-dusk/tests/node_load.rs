@@ -23,7 +23,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use hyperlane_core::{
     config::OpSubmissionConfig, HyperlaneDomain, HyperlaneDomainProtocol,
     HyperlaneDomainTechnicalStack, Indexer, Mailbox, MerkleTreeHook, NativeToken, ReorgPeriod,
-    SequenceAwareIndexer, H256,
+    SequenceAwareIndexer, H256, H512,
 };
 use hyperlane_dusk::multicall::{Aggregate, Call};
 use hyperlane_dusk::{
@@ -91,14 +91,70 @@ fn message_id(nonce: u32) -> [u8; 32] {
     message::id(&encoded(nonce))
 }
 
-fn payment(index: u32, per_block: u32) -> GasPaymentRecord {
+fn payment(index: u32, block_height: u64) -> GasPaymentRecord {
     GasPaymentRecord {
         message_id: message_id(index),
         destination: DESTINATION,
         gas_limit: 100,
         payment: 1_000,
-        block_height: FIRST + u64::from(index / per_block),
+        block_height,
     }
+}
+
+/// The transaction that sent message `index`: its dispatch, Merkle
+/// insertion and IGP payment.
+fn transaction(index: u32) -> [u8; 32] {
+    let mut id = [0xaa; 32];
+    id[28..].copy_from_slice(&index.to_be_bytes());
+    id
+}
+
+/// Message `index`'s transaction, as indexers name transactions.
+fn transaction_hash(index: u32) -> H512 {
+    H512::from_slice(&[[0; 32], transaction(index)].concat())
+}
+
+/// The message whose transaction `hash` names, if any.
+fn message_of_transaction(hash: &str) -> Option<u32> {
+    let id: [u8; 32] = hex::decode(hash).ok()?.try_into().ok()?;
+    (id[..28] == [0xaa; 28]).then(|| u32::from_be_bytes(id[28..].try_into().unwrap()))
+}
+
+/// The archive row of message `index`'s record in `contract`, in block
+/// `height`.
+fn row(contract: [u8; 32], index: u32, height: u64) -> Value {
+    let (data, topic) = match contract {
+        MAILBOX => (
+            rkyv(&events::Dispatch {
+                sender: [7; 32],
+                destination: DESTINATION,
+                recipient: [8; 32],
+                message: encoded(index),
+            }),
+            events::Dispatch::TOPIC,
+        ),
+        HOOK => (
+            rkyv(&events::InsertedIntoTree {
+                message_id: message_id(index),
+                index,
+            }),
+            events::InsertedIntoTree::TOPIC,
+        ),
+        _ => (
+            rkyv(&events::GasPayment {
+                message_id: message_id(index),
+                gas_limit: 100,
+                payment: 1_000,
+            }),
+            events::GasPayment::TOPIC,
+        ),
+    };
+    json!({
+        "id": i64::from(index), "block_height": height,
+        "block_hash": hash_hex(height), "origin": hex::encode(transaction(index)),
+        "topic": topic, "source": hex::encode(contract),
+        "data": hex::encode(data), "reverted": false,
+    })
 }
 
 fn rkyv<T: rkyv::Serialize<rkyv::ser::serializers::AllocSerializer<256>>>(value: &T) -> Vec<u8> {
@@ -194,15 +250,17 @@ impl Drop for Server {
 
 /// A node holding `records` dispatches, Merkle insertions and IGP payments,
 /// record `i` in block `FIRST + i / per_block`, that counts the requests it
-/// answers. Its multicall, when it has one, answers an aggregate as one
-/// contract query.
+/// answers. Message `i` sent its three records in one transaction
+/// (`transaction`). Its multicall, when it has one, answers an aggregate as
+/// one contract query.
 struct Chain {
-    records: u32,
-    per_block: u32,
+    /// The block of each message's records.
+    heights: Vec<u64>,
     finalized: u64,
-    tree: Vec<u8>,
-    root: [u8; 32],
-    /// Archive rows by contract, hex.
+    tree: IncrementalMerkle,
+    /// Whether the node keeps an archive of events.
+    archive: bool,
+    /// Archive rows by contract, hex, in row order.
     rows: BTreeMap<String, Vec<Value>>,
     /// Refuse contract queries past 360 in a window of 2 s, as Rusk does.
     rate_limit: bool,
@@ -221,62 +279,45 @@ impl Chain {
 
     /// Records `per_block` to a block.
     fn with_blocks(records: u32, per_block: u32, archive: bool, rate_limit: bool) -> Self {
-        let mut tree = IncrementalMerkle::new();
-        for index in 0..records {
-            tree.insert(message_id(index));
-        }
-        let mut rows = BTreeMap::new();
-        if archive {
-            for (contract, topic) in [
-                (MAILBOX, events::Dispatch::TOPIC),
-                (HOOK, events::InsertedIntoTree::TOPIC),
-                (IGP, events::GasPayment::TOPIC),
-            ] {
-                let contract_rows = (0..records)
-                    .map(|index| {
-                        let data = match contract {
-                            MAILBOX => rkyv(&events::Dispatch {
-                                sender: [7; 32],
-                                destination: DESTINATION,
-                                recipient: [8; 32],
-                                message: encoded(index),
-                            }),
-                            HOOK => rkyv(&events::InsertedIntoTree {
-                                message_id: message_id(index),
-                                index,
-                            }),
-                            _ => rkyv(&events::GasPayment {
-                                message_id: message_id(index),
-                                gas_limit: 100,
-                                payment: 1_000,
-                            }),
-                        };
-                        let height = FIRST + u64::from(index / per_block);
-                        json!({
-                            "id": i64::from(index), "block_height": height,
-                            "block_hash": hash_hex(height), "origin": hex::encode([9; 32]),
-                            "topic": topic, "source": hex::encode(contract),
-                            "data": hex::encode(data), "reverted": false,
-                        })
-                    })
-                    .collect();
-                rows.insert(hex::encode(contract), contract_rows);
-            }
-        }
-        Self {
-            records,
-            per_block,
+        let mut chain = Self {
+            heights: Vec::new(),
             finalized: FIRST + u64::from(records / per_block) + 5,
-            root: tree.root(),
-            tree: rkyv(&tree),
-            rows,
+            tree: IncrementalMerkle::new(),
+            archive,
+            rows: [MAILBOX, HOOK, IGP]
+                .into_iter()
+                .map(|contract| (hex::encode(contract), Vec::new()))
+                .collect(),
             rate_limit,
             window: None,
             multicall: false,
             requests: BTreeMap::new(),
             calls: BTreeMap::new(),
             refusals: 0,
+        };
+        for index in 0..records {
+            chain.record(FIRST + u64::from(index / per_block));
         }
+        chain
+    }
+
+    fn records(&self) -> u32 {
+        self.heights.len() as u32
+    }
+
+    /// The next message's records, in block `height`.
+    fn record(&mut self, height: u64) -> u32 {
+        let index = self.records();
+        self.heights.push(height);
+        self.tree.insert(message_id(index));
+        if self.archive {
+            for contract in [MAILBOX, HOOK, IGP] {
+                if let Some(rows) = self.rows.get_mut(&hex::encode(contract)) {
+                    rows.push(row(contract, index, height));
+                }
+            }
+        }
+        index
     }
 
     /// This chain, with Multicall for Dusk deployed.
@@ -390,11 +431,10 @@ impl Chain {
     /// A view's reply.
     fn query(&self, contract: &[u8; 32], method: &str, body: &[u8]) -> Vec<u8> {
         let index = || u32::from_le_bytes(body[..4].try_into().unwrap());
-        let per_block = self.per_block;
-        let height = |index: u32| FIRST + u64::from(index / per_block);
+        let height = |index: u32| self.heights[index as usize];
         match (name(contract), method) {
             ("mailbox", "nonce") | ("hook", "count") | ("igp", "gas_payment_count") => {
-                self.records.to_le_bytes().to_vec()
+                self.records().to_le_bytes().to_vec()
             }
             ("mailbox", "dispatched_block_height") | ("hook", "inserted_block_height") => {
                 height(index()).to_le_bytes().to_vec()
@@ -411,14 +451,14 @@ impl Chain {
                         .collect::<Vec<_>>(),
                 )
             }
-            ("hook", "tree") => self.tree.clone(),
-            ("hook", "root") => self.root.to_vec(),
-            ("igp", "gas_payment_at") => rkyv(&payment(index(), per_block)),
+            ("hook", "tree") => rkyv(&self.tree),
+            ("hook", "root") => self.tree.root().to_vec(),
+            ("igp", "gas_payment_at") => rkyv(&payment(index(), height(index()))),
             ("igp", "gas_payments") => {
                 let limit = u32::from_le_bytes(body[4..8].try_into().unwrap());
                 rkyv(
                     &(index()..index() + limit)
-                        .map(|index| payment(index, per_block))
+                        .map(|index| payment(index, height(index)))
                         .collect::<Vec<_>>(),
                 )
             }
@@ -474,19 +514,26 @@ impl Chain {
                 } else {
                     -1
                 };
-                let rows = self.rows.get(&source).cloned().unwrap_or_default();
-                let pending: Vec<Value> = rows
-                    .into_iter()
-                    .filter(|row| row["id"].as_i64().unwrap() > after)
-                    .collect();
+                let rows = self
+                    .rows
+                    .get(&source)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let pending =
+                    &rows[rows.partition_point(|row| row["id"].as_i64().unwrap() <= after)..];
                 let has_next = pending.len() > limit;
-                let page: Vec<Value> = pending.into_iter().take(limit).collect();
+                let page: Vec<Value> = pending.iter().take(limit).cloned().collect();
                 let start = page.first().map(|row| cursor(row["id"].as_i64().unwrap()));
                 let end = page.last().map(|row| cursor(row["id"].as_i64().unwrap()));
                 json!({"finalizedEvents": {"json": {
                     "events": page, "startCursor": start, "endCursor": end,
                     "hasNextPage": has_next,
                 }}})
+            }
+            "tx" => {
+                let height = message_of_transaction(&quoted_after("hash: \""))
+                    .and_then(|index| self.heights.get(index as usize));
+                json!({ "tx": height.map(|height| json!({ "blockHeight": height })) })
             }
             _ => panic!("unexpected GraphQL query: {query}"),
         }
@@ -528,6 +575,14 @@ impl Node {
     /// The node finalizes one more block, without new records.
     fn finalize_a_block(&self) {
         self.chain.lock().unwrap().finalized += 1;
+    }
+
+    /// One more message, sent in the tip block, which is not final yet: its
+    /// index.
+    fn send_a_message(&self) -> u32 {
+        let mut chain = self.chain.lock().unwrap();
+        let tip = chain.finalized + 1;
+        chain.record(tip)
     }
 
     /// The requests answered since the last call, by kind.
@@ -869,6 +924,157 @@ async fn restart_catch_up_requests_for_ten_thousand_records() {
     let [single, batched] = report_catch_up(10_000, 10).await;
     assert!(single >= 30_000, "{single}");
     assert!(batched <= 200, "{batched}");
+}
+
+/// Messages `message_lookups` counts the requests of.
+const LOOKED_UP: u32 = 4;
+
+/// The relayer's three record indexers at the tip of `records` messages,
+/// one a block, and then `LOOKED_UP` messages more, each in a block of its
+/// own, as the relayer meets them: a tick while the message's block is the
+/// tip, a tick once it is final, and the lookups of its transaction that
+/// `txIdIndexingEnabled` makes, the IGP's and the hook's, and the
+/// dispatch's own. One message goes first, which saves the archive scan
+/// positions near the tip. Returns the requests by kind and the calls
+/// aggregates made, for the `LOOKED_UP` messages after it.
+async fn message_lookups(
+    records: u32,
+    multicall: bool,
+) -> (BTreeMap<String, usize>, BTreeMap<String, usize>) {
+    let node = Node::start(Chain::new(records, true, false).with_multicall(multicall));
+    let store = tempfile::tempdir().unwrap();
+    let rues = Arc::new(
+        RuesClient::new_with_event_cursor_dir(node.url(), store.path().to_path_buf())
+            .unwrap()
+            .with_query_rate_limit(UNPACED)
+            .with_multicall(multicall_of(multicall))
+            .with_identity(IDENTITY),
+    );
+    let dispatches = DuskMailboxIndexer::new(rues.clone(), H256::from(MAILBOX), ORIGIN);
+    let insertions = DuskMerkleTreeHookIndexer::new(rues.clone(), H256::from(HOOK));
+    let payments = DuskInterchainGasPaymasterIndexer::new(rues.clone(), H256::from(IGP));
+    // Each indexer's count of final records, at a new tick.
+    let tick = || async {
+        rues.expire_block_pair().await;
+        let (dispatched, _) = dispatches.latest_sequence_count_and_tip().await.unwrap();
+        let (inserted, _) = insertions.latest_sequence_count_and_tip().await.unwrap();
+        let (paid, _) = payments.latest_sequence_count_and_tip().await.unwrap();
+        assert_eq!((dispatched, inserted), (paid, paid));
+        paid.unwrap()
+    };
+    assert_eq!(tick().await, records);
+    for message in 0..=LOOKED_UP {
+        if message == 1 {
+            node.take_requests();
+            node.take_calls();
+        }
+        let index = node.send_a_message();
+        assert_eq!(tick().await, index);
+        node.finalize_a_block();
+        assert_eq!(tick().await, index + 1);
+        let hash = transaction_hash(index);
+        assert_eq!(payments.fetch_logs_by_tx_hash(hash).await.unwrap().len(), 1);
+        assert_eq!(
+            insertions.fetch_logs_by_tx_hash(hash).await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            dispatches.fetch_logs_by_tx_hash(hash).await.unwrap().len(),
+            1
+        );
+    }
+    RuesClient::forget_shared_client(&node.url(), store.path());
+    (node.take_requests(), node.take_calls())
+}
+
+/// Reads of `view` among `requests` and the `calls` of aggregates.
+fn reads_of(
+    view: &str,
+    requests: &BTreeMap<String, usize>,
+    calls: &BTreeMap<String, usize>,
+) -> usize {
+    requests.get(view).unwrap_or(&0) + calls.get(view).unwrap_or(&0)
+}
+
+#[tokio::test]
+async fn transaction_lookups_cost_the_same_whatever_the_history() {
+    for multicall in [false, true] {
+        let mut runs = Vec::new();
+        for records in [100, 10_000] {
+            let (requests, calls) = message_lookups(records, multicall).await;
+            eprintln!(
+                "{LOOKED_UP} messages after {records}, {}: {} requests: {requests:?}; calls in aggregates: {calls:?}",
+                if multicall { "with a multicall" } else { "one query a read" },
+                total(&requests)
+            );
+            runs.push((requests, calls));
+        }
+        // The same requests, and the same reads in aggregates, whatever
+        // the history.
+        assert_eq!(runs[0], runs[1]);
+        let (requests, calls) = &runs[1];
+        let messages = LOOKED_UP as usize;
+        // A payment's height is read while its block is the tip and once it
+        // is final, and the lookup of its transaction reads none.
+        assert!(
+            reads_of("igp.gas_payment_at", requests, calls) <= 2 * messages,
+            "{requests:?} {calls:?}"
+        );
+        // A dispatch's and an insertion's once more, with the record.
+        for view in [
+            "mailbox.dispatched_block_height",
+            "hook.inserted_block_height",
+        ] {
+            assert!(
+                reads_of(view, requests, calls) <= 3 * messages,
+                "{view}: {requests:?} {calls:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_restart_reads_each_payment_height_once_for_a_backlog() {
+    const RECORDS: u32 = 100;
+    const WAITING: u32 = 40;
+    for multicall in [false, true] {
+        // Messages in blocks of their own, a few blocks apart.
+        let mut chain = Chain::new(0, true, false).with_multicall(multicall);
+        for index in 0..RECORDS {
+            chain.record(FIRST + 3 * u64::from(index));
+        }
+        chain.finalized = FIRST + 3 * u64::from(RECORDS);
+        let node = Node::start(chain);
+        let store = tempfile::tempdir().unwrap();
+        let rues = Arc::new(
+            RuesClient::new_with_event_cursor_dir(node.url(), store.path().to_path_buf())
+                .unwrap()
+                .with_query_rate_limit(UNPACED)
+                .with_multicall(multicall_of(multicall))
+                .with_identity(IDENTITY),
+        );
+        let payments = DuskInterchainGasPaymasterIndexer::new(rues.clone(), H256::from(IGP));
+        // A relayer restarted with the last messages waiting: its IGP
+        // indexer's first tick, then the lookups of their transactions.
+        let (count, _) = payments.latest_sequence_count_and_tip().await.unwrap();
+        assert_eq!(count, Some(RECORDS));
+        for index in RECORDS - WAITING..RECORDS {
+            let logs = payments
+                .fetch_logs_by_tx_hash(transaction_hash(index))
+                .await
+                .unwrap();
+            assert_eq!(logs.len(), 1);
+        }
+        RuesClient::forget_shared_client(&node.url(), store.path());
+        let (requests, calls) = (node.take_requests(), node.take_calls());
+        let reads = reads_of("igp.gas_payment_at", &requests, &calls);
+        eprintln!(
+            "restart with {WAITING} of {RECORDS} messages waiting, {}: {reads} payment heights read; {requests:?}; calls in aggregates: {calls:?}",
+            if multicall { "with a multicall" } else { "one query a read" },
+        );
+        // No payment's height is read twice.
+        assert!(reads <= RECORDS as usize, "{reads}");
+    }
 }
 
 /// The relayer checks whether `messages` messages it prepares together are

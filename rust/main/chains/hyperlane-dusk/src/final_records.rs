@@ -10,33 +10,47 @@
 //!
 //! A search for a height at or below the last final block shows two things
 //! that no rollback can change: the records before the index it found are
-//! at or below that height, and every later record is above it. So the
-//! answer for a final height is kept, and asked again it costs no read at
-//! all, not even of the record count. The highest one is the boundary the
-//! next search starts from: it reads the count, and gallops (1, 2, 4, ...
-//! records) from the boundary towards the answer, which costs no further
-//! read while no new record is final, and about 2·log2(k) reads for k
-//! records past the boundary. Without a usable boundary (after a restart, or
-//! when the endpoint reports fewer records than the boundary counts, which
-//! only an inconsistent endpoint does) the search covers all records again.
+//! at or below that height, and every later record is above it. The answer
+//! for the highest height searched is the boundary the next search starts
+//! from: it reads the count, and gallops (1, 2, 4, ... records) from the
+//! boundary towards the answer, which costs no further read while no new
+//! record is final, and about 2·log2(k) reads for k records past the
+//! boundary. Asked again for the boundary's height, it costs no read at
+//! all, not even of the record count. Without a usable boundary (after a
+//! restart, or when the endpoint reports fewer records than the boundary
+//! counts, which only an inconsistent endpoint does) the search covers all
+//! records again.
+//!
+//! A record a search read at or below a final height is final, and so is
+//! its height, so the heights searches read are kept: for each block, the
+//! first and the last of its records read, for the most recent
+//! `KEPT_BLOCKS` blocks. A height below the boundary's, such as the block
+//! of a transaction looked up by hash, is searched only between the closest
+//! kept records on either side of it. That costs no read at all when the
+//! two are neighbours, as they are for every record a search read whole,
+//! and otherwise reads only records no search has read, whatever the
+//! contract's history. Without a kept record below the height, its search
+//! starts at the first record; without one above it, at the boundary.
 //!
 //! Through a multicall, one read takes the heights of up to 256 records at
 //! once: a search then reads the heights of every record in its range when
 //! there are that few, and otherwise of 256 spread evenly over it, each
 //! read narrowing the range 257-fold. A restart's search over 10,000
 //! records takes two reads instead of thirteen, and a final block with up
-//! to 256 new records one.
+//! to 256 new records one, which keeps the height of every one of them.
 
-use std::collections::VecDeque;
+use std::collections::BTreeMap;
 use std::future::Future;
+use std::ops::Bound;
 
 use tracing::warn;
 
-use hyperlane_core::ChainResult;
+use hyperlane_core::{ChainCommunicationError, ChainResult};
 
-/// Answers kept for heights other than the boundary's, such as the blocks
-/// of transactions looked up by hash.
-const KEPT_ANSWERS: usize = 16;
+/// Blocks whose records' heights a contract keeps, the most recent ones a
+/// search read: 4,096 blocks are 11 hours of a 10 s chain that adds records
+/// to every block, and more of a quieter one. Each takes a few dozen bytes.
+const KEPT_BLOCKS: usize = 4_096;
 
 /// The first `count` records are at or below block `height`, which was at
 /// or below the last final block when it was found, and every later record
@@ -47,32 +61,108 @@ struct Boundary {
     height: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Known {
     /// The answer for the highest height searched.
     boundary: Option<Boundary>,
-    /// Recent answers for other heights.
-    answers: VecDeque<Boundary>,
+    /// The heights of final records searches read: for each block, the
+    /// first and the last of its records read. All of them are at or below
+    /// the boundary's height, and before its count.
+    heights: BTreeMap<u64, (u32, u32)>,
+    /// Most blocks `heights` keeps.
+    capacity: usize,
+}
+
+impl Default for Known {
+    fn default() -> Self {
+        Self {
+            boundary: None,
+            heights: BTreeMap::new(),
+            capacity: KEPT_BLOCKS,
+        }
+    }
 }
 
 impl Known {
-    fn answer(&self, height: u64) -> Option<u32> {
-        self.boundary
-            .iter()
-            .chain(&self.answers)
-            .find(|known| known.height == height)
-            .map(|known| known.count)
+    /// Where the first record above `height`, below the boundary's height,
+    /// is as far as the kept heights show: in `low..=high`, every record
+    /// before `low` at or below `height`, and every one from `high` on
+    /// above it. `low` is past `high` only when the endpoint answered
+    /// inconsistently.
+    fn bracket(&self, height: u64, boundary: Boundary) -> (u32, u32) {
+        let low = self
+            .heights
+            .range(..=height)
+            .next_back()
+            .map_or(0, |(_, &(_, last))| last.saturating_add(1));
+        let high = self
+            .heights
+            .range((Bound::Excluded(height), Bound::Unbounded))
+            .next()
+            .map_or(boundary.count, |(_, &(first, _))| first.min(boundary.count));
+        (low, high)
     }
 
-    fn remember(&mut self, found: Boundary) {
-        match self.boundary {
-            Some(boundary) if found.height < boundary.height => {
-                if self.answers.len() == KEPT_ANSWERS {
-                    self.answers.pop_front();
-                }
-                self.answers.push_back(found);
+    /// Keep that record `index`, which is final, is in block `height`.
+    /// Keeps nothing, and returns false, when that contradicts a kept
+    /// height: heights never decrease along the records.
+    fn keep(&mut self, index: u32, height: u64) -> bool {
+        let after_lower = self
+            .heights
+            .range(..height)
+            .next_back()
+            .is_none_or(|(_, &(_, last))| last < index);
+        let before_higher = self
+            .heights
+            .range((Bound::Excluded(height), Bound::Unbounded))
+            .next()
+            .is_none_or(|(_, &(first, _))| index < first);
+        if !(after_lower && before_higher) {
+            return false;
+        }
+        let (first, last) = self.heights.entry(height).or_insert((index, index));
+        *first = (*first).min(index);
+        *last = (*last).max(index);
+        true
+    }
+
+    /// Keep what a search for `height`, which started from boundary
+    /// `before`, found: `found` records at or below it, having read the
+    /// heights in `reads`. Every one of them at or below a final height is
+    /// kept, unless it contradicts what the search found or what is kept.
+    fn remember(
+        &mut self,
+        height: u64,
+        found: u32,
+        before: Option<Boundary>,
+        reads: Vec<(u32, u64)>,
+    ) {
+        let final_height = before.map_or(height, |before| before.height.max(height));
+        let mut consistent = true;
+        for (index, record_height) in reads {
+            let agrees = (index < found) == (record_height <= height);
+            if agrees && record_height <= final_height {
+                consistent &= self.keep(index, record_height);
             }
-            _ => self.boundary = Some(found),
+        }
+        if !consistent {
+            warn!(
+                final_height,
+                "Dusk endpoint reports record heights that contradict ones it reported before; forgetting the kept heights"
+            );
+            self.heights.clear();
+        }
+        match self.boundary {
+            Some(boundary) if height < boundary.height => {}
+            _ => {
+                self.boundary = Some(Boundary {
+                    count: found,
+                    height,
+                })
+            }
+        }
+        while self.heights.len() > self.capacity {
+            self.heights.pop_first();
         }
     }
 }
@@ -86,13 +176,26 @@ pub(crate) struct FinalRecords {
 }
 
 impl FinalRecords {
+    /// One that keeps the heights of at most `capacity` blocks.
+    #[cfg(test)]
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            known: tokio::sync::Mutex::new(Known {
+                capacity,
+                ..Known::default()
+            }),
+        }
+    }
+
     /// How many of the contract's records are at or below block `height`:
     /// the index of the first record above it. `height` must be at or below
     /// the last final block, read before any record. `count` reads how many
     /// records there are, and `heights_of(indices)` the heights of records,
-    /// at most `probes` of them per read; neither is called for a height
-    /// asked before. With `probes` of 1 the search reads one record at a
-    /// time, galloping from the boundary.
+    /// at most `probes` of them per read; neither is called for the
+    /// boundary's height, nor for a height between two neighbouring kept
+    /// records. With `probes` of 1 the search reads one record at a time,
+    /// galloping from the boundary, or from the closest kept record above
+    /// the height.
     pub(crate) async fn count_at_or_below<C, CF, F, Fut>(
         &self,
         height: u64,
@@ -107,48 +210,73 @@ impl FinalRecords {
         Fut: Future<Output = ChainResult<Vec<u64>>>,
     {
         let mut known = self.known.lock().await;
-        if let Some(found) = known.answer(height) {
-            return Ok(found);
-        }
+        // Below the boundary, the kept heights may answer without a read.
+        let below = match known.boundary {
+            Some(boundary) if height == boundary.height => return Ok(boundary.count),
+            Some(boundary) if height < boundary.height => {
+                let (low, high) = known.bracket(height, boundary);
+                if low == high {
+                    return Ok(low);
+                }
+                Some((low, high))
+            }
+            _ => None,
+        };
         let count = count().await?;
-        let search = match known.boundary {
-            Some(boundary) if boundary.count > count => {
+        let search = match (known.boundary, below) {
+            (Some(boundary), _) if boundary.count > count => {
                 warn!(
                     records = count,
                     final_records = boundary.count,
                     final_height = boundary.height,
                     "Dusk endpoint reports fewer records than were final before; searching them all again"
                 );
-                *known = Known::default();
+                *known = Known {
+                    capacity: known.capacity,
+                    ..Known::default()
+                };
                 Search::All { high: count }
             }
             // Every record before the boundary is at or below `height`.
-            Some(boundary) if height >= boundary.height => Search::Up {
+            (Some(boundary), _) if height >= boundary.height => Search::Up {
                 low: boundary.count,
                 high: count,
             },
+            (Some(_), Some((low, high))) if low <= high => Search::Down { low, high },
             // Every record from the boundary on is above `height`.
-            Some(boundary) => Search::Down {
-                high: boundary.count,
-            },
-            None => Search::All { high: count },
+            (Some(boundary), _) => {
+                warn!(
+                    height,
+                    "Dusk endpoint's kept record heights contradict each other; searching below the boundary again"
+                );
+                known.heights.clear();
+                Search::Down {
+                    low: 0,
+                    high: boundary.count,
+                }
+            }
+            (None, _) => Search::All { high: count },
         };
-        let heights_of = &mut heights_of;
+        let before = known.boundary;
+        let mut reads = Reads {
+            heights_of: &mut heights_of,
+            seen: Vec::new(),
+        };
         let found = match (search, probes) {
-            (Search::Up { low, high }, 0 | 1) => gallop_up(low, high, height, heights_of).await?,
-            (Search::Down { high }, 0 | 1) => gallop_down(high, height, heights_of).await?,
-            (Search::All { high }, 0 | 1) => first_above(0, high, height, heights_of).await?,
-            (Search::Up { low, high }, _) => {
-                first_above_batched(low, high, height, probes, heights_of).await?
+            (Search::Up { low, high }, 0 | 1) => gallop_up(low, high, height, &mut reads).await?,
+            (Search::Down { low, high }, 0 | 1) => {
+                gallop_down(low, high, height, &mut reads).await?
             }
-            (Search::Down { high } | Search::All { high }, _) => {
-                first_above_batched(0, high, height, probes, heights_of).await?
+            (Search::All { high }, 0 | 1) => first_above(0, high, height, &mut reads).await?,
+            (Search::Up { low, high } | Search::Down { low, high }, _) => {
+                first_above_batched(low, high, height, probes, &mut reads).await?
+            }
+            (Search::All { high }, _) => {
+                first_above_batched(0, high, height, probes, &mut reads).await?
             }
         };
-        known.remember(Boundary {
-            count: found,
-            height,
-        });
+        let seen = reads.seen;
+        known.remember(height, found, before, seen);
         Ok(found)
     }
 }
@@ -159,26 +287,48 @@ enum Search {
     /// Above the boundary: `low..high`, every record before `low` at or
     /// below the height.
     Up { low: u32, high: u32 },
-    /// Below the boundary: `0..high`, every record from `high` on above it.
-    Down { high: u32 },
+    /// Below the boundary: `low..high`, every record before `low` at or
+    /// below the height, and every record from `high` on above it.
+    Down { low: u32, high: u32 },
     /// Every record, `0..high`.
     All { high: u32 },
 }
 
-/// The height of the record at `index`, read on its own.
-async fn height_of<F, Fut>(heights_of: &mut F, index: u32) -> ChainResult<u64>
+/// The record heights a search reads, and every one it read.
+struct Reads<'a, F> {
+    heights_of: &'a mut F,
+    seen: Vec<(u32, u64)>,
+}
+
+impl<F, Fut> Reads<'_, F>
 where
     F: FnMut(Vec<u32>) -> Fut,
     Fut: Future<Output = ChainResult<Vec<u64>>>,
 {
-    match heights_of(vec![index]).await?.as_slice() {
-        [height] => Ok(*height),
-        heights => Err(hyperlane_core::ChainCommunicationError::from_other_str(
-            &format!(
-                "Dusk endpoint returned {} heights for one record",
-                heights.len()
-            ),
-        )),
+    /// The heights of the records at `indices`, in one read.
+    async fn heights(&mut self, indices: Vec<u32>) -> ChainResult<Vec<u64>> {
+        let heights = (self.heights_of)(indices.clone()).await?;
+        if heights.len() != indices.len() {
+            return Err(ChainCommunicationError::from_other_str(&format!(
+                "Dusk endpoint returned {} heights for {} records",
+                heights.len(),
+                indices.len()
+            )));
+        }
+        self.seen
+            .extend(indices.into_iter().zip(heights.iter().copied()));
+        Ok(heights)
+    }
+
+    /// The height of the record at `index`, read on its own.
+    async fn height(&mut self, index: u32) -> ChainResult<u64> {
+        self.heights(vec![index])
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                ChainCommunicationError::from_other_str("Dusk endpoint returned no height")
+            })
     }
 }
 
@@ -186,7 +336,12 @@ where
 /// record before `low` is at or below it: probe `low`, `low + 1`,
 /// `low + 3`, `low + 7`, ... until one is above it or past `high`, then
 /// search the last step.
-async fn gallop_up<F, Fut>(low: u32, high: u32, height: u64, heights_of: &mut F) -> ChainResult<u32>
+async fn gallop_up<F, Fut>(
+    low: u32,
+    high: u32,
+    height: u64,
+    reads: &mut Reads<'_, F>,
+) -> ChainResult<u32>
 where
     F: FnMut(Vec<u32>) -> Fut,
     Fut: Future<Output = ChainResult<Vec<u64>>>,
@@ -198,20 +353,25 @@ where
         if probe >= high {
             break high;
         }
-        if height_of(heights_of, probe).await? > height {
+        if reads.height(probe).await? > height {
             break probe;
         }
         low = probe + 1;
         step = step.saturating_mul(2);
     };
-    first_above(low, high, height, heights_of).await
+    first_above(low, high, height, reads).await
 }
 
-/// The first record before `high` above `height`, when every record from
-/// `high` on is above it: probe `high - 1`, `high - 2`, `high - 4`, ...
-/// until one is at or below it or the first record is passed, then search
-/// the last step.
-async fn gallop_down<F, Fut>(high: u32, height: u64, heights_of: &mut F) -> ChainResult<u32>
+/// The first record in `floor..high` above `height`, or `high`, when every
+/// record before `floor` is at or below it and every record from `high` on
+/// above it: probe `high - 1`, `high - 2`, `high - 4`, ... until one is at
+/// or below it or `floor` is passed, then search the last step.
+async fn gallop_down<F, Fut>(
+    floor: u32,
+    high: u32,
+    height: u64,
+    reads: &mut Reads<'_, F>,
+) -> ChainResult<u32>
 where
     F: FnMut(Vec<u32>) -> Fut,
     Fut: Future<Output = ChainResult<Vec<u64>>>,
@@ -219,16 +379,16 @@ where
     let mut high = high;
     let mut step = 1u32;
     let low = loop {
-        let Some(probe) = high.checked_sub(step) else {
-            break 0;
+        let Some(probe) = high.checked_sub(step).filter(|probe| *probe >= floor) else {
+            break floor;
         };
-        if height_of(heights_of, probe).await? <= height {
+        if reads.height(probe).await? <= height {
             break probe + 1;
         }
         high = probe;
         step = step.saturating_mul(2);
     };
-    first_above(low, high, height, heights_of).await
+    first_above(low, high, height, reads).await
 }
 
 /// The first record in `low..high` above `height`, or `high`, by binary
@@ -237,7 +397,7 @@ async fn first_above<F, Fut>(
     low: u32,
     high: u32,
     height: u64,
-    heights_of: &mut F,
+    reads: &mut Reads<'_, F>,
 ) -> ChainResult<u32>
 where
     F: FnMut(Vec<u32>) -> Fut,
@@ -246,7 +406,7 @@ where
     let (mut low, mut high) = (low, high);
     while low < high {
         let middle = low + (high - low) / 2;
-        if height_of(heights_of, middle).await? > height {
+        if reads.height(middle).await? > height {
             high = middle;
         } else {
             low = middle + 1;
@@ -264,7 +424,7 @@ async fn first_above_batched<F, Fut>(
     high: u32,
     height: u64,
     probes: usize,
-    heights_of: &mut F,
+    reads: &mut Reads<'_, F>,
 ) -> ChainResult<u32>
 where
     F: FnMut(Vec<u32>) -> Fut,
@@ -283,16 +443,7 @@ where
                 .collect()
         };
         indices.dedup();
-        let heights = heights_of(indices.clone()).await?;
-        if heights.len() != indices.len() {
-            return Err(hyperlane_core::ChainCommunicationError::from_other_str(
-                &format!(
-                    "Dusk endpoint returned {} heights for {} records",
-                    heights.len(),
-                    indices.len()
-                ),
-            ));
-        }
+        let heights = reads.heights(indices.clone()).await?;
         for (index, record_height) in indices.into_iter().zip(heights) {
             if record_height > height {
                 high = index;
@@ -306,17 +457,23 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashSet;
 
     use super::*;
 
     /// A contract whose record `i` is at `heights[i]`, counting reads of
-    /// its record count, reads of record heights, and records read.
+    /// its record count, reads of record heights, records read, and
+    /// records read again.
     struct Contract {
         heights: Vec<u64>,
         counts: Cell<usize>,
         reads: Cell<usize>,
         records: Cell<usize>,
+        /// Every record read, ever.
+        read: RefCell<HashSet<u32>>,
+        /// Records read that a search had read before.
+        repeated: Cell<usize>,
     }
 
     impl Contract {
@@ -326,6 +483,8 @@ mod tests {
                 counts: Cell::new(0),
                 reads: Cell::new(0),
                 records: Cell::new(0),
+                read: RefCell::new(HashSet::new()),
+                repeated: Cell::new(0),
             }
         }
 
@@ -356,6 +515,12 @@ mod tests {
                         assert!(indices.windows(2).all(|pair| pair[0] < pair[1]));
                         self.reads.set(self.reads.get() + 1);
                         self.records.set(self.records.get() + indices.len());
+                        let mut read = self.read.borrow_mut();
+                        for index in &indices {
+                            if !read.insert(*index) {
+                                self.repeated.set(self.repeated.get() + 1);
+                            }
+                        }
                         let heights: Vec<u64> = indices
                             .iter()
                             .map(|index| self.heights[*index as usize])
@@ -384,13 +549,15 @@ mod tests {
             .chain((0..=top).step_by(7))
             .collect();
         for probes in [1, 2, 3, 16, 256] {
-            let records = FinalRecords::default();
-            for &height in &order {
-                assert_eq!(
-                    contract.search_with(&records, height, probes).await,
-                    contract.expected(height),
-                    "height {height}, {probes} probes"
-                );
+            // Keeping the heights of every block, or of a few only.
+            for records in [FinalRecords::default(), FinalRecords::with_capacity(3)] {
+                for &height in &order {
+                    assert_eq!(
+                        contract.search_with(&records, height, probes).await,
+                        contract.expected(height),
+                        "height {height}, {probes} probes"
+                    );
+                }
             }
         }
     }
@@ -462,9 +629,14 @@ mod tests {
         let contract = Contract::new(heights);
         assert_eq!(contract.search_with(&batched, 30_150, 256).await, 10_151);
         assert_eq!((contract.reads.get(), contract.records.get()), (1, 200));
-        // A transaction's older block, below the boundary.
+        // A transaction's older block, below the boundary: one read, of the
+        // records between two the restart's search read.
         assert_eq!(contract.search_with(&batched, 5_000, 256).await, 5_001);
-        assert!(contract.reads.get() <= 2, "{}", contract.reads.get());
+        assert_eq!(contract.reads.get(), 1);
+        assert!(contract.records.get() <= 40, "{}", contract.records.get());
+        // The block of a record the new block's search read: no read.
+        assert_eq!(contract.search_with(&batched, 30_100, 256).await, 10_101);
+        assert_eq!((contract.counts.get(), contract.reads.get()), (0, 0));
         // The boundary is still the highest one.
         assert_eq!(contract.search_with(&batched, 30_150, 256).await, 10_151);
         assert_eq!(contract.reads.get(), 0);
@@ -485,6 +657,15 @@ mod tests {
         // The search started over, so the boundary is the new one.
         assert_eq!(short.search(&records, 2002).await, 500);
         assert_eq!(short.reads.get(), 0);
+        // And the heights the long history's search kept are gone: its
+        // records past 500 are not this endpoint's.
+        assert!(records
+            .known
+            .lock()
+            .await
+            .heights
+            .values()
+            .all(|(_, last)| *last < 500));
     }
 
     #[tokio::test]
@@ -498,6 +679,154 @@ mod tests {
         // The idle search still starts at the highest boundary.
         assert_eq!(contract.search(&records, 30_000).await, 10_000);
         assert_eq!(contract.reads.get(), 0);
+    }
+
+    /// The block of each record a search read is known for good: a search
+    /// below the boundary reads only records no search read before, and none
+    /// at all between two neighbours that were read.
+    #[tokio::test]
+    async fn searches_below_the_boundary_read_only_records_none_read_before() {
+        // Two records to a block, some blocks without any.
+        let heights: Vec<u64> = (0..2_000u64).map(|i| 100 + i / 2 * 3).collect();
+        let top = *heights.last().unwrap();
+        for probes in [1, 256] {
+            let contract = Contract::new(heights.clone());
+            let records = FinalRecords::default();
+            assert_eq!(contract.search_with(&records, top + 5, probes).await, 2_000);
+            // Every block from the top down, and each twice, as a lookup
+            // asks for a block and the one below it.
+            for height in (90..=top).rev() {
+                for height in [height, height.saturating_sub(1)] {
+                    assert_eq!(
+                        contract.search_with(&records, height, probes).await,
+                        contract.expected(height),
+                        "height {height}, {probes} probes"
+                    );
+                }
+            }
+            assert_eq!(contract.repeated.get(), 0, "{probes} probes");
+            // Asked again, every one of them is answered without a read.
+            let reads_before = contract.read.borrow().len();
+            for height in (90..=top).rev() {
+                assert_eq!(
+                    contract.search_with(&records, height, probes).await,
+                    contract.expected(height)
+                );
+                assert_eq!((contract.counts.get(), contract.reads.get()), (0, 0));
+            }
+            assert_eq!(contract.read.borrow().len(), reads_before);
+        }
+    }
+
+    /// The relayer's lookups of each new message's transaction, as
+    /// `txIdIndexingEnabled` makes them: the message's block and the one
+    /// below it, once its block is final and the indexer's tick has read
+    /// it. They cost the same reads after 100 records as after 10,000.
+    #[tokio::test]
+    async fn a_message_costs_the_same_reads_whatever_the_history() {
+        /// Reads of record heights for `messages` messages after `history`
+        /// records, one a block, and the count reads among them.
+        async fn per_message(history: u64, probes: usize) -> (usize, usize, usize) {
+            const MESSAGES: u64 = 20;
+            let mut heights: Vec<u64> = (0..history).map(|i| 1_000 + i).collect();
+            let records = FinalRecords::default();
+            let mut final_height = 1_000 + history + 5;
+            let contract = Contract::new(heights.clone());
+            contract.search_with(&records, final_height, probes).await;
+            let (mut reads, mut records_read, mut counts) = (0, 0, 0);
+            for _ in 0..MESSAGES {
+                // The message's block is the tip: the tick reads nothing new.
+                heights.push(final_height + 1);
+                let contract = Contract::new(heights.clone());
+                contract.search_with(&records, final_height, probes).await;
+                // Its block is final: the tick reads it.
+                final_height += 1;
+                contract.search_with(&records, final_height, probes).await;
+                let tick = (
+                    contract.reads.get(),
+                    contract.records.get(),
+                    contract.counts.get(),
+                );
+                // The lookup of its transaction.
+                let below = contract
+                    .search_with(&records, final_height - 1, probes)
+                    .await;
+                let lookup_below = (
+                    contract.reads.get(),
+                    contract.records.get(),
+                    contract.counts.get(),
+                );
+                let at = contract.search_with(&records, final_height, probes).await;
+                assert_eq!(at - below, 1);
+                reads += tick.0 + lookup_below.0 + contract.reads.get();
+                records_read += tick.1 + lookup_below.1 + contract.records.get();
+                counts += tick.2 + lookup_below.2 + contract.counts.get();
+            }
+            (reads, records_read, counts)
+        }
+        for probes in [1, 256] {
+            let short = per_message(100, probes).await;
+            let long = per_message(10_000, probes).await;
+            assert_eq!(short, long, "{probes} probes");
+            // The tick reads the new record and the count; the lookup
+            // nothing.
+            assert_eq!(long, (20, 20, 20), "{probes} probes");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_kept_heights_are_bounded() {
+        // A record in each of 10,000 blocks, every one read.
+        let contract = Contract::new((0..10_000).map(|i| 100 + i).collect());
+        let records = FinalRecords::default();
+        assert_eq!(contract.search_with(&records, 20_000, 256).await, 10_000);
+        for height in (100..10_100).step_by(50) {
+            assert_eq!(
+                contract.search_with(&records, height, 256).await,
+                contract.expected(height)
+            );
+        }
+        let kept = records.known.lock().await.heights.len();
+        assert!(kept <= KEPT_BLOCKS, "{kept}");
+        // The most recent are kept: a block among them costs no read, and
+        // an older one is still found.
+        assert_eq!(contract.search_with(&records, 10_000, 256).await, 9_901);
+        assert_eq!(contract.reads.get(), 0);
+        assert_eq!(contract.search_with(&records, 150, 256).await, 51);
+        assert!(contract.reads.get() <= 2, "{}", contract.reads.get());
+    }
+
+    #[tokio::test]
+    async fn heights_that_contradict_the_kept_ones_are_not_kept() {
+        let mut known = Known::default();
+        assert!(known.keep(10, 100));
+        assert!(known.keep(12, 100));
+        assert!(known.keep(20, 110));
+        // A record before a kept one in a later block, or after a kept one
+        // in an earlier block.
+        assert!(!known.keep(15, 120));
+        assert!(!known.keep(11, 90));
+        assert!(!known.keep(25, 105));
+        // Between two kept records of one block, any block but that one
+        // contradicts them.
+        assert!(!known.keep(11, 101));
+        assert!(known.keep(11, 100));
+        assert_eq!(
+            known
+                .heights
+                .iter()
+                .map(|(h, r)| (*h, *r))
+                .collect::<Vec<_>>(),
+            [(100, (10, 12)), (110, (20, 20))]
+        );
+        // A search whose reads contradict the kept heights forgets them all.
+        known.boundary = Some(Boundary {
+            count: 30,
+            height: 120,
+        });
+        known.remember(105, 13, known.boundary, vec![(13, 101), (12, 104)]);
+        assert!(known.heights.is_empty());
+        assert_eq!(known.boundary.map(|boundary| boundary.height), Some(120));
     }
 
     #[tokio::test]
