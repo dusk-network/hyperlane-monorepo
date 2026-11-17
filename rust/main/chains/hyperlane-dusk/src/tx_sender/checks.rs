@@ -256,7 +256,7 @@ pub fn helper_output(data: &[u8]) {
         stdout: stdout.into_bytes(),
         stderr: stderr.into_bytes(),
     };
-    let result = helper_result("process", &output, prepared.as_deref());
+    let result = helper_result("process", &output, prepared.as_deref(), false);
     // An error about another transaction than the one prepared.
     let disagrees = prepared
         .as_deref()
@@ -299,7 +299,7 @@ fn success(input: &mut Input, prepared: Option<&str>, tx_id: &str, other: &str) 
         stdout: stdout.into_bytes(),
         stderr: Vec::new(),
     };
-    let result = helper_result("process", &output, prepared);
+    let result = helper_result("process", &output, prepared, false);
     if let Ok(json) = result {
         assert_eq!(json["success"].as_bool(), Some(true));
         let id = dusk_tx_id_to_h512(json["tx_id"].as_str().unwrap_or_default());

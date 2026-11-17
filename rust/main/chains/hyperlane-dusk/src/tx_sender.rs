@@ -563,7 +563,7 @@ async fn run_dusk_tx_at(
     if let Word::Withheld(why) = &run.word {
         return Err(withheld(fn_name, &run, why));
     }
-    let json = helper_result(fn_name, &run.output, run.prepared.as_deref())?;
+    let json = helper_result(fn_name, &run.output, run.prepared.as_deref(), false)?;
 
     let tx_id = json
         .get("tx_id")
@@ -583,10 +583,17 @@ async fn run_dusk_tx_at(
 /// exit status and output describe. Stdout and stderr can each be up to
 /// `MAX_DUSK_TX_STREAM_BYTES`, so only a bounded part of either goes into an
 /// error or a log line. The helper's error text is classified whole.
+///
+/// `word_withheld`: the agent did not let the helper send. Only then does a
+/// `Not submitted:` line on its stderr show that it sent nothing: dusk-tx
+/// prints one only when it stops without the word. Once let send, or
+/// sending on its own, it may have sent whatever its stderr holds, and the
+/// outcome is unknown unless its own error says otherwise.
 fn helper_result(
     fn_name: &str,
     output: &std::process::Output,
     prepared_tx_id: Option<&str>,
+    word_withheld: bool,
 ) -> Result<Value, HyperlaneDuskError> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -629,8 +636,9 @@ fn helper_result(
                 }
                 let detail = format!("dusk-tx call {fn_name} failed: {detail}");
                 // A complete preverify diagnostic proves propagation never
-                // ran, and so does the helper's word that it sent nothing.
-                if before_propagation_error(err) || said_not_submitted(&stderr) {
+                // ran, and so does the helper's word that it sent nothing,
+                // when it was not let send.
+                if before_propagation_error(err) || (word_withheld && said_not_submitted(&stderr)) {
                     return Err(HyperlaneDuskError::NotSubmitted(detail));
                 }
                 return Err(helper_failure(prepared_tx_id, detail));
@@ -640,7 +648,7 @@ fn helper_result(
             "dusk-tx call {fn_name} failed (exit code {code}): {}",
             bounded_text(&stderr)
         );
-        if said_not_submitted(&stderr) {
+        if word_withheld && said_not_submitted(&stderr) {
             return Err(HyperlaneDuskError::NotSubmitted(detail));
         }
         return Err(helper_failure(prepared_tx_id, detail));
@@ -843,7 +851,7 @@ async fn wait_for_child_output(
 /// before it signed one, and says why itself.
 fn withheld(fn_name: &str, run: &HelperRun, why: &str) -> HyperlaneDuskError {
     let Some(tx_id) = &run.prepared else {
-        return match helper_result(fn_name, &run.output, None) {
+        return match helper_result(fn_name, &run.output, None, true) {
             Err(error) => error,
             Ok(_) => HyperlaneDuskError::NotSubmitted(format!(
                 "dusk-tx call {fn_name} reported success without naming the transaction it prepared, which it was never let send"
@@ -1439,22 +1447,54 @@ mod tests {
             ),
         ] {
             assert!(matches!(
-                helper_result("process", &output(stdout, stderr), Some(&tx_id)),
+                helper_result("process", &output(stdout, stderr), Some(&tx_id), true),
                 Err(HyperlaneDuskError::NotSubmitted(_))
             ));
         }
         // Without that word, a helper that named its transaction may have
         // sent it.
         assert!(matches!(
-            helper_result("process", &output(String::new(), &prepared), Some(&tx_id)),
+            helper_result(
+                "process",
+                &output(String::new(), &prepared),
+                Some(&tx_id),
+                true
+            ),
             Err(HyperlaneDuskError::SubmissionOutcomeUnknown { .. })
         ));
+        // Once let send, a `Not submitted:` line on its stderr is not its
+        // refusal, which it prints only without the word: it may have sent
+        // the transaction. Its own error still says when it sent nothing.
+        for (stdout, outcome_unknown) in [
+            (String::new(), true),
+            (
+                serde_json::json!({ "success": false, "error": "no word" }).to_string(),
+                true,
+            ),
+            (
+                serde_json::json!({ "success": false, "error": format!(
+                    "Transaction {tx_id} submission failed: Not submitted: {reason}"
+                ) })
+                .to_string(),
+                false,
+            ),
+        ] {
+            let result = helper_result("process", &output(stdout, &said), Some(&tx_id), false);
+            assert_eq!(
+                matches!(
+                    result,
+                    Err(HyperlaneDuskError::SubmissionOutcomeUnknown { ref tx_id, .. }) if *tx_id == "ab".repeat(32)
+                ),
+                outcome_unknown,
+                "{result:?}"
+            );
+        }
         let unknown = serde_json::json!({ "success": false, "error": format!(
             "Transaction {tx_id} submission failed: Propagation outcome unknown: closed; retain tx_id={tx_id}"
         ) })
         .to_string();
         assert!(matches!(
-            helper_result("process", &output(unknown, &said), Some(&tx_id)),
+            helper_result("process", &output(unknown, &said), Some(&tx_id), true),
             Err(HyperlaneDuskError::SubmissionOutcomeUnknown { .. })
         ));
     }
@@ -1599,7 +1639,7 @@ mod tests {
             // A successful exit whose output is not JSON.
             (output(0, huge.clone(), ""), Some(tx_id.as_str())),
         ] {
-            let error = helper_result("process", &output, prepared)
+            let error = helper_result("process", &output, prepared, false)
                 .unwrap_err()
                 .to_string();
             assert!(error.len() < 3 * 1024, "{} bytes", error.len());
@@ -1610,7 +1650,8 @@ mod tests {
             helper_result(
                 "process",
                 &output(1, error_json(format!("Transaction {tx_id} failed: {huge}")), ""),
-                None
+                None,
+                false
             ),
             Err(HyperlaneDuskError::TransactionExecutionFailed { tx_id: failed, .. }) if failed == tx_id
         ));
@@ -1631,7 +1672,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(run.output.stderr.len(), 900_000);
-        let error = helper_result("process", &run.output, run.prepared.as_deref())
+        let error = helper_result("process", &run.output, run.prepared.as_deref(), false)
             .unwrap_err()
             .to_string();
         assert!(error.len() < 2 * 1024, "{} bytes", error.len());
