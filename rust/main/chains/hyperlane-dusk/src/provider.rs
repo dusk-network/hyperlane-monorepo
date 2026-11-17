@@ -8,6 +8,7 @@ use hyperlane_core::{
     HyperlaneProvider, HyperlaneProviderError, TxnInfo, H256, H512, U256,
 };
 
+use crate::rues::{bounded_error, bounded_json, bounded_text};
 use crate::tx_sender::h512_to_dusk_tx_id;
 use crate::{HyperlaneDuskError, RuesClient};
 
@@ -58,7 +59,10 @@ impl HyperlaneProvider for DuskProvider {
             .get("header")
             .and_then(|v| v.as_object())
             .ok_or_else(|| {
-                HyperlaneDuskError::Other(format!("GraphQL block response missing header: {data}"))
+                HyperlaneDuskError::Other(format!(
+                    "GraphQL block response missing header: {}",
+                    bounded_json(&data)
+                ))
             })?;
 
         let returned_height = required_u64(header, "height", "block header")?;
@@ -69,15 +73,23 @@ impl HyperlaneProvider for DuskProvider {
         }
 
         let hash_hex = header.get("hash").and_then(|v| v.as_str()).ok_or_else(|| {
-            HyperlaneDuskError::Other(format!("GraphQL block header missing hash: {data}"))
+            HyperlaneDuskError::Other(format!(
+                "GraphQL block header missing hash: {}",
+                bounded_json(&data)
+            ))
         })?;
         let hash_bytes = hex::decode(hash_hex).map_err(|e| {
-            HyperlaneDuskError::Other(format!("Invalid hex block hash '{hash_hex}': {e}"))
+            HyperlaneDuskError::Other(format!(
+                "Invalid hex block hash '{}': {}",
+                bounded_text(hash_hex),
+                bounded_error(e)
+            ))
         })?;
         if hash_bytes.len() != 32 {
             return Err(HyperlaneDuskError::Other(format!(
-                "Block hash is not 32 bytes (got {}): {hash_hex}",
-                hash_bytes.len()
+                "Block hash is not 32 bytes (got {}): {}",
+                hash_bytes.len(),
+                bounded_text(hash_hex)
             ))
             .into());
         }
@@ -86,7 +98,10 @@ impl HyperlaneProvider for DuskProvider {
             .get("timestamp")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| {
-                HyperlaneDuskError::Other(format!("GraphQL block header missing timestamp: {data}"))
+                HyperlaneDuskError::Other(format!(
+                    "GraphQL block header missing timestamp: {}",
+                    bounded_json(&data)
+                ))
             })?;
 
         Ok(BlockInfo {
@@ -116,7 +131,10 @@ impl HyperlaneProvider for DuskProvider {
         }
 
         let inner_tx = spent.get("tx").and_then(|v| v.as_object()).ok_or_else(|| {
-            HyperlaneDuskError::Other(format!("GraphQL tx response missing tx field: {data}"))
+            HyperlaneDuskError::Other(format!(
+                "GraphQL tx response missing tx field: {}",
+                bounded_json(&data)
+            ))
         })?;
 
         let gas_limit = required_u64(inner_tx, "gasLimit", "transaction")?;
@@ -126,7 +144,8 @@ impl HyperlaneProvider for DuskProvider {
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| {
                 HyperlaneDuskError::Other(format!(
-                    "GraphQL transaction is missing its JSON identity data: {data}"
+                    "GraphQL transaction is missing its JSON identity data: {}",
+                    bounded_json(&data)
                 ))
             })?;
         let (sender, nonce) = moonlight_identity_from_json(transaction_json)?;
@@ -150,7 +169,8 @@ impl HyperlaneProvider for DuskProvider {
             .and_then(|v| v.as_u64())
             .ok_or_else(|| {
                 HyperlaneDuskError::Other(format!(
-                    "GraphQL spent transaction missing numeric gasSpent: {data}"
+                    "GraphQL spent transaction missing numeric gasSpent: {}",
+                    bounded_json(&data)
                 ))
             })?;
 
@@ -207,28 +227,42 @@ impl HyperlaneProvider for DuskProvider {
             .and_then(|v| v.as_array())
             .and_then(|ary| ary.first())
             .ok_or_else(|| {
-                HyperlaneDuskError::Other(format!("GraphQL blocks response missing blocks: {data}"))
+                HyperlaneDuskError::Other(format!(
+                    "GraphQL blocks response missing blocks: {}",
+                    bounded_json(&data)
+                ))
             })?;
 
         let header = first
             .get("header")
             .and_then(|v| v.as_object())
             .ok_or_else(|| {
-                HyperlaneDuskError::Other(format!("GraphQL blocks response missing header: {data}"))
+                HyperlaneDuskError::Other(format!(
+                    "GraphQL blocks response missing header: {}",
+                    bounded_json(&data)
+                ))
             })?;
 
         let height = required_u64(header, "height", "latest block header")?;
         required_u64(header, "timestamp", "latest block header")?;
         let hash_hex = header.get("hash").and_then(|v| v.as_str()).ok_or_else(|| {
-            HyperlaneDuskError::Other(format!("GraphQL latest block header missing hash: {data}"))
+            HyperlaneDuskError::Other(format!(
+                "GraphQL latest block header missing hash: {}",
+                bounded_json(&data)
+            ))
         })?;
         let hash_bytes = hex::decode(hash_hex).map_err(|error| {
-            HyperlaneDuskError::Other(format!("Invalid latest block hash '{hash_hex}': {error}"))
+            HyperlaneDuskError::Other(format!(
+                "Invalid latest block hash '{}': {}",
+                bounded_text(hash_hex),
+                bounded_error(error)
+            ))
         })?;
         if hash_bytes.len() != 32 {
             return Err(HyperlaneDuskError::Other(format!(
-                "Latest block hash is not 32 bytes (got {}): {hash_hex}",
-                hash_bytes.len()
+                "Latest block hash is not 32 bytes (got {}): {}",
+                hash_bytes.len(),
+                bounded_text(hash_hex)
             ))
             .into());
         }
@@ -241,7 +275,10 @@ impl HyperlaneProvider for DuskProvider {
 
 fn moonlight_identity_from_json(value: &str) -> Result<(H256, u64), HyperlaneDuskError> {
     let transaction: serde_json::Value = serde_json::from_str(value).map_err(|error| {
-        HyperlaneDuskError::Other(format!("Invalid ledger transaction JSON: {error}"))
+        HyperlaneDuskError::Other(format!(
+            "Invalid ledger transaction JSON: {}",
+            bounded_error(error)
+        ))
     })?;
     if transaction.get("type").and_then(serde_json::Value::as_str) != Some("moonlight") {
         return Err(HyperlaneDuskError::Other(
@@ -253,7 +290,8 @@ fn moonlight_identity_from_json(value: &str) -> Result<(H256, u64), HyperlaneDus
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| {
             HyperlaneDuskError::Other(format!(
-                "Moonlight transaction JSON is missing numeric nonce: {transaction}"
+                "Moonlight transaction JSON is missing numeric nonce: {}",
+                bounded_json(&transaction)
             ))
         })?;
     let sender_bs58 = transaction
@@ -261,11 +299,15 @@ fn moonlight_identity_from_json(value: &str) -> Result<(H256, u64), HyperlaneDus
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| {
             HyperlaneDuskError::Other(format!(
-                "Moonlight transaction JSON is missing sender: {transaction}"
+                "Moonlight transaction JSON is missing sender: {}",
+                bounded_json(&transaction)
             ))
         })?;
     let sender_bytes = bs58::decode(sender_bs58).into_vec().map_err(|error| {
-        HyperlaneDuskError::Other(format!("Invalid Moonlight sender encoding: {error}"))
+        HyperlaneDuskError::Other(format!(
+            "Invalid Moonlight sender encoding: {}",
+            bounded_error(error)
+        ))
     })?;
     if sender_bytes.len() != 96 {
         return Err(HyperlaneDuskError::Other(format!(
@@ -288,7 +330,7 @@ fn required_u64(
         .ok_or_else(|| {
             HyperlaneDuskError::Other(format!(
                 "GraphQL {context} missing numeric {field}: {}",
-                serde_json::Value::Object(object.clone())
+                bounded_json(&serde_json::Value::Object(object.clone()))
             ))
         })
 }

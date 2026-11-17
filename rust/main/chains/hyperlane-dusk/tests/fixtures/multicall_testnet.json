@@ -1,0 +1,17 @@
+{
+  "source": "Replies of the multicall deployed at 93de287b7d349d678a0038fe7772e8960e1a84a1b5da2d0b1f62f532616ce1d4 on Dusk testnet (testnet.nodes.dusk.network, Rusk 1.7.3, chain ID 2), captured 2026-11-15",
+  "version": {
+    "reply": "01000000"
+  },
+  "empty": {
+    "request": "0000000000000000",
+    "reply": "23454a0000000000f8ffffff00000000",
+    "height": 4867363
+  },
+  "chain_id": {
+    "request": "636861696e5f6964010000000000000000000000000000000000000000000000000000000000000008000000d8ffffffd8ffffff000000000000000000000000c8ffffff01000000",
+    "reply": "0200000000000000f8ffffff01000000000000000000000023454a0000000000e4ffffff01000000",
+    "height": 4867363,
+    "single_query_reply": "02"
+  }
+}

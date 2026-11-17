@@ -1245,6 +1245,234 @@ mod test {
         );
     }
 
+    #[tokio::test]
+    async fn dusk_chain_components_build_without_reaching_the_node() {
+        use hyperlane_core::H256;
+
+        let directory = tempfile::tempdir().unwrap();
+        // Nothing listens on this port any more: the node is unreachable, as
+        // a relayer starting before its Rusk node would find it.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let value = json!({
+            "domainid": 1337, "chainid": 7, "name": "test", "protocol": "dusk",
+            "rpcurls": [{"http": format!("http://127.0.0.1:{port}")}],
+            "eventcursordir": directory.path().join("events"),
+            "mailbox": "0x0000000000000000000000000000000000000001",
+            "interchaingaspaymaster": "0x0000000000000000000000000000000000000002",
+            "validatorannounce": "0x0000000000000000000000000000000000000003",
+            "merkletreehook": "0x0000000000000000000000000000000000000004"
+        });
+        let chain = parse_chain(
+            ValueParser::new(Default::default(), &value),
+            "test",
+            "fallback",
+        )
+        .unwrap();
+        let metrics =
+            crate::CoreMetrics::new("dusk-offline", 0, prometheus::Registry::new()).unwrap();
+        // Everything a relayer builds for the chain, without a request.
+        let mailbox = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            chain.build_provider(&metrics).await?;
+            chain.build_message_indexer(&metrics, false).await?;
+            chain.build_delivery_indexer(&metrics, false).await?;
+            chain
+                .build_interchain_gas_payment_indexer(&metrics, false)
+                .await?;
+            chain
+                .build_merkle_tree_hook_indexer(&metrics, false)
+                .await?;
+            chain.build_validator_announce(&metrics).await?;
+            chain.build_merkle_tree_hook(&metrics).await?;
+            chain.build_mailbox(&metrics).await
+        })
+        .await
+        .expect("building makes no request")
+        .unwrap();
+        // Reads fail until the endpoint is shown to serve the configured
+        // deployment, and each one tries again.
+        for _ in 0..2 {
+            let error = mailbox
+                .delivered(H256::zero())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("not verified yet"), "{error}");
+        }
+    }
+
+    #[test]
+    fn dusk_gas_limit_defaults_to_five_million() {
+        let mut value = json!({
+            "domainid": 1337, "chainid": 7, "name": "test", "protocol": "dusk",
+            "rpcurls": [{"http": "http://localhost:8080"}],
+            "eventcursordir": "/tmp/dusk-parser-events",
+            "mailbox": "0x0000000000000000000000000000000000000001",
+            "interchaingaspaymaster": "0x0000000000000000000000000000000000000002",
+            "validatorannounce": "0x0000000000000000000000000000000000000003",
+            "merkletreehook": "0x0000000000000000000000000000000000000004"
+        });
+        let gas_limit = |value: &serde_json::Value| {
+            let chain = parse_chain(
+                ValueParser::new(Default::default(), value),
+                "test",
+                "fallback",
+            )
+            .unwrap();
+            let crate::settings::ChainConnectionConf::Dusk(connection) = chain.connection else {
+                panic!("expected Dusk transport");
+            };
+            connection.gas_limit
+        };
+        assert_eq!(gas_limit(&value), 5_000_000);
+        value["gaslimit"] = json!(30_000_000);
+        assert_eq!(gas_limit(&value), 30_000_000);
+        // No block holds more.
+        value["gaslimit"] = json!(3_000_000_000u64);
+        assert_eq!(gas_limit(&value), 3_000_000_000);
+        value["gaslimit"] = json!(3_000_000_001u64);
+        let error = parse_chain(
+            ValueParser::new(Default::default(), &value),
+            "test",
+            "fallback",
+        )
+        .expect_err("a gasLimit over the block gas limit must be rejected")
+        .to_string();
+        assert!(error.contains("block gas limit"), "{error}");
+    }
+
+    #[test]
+    fn dusk_contract_queries_are_paced_at_a_configurable_rate() {
+        let mut value = json!({
+            "domainid": 1337, "chainid": 7, "name": "test", "protocol": "dusk",
+            "rpcurls": [{"http": "http://localhost:8080"}],
+            "eventcursordir": "/tmp/dusk-parser-events",
+            "mailbox": "0x0000000000000000000000000000000000000001",
+            "interchaingaspaymaster": "0x0000000000000000000000000000000000000002",
+            "validatorannounce": "0x0000000000000000000000000000000000000003",
+            "merkletreehook": "0x0000000000000000000000000000000000000004"
+        });
+        let limit = |value: &serde_json::Value| {
+            parse_chain(
+                ValueParser::new(Default::default(), value),
+                "test",
+                "fallback",
+            )
+            .map(|chain| {
+                let crate::settings::ChainConnectionConf::Dusk(connection) = chain.connection
+                else {
+                    panic!("expected Dusk transport");
+                };
+                connection.query_rate_limit
+            })
+        };
+        assert_eq!(
+            limit(&value).unwrap(),
+            hyperlane_dusk::QueryRateLimit {
+                per_second: 100,
+                burst: 20
+            }
+        );
+        value["contractqueriespersecond"] = json!(150);
+        value["contractqueryburst"] = json!(40);
+        assert_eq!(
+            limit(&value).unwrap(),
+            hyperlane_dusk::QueryRateLimit {
+                per_second: 150,
+                burst: 40
+            }
+        );
+        for key in ["contractqueriespersecond", "contractqueryburst"] {
+            let mut zero = value.clone();
+            zero[key] = json!(0);
+            let error = limit(&zero).expect_err("zero must be rejected").to_string();
+            assert!(error.contains("greater than zero"), "{key}: {error}");
+        }
+    }
+
+    #[test]
+    fn dusk_batches_reads_through_its_batch_contract_address() {
+        let mut value = json!({
+            "domainid": 1337, "chainid": 7, "name": "test", "protocol": "dusk",
+            "rpcurls": [{"http": "http://localhost:8080"}],
+            "eventcursordir": "/tmp/dusk-parser-events",
+            "mailbox": "0x0000000000000000000000000000000000000001",
+            "interchaingaspaymaster": "0x0000000000000000000000000000000000000002",
+            "validatorannounce": "0x0000000000000000000000000000000000000003",
+            "merkletreehook": "0x0000000000000000000000000000000000000004"
+        });
+        let multicall = |value: &serde_json::Value| {
+            let chain = parse_chain(
+                ValueParser::new(Default::default(), value),
+                "test",
+                "fallback",
+            )
+            .unwrap();
+            let crate::settings::ChainConnectionConf::Dusk(connection) = chain.connection else {
+                panic!("expected Dusk transport");
+            };
+            connection.multicall()
+        };
+        // No default: every contract read is one query.
+        assert_eq!(multicall(&value), None);
+        // Where mainnet and testnet run Multicall for Dusk.
+        let deployed = "0x93de287b7d349d678a0038fe7772e8960e1a84a1b5da2d0b1f62f532616ce1d4";
+        value["batchcontractaddress"] = json!(deployed);
+        assert_eq!(
+            multicall(&value),
+            Some(
+                hyperlane_core::utils::hex_or_base58_or_bech32_to_h256(deployed)
+                    .unwrap()
+                    .into()
+            )
+        );
+    }
+
+    #[test]
+    fn dusk_pipelines_deliveries_only_when_opted_in() {
+        let mut value = json!({
+            "domainid": 1337, "chainid": 7, "name": "test", "protocol": "dusk",
+            "rpcurls": [{"http": "http://localhost:8080"}],
+            "eventcursordir": "/tmp/dusk-parser-events",
+            "mailbox": "0x0000000000000000000000000000000000000001",
+            "interchaingaspaymaster": "0x0000000000000000000000000000000000000002",
+            "validatorannounce": "0x0000000000000000000000000000000000000003",
+            "merkletreehook": "0x0000000000000000000000000000000000000004"
+        });
+        let pipelined = |value: &serde_json::Value| {
+            let chain = parse_chain(
+                ValueParser::new(Default::default(), value),
+                "test",
+                "fallback",
+            )
+            .unwrap();
+            let crate::settings::ChainConnectionConf::Dusk(connection) = chain.connection else {
+                panic!("expected Dusk transport");
+            };
+            (
+                connection.pipeline_deliveries,
+                connection.pipelines_deliveries(),
+            )
+        };
+        // Off by default.
+        assert_eq!(pipelined(&value), (false, false));
+        // A batch size alone, as the deploy scripts write it, delivers one
+        // at a time.
+        value["maxbatchsize"] = json!(16);
+        assert_eq!(pipelined(&value), (false, false));
+        value["pipelinedeliveries"] = json!(true);
+        assert_eq!(pipelined(&value), (true, true));
+        // Opted in, with batches of one.
+        value["maxbatchsize"] = json!(1);
+        assert_eq!(pipelined(&value), (true, false));
+        value["pipelinedeliveries"] = json!(false);
+        value["maxbatchsize"] = json!(16);
+        assert_eq!(pipelined(&value), (false, false));
+    }
+
     #[test]
     fn rejects_zero_max_batch_size() {
         let value = serde_json::json!({

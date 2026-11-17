@@ -1,7 +1,8 @@
 use hyperlane_core::{ChainCommunicationError, HyperlaneCustomErrorWrapper, H512};
 
-/// Errors specific to the Dusk chain integration.
-#[derive(Debug, thiserror::Error)]
+/// Errors specific to the Dusk chain integration. Every reader of a batched
+/// read gets its own copy of the read's error.
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum HyperlaneDuskError {
     /// HTTP error communicating with the RUES endpoint.
     #[error("RUES HTTP request failed ({kind}, status={status:?})")]
@@ -18,6 +19,25 @@ pub enum HyperlaneDuskError {
         status: u16,
         /// Response body.
         body: String,
+    },
+    /// The endpoint refused a request for its rate limit each time the agent
+    /// sent it, waiting longer before each try. The endpoint ran none of
+    /// them; the caller tries again later.
+    #[error("Dusk endpoint refused a {class} request {refusals} times for its rate limit")]
+    RateLimited {
+        /// The class of request, as the endpoint limits it.
+        class: &'static str,
+        /// How many times it was refused.
+        refusals: u32,
+    },
+    /// A response body over the agent's transport limit, refused from its
+    /// declared length or once reading it passed the limit.
+    #[error("{context} response exceeds {limit} bytes")]
+    ResponseTooLarge {
+        /// What the request was for.
+        context: &'static str,
+        /// The limit, in bytes.
+        limit: usize,
     },
     /// rkyv deserialization error.
     #[error("rkyv deserialization error: {0}")]
@@ -40,6 +60,12 @@ pub enum HyperlaneDuskError {
         /// Original helper diagnostic.
         detail: String,
     },
+    /// The helper did not propagate the transaction it prepared: the node
+    /// refused it at preverification, preverification could not be asked,
+    /// or the helper was not let send it (`--ack-before-send`). Nothing of
+    /// it reached the node.
+    #[error("{0}")]
+    NotSubmitted(String),
     /// The helper observed an included execution failure. Reconcile its exact
     /// receipt so callers can account for gas despite unsuccessful execution.
     #[error("Dusk transaction {tx_id} execution failed: {detail}")]
@@ -56,6 +82,25 @@ pub enum HyperlaneDuskError {
     /// finalized block provenance. Transport failures must not use this variant.
     #[error("{0}")]
     FinalizedEventMismatch(String),
+    /// The endpoint has not been shown to serve the configured deployment
+    /// yet: its chain ID, contracts and their bindings. No request was sent.
+    #[error("Dusk endpoint identity is not verified yet: {0}")]
+    IdentityUnverified(String),
+    /// A record is in the node's current state, but the agent cannot show
+    /// yet that the block holding it is final. The caller checks again later.
+    #[error("{0}")]
+    NotFinal(String),
+    /// Finalized contract state proves rows exist in a finalized block that
+    /// the endpoint's archive has passed without them. Retrying the same
+    /// archive does not help; its node has to repair it.
+    #[error("{0}")]
+    ArchiveMissingRows(String),
+    /// An event log found that the endpoint's finalized history changed
+    /// under sequences consumers have read. It stops, rather than number
+    /// them differently, until the operator resets the agent's database and
+    /// its event store.
+    #[error("{0}")]
+    EventLogHalted(String),
     /// Generic error.
     #[error("{0}")]
     Other(String),

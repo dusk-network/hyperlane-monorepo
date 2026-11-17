@@ -3,9 +3,9 @@
 // Public process regression for receipt accounting. The helper is local, consumes a
 // synthetic fixture signer from stdin without printing it, and never submits.
 use hyperlane_core::{
-    config::OpSubmissionConfig, HyperlaneDomain, HyperlaneDomainProtocol,
-    HyperlaneDomainTechnicalStack, HyperlaneMessage, Mailbox, Metadata, NativeToken, TxOutcome,
-    H256, U256,
+    config::OpSubmissionConfig, ChainCommunicationError, FixedPointNumber, HyperlaneDomain,
+    HyperlaneDomainProtocol, HyperlaneDomainTechnicalStack, HyperlaneMessage, Mailbox, Metadata,
+    NativeToken, TxCostEstimate, TxOutcome, H256, U256,
 };
 use hyperlane_dusk::{ConnectionConf, DuskMailbox, DuskProvider, DuskSigner, RuesClient};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -24,6 +24,26 @@ static HELPER_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const FULL_GAS: u64 = 500_000_000;
 const TX: [u8; 32] = [0x11; 32];
+const MAILBOX: [u8; 32] = [0x02; 32];
+
+/// How the endpoint answers the unsigned `process` query.
+#[derive(Clone, Copy, Debug)]
+enum Simulation {
+    /// Rusk's answer when `process` returns: the encoding of `()`, which is
+    /// empty.
+    Passes,
+    /// Rusk's answer to a contract panic in a query.
+    Panics,
+    /// A proxy in front of the node answers with its own page and status 200.
+    ProxyPage,
+    /// A success reply that is not the encoding of `()`.
+    UnexpectedValue,
+    /// An error reply with a body far larger than any diagnostic needs.
+    HugeError,
+}
+
+/// Size of the `HugeError` body.
+const HUGE_ERROR_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug)]
 enum Helper {
@@ -47,10 +67,14 @@ struct Fixture {
     directory: TempDir,
     stop: Arc<AtomicBool>,
     queries: Arc<AtomicUsize>,
+    simulations: Arc<AtomicUsize>,
     worker: Option<JoinHandle<()>>,
 }
 impl Fixture {
     fn start(helper: Helper) -> Self {
+        Self::start_with_simulation(helper, Simulation::Passes)
+    }
+    fn start_with_simulation(helper: Helper, simulation: Simulation) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let tx = hex::encode(TX);
         let (value, code) = match helper {
@@ -113,13 +137,15 @@ impl Fixture {
         } else {
             format!("exit {code}")
         };
+        // Once it names its transaction, the helper waits for the word to
+        // send it (`--ack-before-send`).
         let prepared = if matches!(helper, Helper::RejectedBeforeSubmission) {
             String::new()
         } else {
-            format!("printf '%s\\n' '  Prepared TX {tx}; reconcile this exact hash before retrying if submission is interrupted' >&2\n")
+            format!("printf '%s\\n' '  Prepared TX {tx}; reconcile this exact hash before retrying if submission is interrupted' >&2\nIFS= read -r fixture_word\n[ \"$fixture_word\" = send ] || {{ echo 'Not submitted: no word to send' >&2; exit 1; }}\n")
         };
         std::fs::write(&helper_path,format!(
-            "#!/bin/sh\nIFS= read -r fixture_url\nIFS= read -r fixture_input\n[ -n \"$fixture_url\" ] && [ -n \"$fixture_input\" ] || exit 89\nfor fixture_arg do\n  [ \"$fixture_arg\" != \"$fixture_url\" ] && [ \"$fixture_arg\" != \"$fixture_input\" ] || exit 90\ndone\n{prepared}printf '%s\\n' '{output}'\n{termination}\n")).unwrap();
+            "#!/bin/sh\nif [ \"$1\" = call ] && [ \"$2\" = --help ]; then printf '      --ack-before-send\\n'; exit 0; fi\n: > \"$0.invoked\"\ncase \" $* \" in *\" --ack-before-send \"*) ;; *) exit 91 ;; esac\nIFS= read -r fixture_url\nIFS= read -r fixture_input\n[ -n \"$fixture_url\" ] && [ -n \"$fixture_input\" ] || exit 89\nfor fixture_arg do\n  [ \"$fixture_arg\" != \"$fixture_url\" ] && [ \"$fixture_arg\" != \"$fixture_input\" ] || exit 90\ndone\n{prepared}printf '%s\\n' '{output}'\n{termination}\n")).unwrap();
         std::fs::set_permissions(&helper_path, std::fs::Permissions::from_mode(0o700)).unwrap();
         // This is only the test process environment; live agents are separate.
         std::env::set_var("DUSK_TX_BIN", &helper_path);
@@ -130,6 +156,12 @@ impl Fixture {
         let worker_stop = stop.clone();
         let queries = Arc::new(AtomicUsize::new(0));
         let worker_queries = queries.clone();
+        let simulations = Arc::new(AtomicUsize::new(0));
+        let worker_simulations = simulations.clone();
+        let simulation_path = format!("/on/contracts:{}/process", hex::encode(MAILBOX));
+        let simulation_args = rkyv::to_bytes::<_, 256>(&(Vec::<u8>::new(), encoded_message()))
+            .unwrap()
+            .to_vec();
         let worker = thread::spawn(move || {
             while !worker_stop.load(Ordering::SeqCst) {
                 let (mut stream, _) = match listener.accept() {
@@ -147,7 +179,7 @@ impl Fixture {
                 let mut reader = BufReader::new(&mut stream);
                 let mut request = String::new();
                 reader.read_line(&mut request).unwrap();
-                assert_eq!(request.split_whitespace().nth(1), Some("/on/graphql/query"));
+                let path = request.split_whitespace().nth(1).unwrap().to_owned();
                 let mut length = 0usize;
                 loop {
                     let mut header = String::new();
@@ -161,18 +193,56 @@ impl Fixture {
                 }
                 let mut body = vec![0; length];
                 reader.read_exact(&mut body).unwrap();
-                let query = String::from_utf8(body).unwrap();
-                assert_eq!(
-                    query,
-                    format!("query {{ tx(hash: \"{tx}\") {{ gasSpent err }} }}")
-                );
-                worker_queries.fetch_add(1, Ordering::SeqCst);
-                let reply = serde_json::to_vec(&serde_json::json!({"tx":{
-                    "gasSpent":FULL_GAS,"err":"recipient rejected"}}))
-                .unwrap();
+                let (status, reply) = if path == simulation_path {
+                    assert_eq!(body, simulation_args, "unexpected process query argument");
+                    worker_simulations.fetch_add(1, Ordering::SeqCst);
+                    match simulation {
+                        Simulation::Passes => ("200 OK", Vec::new()),
+                        Simulation::Panics => (
+                            "500 Internal Server Error",
+                            br#"{"error":"Internal server error"}"#.to_vec(),
+                        ),
+                        Simulation::ProxyPage => (
+                            "200 OK",
+                            b"<html><body>502 Bad Gateway</body></html>".to_vec(),
+                        ),
+                        Simulation::UnexpectedValue => ("200 OK", vec![0]),
+                        Simulation::HugeError => {
+                            ("500 Internal Server Error", vec![b'x'; HUGE_ERROR_BYTES])
+                        }
+                    }
+                } else if path.starts_with("/on/account:") {
+                    // The account a delivery is signed with has sent nothing
+                    // yet; the Mailbox reads it before it sends one.
+                    let reply = serde_json::to_vec(
+                        &serde_json::json!({"balance": 1u64 << 40, "nonce": 0, "next_nonce": 1}),
+                    )
+                    .unwrap();
+                    ("200 OK", reply)
+                } else {
+                    assert_eq!(path, "/on/graphql/query");
+                    let query = String::from_utf8(body).unwrap();
+                    if query == "query { lastBlockPair { json } }" {
+                        let block = serde_json::json!([1, "11".repeat(32)]);
+                        let reply = serde_json::to_vec(&serde_json::json!({"lastBlockPair": {
+                            "json": {"last_block": block, "last_finalized_block": block}}}))
+                        .unwrap();
+                        ("200 OK", reply)
+                    } else {
+                        assert_eq!(
+                            query,
+                            format!("query {{ tx(hash: \"{tx}\") {{ gasSpent err }} }}")
+                        );
+                        worker_queries.fetch_add(1, Ordering::SeqCst);
+                        let reply = serde_json::to_vec(&serde_json::json!({"tx":{
+                            "gasSpent":FULL_GAS,"err":"recipient rejected"}}))
+                        .unwrap();
+                        ("200 OK", reply)
+                    }
+                };
                 write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     reply.len()
                 )
                 .unwrap();
@@ -184,8 +254,18 @@ impl Fixture {
             directory,
             stop,
             queries,
+            simulations,
             worker: Some(worker),
         }
+    }
+    fn simulations(&self) -> usize {
+        self.simulations.load(Ordering::SeqCst)
+    }
+    fn helper_invoked(&self) -> bool {
+        self.directory
+            .path()
+            .join("fixture-helper.invoked")
+            .exists()
     }
     fn mailbox(&self) -> DuskMailbox {
         let domain = HyperlaneDomain::from_config(
@@ -201,7 +281,7 @@ impl Fixture {
         DuskMailbox::new(
             provider,
             rues,
-            H256::repeat_byte(2),
+            H256::from(MAILBOX),
             H256::repeat_byte(3),
             domain,
             Some(signer),
@@ -213,6 +293,8 @@ impl Fixture {
                 gas_price: 2,
                 native_token: NativeToken::default(),
                 op_submission_config: OpSubmissionConfig::default(),
+                query_rate_limit: hyperlane_dusk::QueryRateLimit::default(),
+                pipeline_deliveries: false,
             },
         )
     }
@@ -228,8 +310,8 @@ impl Drop for Fixture {
         }
     }
 }
-async fn process(fixture: &Fixture) -> Result<TxOutcome, String> {
-    let message = HyperlaneMessage {
+fn message() -> HyperlaneMessage {
+    HyperlaneMessage {
         version: 3,
         nonce: 0,
         origin: 7,
@@ -237,10 +319,20 @@ async fn process(fixture: &Fixture) -> Result<TxOutcome, String> {
         destination: 4242,
         recipient: H256::repeat_byte(5),
         body: vec![0],
-    };
+    }
+}
+/// `message()` in the Dusk wire format, built independently of the adapter.
+fn encoded_message() -> Vec<u8> {
+    hyperlane_dusk_types::message::encode(3, 0, 7, [4; 32], 4242, [5; 32], &[0])
+}
+async fn process(fixture: &Fixture) -> Result<TxOutcome, String> {
     fixture
         .mailbox()
-        .process(&message, &Metadata::new(vec![]), Some(U256::from(FULL_GAS)))
+        .process(
+            &message(),
+            &Metadata::new(vec![]),
+            Some(U256::from(FULL_GAS)),
+        )
         .await
         .map_err(|e| e.to_string())
 }
@@ -344,4 +436,180 @@ async fn helper_results_cannot_replace_the_prepared_transaction_identity() {
     ] {
         assert_interrupted_helper_reconciles(helper).await;
     }
+}
+
+#[tokio::test]
+async fn passing_simulation_proceeds_to_submission() {
+    let _env_guard = HELPER_ENV.lock().await;
+    let fixture = Fixture::start(Helper::Success);
+    assert_failed_outcome(process(&fixture).await.unwrap());
+    assert_eq!(fixture.simulations(), 1);
+    assert!(fixture.helper_invoked());
+    assert_eq!(fixture.queries.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_delivery_right_after_its_estimate_is_simulated_once() {
+    let _env_guard = HELPER_ENV.lock().await;
+    let fixture = Fixture::start(Helper::Success);
+    // The relayer's preparation, its dry run before submitting, and the
+    // Mailbox's own check, moments apart, on one adapter.
+    let mailbox = fixture.mailbox();
+    for _ in 0..2 {
+        mailbox
+            .process_estimate_costs(&message(), &Metadata::new(vec![]))
+            .await
+            .unwrap();
+    }
+    assert_failed_outcome(
+        mailbox
+            .process(
+                &message(),
+                &Metadata::new(vec![]),
+                Some(U256::from(FULL_GAS)),
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(fixture.simulations(), 1);
+    assert!(fixture.helper_invoked());
+}
+
+#[tokio::test]
+async fn failed_simulation_never_invokes_the_helper() {
+    let _env_guard = HELPER_ENV.lock().await;
+    let fixture = Fixture::start_with_simulation(Helper::Success, Simulation::Panics);
+    let error = fixture
+        .mailbox()
+        .process(
+            &message(),
+            &Metadata::new(vec![]),
+            Some(U256::from(FULL_GAS)),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, ChainCommunicationError::SimulationFailed(_)),
+        "{error}"
+    );
+    assert_eq!(fixture.simulations(), 1);
+    assert!(!fixture.helper_invoked());
+    assert_eq!(fixture.queries.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn failed_simulation_fails_the_estimate() {
+    let _env_guard = HELPER_ENV.lock().await;
+    let fixture = Fixture::start_with_simulation(Helper::Success, Simulation::Panics);
+    let error = fixture
+        .mailbox()
+        .process_estimate_costs(&message(), &Metadata::new(vec![]))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, ChainCommunicationError::SimulationFailed(_)),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("Internal server error"),
+        "{error}"
+    );
+    assert_eq!(fixture.simulations(), 1);
+    assert!(!fixture.helper_invoked());
+}
+
+#[tokio::test]
+async fn passing_simulation_estimates_the_configured_ceiling() {
+    let _env_guard = HELPER_ENV.lock().await;
+    let fixture = Fixture::start(Helper::Success);
+    let estimate = fixture
+        .mailbox()
+        .process_estimate_costs(&message(), &Metadata::new(vec![]))
+        .await
+        .unwrap();
+    assert_eq!(
+        estimate,
+        TxCostEstimate {
+            gas_limit: U256::from(FULL_GAS),
+            gas_price: FixedPointNumber::from(2),
+            l2_gas_limit: None,
+        }
+    );
+    assert_eq!(fixture.simulations(), 1);
+    assert!(!fixture.helper_invoked());
+}
+
+#[tokio::test]
+async fn a_success_reply_other_than_unit_fails_the_simulation() {
+    let _env_guard = HELPER_ENV.lock().await;
+    for simulation in [Simulation::ProxyPage, Simulation::UnexpectedValue] {
+        let fixture = Fixture::start_with_simulation(Helper::Success, simulation);
+        let estimate = fixture
+            .mailbox()
+            .process_estimate_costs(&message(), &Metadata::new(vec![]))
+            .await
+            .unwrap_err();
+        let process = fixture
+            .mailbox()
+            .process(
+                &message(),
+                &Metadata::new(vec![]),
+                Some(U256::from(FULL_GAS)),
+            )
+            .await
+            .unwrap_err();
+        for error in [estimate, process] {
+            assert!(
+                matches!(error, ChainCommunicationError::SimulationFailed(_)),
+                "{simulation:?}: {error}"
+            );
+            assert!(
+                error.to_string().contains("instead of the encoding of ()"),
+                "{simulation:?}: {error}"
+            );
+        }
+        assert_eq!(fixture.simulations(), 2);
+        assert!(!fixture.helper_invoked(), "{simulation:?}");
+        assert_eq!(fixture.queries.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn a_huge_simulation_error_body_is_cut_before_it_reaches_the_error() {
+    let _env_guard = HELPER_ENV.lock().await;
+    let fixture = Fixture::start_with_simulation(Helper::Success, Simulation::HugeError);
+    let error = fixture
+        .mailbox()
+        .process_estimate_costs(&message(), &Metadata::new(vec![]))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, ChainCommunicationError::SimulationFailed(_)),
+        "{error}"
+    );
+    let error = error.to_string();
+    assert!(error.len() < 2048, "{} bytes", error.len());
+    assert!(
+        error.contains(&format!("[truncated, {HUGE_ERROR_BYTES} bytes]")),
+        "{error}"
+    );
+    assert!(!fixture.helper_invoked());
+}
+
+#[tokio::test]
+async fn oversized_process_payload_fails_before_simulation() {
+    let _env_guard = HELPER_ENV.lock().await;
+    let fixture = Fixture::start(Helper::Success);
+    let error = fixture
+        .mailbox()
+        .process_estimate_costs(&message(), &Metadata::new(vec![0; 60 * 1024]))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("argument limit of the dusk-tx helper"),
+        "{error}"
+    );
+    assert_eq!(fixture.simulations(), 0);
 }

@@ -16,7 +16,7 @@ rocksdb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "process", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "time"] }
 tracing.workspace = true
 tracing-futures.workspace = true
 url.workspace = true
@@ -32,7 +32,7 @@ dusk-bytes = "0.1.7"
 # separately built `dusk-tx` helper. Pin the companion repository to an exact
 # reviewed commit so release/Docker builds do not depend on an adjacent checkout
 # and cannot drift with a moving branch.
-hyperlane-dusk-types = { git = "https://github.com/dusk-network/hyperlane-dusk", rev = "f6be24a411f2a0a247b8d1b798106c37449f7dcf", features = ["serde"] }
+hyperlane-dusk-types = { git = "https://github.com/dusk-network/hyperlane-dusk", rev = "ae77c887223bd262c109ff054d726aff21b070c7", features = ["serde"] }
 
 # rkyv for RUES binary serialization (matching on-chain contract serialization)
 rkyv = { version = "0.7", features = ["validation"] }

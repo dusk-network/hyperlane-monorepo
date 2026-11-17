@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -13,11 +14,16 @@ use hyperlane_core::{
 
 use hyperlane_dusk_types::{events, GasPaymentRecord};
 
-use crate::rues::rkyv_serialize;
+use crate::final_records::FinalRecords;
+use crate::rues::{
+    exact_event_data, list_reply, rkyv_deserialize, rkyv_serialize, Read, U32_REPLY,
+};
 use crate::tx_sender::{dusk_tx_id_to_h512, h512_to_dusk_tx_id};
 use crate::{DuskProvider, RuesClient};
 
 const GAS_PAYMENT_PAGE_SIZE: u32 = 256;
+/// The bytes of a stored payment record.
+const PAYMENT_REPLY: usize = std::mem::size_of::<rkyv::Archived<GasPaymentRecord>>();
 
 /// Dusk InterchainGasPaymaster implementation (marker contract).
 #[derive(Debug, Clone)]
@@ -62,51 +68,62 @@ pub struct DuskInterchainGasPaymasterIndexer {
     rues: Arc<RuesClient>,
     igp_id: [u8; 32],
     igp_address: H256,
+    /// Where the payments last crossed a final height.
+    payments: Arc<FinalRecords>,
 }
 
 impl DuskInterchainGasPaymasterIndexer {
     /// Create a new indexer.
     pub fn new(rues: Arc<RuesClient>, igp_id: H256) -> Self {
         Self {
-            rues,
             igp_id: igp_id.into(),
             igp_address: igp_id,
+            payments: rues.final_records(igp_id.into(), "gas_payment_at"),
+            rues,
         }
     }
 
-    async fn payment_record(&self, sequence: u32) -> ChainResult<GasPaymentRecord> {
-        Ok(self
+    /// The blocks of the payments at `sequences`, from their records.
+    async fn payment_heights(&self, sequences: Vec<u32>) -> ChainResult<Vec<u64>> {
+        let records: Vec<GasPaymentRecord> = self
             .rues
-            .contract_query(&self.igp_id, "gas_payment_at", &(sequence,))
-            .await?)
+            .read_indexed(self.igp_id, "gas_payment_at", &sequences, PAYMENT_REPLY)
+            .await?;
+        Ok(records.iter().map(|record| record.block_height).collect())
     }
 
-    async fn first_payment_at_or_after(&self, count: u32, block_height: u64) -> ChainResult<u32> {
-        let mut low = 0u32;
-        let mut high = count;
-        while low < high {
-            let middle = low + (high - low) / 2;
-            if self.payment_record(middle).await?.block_height < block_height {
-                low = middle + 1;
-            } else {
-                high = middle;
-            }
-        }
-        Ok(low)
+    /// The IGP's payment count, read once per final block.
+    async fn payment_count(&self) -> ChainResult<u32> {
+        let read = Read::new(self.igp_id, "gas_payment_count", &(), U32_REPLY)?;
+        Ok(rkyv_deserialize(&self.rues.final_tick_read(read).await?)?)
     }
 
+    /// How many payments are at or below final block `block_height`.
+    async fn payments_at_or_below(&self, block_height: u64) -> ChainResult<u32> {
+        let probes = self.rues.batch_capacity().await?;
+        self.payments
+            .count_at_or_below(
+                block_height,
+                || self.payment_count(),
+                probes,
+                |sequences| self.payment_heights(sequences),
+            )
+            .await
+    }
+
+    /// The payments of final block `block_height`.
     async fn payment_range_at_block(
         &self,
-        count: u32,
         block_height: u64,
     ) -> ChainResult<Option<RangeInclusive<u32>>> {
-        let first = self.first_payment_at_or_after(count, block_height).await?;
-        if first == count || self.payment_record(first).await?.block_height != block_height {
+        let first = match block_height.checked_sub(1) {
+            Some(below) => self.payments_at_or_below(below).await?,
+            None => 0,
+        };
+        let after = self.payments_at_or_below(block_height).await?;
+        if after == first {
             return Ok(None);
         }
-        let after = self
-            .first_payment_at_or_after(count, block_height.saturating_add(1))
-            .await?;
         Ok(Some(crate::bounded_block_range(
             first,
             after,
@@ -114,13 +131,118 @@ impl DuskInterchainGasPaymasterIndexer {
         )?))
     }
 
-    async fn finalized_payment_count(&self, current_count: u32) -> ChainResult<(u32, u32)> {
+    /// The final payments and the last final block.
+    async fn finalized_payment_count(&self) -> ChainResult<(u32, u32)> {
         let finalized_tip = self.rues.finalized_block_number().await?;
-        let finalized_count = self
-            .first_payment_at_or_after(current_count, u64::from(finalized_tip) + 1)
-            .await?;
+        let finalized_count = self.payments_at_or_below(u64::from(finalized_tip)).await?;
         Ok((finalized_count, finalized_tip))
     }
+
+    /// The stored payment records in `range` below `count`, read a page of
+    /// records at a time, the pages together.
+    async fn payment_records(
+        &self,
+        range: RangeInclusive<u32>,
+        count: u32,
+    ) -> ChainResult<Vec<(u32, GasPaymentRecord)>> {
+        let mut pages = Vec::new();
+        let mut next = *range.start();
+        let requested_end = *range.end();
+        while next < count && next <= requested_end {
+            let limit = (count - next)
+                .min(requested_end.saturating_sub(next).saturating_add(1))
+                .min(GAS_PAYMENT_PAGE_SIZE);
+            pages.push((
+                next,
+                limit,
+                Read::new(
+                    self.igp_id,
+                    "gas_payments",
+                    &(next, limit),
+                    list_reply(limit as usize, PAYMENT_REPLY),
+                )?,
+            ));
+            next += limit;
+        }
+        let reads: Vec<Read> = pages.iter().map(|(_, _, read)| read.clone()).collect();
+        let replies = self.rues.read_all(&reads).await?;
+        let mut stored = Vec::new();
+        for ((start, limit, _), reply) in pages.into_iter().zip(replies) {
+            let records: Vec<GasPaymentRecord> = rkyv_deserialize(&reply)?;
+            if records.len() != limit as usize {
+                return Err(crate::HyperlaneDuskError::Other(format!(
+                    "IGP returned {} payment records for page start={start} limit={limit}",
+                    records.len()
+                ))
+                .into());
+            }
+            for (offset, record) in records.into_iter().enumerate() {
+                ensure_cursor_height(record.block_height)?;
+                stored.push((start + offset as u32, record));
+            }
+        }
+        Ok(stored)
+    }
+
+    /// Match finalized stored payment records to their archive rows, one
+    /// archive pass per block, however many payments it holds. Identical
+    /// payments in one block share the first matching row.
+    async fn payment_logs(
+        &self,
+        stored: &[(u32, GasPaymentRecord)],
+    ) -> ChainResult<Vec<(Indexed<InterchainGasPayment>, LogMeta)>> {
+        let mut results = Vec::with_capacity(stored.len());
+        for block in stored.chunk_by(|a, b| a.1.block_height == b.1.block_height) {
+            let Some((_, first)) = block.first() else {
+                continue;
+            };
+            let mut expected = Vec::with_capacity(block.len());
+            for (index, record) in block {
+                expected.push((*index as usize, payment_event(record)?));
+            }
+            let sequences: Vec<usize> = expected.iter().map(|(index, _)| *index).collect();
+            let matches = self
+                .rues
+                .finalized_contract_events_at_block(
+                    &self.igp_id,
+                    events::GasPayment::TOPIC,
+                    first.block_height,
+                    &sequences,
+                    exact_event_data(expected),
+                )
+                .await?;
+
+            for ((index, record), matched) in block.iter().zip(matches) {
+                let payment = InterchainGasPayment {
+                    message_id: H256::from_slice(&record.message_id),
+                    destination: record.destination,
+                    payment: U256::from(record.payment),
+                    gas_amount: U256::from(record.gas_limit),
+                };
+                let provenance = matched.provenance;
+                let indexed = Indexed::from(payment).with_sequence(*index);
+                let meta = LogMeta {
+                    address: self.igp_address,
+                    block_number: provenance.block_height,
+                    block_hash: provenance.block_hash,
+                    transaction_id: provenance.transaction_id,
+                    transaction_index: 0,
+                    log_index: U256::from(*index),
+                };
+                results.push((indexed, meta));
+            }
+        }
+        Ok(results)
+    }
+}
+
+/// The `GasPayment` event the IGP emits for a stored record.
+fn payment_event(record: &GasPaymentRecord) -> ChainResult<Vec<u8>> {
+    Ok(rkyv_serialize(&events::GasPayment {
+        message_id: record.message_id,
+        gas_limit: record.gas_limit,
+        payment: record.payment,
+    })?)
 }
 
 #[async_trait]
@@ -129,74 +251,9 @@ impl Indexer<InterchainGasPayment> for DuskInterchainGasPaymasterIndexer {
         &self,
         range: RangeInclusive<u32>,
     ) -> ChainResult<Vec<(Indexed<InterchainGasPayment>, LogMeta)>> {
-        let mut results = Vec::new();
-
-        let payment_count: u32 = self
-            .rues
-            .contract_query(&self.igp_id, "gas_payment_count", &())
-            .await?;
-        let (finalized_count, _) = self.finalized_payment_count(payment_count).await?;
-
-        let mut next = *range.start();
-        let requested_end = *range.end();
-        while next < finalized_count && next <= requested_end {
-            let limit = (finalized_count - next)
-                .min(requested_end.saturating_sub(next).saturating_add(1))
-                .min(GAS_PAYMENT_PAGE_SIZE);
-            let records: Vec<GasPaymentRecord> = self
-                .rues
-                .contract_query(&self.igp_id, "gas_payments", &(next, limit))
-                .await?;
-            if records.len() != limit as usize {
-                return Err(crate::HyperlaneDuskError::Other(format!(
-                    "IGP returned {} payment records for page start={next} limit={limit}",
-                    records.len()
-                ))
-                .into());
-            }
-
-            for (offset, record) in records.into_iter().enumerate() {
-                let index = next + offset as u32;
-                ensure_cursor_height(record.block_height)?;
-
-                let payment = InterchainGasPayment {
-                    message_id: H256::from_slice(&record.message_id),
-                    destination: record.destination,
-                    payment: U256::from(record.payment),
-                    gas_amount: U256::from(record.gas_limit),
-                };
-
-                let expected_event = rkyv_serialize(&events::GasPayment {
-                    message_id: record.message_id,
-                    gas_limit: record.gas_limit,
-                    payment: record.payment,
-                })?;
-                let provenance = self
-                    .rues
-                    .finalized_contract_event(
-                        &self.igp_id,
-                        events::GasPayment::TOPIC,
-                        index as usize,
-                        record.block_height,
-                        &expected_event,
-                    )
-                    .await?;
-
-                let indexed = Indexed::from(payment).with_sequence(index);
-                let meta = LogMeta {
-                    address: self.igp_address,
-                    block_number: provenance.block_height,
-                    block_hash: provenance.block_hash,
-                    transaction_id: provenance.transaction_id,
-                    transaction_index: 0,
-                    log_index: U256::from(index),
-                };
-
-                results.push((indexed, meta));
-            }
-            next += limit;
-        }
-
+        let (finalized_count, _) = self.finalized_payment_count().await?;
+        let stored = self.payment_records(range, finalized_count).await?;
+        let results = self.payment_logs(&stored).await?;
         debug!(count = results.len(), "Fetched interchain gas payment logs");
         Ok(results)
     }
@@ -217,14 +274,44 @@ impl Indexer<InterchainGasPayment> for DuskInterchainGasPaymasterIndexer {
         if block_height > self.rues.finalized_block_height().await? {
             return Ok(vec![]);
         }
-        let count: u32 = self
+        let rows = self
             .rues
-            .contract_query(&self.igp_id, "gas_payment_count", &())
+            .finalized_rows_of_transaction(
+                &self.igp_id,
+                events::GasPayment::TOPIC,
+                block_height,
+                &crate::dusk_transaction_bytes(&tx_hash),
+            )
             .await?;
-        let Some(range) = self.payment_range_at_block(count, block_height).await? else {
+        // Contract state decides whether the block holds any payment, also
+        // when the transaction's rows are empty: an empty selection is not
+        // evidence that it paid nothing.
+        let Some(range) = self.payment_range_at_block(block_height).await? else {
             return Ok(vec![]);
         };
         crate::ensure_tx_hash_lookup_budget(&range, "IGP payment")?;
+        if let Some(rows) = rows.filter(|rows| !rows.is_empty()) {
+            // Only a record whose event bytes the transaction emitted can
+            // have it as provenance, so only those are matched, against the
+            // block's rows read once. The block is at or below the finalized
+            // height, so all of its records are finalized.
+            let emitted: HashSet<Vec<u8>> = rows.into_iter().collect();
+            let mut candidates = Vec::new();
+            let after = range.end().saturating_add(1);
+            for (index, record) in self.payment_records(range, after).await? {
+                if emitted.contains(&payment_event(&record)?) {
+                    candidates.push((index, record));
+                }
+            }
+            return Ok(self
+                .payment_logs(&candidates)
+                .await?
+                .into_iter()
+                .filter(|(_, meta)| {
+                    meta.transaction_id == tx_hash && meta.block_number == block_height
+                })
+                .collect());
+        }
         let mut logs = Vec::new();
         for chunk in crate::block_range_chunks(range) {
             logs.extend(
@@ -254,12 +341,10 @@ fn ensure_cursor_height(block_height: u64) -> ChainResult<()> {
 
 #[async_trait]
 impl SequenceAwareIndexer<InterchainGasPayment> for DuskInterchainGasPaymasterIndexer {
+    /// The final payments and the last final block. While the node has
+    /// finalized no new block, this reads only the shared `lastBlockPair`.
     async fn latest_sequence_count_and_tip(&self) -> ChainResult<(Option<u32>, u32)> {
-        let count: u32 = self
-            .rues
-            .contract_query(&self.igp_id, "gas_payment_count", &())
-            .await?;
-        let (finalized_count, finalized_tip) = self.finalized_payment_count(count).await?;
+        let (finalized_count, finalized_tip) = self.finalized_payment_count().await?;
         Ok((Some(finalized_count), finalized_tip))
     }
 }

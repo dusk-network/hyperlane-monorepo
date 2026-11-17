@@ -1,9 +1,10 @@
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use hyperlane_core::{
     accumulator::incremental::IncrementalMerkle, BatchResult, ChainResult, Checkpoint,
@@ -12,11 +13,317 @@ use hyperlane_core::{
     Metadata, QueueOperation, ReorgPeriod, TxCostEstimate, TxOutcome, H256, U256,
 };
 
-use crate::rues::rkyv_serialize;
+use hyperlane_dusk_types::events;
+use hyperlane_dusk_types::merkle::{IncrementalMerkle as HookTree, TREE_DEPTH};
+
+use crate::final_records::FinalRecords;
+use crate::rues::{
+    bounded_body, bounded_error, bounded_json, bounded_text, fits_one_aggregate, list_reply,
+    rkyv_deserialize, rkyv_serialize, BlockPair, CheckHold, ConfirmedTransaction, LogLookup,
+    PreparedDelivery, Read, SentDelivery, TransactionStatus, BOOL_REPLY, ID_REPLY, U32_REPLY,
+    U64_REPLY,
+};
 use crate::{ConnectionConf, DuskProvider, DuskSigner, HyperlaneDuskError, RuesClient};
 
+mod pipeline;
+
+use pipeline::Standing;
+
 const TX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(120);
+/// Most message IDs one `message_ids` query returns.
 const MERKLE_HISTORY_PAGE_SIZE: u32 = 256;
+/// Pages of message IDs one aggregate carries.
+const MERKLE_PAGES_PER_AGGREGATE: usize = 7;
+/// The bytes of the hook's `tree` reply.
+const HOOK_TREE_REPLY: usize = std::mem::size_of::<rkyv::Archived<HookTree>>();
+/// Archive pages a delivery check reads to bring the delivery log up to
+/// date, on to the end of the block being read.
+const DELIVERED_LOG_PAGES: usize = 4;
+/// Messages whose last delivery check a Mailbox keeps.
+const MAX_DELIVERY_CHECKS: usize = 4096;
+/// How long a passed `process` simulation stands for the same arguments.
+/// The relayer simulates a delivery when it prepares it, again just before
+/// it submits it, and the Mailbox did a third time in `process`: when the
+/// submission follows the preparation at once, the three ran within a few
+/// hundred milliseconds of each other on the same state. A Dusk block takes
+/// about 10 s, and the transaction waits as long again for its block.
+const SIMULATION_REUSE: Duration = Duration::from_secs(2);
+/// Simulations a Mailbox remembers.
+const MAX_REMEMBERED_SIMULATIONS: usize = 1024;
+/// Rusk 1.7.3's block gas limit (`DEFAULT_BLOCK_GAS_LIMIT`). The mempool
+/// admits a transaction with a higher limit, but no block can hold it.
+pub const RUSK_BLOCK_GAS_LIMIT: u64 = 3_000_000_000;
+/// How long a batch waits for the node to hold one delivery before it sends
+/// the next.
+const HELD_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a batch sends deliveries: it sends none after this, and leaves
+/// the rest to be sent one at a time.
+const BATCH_SEND_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long after it was sent a delivery's transaction may still be on its
+/// way into the node's mempool.
+const DROP_GRACE: Duration = Duration::from_secs(60);
+/// Most deliveries a signer has outstanding: sent, and in no block yet.
+/// Rusk bounds only the transactions it holds back for an earlier nonce,
+/// not those it admitted in nonce order.
+const MAX_OUTSTANDING_DELIVERIES: usize = 64;
+/// Most kept transactions a delivery looks up to make room for its own
+/// (`DuskMailbox::room_for_prepared`).
+const PREPARED_LOOKUPS: usize = 16;
+/// How often deliveries look kept transactions of other messages up
+/// (`DuskMailbox::sweep_prepared`).
+const PREPARED_SWEEP: Duration = Duration::from_secs(300);
+/// Most kept transactions known to have left the mempool that a Mailbox
+/// remembers (`DuskMailbox::wait_for_signer`).
+const MAX_SETTLED: usize = 1024;
+
+/// How long after a proven reading of the signer's account a second
+/// reading must show its nonce too before kept transactions it shows unable
+/// to execute are forgotten (`DuskMailbox::nonce_evidence`).
+const NONCE_GAP: Duration = Duration::from_secs(600);
+
+/// A reading of the signer's account at the node's tip block: the block,
+/// the account's nonce there, and when it was taken
+/// (`DuskMailbox::nonce_evidence`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Reading {
+    height: u64,
+    hash: H256,
+    nonce: u64,
+    taken_at: std::time::Instant,
+}
+
+/// A reading proven: its block was final, and still the node's block at its
+/// height. Its nonce is the account's nonce at a final block, as far as the
+/// reading is right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Proven {
+    nonce: u64,
+    taken_at: std::time::Instant,
+}
+
+/// What readings of the signer's account show of the nonces it has used
+/// for good.
+#[derive(Debug, Default)]
+struct FinalNonce {
+    /// A reading whose block is not final yet.
+    waiting: Option<Reading>,
+    /// The proven reading a second one confirms, once it is
+    /// `SubmissionLimits::nonce_gap` old.
+    older: Option<Proven>,
+    /// The next proven reading, which takes the older one's place once it
+    /// is that old too.
+    newer: Option<Proven>,
+}
+
+impl FinalNonce {
+    fn prove(&mut self, reading: &Reading) {
+        let proven = Proven {
+            nonce: reading.nonce,
+            taken_at: reading.taken_at,
+        };
+        if self.older.is_none() {
+            self.older = Some(proven);
+        } else if self.newer.is_none() {
+            self.newer = Some(proven);
+        }
+    }
+
+    /// The proven reading taken at least `gap` before `at`, after the newer
+    /// one takes the older one's place once it is that old.
+    fn aged(&mut self, gap: Duration, at: std::time::Instant) -> Option<Proven> {
+        let aged = |proven: &Proven| at.saturating_duration_since(proven.taken_at) >= gap;
+        if self.newer.as_ref().is_some_and(aged) {
+            self.older = self.newer.take();
+        }
+        self.older.filter(aged)
+    }
+}
+
+/// A kept transaction a lookup for room missed, in neither the mempool nor
+/// a block, with its nonce shown used, until a second lookup
+/// (`DuskMailbox::reclaim_prepared`): which transaction, and when it was
+/// missed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Missed {
+    tx_id: [u8; 32],
+    at: std::time::Instant,
+}
+
+/// Whether two readings of the account show nonce `nonce` used, up to
+/// `used` (`DuskMailbox::nonce_evidence`).
+fn nonce_used(nonce: Option<u64>, used: Option<u64>) -> bool {
+    matches!((nonce, used), (Some(nonce), Some(used)) if nonce <= used)
+}
+
+/// What a delivery check found.
+#[derive(Debug, Clone)]
+enum Delivery {
+    /// In a final block, for good.
+    Final,
+    /// Not delivered at the tip.
+    Absent,
+    /// Delivered at the tip in a block that is not final yet, which stays
+    /// so until the node finalizes another block; why.
+    Pending(String),
+    /// Delivered at the tip, but the check could not settle whether it is
+    /// final: the delivery log cannot be read or does not reach the last
+    /// final block, or the blocks above it cannot be read; why.
+    Unsettled(String),
+}
+
+impl Delivery {
+    /// How long the check holds, made at last final block `finalized`
+    /// with the delivery log read up to `progress`.
+    fn hold(&self, finalized: u64, progress: impl FnOnce() -> Option<LogProgress>) -> CheckHold {
+        match self {
+            Self::Final => CheckHold::Forever,
+            Self::Absent | Self::Pending(_) => CheckHold::FinalBlock(finalized),
+            Self::Unsettled(_) => CheckHold::unsettled(finalized, progress()),
+        }
+    }
+}
+
+/// How far the delivery log reaches, as `RuesClient::event_log_progress`
+/// gives it.
+type LogProgress = crate::rues::LogState;
+
+/// The last delivery check of each message and how long it holds. Until
+/// the node finalizes another block, a check that settled finds the same:
+/// the relayer asks again every half second while it waits for signatures.
+/// One the delivery log could not settle holds only briefly, and only while
+/// the log has not read on: the next check tries the archive again, or
+/// reads on in it.
+#[derive(Debug, Default)]
+struct DeliveryChecks {
+    checks: HashMap<H256, (CheckHold, Delivery)>,
+}
+
+impl DeliveryChecks {
+    /// The check of `id` that still holds at last final block `finalized`,
+    /// the delivery log having read up to what `progress` returns.
+    fn get(
+        &self,
+        id: H256,
+        finalized: u64,
+        progress: impl FnOnce() -> Option<LogProgress>,
+    ) -> Option<Delivery> {
+        let (hold, delivery) = self.checks.get(&id)?;
+        hold.holds(finalized, progress).then(|| delivery.clone())
+    }
+
+    fn insert(&mut self, id: H256, finalized: u64, hold: CheckHold, delivery: Delivery) {
+        if self.checks.len() >= MAX_DELIVERY_CHECKS && !self.checks.contains_key(&id) {
+            // Checks made at earlier final blocks no longer hold; a final
+            // delivery that goes is checked again.
+            self.checks.retain(|_, (hold, _)| hold.at(finalized));
+            if self.checks.len() >= MAX_DELIVERY_CHECKS {
+                self.checks.clear();
+            }
+        }
+        self.checks.insert(id, (hold, delivery));
+    }
+}
+
+/// The key a signer's deliveries are kept under: its address.
+fn signer_key(signer: &DuskSigner) -> [u8; 32] {
+    signer.eth_address().into()
+}
+
+/// An endpoint, a Mailbox and a signer whose delivery mode was logged.
+type LoggedMode = (String, H256, [u8; 32]);
+
+/// Say once per process, for each endpoint, Mailbox and signer, how this
+/// agent submits deliveries.
+fn log_delivery_mode(
+    domain: &HyperlaneDomain,
+    mailbox: &H256,
+    signer: &DuskSigner,
+    conn: &ConnectionConf,
+) {
+    static LOGGED: std::sync::OnceLock<StdMutex<std::collections::HashSet<LoggedMode>>> =
+        std::sync::OnceLock::new();
+    let key = (conn.url.as_str().to_owned(), *mailbox, signer_key(signer));
+    let first = LOGGED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(key);
+    if !first {
+        return;
+    }
+    let max_batch_size = conn.op_submission_config.max_batch_size;
+    if conn.pipelines_deliveries() {
+        warn!(
+            domain = %domain.name(),
+            max_batch_size,
+            "Dusk deliveries are pipelined (pipelineDeliveries, experimental): a batch goes as consecutive transactions of the signer, with nonces this agent chooses and keeps in eventCursorDir; no other process may sign with this key"
+        );
+    } else {
+        info!(
+            domain = %domain.name(),
+            max_batch_size,
+            pipeline_deliveries = conn.pipeline_deliveries,
+            "Dusk deliveries go one at a time: dusk-tx signs each with the account's next nonce and waits for its block (pipelined deliveries are off; they need pipelineDeliveries and a maxBatchSize above 1)"
+        );
+    }
+}
+
+/// Milliseconds since the Unix epoch, by the wall clock.
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// How long a Mailbox waits while it submits deliveries, and how many it
+/// keeps outstanding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmissionLimits {
+    /// For a sent transaction to be in a block.
+    pub receipt: Duration,
+    /// How long a block takes: a sent transaction is looked up as often as
+    /// a block can bring it (`RuesClient::wait_for_tx`).
+    pub block: Duration,
+    /// For the node to hold a pipelined transaction before the next is
+    /// sent.
+    pub held: Duration,
+    /// For a batch to send its transactions: it sends none after this.
+    pub batch: Duration,
+    /// For a sent transaction to reach the node's mempool: one in neither
+    /// the mempool nor a block counts as dropped only after this.
+    pub drop_grace: Duration,
+    /// Most deliveries the signer has outstanding: sent, and in no block
+    /// yet.
+    pub outstanding: usize,
+    /// Most deliveries sent one at a time whose transaction the signer
+    /// keeps (`DuskMailbox::room_for_prepared`).
+    pub prepared: usize,
+    /// How often a delivery looks kept transactions of other messages up,
+    /// to forget those that can no longer land (`DuskMailbox::sweep_prepared`).
+    pub sweep: Duration,
+    /// How long after the first of two readings of the signer's account the
+    /// second is taken, at least, before kept transactions whose nonce both
+    /// show used are forgotten (`DuskMailbox::nonce_evidence`).
+    pub nonce_gap: Duration,
+}
+
+impl Default for SubmissionLimits {
+    fn default() -> Self {
+        Self {
+            receipt: TX_CONFIRMATION_TIMEOUT,
+            block: crate::rues::BLOCK_TIME,
+            held: HELD_TIMEOUT,
+            batch: BATCH_SEND_TIMEOUT,
+            drop_grace: DROP_GRACE,
+            outstanding: MAX_OUTSTANDING_DELIVERIES,
+            prepared: crate::rues::MAX_PREPARED_DELIVERIES,
+            sweep: PREPARED_SWEEP,
+            nonce_gap: NONCE_GAP,
+        }
+    }
+}
 
 /// Dusk Mailbox contract adapter.
 #[derive(Debug, Clone)]
@@ -28,6 +335,52 @@ pub struct DuskMailbox {
     domain: HyperlaneDomain,
     signer: Option<DuskSigner>,
     conn: ConnectionConf,
+    /// The hook's Merkle tree as far as checkpoints have read it, shared by
+    /// every clone.
+    merkle: Arc<tokio::sync::Mutex<MerkleCache>>,
+    /// Where the hook's insertions last crossed a final height.
+    insertions: Arc<FinalRecords>,
+    /// The last delivery check of each message, shared by every clone.
+    delivery_checks: Arc<StdMutex<DeliveryChecks>>,
+    /// When `process` last passed its simulation, by the keccak256 of its
+    /// arguments, shared by every clone.
+    simulations: Arc<StdMutex<HashMap<[u8; 32], std::time::Instant>>>,
+    limits: SubmissionLimits,
+    /// Where the last look among the transactions kept for deliveries
+    /// stopped: when it was prepared, and its message.
+    prepared_scan: Arc<StdMutex<Option<(u64, H256)>>>,
+    /// When kept transactions were last swept (`sweep_prepared`).
+    last_sweep: Arc<StdMutex<Option<std::time::Instant>>>,
+    /// The signer's nonce at the last final block, as far as shown.
+    final_nonce: Arc<StdMutex<FinalNonce>>,
+    /// The kept transactions a lookup for room missed, by message, until
+    /// they are looked up again (`reclaim_prepared`): kept across looks, so
+    /// that a look cut short by its deadline loses none.
+    missed: Arc<StdMutex<BTreeMap<H256, Missed>>>,
+    /// Kept transactions known to have left the mempool
+    /// (`wait_for_signer`).
+    settled: Arc<StdMutex<std::collections::HashSet<[u8; 32]>>>,
+    /// Whether deliveries are pipelined (`ConnectionConf::pipelines_deliveries`).
+    /// Otherwise each goes one at a time: `dusk-tx` signs it with the
+    /// account's nonce plus one, as the node reports it, and waits for its
+    /// block.
+    pipelined: bool,
+}
+
+/// The MerkleTreeHook keeps no root per insertion, so checkpoints compute
+/// roots from the message IDs it stores: this is the tree of its first
+/// `tree.count()` leaves. It only ever holds leaves of final insertions,
+/// which no rollback can change, so it is extended, never rebuilt, unless a
+/// check against the hook fails. It takes 32 branch nodes and a count,
+/// however many leaves it holds.
+#[derive(Debug, Default)]
+struct MerkleCache {
+    tree: IncrementalMerkle,
+    /// The last leaf ingested, `None` for an empty tree.
+    last: Option<H256>,
+    /// The tree has passed `verify_tree` with this many leaves. Its leaves
+    /// are final, so the check would read the same answers again.
+    verified: Option<usize>,
 }
 
 impl DuskMailbox {
@@ -41,15 +394,38 @@ impl DuskMailbox {
         signer: Option<DuskSigner>,
         conn: ConnectionConf,
     ) -> Self {
+        let pipelined = conn.pipelines_deliveries();
+        if let Some(signer) = &signer {
+            log_delivery_mode(&domain, &mailbox_id, signer, &conn);
+        }
         Self {
             provider,
+            insertions: rues.final_records(merkle_tree_hook_id.into(), "inserted_block_height"),
             rues,
             mailbox_id: mailbox_id.into(),
             merkle_tree_hook_id: merkle_tree_hook_id.into(),
             domain,
             signer,
             conn,
+            merkle: Arc::new(tokio::sync::Mutex::new(MerkleCache::default())),
+            delivery_checks: Arc::default(),
+            simulations: Arc::default(),
+            limits: SubmissionLimits::default(),
+            prepared_scan: Arc::default(),
+            last_sweep: Arc::default(),
+            final_nonce: Arc::default(),
+            missed: Arc::default(),
+            settled: Arc::default(),
+            pipelined,
         }
+    }
+
+    /// This Mailbox, submitting deliveries within `limits`, for tests that
+    /// cannot wait minutes.
+    #[doc(hidden)]
+    pub fn with_submission_limits(mut self, limits: SubmissionLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     /// Encode a HyperlaneMessage to the Dusk wire format.
@@ -65,60 +441,1406 @@ impl DuskMailbox {
         )
     }
 
-    async fn merkle_tree_count(&self) -> ChainResult<u32> {
-        Ok(self
-            .rues
-            .contract_query(&self.merkle_tree_hook_id, "count", &())
-            .await?)
+    /// Run `process` as an unsigned contract query before paying for it.
+    ///
+    /// Dusk charges a failed transaction its whole gas limit, so a delivery
+    /// that would revert must not be submitted. Rusk runs contract queries in
+    /// a throwaway session on the current tip: writes are discarded and
+    /// nothing is signed, so an endpoint gets no transaction it could replay.
+    /// A contract panic comes back as an HTTP error.
+    ///
+    /// This filters out deliveries that fail; it cannot prove one will
+    /// succeed. A query runs with the node's block gas limit rather than the
+    /// transaction's, and a recipient can tell a query from a transaction.
+    ///
+    /// `process` returns `()`, so a successful query replies with exactly its
+    /// encoding. Any other success reply, such as a proxy's error page sent
+    /// with status 200, did not come from running `process` and fails the
+    /// simulation.
+    ///
+    /// A simulation of the same arguments that passed less than
+    /// `SIMULATION_REUSE` ago stands for this one: it ran on the state this
+    /// one would read, as far as a delivery can tell.
+    async fn simulate_process(&self, message_id: H256, args: &[u8]) -> ChainResult<()> {
+        let key = hyperlane_dusk_types::message::keccak256(args);
+        let passed_recently = self
+            .simulations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .is_some_and(|passed| passed.elapsed() < SIMULATION_REUSE);
+        if passed_recently {
+            debug!(
+                ?message_id,
+                "Dusk process simulation passed moments ago; not running it again"
+            );
+            return Ok(());
+        }
+        self.simulate_process_now(message_id, args).await
     }
 
-    async fn merkle_insertion_height(&self, index: u32) -> ChainResult<u64> {
+    /// Run `process` as an unsigned contract query now, whatever passed
+    /// before (`simulate_process`).
+    async fn simulate_process_now(&self, message_id: H256, args: &[u8]) -> ChainResult<()> {
+        let key = hyperlane_dusk_types::message::keccak256(args);
+        let unit = rkyv_serialize(&())?;
+        let failure = match self
+            .rues
+            .contract_query_raw(&self.mailbox_id, "process", args)
+            .await
+        {
+            Ok(reply) if reply == unit => {
+                let mut simulations = self
+                    .simulations
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if simulations.len() >= MAX_REMEMBERED_SIMULATIONS {
+                    simulations.retain(|_, passed| passed.elapsed() < SIMULATION_REUSE);
+                }
+                simulations.insert(key, std::time::Instant::now());
+                return Ok(());
+            }
+            Ok(reply) => format!(
+                "replied with {} bytes instead of the encoding of (): {}",
+                reply.len(),
+                bounded_body(&reply)
+            ),
+            Err(error) => error.to_string(),
+        };
+        warn!(
+            ?message_id,
+            error = %failure,
+            "Dusk process simulation failed; not submitting the message"
+        );
+        Err(ChainCommunicationError::SimulationFailed(format!(
+            "Dusk Mailbox process query failed for message {message_id:?}: {failure}"
+        )))
+    }
+
+    /// Wait out what a pipelined run of this signer left in flight, before
+    /// a delivery goes one at a time: fails, and the relayer tries again
+    /// later, while one of its transactions may still be admitted ahead of
+    /// it. Without any, nothing is read from the node; and they never
+    /// change how the delivery is signed: only `dusk-tx` chooses the nonce
+    /// of a delivery sent one at a time.
+    ///
+    /// The leftovers are reconciled with the node (`survey`), under the
+    /// signer's submission lock. A reservation whose transaction is in a
+    /// final block is released, and one that can no longer be admitted
+    /// (`Standing::Dropped`, `Standing::Taken`) too. One whose transaction
+    /// is in a block that is not final yet is kept until it is, but holds
+    /// nothing up: `dusk-tx` signs above its nonce, and a rollback puts it
+    /// back into the mempool, where the node refuses another transaction
+    /// of its nonce. One that may still be admitted holds every delivery
+    /// back: its transaction is in the mempool, it was sent within the drop
+    /// grace, the mempool holds its nonce for a transaction it does not
+    /// name, or it cannot be looked up. The previous version's records are
+    /// treated alike.
+    async fn wait_out_pipelined(&self, signer: &DuskSigner) -> ChainResult<()> {
+        let key = signer_key(signer);
+        // A record that does not decode holds everything back: its nonce
+        // and transactions are unknown.
+        if self.rues.reservations(&key)?.is_empty() && self.rues.sent_deliveries(&key)?.is_empty() {
+            return Ok(());
+        }
+        let deadline = tokio::time::Instant::now() + self.limits.batch;
+        let lock = self.rues.submission_lock(key);
+        let Ok(_submission) = tokio::time::timeout_at(deadline, lock.lock()).await else {
+            return Err(HyperlaneDuskError::Other(
+                "Dusk signer's pipelined deliveries are being sent; the next delivery goes later"
+                    .into(),
+            )
+            .into());
+        };
+        let survey = self.survey(signer, deadline).await?;
+        let mut live = survey.legacy_live;
+        for (nonce, (_, standing)) in &survey.held {
+            match standing {
+                Standing::Landed(_) => {}
+                Standing::Dropped | Standing::Taken => {
+                    debug!(
+                        nonce,
+                        ?standing,
+                        "Dusk pipelined transaction can no longer be admitted; releasing its nonce"
+                    );
+                    self.release(&key, *nonce);
+                }
+                _ => live += 1,
+            }
+        }
+        if live == 0 {
+            return Ok(());
+        }
+        warn!(
+            live,
+            "Dusk deliveries a pipelined run left in flight may still be admitted; deliveries one at a time wait until they are in blocks or gone"
+        );
+        Err(HyperlaneDuskError::Other(format!(
+            "{live} Dusk deliveries a pipelined run of this signer left in flight may still be admitted; the next delivery goes once they are in blocks or gone"
+        ))
+        .into())
+    }
+
+    /// How many deliveries and fillers of the signer are kept in flight,
+    /// for tests.
+    #[doc(hidden)]
+    pub fn deliveries_in_flight(&self) -> ChainResult<usize> {
+        Ok(self.nonce_reservations()?.len() + self.legacy_in_flight()?)
+    }
+
+    /// The signer's nonce reservations, each with the transactions signed
+    /// with it, for tests.
+    #[doc(hidden)]
+    pub fn nonce_reservations(&self) -> ChainResult<Vec<(u64, Vec<String>)>> {
+        let Some(signer) = &self.signer else {
+            return Ok(Vec::new());
+        };
         Ok(self
             .rues
-            .contract_query(
-                &self.merkle_tree_hook_id,
+            .reservations(&signer_key(signer))?
+            .into_iter()
+            .map(|reservation| {
+                (
+                    reservation.nonce,
+                    reservation.txs.iter().map(hex::encode).collect(),
+                )
+            })
+            .collect())
+    }
+
+    /// How many records of deliveries in flight of the previous version
+    /// the signer has, for tests.
+    #[doc(hidden)]
+    pub fn legacy_in_flight(&self) -> ChainResult<usize> {
+        let Some(signer) = &self.signer else {
+            return Ok(0);
+        };
+        Ok(self.rues.sent_deliveries(&signer_key(signer))?.len())
+    }
+
+    /// Keep a delivery in flight as the previous version did: `message`,
+    /// signed with `nonce`, its last transaction `tx_id` sent at `sent_at`
+    /// (milliseconds since the Unix epoch), for tests of what it left.
+    #[doc(hidden)]
+    pub fn record_legacy_delivery(
+        &self,
+        message: H256,
+        nonce: u64,
+        tx_id: Option<[u8; 32]>,
+        sent_at: u64,
+    ) -> ChainResult<()> {
+        let signer = self
+            .signer
+            .as_ref()
+            .ok_or(HyperlaneDuskError::SignerUnavailable)?;
+        Ok(self.rues.record_sent_delivery(
+            &signer_key(signer),
+            message,
+            &SentDelivery {
+                nonce,
+                tx_id,
+                sent_at,
+            },
+        )?)
+    }
+
+    /// Submit one delivery of `message`, one at a time, as Dusk relayers
+    /// always have: `dusk-tx` signs it with the account's nonce plus one, as
+    /// the node reports it, sends it and waits for its block. No nonce is
+    /// chosen here. While an earlier transaction of the signer is in the
+    /// mempool, the node refuses another with its nonce at preverification,
+    /// so at most one transaction of a nonce can be in a block. When the
+    /// helper's outcome is unknown, the transaction it prepared is followed
+    /// by its exact hash.
+    ///
+    /// That hash is kept for the message once the helper prints it, and the
+    /// helper sends the transaction only once it is kept: it waits for the
+    /// agent's word (`dusk_tx_call_kept`). A delivery submitted again looks
+    /// the transaction up first (`follow_prepared`). Otherwise the first
+    /// transaction could land after the relayer's simulation passed and
+    /// before the helper read the account's nonce: the helper would sign the
+    /// next nonce, and a second transaction would land and fail, paying its
+    /// whole gas limit. A hash that cannot be kept leaves the helper without
+    /// the word: it sends nothing, and the delivery fails `NotSubmitted`, so
+    /// that the next submission goes at once.
+    async fn process_one(
+        &self,
+        signer: &DuskSigner,
+        message: H256,
+        args: &[u8],
+        gas_limit: u64,
+    ) -> ChainResult<TxOutcome> {
+        let key = signer_key(signer);
+        if let Some(prepared) = self.rues.prepared_delivery(&key, message)? {
+            if let Some(outcome) = self.follow_prepared(&key, message, &prepared).await? {
+                return self.reported(&key, message, outcome);
+            }
+        }
+        self.sweep_prepared(&key, signer, message).await;
+        self.room_for_prepared(&key, signer, message).await?;
+        let keep = |tx_id: &str, nonce: Option<u64>| -> Result<(), HyperlaneDuskError> {
+            let tx_id = hex::decode(tx_id)
+                .ok()
+                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                .ok_or_else(|| {
+                    HyperlaneDuskError::Other(format!(
+                        "dusk-tx named a transaction whose hash is not 32 bytes of hex: {}",
+                        bounded_text(tx_id)
+                    ))
+                })?;
+            let prepared = PreparedDelivery {
+                tx_id,
+                prepared_at: unix_millis(),
+                failure_reported: false,
+                nonce,
+            };
+            self.rues
+                .keep_prepared_delivery(&key, message, &prepared, self.limits.prepared)
+                .inspect_err(|error| {
+                    warn!(
+                        message_id = ?message,
+                        error = %bounded_error(error),
+                        "Failed to keep the transaction prepared for a Dusk delivery; the helper is not let send it"
+                    );
+                })
+        };
+        let call_result = crate::tx_sender::dusk_tx_call_kept(
+            &self.conn,
+            signer,
+            &self.mailbox_id,
+            "process",
+            args,
+            Some(gas_limit),
+            &keep,
+        )
+        .await;
+        let tx_id = match call_result {
+            Ok(response) => response
+                .get("tx_id")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    HyperlaneDuskError::Other(format!(
+                        "dusk-tx response is missing string tx_id: {}",
+                        bounded_json(&response)
+                    ))
+                })?
+                .to_owned(),
+            Err(HyperlaneDuskError::SubmissionOutcomeUnknown { tx_id, detail })
+            | Err(HyperlaneDuskError::TransactionExecutionFailed { tx_id, detail }) => {
+                warn!(%tx_id, %detail, "Reconciling Dusk submission receipt by exact hash");
+                tx_id
+            }
+            Err(error @ HyperlaneDuskError::NotSubmitted(_)) => {
+                // Nothing of it reached the node, so there is nothing to
+                // follow. Kept, it would only hold the next submission back
+                // for the drop grace. A helper not let send it, because its
+                // hash could not be kept, left nothing to forget.
+                if let Err(forget) = self.rues.forget_prepared_delivery(&key, message) {
+                    debug!(
+                        message_id = ?message,
+                        error = %bounded_error(&forget),
+                        "Failed to forget the transaction of a Dusk delivery the node refused"
+                    );
+                }
+                return Err(error.into());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let outcome = self.outcome_of(&tx_id).await?;
+        self.reported(&key, message, outcome)
+    }
+
+    /// `outcome`, of the transaction kept for `message`, as `process`
+    /// reports it to the relayer, which charges the gas it spent to the
+    /// message. A failure is noted on the kept transaction first, so that
+    /// it is reported once: a submission of the message again then sends
+    /// another transaction once that one's block is final, instead of
+    /// reporting it again (`follow_prepared`). Fails, reporting nothing,
+    /// when it cannot be noted; the next submission reports it. Either way
+    /// the transaction is in a block, out of the mempool (`wait_for_signer`).
+    fn reported(
+        &self,
+        key: &[u8; 32],
+        message: H256,
+        outcome: TxOutcome,
+    ) -> ChainResult<TxOutcome> {
+        let mut tx_id = [0u8; 32];
+        tx_id.copy_from_slice(&outcome.transaction_id.as_bytes()[32..]);
+        self.settle(tx_id);
+        if !outcome.executed {
+            self.rues.report_prepared_failure(key, message, tx_id)?;
+        }
+        Ok(outcome)
+    }
+
+    /// Note that kept transaction `tx_id` has left the mempool, so that
+    /// `wait_for_signer` does not look it up again.
+    fn settle(&self, tx_id: [u8; 32]) {
+        let mut settled = self.settled.lock().unwrap_or_else(PoisonError::into_inner);
+        if settled.len() >= MAX_SETTLED {
+            settled.clear();
+        }
+        settled.insert(tx_id);
+    }
+
+    /// Wait until the transaction kept for the signer's latest delivery of
+    /// another message has left the mempool, before this delivery is
+    /// simulated and signed one at a time.
+    ///
+    /// `dusk-tx` signs a delivery with the account's nonce plus one, which a
+    /// transaction of the account in the mempool holds: the node refuses the
+    /// delivery at preverification. A relayer restarted while a delivery's
+    /// transaction waits in the mempool used to submit every other ready
+    /// message first, each signed and refused, one error each. Only the
+    /// latest kept transaction is looked up: one at a time, a delivery is
+    /// signed only once the one before has left the mempool, so the latest
+    /// is the one that may still be in it. It is looked up once: a
+    /// transaction whose outcome was reported, or found out of the mempool,
+    /// is not looked up again. Waits at most `SubmissionLimits::receipt`
+    /// from its call, the scan of kept transactions and lookups included,
+    /// then fails, signing nothing, and the relayer tries again later.
+    async fn wait_for_signer(&self, signer: &DuskSigner, message: H256) -> ChainResult<()> {
+        let deadline = tokio::time::Instant::now() + self.limits.receipt;
+        let key = signer_key(signer);
+        let latest = self
+            .rues
+            .prepared_deliveries(&key)?
+            .into_iter()
+            .filter(|(other, _)| *other != message)
+            .filter_map(|(other, delivery)| delivery.map(|delivery| (other, delivery)))
+            .max_by_key(|(other, delivery)| (delivery.prepared_at, *other));
+        let Some((other, delivery)) = latest else {
+            return Ok(());
+        };
+        if self
+            .settled
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&delivery.tx_id)
+        {
+            return Ok(());
+        }
+        let tx_id = hex::encode(delivery.tx_id);
+        let busy = || -> ChainCommunicationError {
+            HyperlaneDuskError::Other(format!(
+                "The Dusk signer's transaction {tx_id}, kept for message {other:?}, is still in the mempool, or could not be looked up in time; the delivery of message {message:?} goes once it has left it"
+            ))
+            .into()
+        };
+        let mut waited = false;
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(busy());
+            }
+            let status = tokio::time::timeout_at(deadline, self.rues.transaction_status(&tx_id))
+                .await
+                .map_err(|_| busy())??;
+            if status != TransactionStatus::Pending {
+                self.settle(delivery.tx_id);
+                return Ok(());
+            }
+            if !waited {
+                info!(
+                    message_id = ?message,
+                    other = ?other,
+                    %tx_id,
+                    "Dusk signer's transaction for another delivery is in the mempool; this delivery waits for it before it is signed"
+                );
+                waited = true;
+            }
+            let now = tokio::time::Instant::now();
+            tokio::time::sleep_until((now + self.limits.block / 2).min(deadline)).await;
+        }
+    }
+
+    /// Make room to keep a transaction for `message`: a signer keeps those
+    /// of at most `SubmissionLimits::prepared` deliveries. At the bound,
+    /// kept transactions are looked up, and those whose records are no
+    /// longer needed are forgotten (`reclaim_prepared`). While none can go,
+    /// the delivery fails, and the relayer tries it again later, once kept
+    /// transactions have settled.
+    async fn room_for_prepared(
+        &self,
+        key: &[u8; 32],
+        signer: &DuskSigner,
+        message: H256,
+    ) -> ChainResult<()> {
+        let kept = self
+            .rues
+            .prepared_deliveries(key)?
+            .iter()
+            .filter(|(other, _)| *other != message)
+            .count();
+        let limit = self.limits.prepared;
+        if kept < limit {
+            return Ok(());
+        }
+        let (looked, freed) = self.reclaim_prepared(key, signer, Some(message)).await?;
+        if kept - freed < limit {
+            return Ok(());
+        }
+        warn!(
+            kept,
+            looked,
+            "A Dusk signer keeps the transactions of as many deliveries as it may, and none it looked up can be forgotten yet; the next delivery goes once one can"
+        );
+        Err(HyperlaneDuskError::Other(format!(
+            "The Dusk signer keeps the transactions of {kept} deliveries, the most it keeps, and none of the {looked} it looked up can be forgotten for room yet: each may still land, or failed without its failure reported yet. The delivery of message {message:?} goes once kept transactions settle"
+        ))
+        .into())
+    }
+
+    /// Look kept transactions of the signer up, other than `message`'s, at
+    /// most `PREPARED_LOOKUPS` new ones, the oldest first and on later looks
+    /// on from where the last one stopped, and forget those whose records
+    /// are no longer needed. Second looks at earlier misses come on top, at
+    /// most `PREPARED_LOOKUPS` before the new ones and again after them: at
+    /// most three times `PREPARED_LOOKUPS` lookups a look, all within its
+    /// deadline. How many it looked up, and how many it forgot.
+    ///
+    /// A record is no longer needed when its transaction can neither land
+    /// again nor still owes a report:
+    ///
+    /// - In a block at or below the last final block, executed, or failed
+    ///   with its failure reported. One that failed before its failure was
+    ///   reported is kept: its message's next submission reports it, and
+    ///   its gas would otherwise never be charged.
+    /// - In no block and not in the node's mempool, signed with a nonce two
+    ///   readings of the account show used: one proven at a final block, and
+    ///   one taken now, at least `SubmissionLimits::nonce_gap` after it
+    ///   (`nonce_evidence`), before the transaction is looked up. A lookup
+    ///   can miss a transaction that stays on the node (`transaction_status`
+    ///   says how), so each such transaction is noted as missed, looked up
+    ///   again at least half a block (`SubmissionLimits::block`) later, and
+    ///   goes only if it is missed again, its nonce still shown used. A look
+    ///   looks earlier misses up again first, and at its end waits once
+    ///   until all of them are half a block old, its own included, and looks
+    ///   those up again; a later look does it for those a look cut short
+    ///   left.
+    ///
+    /// Everything else is kept: a transaction in a block that is not final;
+    /// one in the mempool, whatever the readings show, since a rollback puts
+    /// a transaction back there; one in neither whose nonce the readings do
+    /// not both show used; and one kept without its nonce (by a dusk-tx from
+    /// before it named it), which can only go once it is in a final block. A
+    /// record that does not decode cannot be looked up, and stays.
+    ///
+    /// A pass ends within `SubmissionLimits::receipt`: one that runs out,
+    /// its requests slow, keeps what it forgot so far, the transactions it
+    /// missed and the cursor where it stopped, and counts only what it
+    /// looked up.
+    async fn reclaim_prepared(
+        &self,
+        key: &[u8; 32],
+        signer: &DuskSigner,
+        message: Option<H256>,
+    ) -> ChainResult<(usize, usize)> {
+        let mut tally = (0, 0);
+        let deadline = tokio::time::Instant::now() + self.limits.receipt;
+        let pass = self.reclaim_pass(key, signer, message, &mut tally);
+        match tokio::time::timeout_at(deadline, pass).await {
+            Ok(result) => result?,
+            Err(_) => debug!(
+                looked = tally.0,
+                freed = tally.1,
+                "Kept Dusk delivery transactions could not all be looked up within the receipt wait; the next look goes on"
+            ),
+        }
+        Ok(tally)
+    }
+
+    /// One pass of `reclaim_prepared`, which adds to `tally` how many it
+    /// looked up and how many it forgot as it goes.
+    async fn reclaim_pass(
+        &self,
+        key: &[u8; 32],
+        signer: &DuskSigner,
+        message: Option<H256>,
+        tally: &mut (usize, usize),
+    ) -> ChainResult<()> {
+        // One that does not decode cannot be looked up.
+        let mut candidates: Vec<(u64, H256, PreparedDelivery)> = self
+            .rues
+            .prepared_deliveries(key)?
+            .into_iter()
+            .filter(|(other, _)| Some(*other) != message)
+            .filter_map(|(other, delivery)| {
+                delivery.map(|delivery| (delivery.prepared_at, other, delivery))
+            })
+            .collect();
+        // A miss whose record has gone, or holds another transaction now, is
+        // dropped.
+        self.missed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|other, missed| {
+                candidates
+                    .iter()
+                    .any(|(_, kept, delivery)| kept == other && delivery.tx_id == missed.tx_id)
+            });
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        candidates.sort_by_key(|(prepared_at, other, _)| (*prepared_at, *other));
+        let after = *self
+            .prepared_scan
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let start = after.map_or(0, |after| {
+            candidates.partition_point(|(prepared_at, other, _)| (*prepared_at, *other) <= after)
+        });
+        let (used, finalized) = self.nonce_evidence(signer).await?;
+        // Earlier misses first, so that looks cut short by their deadline
+        // still get on.
+        self.look_again(key, &candidates, used, tally).await?;
+        let batch = candidates.len().min(PREPARED_LOOKUPS);
+        for (prepared_at, other, delivery) in candidates.iter().cycle().skip(start).take(batch) {
+            *self
+                .prepared_scan
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some((*prepared_at, *other));
+            // A miss waits for its second lookup.
+            if self
+                .missed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(other)
+            {
+                continue;
+            }
+            let status = self
+                .rues
+                .transaction_status(&hex::encode(delivery.tx_id))
+                .await?;
+            tally.0 += 1;
+            match status {
+                TransactionStatus::Included {
+                    block_height,
+                    receipt,
+                } => {
+                    if block_height > finalized
+                        || (receipt.error.is_some() && !delivery.failure_reported)
+                    {
+                        continue;
+                    }
+                }
+                // A rollback puts a transaction back into the mempool.
+                TransactionStatus::Pending => continue,
+                TransactionStatus::Unknown => {
+                    if nonce_used(delivery.nonce, used) {
+                        let mut missed = self.missed.lock().unwrap_or_else(PoisonError::into_inner);
+                        if missed.len() < self.limits.prepared {
+                            missed.insert(
+                                *other,
+                                Missed {
+                                    tx_id: delivery.tx_id,
+                                    at: std::time::Instant::now(),
+                                },
+                            );
+                        }
+                    }
+                    continue;
+                }
+            }
+            tally.1 += usize::from(self.forget_kept(key, *other, delivery)?);
+        }
+        // Misses not half a block old yet, this look's or an earlier one's,
+        // are looked up again once they all are, if the look has the time.
+        let due = self
+            .missed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .map(|missed| missed.at + self.limits.block / 2)
+            .max();
+        if let Some(due) = due {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
+            self.look_again(key, &candidates, used, tally).await?;
+        }
+        Ok(())
+    }
+
+    /// Look the kept transactions a lookup for room missed at least half a
+    /// block (`SubmissionLimits::block`) ago up again, at most
+    /// `PREPARED_LOOKUPS`, the earliest missed first, and forget those
+    /// missed again whose nonce `used`, from this look's readings, still
+    /// covers. A miss is dropped once looked up again, whatever that finds,
+    /// and so is one whose record that nonce no longer covers.
+    async fn look_again(
+        &self,
+        key: &[u8; 32],
+        candidates: &[(u64, H256, PreparedDelivery)],
+        used: Option<u64>,
+        tally: &mut (usize, usize),
+    ) -> ChainResult<()> {
+        let due: Vec<(H256, Missed)> = {
+            let missed = self.missed.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut due: Vec<_> = missed
+                .iter()
+                .filter(|(_, missed)| missed.at.elapsed() >= self.limits.block / 2)
+                .map(|(other, missed)| (*other, *missed))
+                .collect();
+            due.sort_by_key(|(other, missed)| (missed.at, *other));
+            due.truncate(PREPARED_LOOKUPS);
+            due
+        };
+        for (other, missed) in due {
+            let kept = candidates
+                .iter()
+                .find(|(_, kept, delivery)| *kept == other && delivery.tx_id == missed.tx_id)
+                .map(|(_, _, delivery)| delivery)
+                .filter(|delivery| nonce_used(delivery.nonce, used));
+            let Some(delivery) = kept else {
+                self.missed
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&other);
+                continue;
+            };
+            let status = self
+                .rues
+                .transaction_status(&hex::encode(missed.tx_id))
+                .await?;
+            tally.0 += 1;
+            self.missed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&other);
+            if status == TransactionStatus::Unknown {
+                tally.1 += usize::from(self.forget_kept(key, other, delivery)?);
+            }
+        }
+        Ok(())
+    }
+
+    /// Forget the transaction kept for `message`'s delivery, which can no
+    /// longer land (`reclaim_prepared`), unless another has taken its place.
+    /// Whether it was forgotten.
+    fn forget_kept(
+        &self,
+        key: &[u8; 32],
+        message: H256,
+        delivery: &PreparedDelivery,
+    ) -> ChainResult<bool> {
+        let forgot = self
+            .rues
+            .forget_prepared_transaction(key, message, delivery.tx_id)?;
+        if forgot {
+            debug!(
+                message_id = ?message,
+                tx_id = %hex::encode(delivery.tx_id),
+                nonce = ?delivery.nonce,
+                "Forgot the transaction kept for a Dusk delivery: it can no longer land"
+            );
+        }
+        Ok(forgot)
+    }
+
+    /// Every `SubmissionLimits::sweep`, at a delivery of any message,
+    /// forget kept transactions whose records are no longer needed
+    /// (`reclaim_prepared`), so that those of messages the relayer gave up
+    /// on, which no submission of their own will ever clear, do not pile
+    /// up to the bound. Nothing is read while nothing else is kept. Best
+    /// effort: a failure is logged, and the delivery goes on.
+    async fn sweep_prepared(&self, key: &[u8; 32], signer: &DuskSigner, message: H256) {
+        {
+            let mut last = self
+                .last_sweep
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if last.is_some_and(|at| at.elapsed() < self.limits.sweep) {
+                return;
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        match self.reclaim_prepared(key, signer, Some(message)).await {
+            Ok((_, 0)) => {}
+            Ok((looked, freed)) => debug!(
+                looked,
+                freed, "Dusk delivery records no longer needed were forgotten"
+            ),
+            Err(error) => debug!(
+                error = %bounded_error(&error),
+                "Could not look up kept Dusk delivery transactions; the next sweep tries again"
+            ),
+        }
+    }
+
+    /// The nonce up to which two readings of the signer's account show its
+    /// nonces used, if they do, and the last final block, read first.
+    ///
+    /// Rusk reads an account at its tip only. A reading is the account
+    /// between two reads of the tip that agree, taken as the account at that
+    /// tip block. Once its height is final, the reading is proven if that
+    /// block is still the node's block there; one whose block was replaced
+    /// is dropped, since its nonce came from a block the chain left. A
+    /// proven reading can still be wrong: a block can be accepted and rolled
+    /// back between the two tip reads, and the account read meanwhile shows
+    /// that block's transactions. So a proven reading only counts with a
+    /// second one, the account read now, asked for at least
+    /// `SubmissionLimits::nonce_gap` after the first was taken and after it
+    /// was proven: the nonce returned is the smaller of the two. Only blocks
+    /// rolled back around both readings could make both wrong. Each call
+    /// proves the reading that waits, and takes a new one while one could be
+    /// kept; a tip that changes during a reading gives none.
+    async fn nonce_evidence(&self, signer: &DuskSigner) -> ChainResult<(Option<u64>, u64)> {
+        let pair = self.rues.fresh_block_pair().await?;
+        let finalized = pair.finalized();
+        let waiting = self
+            .final_nonce
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .waiting;
+        if let Some(reading) = waiting {
+            if reading.height <= finalized {
+                let on_chain =
+                    self.rues.ledger_block_hash(reading.height).await? == Some(reading.hash);
+                let mut state = self
+                    .final_nonce
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if state.waiting == Some(reading) {
+                    state.waiting = None;
+                    if on_chain {
+                        state.prove(&reading);
+                    }
+                }
+            }
+        }
+        let reads = {
+            let state = self
+                .final_nonce
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            state.waiting.is_none() && state.newer.is_none()
+        };
+        // The account read now, and when it was asked for: the second
+        // reading counts from then.
+        let mut now = None;
+        if reads {
+            let asked = std::time::Instant::now();
+            let account = self.rues.account_status(&signer.address_string()).await?;
+            now = Some((account.nonce, asked));
+            let after = self.rues.fresh_block_pair().await?;
+            if after.tip() == pair.tip() {
+                let (height, hash) = pair.tip();
+                let reading = Reading {
+                    height,
+                    hash,
+                    nonce: account.nonce,
+                    taken_at: std::time::Instant::now(),
+                };
+                let mut state = self
+                    .final_nonce
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if height <= after.finalized() {
+                    state.prove(&reading);
+                } else if state.waiting.is_none() {
+                    state.waiting = Some(reading);
+                }
+            }
+        }
+        let at = now.map_or_else(std::time::Instant::now, |(_, asked)| asked);
+        let older = self
+            .final_nonce
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .aged(self.limits.nonce_gap, at);
+        let Some(older) = older else {
+            return Ok((None, finalized));
+        };
+        let now = match now {
+            Some((nonce, _)) => nonce,
+            None => {
+                self.rues
+                    .account_status(&signer.address_string())
+                    .await?
+                    .nonce
+            }
+        };
+        Ok((Some(older.nonce.min(now)), finalized))
+    }
+
+    /// Look kept transactions up and forget those no longer needed, as a
+    /// delivery's sweep does (`reclaim_prepared`), for tests. How many it
+    /// forgot.
+    #[doc(hidden)]
+    pub async fn reclaim_kept_transactions(&self) -> ChainResult<usize> {
+        let signer = self
+            .signer
+            .as_ref()
+            .ok_or(HyperlaneDuskError::SignerUnavailable)?;
+        let (_, freed) = self
+            .reclaim_prepared(&signer_key(signer), signer, None)
+            .await?;
+        Ok(freed)
+    }
+
+    /// What the transaction prepared for an earlier submission of
+    /// `message` one at a time says about submitting it again: an outcome
+    /// to report instead, `None` to send it again (that transaction is then
+    /// forgotten), or an error while that transaction may still land.
+    ///
+    /// - In a block, executed: it is the delivery's outcome, and the
+    ///   relayer's confirmation goes on from it.
+    /// - In a block, failed, and not reported yet, as when it failed after
+    ///   the submission that prepared it returned: it is the delivery's
+    ///   outcome, so that the relayer charges the gas it spent to the
+    ///   message, and decides by its gas payment policy whether to try
+    ///   again. No other transaction is sent meanwhile.
+    /// - In a block, failed, and reported: it spent its nonce and delivered
+    ///   nothing; the delivery goes again once that block is final, at or
+    ///   below the last final block read before the lookup, since until
+    ///   then a rollback can run the transaction again.
+    /// - In the mempool: it is followed to its block, as an unknown outcome
+    ///   is.
+    /// - In neither, prepared less than `SubmissionLimits::drop_grace` ago:
+    ///   it may still be on its way to the node. Past that, it was dropped,
+    ///   if a second lookup half a block (`SubmissionLimits::block`) later
+    ///   misses it too: a lookup can miss a transaction that stays on the
+    ///   node (`transaction_status`). What that lookup finds otherwise is
+    ///   followed as above.
+    async fn follow_prepared(
+        &self,
+        key: &[u8; 32],
+        message: H256,
+        prepared: &PreparedDelivery,
+    ) -> ChainResult<Option<TxOutcome>> {
+        let tx_id = hex::encode(prepared.tx_id);
+        let mut looked_again = false;
+        loop {
+            // The last final block is read before the lookup: a block the
+            // lookup finds the transaction in, at or below it, is that final
+            // block, since a rollback deletes a block's transactions from
+            // the ledger the lookup reads. Read after, it could be final
+            // only for another block at that height, one that took the
+            // place of the transaction's, rolled back in between.
+            let finalized = self.rues.finalized_block_height().await?;
+            match self.rues.transaction_status(&tx_id).await? {
+                TransactionStatus::Included {
+                    block_height,
+                    receipt,
+                } => {
+                    if receipt.error.is_none() {
+                        info!(
+                            message_id = ?message,
+                            %tx_id,
+                            block_height,
+                            "Dusk delivery's earlier transaction is in a block; following it instead of sending another"
+                        );
+                        return Ok(Some(self.outcome_from(&tx_id, &receipt)?));
+                    }
+                    if !prepared.failure_reported {
+                        warn!(
+                            message_id = ?message,
+                            %tx_id,
+                            block_height,
+                            gas_spent = receipt.gas_spent,
+                            "Dusk delivery's earlier transaction failed in a block after its submission returned; reporting it instead of sending another"
+                        );
+                        return Ok(Some(self.outcome_from(&tx_id, &receipt)?));
+                    }
+                    if block_height > finalized {
+                        return Err(HyperlaneDuskError::Other(format!(
+                            "Dusk delivery of message {message:?}: its earlier transaction {tx_id} failed in block {block_height}, which is not final yet; it goes again once that block is final"
+                        ))
+                        .into());
+                    }
+                    debug!(
+                        message_id = ?message,
+                        %tx_id,
+                        block_height,
+                        "Dusk delivery's earlier transaction failed in a final block; sending it again"
+                    );
+                }
+                TransactionStatus::Pending => {
+                    info!(
+                        message_id = ?message,
+                        %tx_id,
+                        "Dusk delivery's earlier transaction is in the mempool; following it instead of sending another"
+                    );
+                    return self.outcome_of(&tx_id).await.map(Some);
+                }
+                TransactionStatus::Unknown => {
+                    let grace =
+                        u64::try_from(self.limits.drop_grace.as_millis()).unwrap_or(u64::MAX);
+                    if unix_millis() < prepared.prepared_at.saturating_add(grace) {
+                        return Err(HyperlaneDuskError::Other(format!(
+                            "Dusk delivery of message {message:?}: its earlier transaction {tx_id} is in neither the mempool nor a block, but may still reach the node; it goes again once it cannot"
+                        ))
+                        .into());
+                    }
+                    // Dropped only if missed again half a block later.
+                    if !looked_again {
+                        looked_again = true;
+                        tokio::time::sleep(self.limits.block / 2).await;
+                        continue;
+                    }
+                    debug!(
+                        message_id = ?message,
+                        %tx_id,
+                        "Dusk delivery's earlier transaction was dropped; sending it again"
+                    );
+                }
+            }
+            break;
+        }
+        self.rues.forget_prepared_delivery(key, message)?;
+        Ok(None)
+    }
+
+    /// The outcome of delivery transaction `tx_id`, once it is in a block
+    /// within `SubmissionLimits::receipt`.
+    async fn outcome_of(&self, tx_id: &str) -> ChainResult<TxOutcome> {
+        crate::tx_sender::dusk_tx_id_to_h512(tx_id)?;
+        let confirmed = self
+            .rues
+            .wait_for_tx_in_blocks_of(tx_id, self.limits.receipt, self.limits.block)
+            .await?;
+        self.outcome_from(tx_id, &confirmed)
+    }
+
+    /// The outcome of delivery transaction `tx_id`, which is in a block with
+    /// receipt `confirmed`.
+    fn outcome_from(
+        &self,
+        tx_id: &str,
+        confirmed: &ConfirmedTransaction,
+    ) -> ChainResult<TxOutcome> {
+        let transaction_id = crate::tx_sender::dusk_tx_id_to_h512(tx_id)?;
+        let executed = confirmed.error.is_none();
+        if let Some(error) = &confirmed.error {
+            let error = bounded_text(error);
+            warn!(tx_id, %error, "Dusk mailbox transaction execution failed");
+        }
+        Ok(TxOutcome {
+            transaction_id,
+            executed,
+            gas_used: U256::from(confirmed.gas_spent),
+            gas_price: FixedPointNumber::from(self.conn.gas_price),
+        })
+    }
+
+    /// Make the next `keeps` keeps and `forgets` forgets of the
+    /// transactions kept for deliveries one at a time fail, as they do when
+    /// the event store cannot be written, for tests of what such a failure
+    /// does. Noting that a failure was reported is a keep.
+    #[doc(hidden)]
+    pub fn fail_prepared_writes(&self, keeps: usize, forgets: usize) {
+        self.rues.fail_prepared_writes(keeps, forgets);
+    }
+
+    /// The nonce of the transaction kept for the last submission of
+    /// `message` one at a time, when the helper named it, for tests.
+    #[doc(hidden)]
+    pub fn prepared_nonce(&self, message: H256) -> ChainResult<Option<u64>> {
+        let Some(signer) = &self.signer else {
+            return Ok(None);
+        };
+        Ok(self
+            .rues
+            .prepared_delivery(&signer_key(signer), message)?
+            .and_then(|prepared| prepared.nonce))
+    }
+
+    /// The transaction kept for the last submission of `message` one at a
+    /// time, for tests.
+    #[doc(hidden)]
+    pub fn prepared_transaction(&self, message: H256) -> ChainResult<Option<String>> {
+        let Some(signer) = &self.signer else {
+            return Ok(None);
+        };
+        Ok(self
+            .rues
+            .prepared_delivery(&signer_key(signer), message)?
+            .map(|prepared| hex::encode(prepared.tx_id)))
+    }
+
+    /// One delivery check of message `id`, whose state is read after
+    /// `pair`, the node's tip and last final block. Fails only when the
+    /// `delivered` query does; a delivery in a block that is not final yet
+    /// is `Pending`, and everything else the check cannot show is
+    /// `Unsettled`.
+    async fn check_delivery(&self, id: H256, pair: &BlockPair) -> ChainResult<Delivery> {
+        let id_bytes: [u8; 32] = id.into();
+        // Read after `pair`'s last final block was final. When batching, it
+        // can come from the endpoint's reads of that block, made before
+        // `pair` itself was read: such a reply can only be as stale as a
+        // check this keeps for the whole block, since a delivery counts
+        // only once its finalized `ProcessId` row does.
+        let read = Read::new(self.mailbox_id, "delivered", &(id_bytes,), BOOL_REPLY)?;
+        let delivered: bool =
+            rkyv_deserialize(&self.rues.tick_read(pair.finalized(), read).await?)?;
+        if !delivered {
+            return Ok(Delivery::Absent);
+        }
+        let lookup = self
+            .rues
+            .finalized_event_log_lookup(
+                &crate::mailbox_indexer::delivery_log(self.mailbox_id),
+                &id_bytes,
+                pair,
+                DELIVERED_LOG_PAGES,
+            )
+            .await;
+        // Only a finalized delivery counts.
+        let final_block = match lookup {
+            Ok(LogLookup::Found(_)) => return Ok(Delivery::Final),
+            Ok(LogLookup::Absent { final_block }) => final_block,
+            Ok(LogLookup::Unknown(reason)) => {
+                debug!(message_id = ?id, %reason, "Dusk delivery log cannot show the delivery final yet");
+                return Ok(Delivery::Unsettled(format!(
+                    "Message {id:?} is delivered at the Dusk tip, but the delivery log cannot show it final yet: {reason}"
+                )));
+            }
+            Err(error) => {
+                let error = bounded_error(&error);
+                debug!(message_id = ?id, %error, "Dusk delivery log cannot be read; the delivery does not count yet");
+                return Ok(Delivery::Unsettled(format!(
+                    "Message {id:?} is delivered at the Dusk tip, but the delivery log that would show it final cannot be read: {error}"
+                )));
+            }
+        };
+        let pending = match self
+            .rues
+            .non_final_events(pair, &self.mailbox_id, events::ProcessId::TOPIC)
+            .await
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                return Ok(Delivery::Unsettled(format!(
+                    "Message {id:?} is delivered at the Dusk tip, but its finality cannot be checked yet: {error}"
+                )))
+            }
+        };
+        for event in pending {
+            let processed = match rkyv_deserialize::<events::ProcessId>(&event.data) {
+                Ok(processed) => processed,
+                Err(error) => {
+                    return Ok(Delivery::Unsettled(format!(
+                        "Message {id:?} is delivered at the Dusk tip, but non-final block {} holds an undecodable ProcessId event: {error}",
+                        event.block_height
+                    )))
+                }
+            };
+            if processed.message_id == id_bytes {
+                return Ok(Delivery::Pending(format!(
+                    "Message {id:?} is delivered in Dusk block {} ({:?}, transaction {}), which is not final yet",
+                    event.block_height,
+                    event.block_hash,
+                    bounded_text(&event.origin)
+                )));
+            }
+        }
+        // In no final block and in no block above them: a block that held
+        // it was rolled back during this check, and the next one reads it
+        // as not delivered, or the archive skipped the final block that
+        // holds it and this stays so.
+        warn!(
+            message_id = ?id,
+            final_block,
+            "Dusk Mailbox reports a delivery that neither the archive's finalized deliveries nor the blocks above the last final one hold"
+        );
+        Ok(Delivery::Unsettled(format!(
+            "Message {id:?} is delivered at the Dusk tip, but no finalized block up to block {final_block}, the last final one, holds its delivery, and no block above it does either: the block that did was rolled back during this check, or the node's archive skipped it"
+        )))
+    }
+
+    /// The gas limit a delivery is submitted with: the relayer's, which
+    /// follows the gas the sender paid for, but at most the configured
+    /// `gasLimit` and Rusk's block gas limit. A failed Dusk transaction pays
+    /// its whole limit, and one above the block gas limit stays in the
+    /// mempool for good.
+    fn submission_gas_limit(&self, message: &HyperlaneMessage, requested: Option<U256>) -> u64 {
+        let ceiling = self.conn.gas_limit.min(RUSK_BLOCK_GAS_LIMIT);
+        let Some(requested) = requested else {
+            return ceiling;
+        };
+        if requested > U256::from(ceiling) {
+            debug!(
+                message_id = ?message.id(),
+                requested = %requested,
+                ceiling,
+                "Dusk delivery gas limit capped at the configured gasLimit"
+            );
+            return ceiling;
+        }
+        requested.low_u64()
+    }
+
+    /// The hook's insertion count, read once per final block.
+    async fn merkle_tree_count(&self) -> ChainResult<u32> {
+        let read = Read::new(self.merkle_tree_hook_id, "count", &(), U32_REPLY)?;
+        Ok(rkyv_deserialize(&self.rues.final_tick_read(read).await?)?)
+    }
+
+    async fn merkle_insertion_heights(&self, indices: Vec<u32>) -> ChainResult<Vec<u64>> {
+        Ok(self
+            .rues
+            .read_indexed(
+                self.merkle_tree_hook_id,
                 "inserted_block_height",
-                &(index,),
+                &indices,
+                U64_REPLY,
             )
             .await?)
     }
 
-    async fn first_merkle_insertion_at_or_after(
-        &self,
-        count: u32,
-        block_height: u64,
-    ) -> ChainResult<u32> {
-        let mut low = 0u32;
-        let mut high = count;
-        while low < high {
-            let middle = low + (high - low) / 2;
-            if self.merkle_insertion_height(middle).await? < block_height {
-                low = middle + 1;
-            } else {
-                high = middle;
-            }
-        }
-        Ok(low)
-    }
-
-    async fn merkle_count_at_height(&self, count: u32, block_height: u64) -> ChainResult<u32> {
-        self.first_merkle_insertion_at_or_after(count, block_height.saturating_add(1))
+    /// How many of the hook's insertions are at or below block
+    /// `block_height`, which is at or below the last final block. Shared
+    /// with the hook's indexer on the same endpoint, and free for a height
+    /// asked before.
+    async fn merkle_count_at_height(&self, block_height: u64) -> ChainResult<u32> {
+        let probes = self.rues.batch_capacity().await?;
+        self.insertions
+            .count_at_or_below(
+                block_height,
+                || self.merkle_tree_count(),
+                probes,
+                |indices| self.merkle_insertion_heights(indices),
+            )
             .await
     }
 
     async fn finalized_merkle_view(&self, reorg_period: &ReorgPeriod) -> ChainResult<(u32, u64)> {
         let finalized_height = self.rues.checkpoint_block_height(reorg_period).await?;
-        let count = self.merkle_tree_count().await?;
-        let finalized_count = self.merkle_count_at_height(count, finalized_height).await?;
+        let finalized_count = self.merkle_count_at_height(finalized_height).await?;
         Ok((finalized_count, finalized_height))
     }
 
-    async fn merkle_root_at(&self, index: u32) -> ChainResult<H256> {
-        let root: [u8; 32] = self
+    /// The tree of the hook's first `count` leaves, the insertions at or
+    /// below block `at_height`, ingested from the message IDs it stores, and
+    /// checked against the hook (`verify_tree`, or `verify_snapshot` when
+    /// one aggregate reads the checks at one state).
+    ///
+    /// The shared tree is extended page by page, so a call that is cancelled
+    /// or fails to read keeps the pages it read. A tree of fewer leaves than
+    /// the shared one holds, for an earlier height, is built on its own. A
+    /// failed check drops the shared tree, so the next call rebuilds it from
+    /// the hook's first leaf: no root is computed from IDs that disagree
+    /// with the hook.
+    async fn tree_at(&self, count: u32, at_height: u64) -> ChainResult<IncrementalMerkle> {
+        let mut shared = self.merkle.lock().await;
+        if shared.verified == Some(count as usize) && shared.tree.count() == count as usize {
+            return Ok(shared.tree.clone());
+        }
+        let extends_shared = shared.tree.count() <= count as usize;
+        let mut earlier = MerkleCache::default();
+        let cache = if extends_shared {
+            &mut *shared
+        } else {
+            &mut earlier
+        };
+        let verdict = match self.snapshot_tree(cache, count, at_height).await? {
+            Some(verdict) => verdict,
+            None => {
+                self.extend_tree(cache, count).await?;
+                self.verify_tree(&cache.tree, cache.last).await?
+            }
+        };
+        let tree = cache.tree.clone();
+        if let Err(detail) = verdict {
+            *shared = MerkleCache::default();
+            warn!(
+                hook = %hex::encode(self.merkle_tree_hook_id),
+                leaves = tree.count(),
+                %detail,
+                "Dusk Merkle tree computed from the hook's stored IDs disagrees with the hook; discarding it"
+            );
+            return Err(HyperlaneDuskError::Other(format!(
+                "Dusk Merkle tree of {} leaves computed from MerkleTreeHook message IDs disagrees with the hook: {detail}",
+                tree.count()
+            ))
+            .into());
+        }
+        if extends_shared {
+            shared.verified = Some(tree.count());
+        }
+        Ok(tree)
+    }
+
+    /// Ingest the hook's stored message IDs from `cache`'s leaf count up to
+    /// `count`, a page of at most `MERKLE_HISTORY_PAGE_SIZE` at a time, each
+    /// page as long as asked.
+    async fn extend_tree(&self, cache: &mut MerkleCache, count: u32) -> ChainResult<()> {
+        loop {
+            let start = cache_count(cache)?;
+            if start >= count {
+                return Ok(());
+            }
+            let limit = (count - start).min(MERKLE_HISTORY_PAGE_SIZE);
+            let page = self
+                .rues
+                .contract_query_raw(
+                    &self.merkle_tree_hook_id,
+                    "message_ids",
+                    &rkyv_serialize(&(start, limit))?,
+                )
+                .await?;
+            ingest_page(cache, &page, start, limit)?;
+        }
+    }
+
+    /// The `message_ids` pages from leaf `start` up to `count`: each page's
+    /// start, length and read.
+    fn tree_pages(&self, start: u32, count: u32) -> ChainResult<Vec<(u32, u32, Read)>> {
+        let mut pages = Vec::new();
+        let mut next = start;
+        while next < count {
+            let limit = (count - next).min(MERKLE_HISTORY_PAGE_SIZE);
+            pages.push((
+                next,
+                limit,
+                Read::new(
+                    self.merkle_tree_hook_id,
+                    "message_ids",
+                    &(next, limit),
+                    list_reply(limit as usize, 32),
+                )?,
+            ));
+            next += limit;
+        }
+        Ok(pages)
+    }
+
+    /// Extend `cache` to the hook's first `count` leaves and check it
+    /// against the hook, reading the checks (`count`, `root`, `tree` and
+    /// `message_id_at(count - 1)`), with the last pages of IDs that fit
+    /// beside them, in one aggregate: at one state, which must be at or
+    /// above block `at_height`, whose insertions the leaves are. `None`
+    /// when no aggregate can, and the caller reads them one query at a
+    /// time.
+    ///
+    /// The state's height only shows that it is not older than the block
+    /// the leaves were counted at. It does not name a block, and the leaves
+    /// are final by their count, found as before.
+    async fn snapshot_tree(
+        &self,
+        cache: &mut MerkleCache,
+        count: u32,
+        at_height: u64,
+    ) -> ChainResult<Option<Result<(), String>>> {
+        let Some(index) = count.checked_sub(1) else {
+            return Ok(None);
+        };
+        if self.rues.batch_capacity().await? == 1 {
+            return Ok(None);
+        }
+        let hook = self.merkle_tree_hook_id;
+        let checks = [
+            Read::new(hook, "count", &(), U32_REPLY)?,
+            Read::new(hook, "root", &(), ID_REPLY)?,
+            Read::new(hook, "tree", &(), HOOK_TREE_REPLY)?,
+            Read::new(hook, "message_id_at", &(index,), ID_REPLY)?,
+        ];
+        let pages = self.tree_pages(cache_count(cache)?, count)?;
+        // The pages before those that fit beside the checks go first, a few
+        // to an aggregate, each ingested once read.
+        let mut lead = pages.len();
+        while lead > 0 {
+            let candidate: Vec<Read> = pages[lead - 1..]
+                .iter()
+                .map(|(_, _, read)| read.clone())
+                .chain(checks.iter().cloned())
+                .collect();
+            if !fits_one_aggregate(&candidate) {
+                break;
+            }
+            lead -= 1;
+        }
+        for chunk in pages[..lead].chunks(MERKLE_PAGES_PER_AGGREGATE) {
+            let reads: Vec<Read> = chunk.iter().map(|(_, _, read)| read.clone()).collect();
+            let replies = self.rues.read_all(&reads).await?;
+            for ((start, limit, _), reply) in chunk.iter().zip(replies) {
+                ingest_page(cache, &reply, *start, *limit)?;
+            }
+        }
+        let mut reads: Vec<Read> = pages[lead..]
+            .iter()
+            .map(|(_, _, read)| read.clone())
+            .collect();
+        reads.extend(checks);
+        let Some(snapshot) = self.rues.read_snapshot(&reads).await? else {
+            return Ok(None);
+        };
+        if snapshot.height < at_height {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Dusk endpoint's state at height {} is below block {at_height}, whose insertions the checkpoint holds; reading it again later",
+                snapshot.height
+            ))
+            .into());
+        }
+        let mut results = snapshot.results.into_iter();
+        let mut next = || {
+            results.next().unwrap_or_else(|| {
+                Err(HyperlaneDuskError::Other(
+                    "Dusk multicall snapshot returned too few results".into(),
+                ))
+            })
+        };
+        for (start, limit, _) in &pages[lead..] {
+            ingest_page(cache, &next()?, *start, *limit)?;
+        }
+        let hook_count: u32 = rkyv_deserialize(&next()?)?;
+        let root: [u8; 32] = rkyv_deserialize(&next()?)?;
+        let hook_tree: HookTree = rkyv_deserialize(&next()?)?;
+        let stored: [u8; 32] = rkyv_deserialize(&next()?)?;
+        Ok(Some(verify_snapshot(
+            &cache.tree,
+            cache.last,
+            index,
+            hook_count,
+            root,
+            &hook_tree,
+            stored,
+        )))
+    }
+
+    /// Check a tree computed from the hook's stored IDs against the hook
+    /// itself: `Ok(Err(detail))` when they disagree. Its last leaf must be
+    /// the ID the hook stores at that index (`message_id_at`). When the hook
+    /// holds exactly these leaves, its own tree (`tree`, one read of its
+    /// branch and count, so a dispatch in between is told apart from a
+    /// mismatch) must have the same count, root and root-making branch nodes
+    /// (`matches_hook_tree`). A tree of fewer leaves than the hook holds can
+    /// only be checked by its last ID: the hook keeps no earlier roots.
+    async fn verify_tree(
+        &self,
+        tree: &IncrementalMerkle,
+        last: Option<H256>,
+    ) -> ChainResult<Result<(), String>> {
+        let Some(index) = tree.count().checked_sub(1) else {
+            return Ok(Ok(()));
+        };
+        let index = u32::try_from(index)
+            .map_err(|_| HyperlaneDuskError::Other("Dusk Merkle tree index exceeds u32".into()))?;
+        let stored: [u8; 32] = self
             .rues
-            .contract_query(&self.merkle_tree_hook_id, "root_at", &(index,))
+            .contract_query(&self.merkle_tree_hook_id, "message_id_at", &(index,))
             .await?;
-        Ok(H256::from_slice(&root))
+        if last != Some(H256::from(stored)) {
+            return Ok(Err(format!(
+                "message_id_at({index}) is {:?}, the last ingested ID {last:?}",
+                H256::from(stored)
+            )));
+        }
+        let hook: HookTree = self
+            .rues
+            .contract_query(&self.merkle_tree_hook_id, "tree", &())
+            .await?;
+        if hook.count as usize != tree.count() {
+            return Ok(Ok(()));
+        }
+        if !matches_hook_tree(tree, &hook) {
+            return Ok(Err(format!(
+                "the hook's own tree of {} leaves has root {:?}, the computed one {:?}",
+                hook.count,
+                H256::from(hook.root()),
+                tree.root()
+            )));
+        }
+        Ok(Ok(()))
     }
 
     async fn finalized_tree(
@@ -126,40 +1848,8 @@ impl DuskMailbox {
         reorg_period: &ReorgPeriod,
     ) -> ChainResult<IncrementalMerkleAtBlock> {
         let (count, finalized_height) = self.finalized_merkle_view(reorg_period).await?;
-        let mut tree = IncrementalMerkle::default();
-        let mut start = 0u32;
-        while start < count {
-            let limit = (count - start).min(MERKLE_HISTORY_PAGE_SIZE);
-            let message_ids: Vec<[u8; 32]> = self
-                .rues
-                .contract_query(&self.merkle_tree_hook_id, "message_ids", &(start, limit))
-                .await?;
-            if message_ids.len() != limit as usize {
-                return Err(HyperlaneDuskError::Other(format!(
-                    "MerkleTreeHook returned {} message IDs for page start={start} limit={limit}",
-                    message_ids.len()
-                ))
-                .into());
-            }
-            for message_id in message_ids {
-                tree.ingest(H256::from_slice(&message_id));
-            }
-            start += limit;
-        }
-
-        if count > 0 {
-            let expected_root = self.merkle_root_at(count - 1).await?;
-            if tree.root() != expected_root {
-                return Err(HyperlaneDuskError::Other(format!(
-                    "Reconstructed finalized merkle root mismatch: on-chain={expected_root:?} local={:?} count={count}",
-                    tree.root()
-                ))
-                .into());
-            }
-        }
-
         Ok(IncrementalMerkleAtBlock {
-            tree,
+            tree: self.tree_at(count, finalized_height).await?,
             block_height: Some(finalized_height),
         })
     }
@@ -167,27 +1857,110 @@ impl DuskMailbox {
     async fn checkpoint_at_height(&self, block_height: u64) -> ChainResult<CheckpointAtBlock> {
         let finalized_height = self.rues.finalized_block_height().await?;
         let effective_height = block_height.min(finalized_height);
-        let current_count = self.merkle_tree_count().await?;
-        let count = self
-            .merkle_count_at_height(current_count, effective_height)
-            .await?;
+        let count = self.merkle_count_at_height(effective_height).await?;
         if count == 0 {
             return Err(HyperlaneDuskError::Other(format!(
                 "MerkleTreeHook has no insertion at or before finalized block {effective_height}"
             ))
             .into());
         }
-        let index = count - 1;
+        let tree = self.tree_at(count, effective_height).await?;
         Ok(CheckpointAtBlock {
             checkpoint: Checkpoint {
                 merkle_tree_hook_address: H256::from_slice(&self.merkle_tree_hook_id),
                 mailbox_domain: self.domain.id(),
-                root: self.merkle_root_at(index).await?,
-                index,
+                root: tree.root(),
+                index: count - 1,
             },
             block_height: Some(effective_height),
         })
     }
+}
+
+/// The leaves `cache` holds.
+fn cache_count(cache: &MerkleCache) -> ChainResult<u32> {
+    Ok(u32::try_from(cache.tree.count())
+        .map_err(|_| HyperlaneDuskError::Other("Dusk Merkle tree count exceeds u32".into()))?)
+}
+
+/// Ingest a `message_ids` reply from leaf `start`, which must hold the
+/// `limit` IDs asked.
+fn ingest_page(cache: &mut MerkleCache, reply: &[u8], start: u32, limit: u32) -> ChainResult<()> {
+    let message_ids: Vec<[u8; 32]> = rkyv_deserialize(reply)?;
+    if message_ids.len() != limit as usize {
+        return Err(HyperlaneDuskError::Other(format!(
+            "MerkleTreeHook returned {} message IDs for page start={start} limit={limit}",
+            message_ids.len()
+        ))
+        .into());
+    }
+    for message_id in message_ids {
+        let leaf = H256::from(message_id);
+        cache.tree.ingest(leaf);
+        cache.last = Some(leaf);
+    }
+    Ok(())
+}
+
+/// `verify_tree`'s check of `tree`, whose last leaf is `last`, from the
+/// hook's replies read at one state: its `count`, `root`, `tree` and the
+/// ID it stores at `index`, the tree's last. `Err(detail)` when they
+/// disagree with the tree or with each other.
+fn verify_snapshot(
+    tree: &IncrementalMerkle,
+    last: Option<H256>,
+    index: u32,
+    count: u32,
+    root: [u8; 32],
+    hook: &HookTree,
+    stored: [u8; 32],
+) -> Result<(), String> {
+    if hook.count != count {
+        return Err(format!(
+            "the hook's count {count} and its tree's {} differ at one state",
+            hook.count
+        ));
+    }
+    if last != Some(H256::from(stored)) {
+        return Err(format!(
+            "message_id_at({index}) is {:?}, the last ingested ID {last:?}",
+            H256::from(stored)
+        ));
+    }
+    if hook.count as usize != tree.count() {
+        return Ok(());
+    }
+    if !matches_hook_tree(tree, hook) {
+        return Err(format!(
+            "the hook's own tree of {} leaves has root {:?}, the computed one {:?}",
+            hook.count,
+            H256::from(hook.root()),
+            tree.root()
+        ));
+    }
+    if H256::from(root) != tree.root() {
+        return Err(format!(
+            "the hook's root {:?} is not the computed one {:?}",
+            H256::from(root),
+            tree.root()
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `tree`, computed from the hook's stored IDs, is the hook's own
+/// tree `hook`: the same leaf count, the same branch nodes at the levels the
+/// count's set bits select, and the same root. Those levels alone determine
+/// the root. The others are not compared: the hook starts every branch node
+/// at zero, where hyperlane-core starts each at the empty subtree's hash, so
+/// two trees of the same leaves differ there.
+fn matches_hook_tree(tree: &IncrementalMerkle, hook: &HookTree) -> bool {
+    let count = hook.count as usize;
+    count == tree.count()
+        && (0..TREE_DEPTH)
+            .filter(|level| (count >> level) & 1 == 1)
+            .all(|level| hook.branch[level] == tree.branch[level].0)
+        && H256::from(hook.root()) == tree.root()
 }
 
 impl HyperlaneChain for DuskMailbox {
@@ -214,53 +1987,15 @@ impl HyperlaneContract for DuskMailbox {
 #[derive(Debug, Clone)]
 pub struct DuskMerkleTreeHook {
     inner: DuskMailbox,
-    identity: Option<Arc<HookIdentity>>,
-}
-
-#[derive(Debug)]
-struct HookIdentity {
-    validator_announce_id: [u8; 32],
-    validated: tokio::sync::OnceCell<()>,
 }
 
 impl DuskMerkleTreeHook {
-    /// Create a hook adapter over the same Dusk connection and topology.
+    /// Create a hook adapter over the same Dusk connection and topology. A
+    /// client made `with_identity` checks the endpoint's deployment before
+    /// its first read, so an offline quorum endpoint keeps its voting slot
+    /// and can recover on a later read.
     pub fn new(inner: DuskMailbox) -> Self {
-        Self {
-            inner,
-            identity: None,
-        }
-    }
-
-    /// Defer endpoint identity queries until the first state read. An offline
-    /// quorum endpoint retains its voting slot and can recover on a later read.
-    /// No state read succeeds until chain, mailbox and announce identities match.
-    pub fn new_with_identity_validation(inner: DuskMailbox, validator_announce_id: H256) -> Self {
-        Self {
-            inner,
-            identity: Some(Arc::new(HookIdentity {
-                validator_announce_id: validator_announce_id.into(),
-                validated: tokio::sync::OnceCell::new(),
-            })),
-        }
-    }
-
-    async fn ensure_identity(&self) -> ChainResult<()> {
-        if let Some(identity) = &self.identity {
-            identity
-                .validated
-                .get_or_try_init(|| {
-                    self.inner.rues.validate_chain_identity(
-                        self.inner.conn.chain_id,
-                        self.inner.domain.id(),
-                        &self.inner.mailbox_id,
-                        &identity.validator_announce_id,
-                        &self.inner.merkle_tree_hook_id,
-                    )
-                })
-                .await?;
-        }
-        Ok(())
+        Self { inner }
     }
 }
 
@@ -296,13 +2031,65 @@ impl Mailbox for DuskMailbox {
         Ok(self.finalized_merkle_view(reorg_period).await?.0)
     }
 
+    /// Whether the message is delivered in a final block.
+    ///
+    /// The relayer stops retrying a message once this returns `true`, but
+    /// the `delivered` query reads the node's tip, which Rusk can still roll
+    /// back. So a delivery the tip holds counts only once the agent's
+    /// delivery log holds its `ProcessId` row in a block that
+    /// `checkBlock(onlyFinalized)` accepts: no rollback can undo it, whoever
+    /// delivered the message. Without that row this fails with `NotFinal`,
+    /// whether the log holds every final block, does not reach the last one
+    /// yet, cannot be read, or the client keeps none, and the relayer checks
+    /// again later; a delivery that is rolled back reads as not delivered,
+    /// and the message is relayed again.
+    ///
+    /// The blocks above the last final one never make a delivery count. They
+    /// are read only where the log holds every final block, to name the
+    /// block that holds the delivery while it is not final: a check reads
+    /// the chain up to a tip that is older than the state it read, so a
+    /// block accepted and rolled back within its requests leaves no trace
+    /// there.
+    ///
+    /// A check that settled holds until the node finalizes another block:
+    /// asked again before that, it is answered without a request. A final
+    /// delivery is answered without a request for good. A check the
+    /// delivery log could not settle, because the archive failed or the log
+    /// does not reach the last final block yet, holds for at most
+    /// `UNSETTLED_REUSE`, and only while the log has not read on: the next
+    /// one tries the archive again, or reads on in it.
     async fn delivered(&self, id: H256) -> ChainResult<bool> {
-        let id_bytes: [u8; 32] = id.into();
-        let delivered: bool = self
-            .rues
-            .contract_query(&self.mailbox_id, "delivered", &(id_bytes,))
-            .await?;
-        Ok(delivered)
+        // The chain first, then the state the check holds, so that no
+        // rollback in between goes unnoticed.
+        let pair = self.rues.block_pair().await?;
+        let finalized = pair.finalized();
+        let log = crate::mailbox_indexer::delivery_log(self.mailbox_id);
+        let known = self
+            .delivery_checks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(id, finalized, || self.rues.event_log_progress(&log));
+        let delivery = match known {
+            Some(delivery) => delivery,
+            None => {
+                // A pipelined delivery's nonce stays held until one of its
+                // transactions is final, whoever delivered the message.
+                let delivery = self.check_delivery(id, &pair).await?;
+                let hold = delivery.hold(finalized, || self.rues.event_log_progress(&log));
+                self.delivery_checks
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(id, finalized, hold, delivery.clone());
+                delivery
+            }
+        };
+        match delivery {
+            Delivery::Final => Ok(true),
+            Delivery::Absent => Ok(false),
+            Delivery::Pending(reason) | Delivery::Unsettled(reason) => {
+                Err(HyperlaneDuskError::NotFinal(reason).into())
+            }
+        }
     }
 
     async fn default_ism(&self) -> ChainResult<H256> {
@@ -315,10 +2102,17 @@ impl Mailbox for DuskMailbox {
 
     async fn recipient_ism(&self, recipient: H256) -> ChainResult<H256> {
         let recipient_bytes: [u8; 32] = recipient.into();
-        let ism_bytes: [u8; 32] = self
-            .rues
-            .contract_query(&self.mailbox_id, "recipient_ism", &(recipient_bytes,))
-            .await?;
+        // Messages to one recipient prepared together ask it together. The
+        // Mailbox runs the recipient's own getter, so the read goes after
+        // the deployment's in an aggregate.
+        let read = Read::new(
+            self.mailbox_id,
+            "recipient_ism",
+            &(recipient_bytes,),
+            ID_REPLY,
+        )?
+        .untrusted();
+        let ism_bytes: [u8; 32] = rkyv_deserialize(&self.rues.coalesced_read(read).await?)?;
         Ok(H256::from_slice(&ism_bytes))
     }
 
@@ -334,76 +2128,65 @@ impl Mailbox for DuskMailbox {
             .ok_or(HyperlaneDuskError::SignerUnavailable)?;
 
         let encoded = Self::encode_message(message);
+        let args = crate::tx_sender::process_args(metadata, &encoded)?;
+        let gas_limit = self.submission_gas_limit(message, tx_gas_limit);
+        let pipelined = self.pipelines_now(signer).await;
+        if !pipelined {
+            self.wait_for_signer(signer, message.id()).await?;
+        }
+
+        // The relayer simulates through process_estimate_costs before calling
+        // this, and that simulation stands when it passed moments ago.
+        // Otherwise it runs here, at the only call that spends gas, so no
+        // caller submits a delivery that would revert.
+        self.simulate_process(message.id(), &args).await?;
+
         info!(
             message_id = ?message.id(),
             nonce = message.nonce,
             "Processing message on Dusk via dusk-tx"
         );
 
-        let args = crate::tx_sender::process_args(metadata, &encoded)?;
-
-        let gas_limit = tx_gas_limit
-            .map(|limit| {
-                if limit > U256::from(u64::MAX) {
-                    return Err(HyperlaneDuskError::Other(format!(
-                        "Dusk transaction gas limit {limit} exceeds u64"
-                    )));
-                }
-                Ok(limit.low_u64())
-            })
-            .transpose()?;
-
-        let call_result = crate::tx_sender::dusk_tx_call(
-            &self.conn,
-            signer,
-            &self.mailbox_id,
-            "process",
-            &args,
-            gas_limit,
-        )
-        .await;
-
-        let tx_id = match call_result {
-            Ok(response) => response
-                .get("tx_id")
-                .and_then(|value| value.as_str())
-                .ok_or_else(|| {
-                    HyperlaneDuskError::Other(format!(
-                        "dusk-tx response is missing string tx_id: {response}"
-                    ))
-                })?
-                .to_owned(),
-            Err(HyperlaneDuskError::SubmissionOutcomeUnknown { tx_id, detail })
-            | Err(HyperlaneDuskError::TransactionExecutionFailed { tx_id, detail }) => {
-                warn!(%tx_id, %detail, "Reconciling Dusk submission receipt by exact hash");
-                tx_id
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let transaction_id = crate::tx_sender::dusk_tx_id_to_h512(&tx_id)?;
-        let confirmed = self
-            .rues
-            .wait_for_tx(&tx_id, TX_CONFIRMATION_TIMEOUT)
-            .await?;
-        let executed = confirmed.error.is_none();
-        if let Some(error) = &confirmed.error {
-            warn!(tx_id, %error, "Dusk mailbox transaction execution failed");
+        if pipelined {
+            return self
+                .process_pipelined(signer, message.id(), &args, gas_limit)
+                .await;
         }
-
-        Ok(TxOutcome {
-            transaction_id,
-            executed,
-            gas_used: U256::from(confirmed.gas_spent),
-            gas_price: FixedPointNumber::from(self.conn.gas_price),
-        })
+        self.wait_out_pipelined(signer).await?;
+        self.process_one(signer, message.id(), &args, gas_limit)
+            .await
     }
 
+    /// Batches are sent as consecutive transactions of the signer's
+    /// account (`process_deliveries`), only when deliveries are pipelined
+    /// (`ConnectionConf::pipelines_deliveries`). Otherwise the relayer
+    /// submits every delivery on its own, through `process`.
     fn supports_batching(&self) -> bool {
-        false
+        self.pipelined
+            && self
+                .signer
+                .as_ref()
+                .is_some_and(|signer| !self.rues.pipelining_stopped(&signer_key(signer)))
     }
 
-    async fn process_batch<'a>(&self, _ops: Vec<&'a QueueOperation>) -> ChainResult<BatchResult> {
-        Err(ChainCommunicationError::BatchingFailed)
+    async fn process_batch<'a>(&self, ops: Vec<&'a QueueOperation>) -> ChainResult<BatchResult> {
+        // Without pipelining, every delivery goes on its own, through
+        // `process`.
+        if !self.pipelined {
+            return Ok(BatchResult::failed(ops.len()));
+        }
+        let deliveries = ops
+            .iter()
+            .map(|op| {
+                let item = op.try_batch()?;
+                Ok((
+                    item.data,
+                    item.submission_data.metadata,
+                    Some(item.submission_data.gas_limit),
+                ))
+            })
+            .collect::<ChainResult<Vec<_>>>()?;
+        self.process_deliveries(&deliveries).await
     }
 
     async fn process_estimate_costs(
@@ -411,12 +2194,14 @@ impl Mailbox for DuskMailbox {
         message: &HyperlaneMessage,
         metadata: &Metadata,
     ) -> ChainResult<TxCostEstimate> {
-        // Current Rusk simulation accepts an ordinary signed transaction that
-        // a remote endpoint can replay through propagation. Until consensus
-        // has a non-propagatable simulation envelope, validate the payload
-        // locally and return the configured conservative ceiling.
+        // Rusk's transaction simulation takes a signed transaction that a
+        // remote endpoint could replay through propagation, so simulate with
+        // an unsigned query of `process` instead. A failure here is a failed
+        // estimate: the relayer retries later without submitting. The query
+        // measures no gas, so the configured gas limit remains the ceiling.
         let encoded = Self::encode_message(message);
-        crate::tx_sender::process_args(metadata, &encoded)?;
+        let args = crate::tx_sender::process_args(metadata, &encoded)?;
+        self.simulate_process(message.id(), &args).await?;
         Ok(TxCostEstimate {
             gas_limit: U256::from(self.conn.gas_limit),
             gas_price: FixedPointNumber::from(self.conn.gas_price),
@@ -437,20 +2222,36 @@ impl Mailbox for DuskMailbox {
         let id_bytes: [u8; 32] = message_id.into();
         Ok(Some(rkyv_serialize(&(id_bytes,))?))
     }
+
+    /// The relayer confirmed `message` delivered: the transaction kept for
+    /// its last submission one at a time is no longer needed.
+    fn on_delivered(&self, message: &HyperlaneMessage) {
+        let Some(signer) = &self.signer else {
+            return;
+        };
+        if let Err(error) = self
+            .rues
+            .forget_prepared_delivery(&signer_key(signer), message.id())
+        {
+            debug!(
+                message_id = ?message.id(),
+                error = %bounded_error(&error),
+                "Failed to forget the transaction kept for a delivered Dusk message"
+            );
+        }
+    }
 }
 
 #[async_trait]
 impl MerkleTreeHook for DuskMerkleTreeHook {
     async fn tree(&self, reorg_period: &ReorgPeriod) -> ChainResult<IncrementalMerkleAtBlock> {
-        // Rusk does not expose historical contract-state queries. Reconstruct
-        // the one-time validator start tree from hook-owned insertion history,
-        // capped at consensus finality, and verify it against the stored root.
-        self.ensure_identity().await?;
+        // Rusk does not expose historical contract-state queries. Build the
+        // tree from the IDs the hook stores, up to the count at consensus
+        // finality, and check it against the hook (`tree_at`).
         self.inner.finalized_tree(reorg_period).await
     }
 
     async fn count(&self, reorg_period: &ReorgPeriod) -> ChainResult<u32> {
-        self.ensure_identity().await?;
         Ok(self.inner.finalized_merkle_view(reorg_period).await?.0)
     }
 
@@ -458,7 +2259,6 @@ impl MerkleTreeHook for DuskMerkleTreeHook {
         &self,
         reorg_period: &ReorgPeriod,
     ) -> ChainResult<CheckpointAtBlock> {
-        self.ensure_identity().await?;
         let finalized_height = self
             .inner
             .rues
@@ -468,7 +2268,6 @@ impl MerkleTreeHook for DuskMerkleTreeHook {
     }
 
     async fn latest_checkpoint_at_block(&self, height: u64) -> ChainResult<CheckpointAtBlock> {
-        self.ensure_identity().await?;
         self.inner.checkpoint_at_height(height).await
     }
 }
@@ -482,6 +2281,64 @@ mod tests {
     use hyperlane_core::config::OpSubmissionConfig;
     use hyperlane_core::{HyperlaneDomainProtocol, HyperlaneDomainTechnicalStack, NativeToken};
     use url::Url;
+
+    /// Insert leaves `0..count` into a tree built the hook's way and one
+    /// built hyperlane-core's way.
+    fn both_trees(count: usize) -> (HookTree, IncrementalMerkle) {
+        let mut hook = HookTree::new();
+        let mut core = IncrementalMerkle::default();
+        for leaf in 0..count {
+            let id = hyperlane_dusk_types::message::keccak256(&(leaf as u64).to_be_bytes());
+            hook.insert(id);
+            core.ingest(H256::from(id));
+        }
+        (hook, core)
+    }
+
+    /// The hook's tree (`types/src/merkle.rs` in the Dusk repository)
+    /// starts every branch node at zero, hyperlane-core's at the empty
+    /// subtree's hash. Their roots agree at every count, and so do the
+    /// branch nodes the count's set bits select, but not all branch nodes.
+    #[test]
+    fn hook_and_core_trees_agree_on_roots_and_on_the_levels_that_make_them() {
+        for count in [
+            1usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100, 127, 128, 129,
+            255, 256, 257, 1000, 1023, 1024, 1025,
+        ] {
+            let (hook, core) = both_trees(count);
+            assert_eq!(hook.count as usize, core.count(), "count {count}");
+            assert_eq!(H256::from(hook.root()), core.root(), "count {count}");
+            assert!(matches_hook_tree(&core, &hook), "count {count}");
+            for level in (0..TREE_DEPTH).filter(|level| (count >> level) & 1 == 1) {
+                assert_eq!(hook.branch[level], core.branch[level].0, "count {count}");
+            }
+        }
+        // After one leaf, levels 1 to 31 hold zero in the hook's tree and the
+        // empty subtrees' hashes in hyperlane-core's: comparing whole branch
+        // arrays would reject trees with the same root.
+        let (hook, core) = both_trees(1);
+        assert_ne!(hook.branch[1], core.branch[1].0);
+        assert_eq!(hook.branch[1], [0u8; 32]);
+    }
+
+    #[test]
+    fn a_hook_tree_with_another_count_or_root_level_does_not_match() {
+        let (hook, core) = both_trees(5);
+        // 5 = 0b101: levels 0 and 2 make the root.
+        let mut tampered = hook.clone();
+        tampered.branch[2][0] ^= 1;
+        assert!(!matches_hook_tree(&core, &tampered));
+        let mut tampered = hook.clone();
+        tampered.branch[0][31] ^= 1;
+        assert!(!matches_hook_tree(&core, &tampered));
+        let mut tampered = hook.clone();
+        tampered.count = 6;
+        assert!(!matches_hook_tree(&core, &tampered));
+        // A level the count does not select leaves the root as it is.
+        let mut unused = hook;
+        unused.branch[1] = [7u8; 32];
+        assert!(matches_hook_tree(&core, &unused));
+    }
 
     #[test]
     fn mailbox_and_hook_adapters_report_distinct_contract_identities() {
@@ -511,11 +2368,64 @@ mod tests {
                 gas_price: 1,
                 native_token: NativeToken::default(),
                 op_submission_config: OpSubmissionConfig::default(),
+                query_rate_limit: crate::QueryRateLimit::default(),
+                pipeline_deliveries: false,
             },
         );
         let hook = DuskMerkleTreeHook::new(mailbox.clone());
         assert_eq!(mailbox.address(), mailbox_id);
         assert_eq!(hook.address(), hook_id);
         assert_ne!(mailbox.address(), hook.address());
+    }
+
+    #[test]
+    fn a_delivery_gas_limit_is_at_most_gas_limit_and_the_block_gas_limit() {
+        let mailbox = |gas_limit: u64| {
+            let rues =
+                Arc::new(RuesClient::new(Url::parse("http://127.0.0.1:1").unwrap()).unwrap());
+            let domain = HyperlaneDomain::from_config(
+                4242,
+                "dusk-test",
+                HyperlaneDomainProtocol::Dusk,
+                HyperlaneDomainTechnicalStack::Other,
+            )
+            .unwrap();
+            let provider = Arc::new(DuskProvider::new(domain.clone(), rues.clone()));
+            DuskMailbox::new(
+                provider,
+                rues,
+                H256::from([1u8; 32]),
+                H256::from([2u8; 32]),
+                domain,
+                None,
+                ConnectionConf {
+                    url: Url::parse("http://127.0.0.1:1").unwrap(),
+                    chain_id: 1,
+                    event_cursor_dir: std::env::temp_dir(),
+                    gas_limit,
+                    gas_price: 1,
+                    native_token: NativeToken::default(),
+                    op_submission_config: OpSubmissionConfig::default(),
+                    query_rate_limit: crate::QueryRateLimit::default(),
+                    pipeline_deliveries: false,
+                },
+            )
+        };
+        let message = HyperlaneMessage::default();
+        let five_million = mailbox(5_000_000);
+        let limit =
+            |requested: Option<U256>| five_million.submission_gas_limit(&message, requested);
+        assert_eq!(limit(None), 5_000_000);
+        assert_eq!(limit(Some(U256::from(2_000_000))), 2_000_000);
+        // A sender that paid for more gas does not raise what a failed
+        // delivery pays, nor one over u64.
+        assert_eq!(limit(Some(U256::from(9_000_000_000u64))), 5_000_000);
+        assert_eq!(limit(Some(U256::MAX)), 5_000_000);
+        // No block holds more than the block gas limit, whatever the
+        // configuration says (the parser refuses such a gasLimit).
+        assert_eq!(
+            mailbox(u64::MAX).submission_gas_limit(&message, None),
+            RUSK_BLOCK_GAS_LIMIT
+        );
     }
 }

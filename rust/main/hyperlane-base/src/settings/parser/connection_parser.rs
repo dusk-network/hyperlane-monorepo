@@ -1086,17 +1086,60 @@ pub fn build_dusk_connection_conf(
         return None;
     }
 
+    // A failed Dusk transaction pays its whole gas limit. A relayed
+    // `process` costs about 1.95M gas plus 0.22M per ISM signature.
     let gas_limit = chain
         .chain(err)
         .get_opt_key("gasLimit")
         .parse_u64()
-        .unwrap_or(500_000_000);
+        .unwrap_or(5_000_000);
+    // No block holds a transaction over the block gas limit, and the mempool
+    // keeps it until it expires.
+    if gas_limit > hyperlane_dusk::RUSK_BLOCK_GAS_LIMIT {
+        err.push(
+            (&chain.cwp).add("gaslimit"),
+            eyre!(
+                "Dusk gasLimit {gas_limit} exceeds Rusk's block gas limit of {}",
+                hyperlane_dusk::RUSK_BLOCK_GAS_LIMIT
+            ),
+        );
+    }
 
     let gas_price = chain
         .chain(err)
         .get_opt_key("gasPrice")
         .parse_u64()
         .unwrap_or(1);
+
+    // Rusk's HTTP policy limits contract queries for all of a node's
+    // clients together (180 a second, 360 in 2 s, in Rusk 1.7.3).
+    let default_limit = hyperlane_dusk::QueryRateLimit::DEFAULT;
+    let mut positive = |key: &str, default: u32| {
+        let value = chain
+            .chain(err)
+            .get_opt_key(key)
+            .parse_u32()
+            .unwrap_or(default);
+        if value == 0 {
+            err.push(
+                (&chain.cwp).add(key.to_ascii_lowercase()),
+                eyre!("Dusk {key} must be greater than zero"),
+            );
+        }
+        value
+    };
+    let query_rate_limit = hyperlane_dusk::QueryRateLimit {
+        per_second: positive("contractQueriesPerSecond", default_limit.per_second),
+        burst: positive("contractQueryBurst", default_limit.burst),
+    };
+
+    // Pipelined deliveries are experimental: a relayer sends one delivery
+    // at a time unless this is set and `maxBatchSize` is above 1.
+    let pipeline_deliveries = chain
+        .chain(err)
+        .get_opt_key("pipelineDeliveries")
+        .parse_bool()
+        .unwrap_or(false);
 
     Some(ChainConnectionConf::Dusk(hyperlane_dusk::ConnectionConf {
         url,
@@ -1106,6 +1149,8 @@ pub fn build_dusk_connection_conf(
         gas_price,
         native_token,
         op_submission_config: operation_batch,
+        query_rate_limit,
+        pipeline_deliveries,
     }))
 }
 

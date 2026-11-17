@@ -126,11 +126,14 @@ impl MultisigIsmMetadataBuilder for MessageIdMultisigMetadataBuilder {
         } else {
             validators
         };
+        // Only signatures over this message's ID can verify on the
+        // destination, so no other signature may take part in the quorum.
         let quorum_checkpoint = checkpoint_syncer
             .fetch_checkpoint(
                 validators,
                 usize::from(threshold),
                 leaf_index,
+                Some(message_id),
                 self.base_builder().destination_domain(),
             )
             .await;
@@ -628,6 +631,70 @@ mod tests {
 
         let expected = MultisigMetadata::new(signed_checkpoint, 1000, None);
         assert_eq!(resp, expected);
+    }
+
+    // The first validator to answer signed the message's root and index with
+    // another message ID. It must neither abort the build nor take part in
+    // the quorum the other two validators form.
+    #[tokio::test]
+    async fn a_validator_signing_another_message_id_does_not_block_metadata() {
+        let message = HyperlaneMessage::default();
+        let checkpoint = CheckpointWithMessageId {
+            checkpoint: Checkpoint {
+                mailbox_domain: 100,
+                merkle_tree_hook_address: H256::zero(),
+                root: H256::repeat_byte(7),
+                index: 1000,
+            },
+            message_id: message.id(),
+        };
+        let mut validators: Vec<_> = dummy_validators().drain(..).take(3).collect();
+        validators[0].fetch_checkpoint = Some(CheckpointWithMessageId {
+            message_id: H256::repeat_byte(2),
+            ..checkpoint
+        });
+        validators[1].fetch_checkpoint = Some(checkpoint);
+        validators[2].fetch_checkpoint = Some(checkpoint);
+        let validator_addresses = validators
+            .iter()
+            .map(|validator| {
+                validator
+                    .public_key
+                    .parse::<H160>()
+                    .expect("valid validator address")
+                    .into()
+            })
+            .collect::<Vec<_>>();
+        let syncers: HashMap<_, _> = build_mock_checkpoint_syncs(&validators)
+            .await
+            .into_iter()
+            .map(|(k, v)| (k, Arc::new(v) as Arc<dyn CheckpointSyncer>))
+            .collect();
+        let multisig_syncer = MultisigCheckpointSyncer::new(syncers, None);
+
+        let base_builder = build_mock_base_builder(
+            HyperlaneDomain::Known(KnownHyperlaneDomain::Optimism),
+            HyperlaneDomain::Known(KnownHyperlaneDomain::Ethereum),
+        );
+        base_builder
+            .responses
+            .get_merkle_leaf_id_by_message_id
+            .lock()
+            .expect("mock responses lock")
+            .push_back(Ok(Some(1000)));
+        let message_builder =
+            MessageMetadataBuilder::new(Arc::new(base_builder), H256::zero(), &message)
+                .await
+                .expect("message metadata builder");
+        let builder = MessageIdMultisigMetadataBuilder::new(message_builder);
+
+        let metadata = builder
+            .fetch_metadata(&validator_addresses, 2, &message, &multisig_syncer)
+            .await
+            .expect("a conflicting signature must not fail the build")
+            .expect("the other two validators form a quorum");
+        let expected = generate_multisig_signed_checkpoint(&validators[1..], checkpoint).await;
+        assert_eq!(metadata, MultisigMetadata::new(expected, 1000, None));
     }
 
     #[tokio::test]

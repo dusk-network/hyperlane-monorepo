@@ -7,7 +7,7 @@ use sha3::{digest::Update, Digest, Keccak256};
 use crate::{utils::domain_hash, Signable, Signature, SignedType, H256};
 
 /// An Hyperlane checkpoint
-#[derive(Copy, Clone, Eq, PartialEq, Serialize, Deserialize, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Serialize, Deserialize, Debug)]
 pub struct Checkpoint {
     /// The merkle tree hook address
     pub merkle_tree_hook_address: H256,
@@ -20,7 +20,7 @@ pub struct Checkpoint {
 }
 
 /// A Hyperlane (checkpoint, messageId) tuple
-#[derive(Copy, Clone, Eq, PartialEq, Serialize, Deserialize, Debug, Deref)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Serialize, Deserialize, Debug, Deref)]
 pub struct CheckpointWithMessageId {
     /// existing Hyperlane checkpoint struct
     #[deref]

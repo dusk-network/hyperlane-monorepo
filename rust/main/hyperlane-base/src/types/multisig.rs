@@ -8,8 +8,8 @@ use serde::Serialize;
 use tracing::{debug, instrument, warn};
 
 use hyperlane_core::{
-    HyperlaneDomain, MultisigSignedCheckpoint, Signature, SignedCheckpointWithMessageId, H160,
-    H256, U256,
+    CheckpointWithMessageId, HyperlaneDomain, MultisigSignedCheckpoint, Signature,
+    SignedCheckpointWithMessageId, H160, H256, U256,
 };
 
 use crate::{CheckpointSyncer, CoreMetrics};
@@ -30,13 +30,13 @@ pub enum CheckpointObservation {
         /// Requested checkpoint index.
         index: u32,
     },
-    /// Verified signatures for one index and root, stopping at quorum.
+    /// Verified signatures for one checkpoint, stopping at quorum.
     Signature {
         /// Checkpoint index.
         index: u32,
         /// Signed root.
         root: H256,
-        /// Verified signers for this root and each exact checkpoint object location.
+        /// Verified signers for this checkpoint and each exact checkpoint object location.
         signers: Vec<CheckpointSigner>,
     },
     /// A failed read does not imply that a validator is down.
@@ -75,6 +75,8 @@ pub enum CheckpointUnavailableReason {
     InvalidSignature,
     /// Recovered signer did not match the expected validator.
     SignerMismatch,
+    /// Checkpoint was signed for a different message ID.
+    MessageIdMismatch,
 }
 
 /// Observers must return immediately without blocking checkpoint collection.
@@ -289,7 +291,7 @@ impl MultisigCheckpointSyncer {
 
             for index in (minimum_index..=start_index).rev() {
                 let checkpoint_res = self
-                    .fetch_checkpoint(validators, threshold, index, destination)
+                    .fetch_checkpoint(validators, threshold, index, None, destination)
                     .await;
                 if let Ok(Some(checkpoint)) = checkpoint_res {
                     return Ok(Some(checkpoint));
@@ -303,20 +305,27 @@ impl MultisigCheckpointSyncer {
     /// Fetches a MultisigSignedCheckpointWithMessageId if there is a quorum.
     /// Validators must reflect the onchain ordering of the set
     /// Returns Ok(None) if there is no quorum.
+    ///
+    /// Only signatures over the same checkpoint (root, index, message ID,
+    /// merkle tree hook and domain) count towards one quorum, so a validator
+    /// that signs a conflicting checkpoint cannot stop the others from
+    /// reaching one. When `message_id` is given, signatures over any other
+    /// message ID are ignored.
     #[instrument(err, skip(self))]
     pub async fn fetch_checkpoint(
         &self,
         validators: &[H256],
         threshold: usize,
         index: u32,
+        message_id: Option<H256>,
         destination: &HyperlaneDomain,
     ) -> Result<Option<MultisigSignedCheckpoint>> {
         self.observe(CheckpointObservation::Fetching { index });
-        // Keeps track of signed validator checkpoints for a particular root.
-        // In practice, it's likely that validators will all sign the same root for a
-        // particular index, but we'd like to be robust to this not being the case
-        let mut signed_checkpoints_per_root: HashMap<
-            H256,
+        // Keeps track of signed validator checkpoints for a particular checkpoint.
+        // In practice, it's likely that validators will all sign the same checkpoint
+        // for a particular index, but we'd like to be robust to this not being the case
+        let mut signed_checkpoints_per_checkpoint: HashMap<
+            CheckpointWithMessageId,
             Vec<(usize, SignedCheckpointWithMessageId)>,
         > = HashMap::new();
 
@@ -424,9 +433,33 @@ impl MultisigCheckpointSyncer {
                 continue;
             }
 
+            // A signature over another message ID cannot be used for this
+            // message, so it must not take part in its quorum.
+            if let Some(message_id) = message_id {
+                if signed_checkpoint.value.message_id != message_id {
+                    self.unavailable(
+                        validator,
+                        Some(index),
+                        CheckpointUnavailableReason::MessageIdMismatch,
+                    );
+                    warn!(
+                        validator = format!("{:#x}", validator),
+                        index = index,
+                        checkpoint_message_id =
+                            format!("{:#x}", signed_checkpoint.value.message_id),
+                        message_id = format!("{:#x}", message_id),
+                        "Validator signed a checkpoint for a different message ID"
+                    );
+                    continue;
+                }
+            }
+
             // Push the signed checkpoint into the hashmap
-            let root = signed_checkpoint.value.root;
-            let signed_checkpoints = signed_checkpoints_per_root.entry(root).or_default();
+            let signed_value = signed_checkpoint.value;
+            let root = signed_value.root;
+            let signed_checkpoints = signed_checkpoints_per_checkpoint
+                .entry(signed_value)
+                .or_default();
             signed_checkpoints.push((validator_index, signed_checkpoint));
 
             // Count the number of signatures for this signed checkpoint
@@ -460,6 +493,7 @@ impl MultisigCheckpointSyncer {
                 validator = format!("{:#x}", validator),
                 index = index,
                 root = format!("{:#x}", root),
+                message_id = format!("{:#x}", signed_value.message_id),
                 signature_count = signature_count,
                 "Found signed checkpoint"
             );
@@ -467,12 +501,18 @@ impl MultisigCheckpointSyncer {
             // If we've hit a quorum, create a MultisigSignedCheckpoint
             if signature_count >= threshold {
                 signed_checkpoints.sort_by_key(|(validator_index, _)| *validator_index);
-                let mut ordered_signed_checkpoints = signed_checkpoints
+                let ordered_signed_checkpoints = signed_checkpoints
                     .iter()
                     .map(|(_, signed_checkpoint)| signed_checkpoint.clone())
                     .collect::<Vec<_>>();
-                let mut checkpoint: MultisigSignedCheckpoint =
-                    (&mut ordered_signed_checkpoints).try_into()?;
+                // Every signature in the group is over `signed_value`.
+                let mut checkpoint = MultisigSignedCheckpoint {
+                    checkpoint: signed_value,
+                    signatures: ordered_signed_checkpoints
+                        .iter()
+                        .map(|signed_checkpoint| signed_checkpoint.signature)
+                        .collect(),
+                };
 
                 // Ensure the signatures are in the correct order, padding with empty signatures if necessary
                 if destination.is_aleo_protocol() {
@@ -942,6 +982,7 @@ mod test {
                 validator_addresses.as_slice(),
                 threshold,
                 index,
+                None,
                 &HyperlaneDomain::Known(KnownHyperlaneDomain::Arbitrum),
             )
             .await
@@ -1013,6 +1054,7 @@ mod test {
                 validator_addresses.as_slice(),
                 2,
                 1000,
+                None,
                 &HyperlaneDomain::Known(KnownHyperlaneDomain::Ethereum),
             )
             .await
@@ -1129,17 +1171,169 @@ mod test {
         let expected = generate_multisig_signed_checkpoint(&validators[1..], checkpoint).await;
         assert_eq!(
             syncer
-                .fetch_checkpoint(&addresses, 2, 1000, &destination)
+                .fetch_checkpoint(&addresses, 2, 1000, None, &destination)
                 .await
                 .expect("invalid signature must not abort quorum"),
             Some(expected)
         );
         assert!(syncer
-            .fetch_checkpoint(&addresses, 3, 1000, &destination)
+            .fetch_checkpoint(&addresses, 3, 1000, None, &destination)
             .await
             .expect("invalid signature is skipped even without quorum")
             .is_none());
         assert_eq!(activity.active.load(Ordering::Relaxed), 0);
+    }
+
+    /// Syncers where validator `i` answers, after `delays[i]`, with its own
+    /// signature over `checkpoints[i]`. Also returns the validator addresses.
+    async fn signing_syncers(
+        validators: &mut [TestValidator],
+        checkpoints: &[CheckpointWithMessageId],
+        delays: &[Duration],
+    ) -> (HashMap<H160, Arc<dyn CheckpointSyncer>>, Vec<H256>) {
+        let mut syncers: HashMap<H160, Arc<dyn CheckpointSyncer>> = HashMap::new();
+        let mut addresses = Vec::new();
+        for ((validator, checkpoint), delay) in validators.iter_mut().zip(checkpoints).zip(delays) {
+            validator.fetch_checkpoint = Some(*checkpoint);
+            let signer: Signers = validator
+                .private_key
+                .parse::<ethers::signers::LocalWallet>()
+                .expect("valid test signer")
+                .into();
+            let address = H160::from_str(&validator.public_key).expect("valid validator");
+            syncers.insert(
+                address,
+                Arc::new(DelayedCheckpointSyncer {
+                    delay: *delay,
+                    latest_index: None,
+                    checkpoint: Some(signer.sign(*checkpoint).await.expect("sign checkpoint")),
+                    checkpoint_location: None,
+                    activity: Arc::new(FetchActivity::default()),
+                }),
+            );
+            addresses.push(H256::from(address));
+        }
+        (syncers, addresses)
+    }
+
+    // Validator A signs the honest root and index with another message ID and
+    // answers first. Grouped by root alone, A and B reached the threshold
+    // together, their checkpoints failed to convert into one quorum, and the
+    // error aborted the fetch before C's signature was read.
+    #[tokio::test]
+    async fn a_conflicting_message_id_does_not_block_the_honest_quorum() {
+        let honest = CheckpointWithMessageId {
+            checkpoint: Checkpoint {
+                mailbox_domain: 100,
+                merkle_tree_hook_address: H256::zero(),
+                root: H256::repeat_byte(7),
+                index: 1000,
+            },
+            message_id: H256::repeat_byte(1),
+        };
+        let conflicting = CheckpointWithMessageId {
+            message_id: H256::repeat_byte(2),
+            ..honest
+        };
+        let mut validators: Vec<_> = dummy_validators().into_iter().take(3).collect();
+        let (syncers, addresses) = signing_syncers(
+            &mut validators,
+            &[conflicting, honest, honest],
+            &[
+                Duration::ZERO,
+                Duration::from_millis(20),
+                Duration::from_millis(40),
+            ],
+        )
+        .await;
+        let destination = HyperlaneDomain::Known(KnownHyperlaneDomain::Ethereum);
+        let expected = generate_multisig_signed_checkpoint(&validators[1..], honest).await;
+
+        // Without an expected message ID, A's signature is kept apart.
+        let syncer = MultisigCheckpointSyncer::new(syncers.clone(), None);
+        assert_eq!(
+            syncer
+                .fetch_checkpoint(&addresses, 2, 1000, None, &destination)
+                .await
+                .expect("a conflicting signature must not abort the fetch"),
+            Some(expected.clone())
+        );
+
+        // With one, A's signature is not counted at all.
+        let observations = Arc::new(Observations::default());
+        let syncer =
+            MultisigCheckpointSyncer::new(syncers, None).with_observer(observations.clone());
+        assert_eq!(
+            syncer
+                .fetch_checkpoint(&addresses, 2, 1000, Some(honest.message_id), &destination)
+                .await
+                .expect("a conflicting signature must not abort the fetch"),
+            Some(expected)
+        );
+        let observations = observations.0.lock().expect("observation lock");
+        assert!(observations.iter().any(|observation| matches!(
+            observation,
+            CheckpointObservation::Unavailable {
+                validator,
+                index: Some(1000),
+                reason: CheckpointUnavailableReason::MessageIdMismatch,
+            } if *validator == addresses[0]
+        )));
+        assert!(observations.iter().all(|observation| match observation {
+            CheckpointObservation::Signature { signers, .. } => signers
+                .iter()
+                .all(|signer| signer.validator != addresses[0]),
+            _ => true,
+        }));
+    }
+
+    // A quorum can only be built for the message being relayed: two
+    // validators that sign another message ID first cannot preempt it.
+    #[tokio::test]
+    async fn signatures_over_another_message_id_cannot_preempt_its_quorum() {
+        let honest = CheckpointWithMessageId {
+            checkpoint: Checkpoint {
+                mailbox_domain: 100,
+                merkle_tree_hook_address: H256::zero(),
+                root: H256::repeat_byte(7),
+                index: 1000,
+            },
+            message_id: H256::repeat_byte(1),
+        };
+        let conflicting = CheckpointWithMessageId {
+            message_id: H256::repeat_byte(2),
+            ..honest
+        };
+        let mut validators: Vec<_> = dummy_validators().into_iter().take(4).collect();
+        let (syncers, addresses) = signing_syncers(
+            &mut validators,
+            &[conflicting, honest, honest, conflicting],
+            &[
+                Duration::ZERO,
+                Duration::from_millis(20),
+                Duration::from_millis(40),
+                Duration::ZERO,
+            ],
+        )
+        .await;
+        let syncer = MultisigCheckpointSyncer::new(syncers, None);
+        let destination = HyperlaneDomain::Known(KnownHyperlaneDomain::Ethereum);
+
+        // Without an expected message ID, the first quorum of identical
+        // checkpoints wins, whatever message it is for.
+        let conflicting_quorum = syncer
+            .fetch_checkpoint(&addresses, 2, 1000, None, &destination)
+            .await
+            .expect("fetch succeeds")
+            .expect("A and D form a quorum");
+        assert_eq!(conflicting_quorum.checkpoint, conflicting);
+
+        let quorum = syncer
+            .fetch_checkpoint(&addresses, 2, 1000, Some(honest.message_id), &destination)
+            .await
+            .expect("fetch succeeds");
+        let expected = generate_multisig_signed_checkpoint(&validators[1..3], honest).await;
+        assert_eq!(quorum, Some(expected));
     }
 
     #[tokio::test]
@@ -1199,7 +1393,7 @@ mod test {
         }
         let syncer = MultisigCheckpointSyncer::new(syncers, None);
         let destination = HyperlaneDomain::Known(KnownHyperlaneDomain::Ethereum);
-        let fetch = syncer.fetch_checkpoint(&addresses, 2, 1000, &destination);
+        let fetch = syncer.fetch_checkpoint(&addresses, 2, 1000, None, &destination);
         // Metadata builders use async_trait's Send future; direct awaiting
         // alone does not exercise that executor requirement.
         assert_send(&fetch);
@@ -1263,6 +1457,7 @@ mod test {
                 validator_addresses.as_slice(),
                 threshold,
                 index,
+                None,
                 &aleo_domain,
             )
             .await
@@ -1340,6 +1535,7 @@ mod test {
                 validator_addresses.as_slice(),
                 threshold,
                 index,
+                None,
                 &ethereum_domain,
             )
             .await
