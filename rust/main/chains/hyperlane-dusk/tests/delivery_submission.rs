@@ -1728,9 +1728,12 @@ async fn a_signer_at_its_bound_of_kept_transactions_forgets_only_final_ones() {
 /// `NotSubmitted`. A hash the agent keeps lets dusk-tx preverify its
 /// transaction, only then; the stand-in node refuses a real Moonlight
 /// transaction there, so that delivery is not submitted either. Runs only
-/// when asked (`--ignored`), with `DUSK_TX_REAL_BIN` naming the build.
+/// when asked (`--ignored`), with `DUSK_TX_REAL_BIN` naming the build: CI
+/// can't build `dusk-tx`, which needs Dusk's private Rusk repository, so
+/// `scripts/dusk-tx-interop-check.sh` builds it at the agent gate's
+/// `DUSK_REF` and runs this as a release check (README, Testing).
 #[tokio::test]
-#[ignore = "runs a dusk-tx build: set DUSK_TX_REAL_BIN to its path"]
+#[ignore = "runs a dusk-tx build: scripts/dusk-tx-interop-check.sh builds one and runs it"]
 async fn a_dusk_tx_build_sends_only_on_the_agents_word() {
     let _env = HELPER_ENV.lock().await;
     let bin = std::env::var("DUSK_TX_REAL_BIN").expect("DUSK_TX_REAL_BIN names a dusk-tx build");

@@ -763,6 +763,28 @@ multicall, in a few minutes. CI runs the others through
 `.github/workflows/dusk-agent-gate.yml`. End-to-end tests against a live
 node are in the companion repository's `demo/` directory.
 
+CI tests the delivery path against a shell stand-in for `dusk-tx`, since
+`dusk-tx` builds against Dusk's private Rusk repository and the agent gate
+can't check that out. One test runs the real helper instead:
+`a_dusk_tx_build_sends_only_on_the_agents_word` checks that the agent and
+`dusk-tx` agree on the `Prepared TX` line, the go-ahead to send and the
+error prefixes that decide whether a delivery may have been sent. It is a
+release check. Before a release, and whenever `DUSK_REF` or `dusk-tx`
+changes, run it with `rusk-private` at hand:
+
+```bash
+bash rust/main/chains/hyperlane-dusk/scripts/dusk-tx-interop-check.sh
+```
+
+It builds `dusk-tx` from the companion repository at the agent gate's
+`DUSK_REF`, which must be the commit `Cargo.toml` pins, and runs the test
+against it. `--dusk-ref <sha>` builds another commit, and `--dusk-tx-bin
+<path>` tests a build you already have. It expects the layout of the
+companion repository's README (`rusk-private` and `hyperlane/dusk` next to
+this checkout); `--dusk-dir` and `--rusk-dir` point elsewhere. The
+companion repository's `make repro-check-agent` runs the same test against
+the `dusk-tx` it builds.
+
 ## Changes outside this crate
 
 The integration also touches shared code: Dusk connection and signer parsing
