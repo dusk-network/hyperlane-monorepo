@@ -54,14 +54,17 @@ const SCAN_ANCHOR_SPACING: u64 = FINALIZED_EVENT_PAGE_SIZE as u64;
 /// Most bytes of a response body that go into an error or a log line.
 const MAX_ERROR_BODY_BYTES: usize = 1024;
 /// The Mailbox state version this agent reads: dispatched message IDs
-/// (`dispatched_id`), and deliveries from `ProcessId` events only.
-const MAILBOX_STATE_VERSION: u32 = 5;
+/// (`dispatched_id`), deliveries from `ProcessId` events only, and `process`
+/// only as a transaction's own call or a query, as the relayer sends and
+/// simulates it.
+const MAILBOX_STATE_VERSION: u32 = 6;
 /// The MerkleTreeHook state version this agent reads: stored message IDs,
 /// from which checkpoints compute their roots (no `root_at`).
 const MERKLE_TREE_HOOK_STATE_VERSION: u32 = 2;
 /// The ValidatorAnnounce state version this agent reads: location hashes,
-/// with the locations in `ValidatorAnnouncement` events.
-const VALIDATOR_ANNOUNCE_STATE_VERSION: u32 = 2;
+/// with the locations in `ValidatorAnnouncement` events, and `announce` only
+/// as a transaction's own call, as the validator sends it.
+const VALIDATOR_ANNOUNCE_STATE_VERSION: u32 = 3;
 /// How long a Dusk block takes: about 10 s on mainnet and testnet. The node
 /// builds a block from what its mempool holds when the block's round starts,
 /// so a transaction it admits is in a block 10 to 20 s later.
@@ -1205,13 +1208,13 @@ impl RuesClient {
             reads.query(self, &mailbox_version).await,
             "Mailbox",
             MAILBOX_STATE_VERSION,
-            "stores dispatched message IDs (dispatched_id) and leaves deliveries to ProcessId events",
+            "stores dispatched message IDs (dispatched_id), leaves deliveries to ProcessId events and takes process only as a transaction's own call",
         )?;
         Self::validate_state_version(
             reads.query(self, &announce_version).await,
             "ValidatorAnnounce",
             VALIDATOR_ANNOUNCE_STATE_VERSION,
-            "stores location hashes (get_announced_storage_location_hashes) and leaves the locations to ValidatorAnnouncement events",
+            "stores location hashes (get_announced_storage_location_hashes), leaves the locations to ValidatorAnnouncement events and takes announce only as a transaction's own call",
         )?;
         Self::validate_mailbox_binding(
             reads.query(self, &announce_binding).await?,
@@ -5676,18 +5679,18 @@ mod tests {
         for (position, bytes, diagnostic) in [
             (
                 3,
-                rkyv_serialize(&4u32).unwrap(),
-                "Dusk Mailbox state_version 4 is not supported: this agent needs state_version 5",
+                rkyv_serialize(&5u32).unwrap(),
+                "Dusk Mailbox state_version 5 is not supported: this agent needs state_version 6",
             ),
             (
                 3,
-                rkyv_serialize(&6u32).unwrap(),
-                "Dusk Mailbox state_version 6 is not supported",
+                rkyv_serialize(&7u32).unwrap(),
+                "Dusk Mailbox state_version 7 is not supported",
             ),
             (
                 4,
-                rkyv_serialize(&1u32).unwrap(),
-                "Dusk ValidatorAnnounce state_version 1 is not supported: this agent needs state_version 2",
+                rkyv_serialize(&2u32).unwrap(),
+                "Dusk ValidatorAnnounce state_version 2 is not supported: this agent needs state_version 3",
             ),
             (
                 5,
@@ -5790,7 +5793,7 @@ mod tests {
             .unwrap();
         // The checks and their errors are those of single queries.
         let mut responses = probe();
-        responses.push(views(merkle, mailbox, 4));
+        responses.push(views(merkle, mailbox, 5));
         let error = client(responses)
             .validate_chain_identity(1, 4242, &mailbox, &announce, &merkle)
             .await
@@ -5798,7 +5801,7 @@ mod tests {
             .to_string();
         assert!(
             error.contains(
-                "Dusk Mailbox state_version 4 is not supported: this agent needs state_version 5"
+                "Dusk Mailbox state_version 5 is not supported: this agent needs state_version 6"
             ),
             "{error}"
         );
@@ -5815,7 +5818,7 @@ mod tests {
             .to_string();
         assert!(
             error.contains(
-                "Failed to query Dusk Mailbox state_version (this agent needs state_version 5)"
+                "Failed to query Dusk Mailbox state_version (this agent needs state_version 6)"
             ) && error.contains("(500)"),
             "{error}"
         );
@@ -5834,8 +5837,9 @@ mod tests {
             .unwrap()
         };
         // Version 4 stored the processed-message log and root_at that this
-        // agent no longer reads, and the Mailbox dropped them in version 5.
-        for version in [0u32, 1, 3, 4, 6] {
+        // agent no longer reads, and the Mailbox dropped them in version 5;
+        // version 5 let contracts call process. Testnet starts at 6.
+        for version in [0u32, 1, 3, 4, 5, 7] {
             let error = identity((200, rkyv_serialize(&version).unwrap()))
                 .validate_chain_identity(1, 4242, &mailbox, &[4u8; 32], &[5u8; 32])
                 .await
@@ -5843,7 +5847,7 @@ mod tests {
                 .to_string();
             assert!(
                 error.contains(&format!("state_version {version} is not supported"))
-                    && error.contains("needs state_version 5"),
+                    && error.contains("needs state_version 6"),
                 "{error}"
             );
         }
@@ -5855,7 +5859,7 @@ mod tests {
             .to_string();
         assert!(
             error.contains("Failed to query Dusk Mailbox state_version")
-                && error.contains("needs state_version 5"),
+                && error.contains("needs state_version 6"),
             "{error}"
         );
     }

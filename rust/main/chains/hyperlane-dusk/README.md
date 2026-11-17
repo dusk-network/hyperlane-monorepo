@@ -606,9 +606,9 @@ how to run the local bridge.
   starts therefore delays its reads, and the relayer keeps the chain instead
   of dropping it. Submissions through the `dusk-tx` helper are checked the
   same way first. The agent accepts only the state versions it reads
-  (Mailbox 5, MerkleTreeHook 2, ValidatorAnnounce 2) and refuses any other
+  (Mailbox 6, MerkleTreeHook 2, ValidatorAnnounce 3) and refuses any other
   with an explicit error, since another version lacks queries the agent
-  uses.
+  uses or bounds less of what anyone can store.
 - **Checkpoints** are read at consensus finality, adjusted by the configured
   reorg period. The Merkle hook keeps no root per insertion, so a
   checkpoint's root is computed: the agent reads the message IDs the hook
@@ -632,9 +632,13 @@ how to run the local bridge.
 ## Supported
 
 - `index.mode: sequence` only.
-- Mailbox `state_version` 5, MerkleTreeHook 2 and ValidatorAnnounce 2: the
+- Mailbox `state_version` 6, MerkleTreeHook 2 and ValidatorAnnounce 3: the
   contracts whose growing state is chunked, which keep deliveries, Merkle
-  roots and announced locations out of contract state.
+  roots and announced locations out of contract state, and which take
+  `process` and `announce` only as a transaction's own call or a query.
+  The relayer delivers and the validator announces in a transaction each,
+  and the relayer's simulation of `process` is a query, so neither
+  changed.
 - Security modules: `MessageIdMultisig`, plus the companion repository's
   test-only null ISM. Routing, Aggregation and CCIP-read ISMs return an
   explicit unsupported error.

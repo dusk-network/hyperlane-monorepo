@@ -1162,13 +1162,16 @@ mod dusk_rpc_tests {
                         (200, vec![3])
                     } else if path.ends_with(&format!("{:064x}/state_version", 1)) {
                         let version: u32 = if current == Fault::OldMailbox as u8 {
-                            4
-                        } else {
                             5
+                        } else {
+                            6
                         };
                         (200, version.to_le_bytes().to_vec())
+                    } else if path.ends_with(&format!("{:064x}/state_version", 3)) {
+                        // ValidatorAnnounce.
+                        (200, 3u32.to_le_bytes().to_vec())
                     } else if path.ends_with("/state_version") {
-                        // ValidatorAnnounce and MerkleTreeHook.
+                        // MerkleTreeHook.
                         (200, 2u32.to_le_bytes().to_vec())
                     } else if path.ends_with("/mailbox") {
                         let wrong = (path.ends_with(&format!("{:064x}/mailbox", 3))

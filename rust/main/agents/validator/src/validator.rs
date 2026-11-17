@@ -1608,7 +1608,9 @@ mod tests {
                         } else if uri.path().ends_with("/hook_type") {
                             (axum::http::StatusCode::OK, vec![3])
                         } else if uri.path().ends_with(&format!("{:064x}/state_version", 1)) {
-                            (axum::http::StatusCode::OK, 5u32.to_le_bytes().to_vec())
+                            (axum::http::StatusCode::OK, 6u32.to_le_bytes().to_vec())
+                        } else if uri.path().ends_with(&format!("{:064x}/state_version", 3)) {
+                            (axum::http::StatusCode::OK, 3u32.to_le_bytes().to_vec())
                         } else if uri.path().ends_with("/state_version") {
                             (axum::http::StatusCode::OK, 2u32.to_le_bytes().to_vec())
                         } else {
