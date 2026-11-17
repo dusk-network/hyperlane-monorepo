@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use base64::engine::{general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use hyperlane_dusk_types::merkle::IncrementalMerkle;
 use hyperlane_dusk_types::{EthAddress, GasPaymentRecord};
 use rkyv::validation::validators::DefaultValidator;
@@ -16,8 +17,8 @@ use super::{
     bounded_body, bounded_text, canonical_event_cursor, decode_event_cursor, graphql_data,
     next_tx_lookup, parse_block_heights, parse_block_pair, parse_confirmed_transaction,
     parse_h256_hex, rkyv_deserialize, rkyv_serialize, validate_finalized_event_page,
-    FinalizedContractEvent, FinalizedEventPage, ScanAnchor, MAX_ERROR_BODY_BYTES,
-    MAX_EVENT_TOPIC_BYTES,
+    validate_transaction_id, FinalizedContractEvent, FinalizedEventPage, ScanAnchor,
+    MAX_ERROR_BODY_BYTES, MAX_EVENT_TOPIC_BYTES,
 };
 use crate::checks::Input;
 
@@ -153,8 +154,9 @@ pub fn confirmed_transaction(data: &[u8]) {
 }
 
 /// Event cursors: every non-negative ID round-trips through its canonical
-/// cursor, negative ones are refused, and any text that decodes is the
-/// canonical cursor of the ID it decodes to.
+/// cursor, negative ones are refused, any text that decodes is the
+/// canonical cursor of the ID it decodes to, and other spellings of a
+/// cursor (leading zeros, signs, spaces, another version) are refused.
 pub fn event_cursor(data: &[u8]) {
     let mut input = Input::new(data);
     let id = match input.u8() % 6 {
@@ -166,9 +168,22 @@ pub fn event_cursor(data: &[u8]) {
     };
     let cursor = canonical_event_cursor(id);
     match decode_event_cursor(&cursor) {
-        Ok(decoded) => assert_eq!(decoded, id),
+        Ok(decoded) => {
+            assert!(id >= 0, "negative ID {id} accepted");
+            assert_eq!(decoded, id);
+        }
         Err(_) => assert!(id < 0),
     }
+    let spelled = match input.u8() % 7 {
+        0 => format!("v1:0{id}"),
+        1 => format!("v1:+{id}"),
+        2 => format!("v1: {id}"),
+        3 => format!("v1:{id} "),
+        4 => format!("v2:{id}"),
+        5 => format!("V1:{id}"),
+        _ => format!("v1:{id}\n"),
+    };
+    assert!(decode_event_cursor(&BASE64_STANDARD.encode(spelled)).is_err());
     let text = String::from_utf8_lossy(input.bytes(64)).into_owned();
     if let Ok(decoded) = decode_event_cursor(&text) {
         assert!(decoded >= 0);
@@ -294,6 +309,25 @@ pub fn event_page(data: &[u8]) {
         accepted, consistent,
         "{page:?} after {previous_id:?} limit {requested_limit}"
     );
+}
+
+/// Transaction IDs go into GraphQL queries as they are, so only exactly 64
+/// hex digits are taken: nothing that could end the query's string.
+pub fn transaction_id(data: &[u8]) {
+    let mut input = Input::new(data);
+    let mut text = match input.u8() % 3 {
+        0 => input.hash_hex(),
+        1 => String::from_utf8_lossy(input.bytes(80)).into_owned(),
+        _ => input.text(70, &["\"", "}", "0x", "ab"]),
+    };
+    if input.bool() && text.len() == 64 && text.is_ascii() {
+        // One character that is not a hex digit.
+        let at = input.below(64);
+        let bad = ['"', 'g', ' ', '}', 'x'][input.below(5)];
+        text.replace_range(at..at + 1, &bad.to_string());
+    }
+    let valid = text.len() == 64 && text.bytes().all(|byte| byte.is_ascii_hexdigit());
+    assert_eq!(validate_transaction_id(&text).is_ok(), valid, "{text:?}");
 }
 
 /// `parse_h256_hex` takes exactly 32 bytes of hex after an optional `0x`.
@@ -481,6 +515,11 @@ mod tests {
     #[test]
     fn event_pages_are_accepted_exactly_when_consistent() {
         run_cases(24, 40_000, 200, super::event_page);
+    }
+
+    #[test]
+    fn transaction_ids_in_queries_are_exactly_64_hex_digits() {
+        run_cases(32, 20_000, 80, super::transaction_id);
     }
 
     #[test]

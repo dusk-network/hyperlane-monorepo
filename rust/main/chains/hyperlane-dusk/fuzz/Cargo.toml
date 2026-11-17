@@ -146,3 +146,10 @@ path = "fuzz_targets/final_records_search.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "transaction_id"
+path = "fuzz_targets/transaction_id.rs"
+test = false
+doc = false
+bench = false

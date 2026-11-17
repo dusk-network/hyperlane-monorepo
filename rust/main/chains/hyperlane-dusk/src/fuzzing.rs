@@ -5,6 +5,6 @@
 pub use crate::final_records::checks::search as final_records_search;
 pub use crate::rues::checks::{
     block_pair, bounded, confirmed_transaction, contract_reply, event_cursor, event_page, graphql,
-    h256_hex, kept_records, lookup_cadence, lookup_reply, scan_anchor,
+    h256_hex, kept_records, lookup_cadence, lookup_reply, scan_anchor, transaction_id,
 };
 pub use crate::tx_sender::checks::{helper_output, prepared_line, tx_id};
