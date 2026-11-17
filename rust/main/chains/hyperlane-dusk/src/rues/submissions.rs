@@ -744,12 +744,12 @@ impl RuesClient {
         let data = self
             .graphql_query(&format!("query {{ {mempool} {ledger} }}"))
             .await?;
-        if let Some(status) = found(tx_id, &data)? {
+        if let Some(status) = found(tx_id, &data, &["mempoolTx", "tx"])? {
             return Ok(status);
         }
-        for field in [&ledger, &mempool, &ledger] {
+        for (field, asked) in [(&ledger, "tx"), (&mempool, "mempoolTx"), (&ledger, "tx")] {
             let data = self.graphql_query(&format!("query {{ {field} }}")).await?;
-            if let Some(status) = found(tx_id, &data)? {
+            if let Some(status) = found(tx_id, &data, &[asked])? {
                 return Ok(status);
             }
         }
@@ -843,10 +843,27 @@ impl RuesClient {
 /// such a transaction.
 const MISSING_INTERMEDIATE_NONCE: &str = "Missing intermediate nonce";
 
-/// Where a lookup of transaction `tx_id` that answered `data` found it: in
-/// a block (`tx`), in the mempool (`mempoolTx`), or, `None`, in neither of
-/// the fields it asked for.
-fn found(tx_id: &str, data: &JsonValue) -> Result<Option<TransactionStatus>, HyperlaneDuskError> {
+/// Where a lookup of transaction `tx_id` that asked for the fields `asked`
+/// and answered `data` found it: in a block (`tx`), in the mempool
+/// (`mempoolTx`), or, `None`, in neither of them.
+///
+/// "Neither" lets the relayer forget a transaction it kept and sign its
+/// message again, so only a reply that says so stands for it: one that
+/// holds every field asked for, each null, as Rusk answers for a hash it
+/// does not know. A reply without one of them, or that is not an object at
+/// all, such as `{}` or a `null` data from a proxy or cache in front of the
+/// node, is an error.
+fn found(
+    tx_id: &str,
+    data: &JsonValue,
+    asked: &[&str],
+) -> Result<Option<TransactionStatus>, HyperlaneDuskError> {
+    if let Some(field) = asked.iter().find(|field| data.get(**field).is_none()) {
+        return Err(HyperlaneDuskError::Other(format!(
+            "Lookup of Dusk transaction {tx_id} answered without its {field} field: {}",
+            bounded_json(data)
+        )));
+    }
     if let Some(transaction) = data.get("tx").filter(|value| !value.is_null()) {
         let block_height = transaction
             .get("blockHeight")
@@ -878,6 +895,40 @@ fn synced() -> WriteOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lookup reply that does not hold the fields asked for, as a proxy,
+    /// a cache or another schema might answer, was read as the transaction
+    /// being in neither place, after which the relayer forgets the
+    /// transaction it kept and signs its message again.
+    #[test]
+    fn a_reply_without_the_fields_asked_for_is_an_error_not_neither_place() {
+        use serde_json::json;
+
+        let both = ["mempoolTx", "tx"];
+        for reply in [
+            json!(null),
+            json!({}),
+            json!("ok"),
+            json!([]),
+            json!({ "tx": null }),
+            json!({ "mempoolTx": null }),
+        ] {
+            assert!(found("ab", &reply, &both).is_err(), "{reply}");
+        }
+        assert!(found("ab", &json!({}), &["tx"]).is_err());
+        assert!(found("ab", &json!({ "tx": null }), &["mempoolTx"]).is_err());
+        // What Rusk answers for a hash it does not know.
+        let unknown = json!({ "mempoolTx": null, "tx": null });
+        assert!(matches!(found("ab", &unknown, &both), Ok(None)));
+        assert!(matches!(
+            found("ab", &json!({ "tx": null }), &["tx"]),
+            Ok(None)
+        ));
+        assert!(matches!(
+            found("ab", &json!({ "mempoolTx": null }), &["mempoolTx"]),
+            Ok(None)
+        ));
+    }
 
     #[test]
     fn sent_deliveries_round_trip_and_reject_corruption() {
