@@ -2194,27 +2194,49 @@ impl RuesClient {
         else {
             return Ok(None);
         };
-        if bytes.len() > MAX_RUES_RESPONSE_BYTES {
-            return Err(HyperlaneDuskError::Other(
-                "Persisted Dusk finalized event exceeds the transport bound".into(),
-            ));
-        }
-        let mut event: FinalizedContractEvent =
-            serde_json::from_slice(&bytes).map_err(|error| {
-                HyperlaneDuskError::Other(format!(
-                    "Failed to decode persisted Dusk finalized event: {}",
-                    bounded_error(error)
-                ))
-            })?;
         // Archive row IDs are pagination hints, not durable provenance. Use
         // the locally owned topic sequence.
-        event.id = i64::try_from(sequence).map_err(|_| {
+        let id = i64::try_from(sequence).map_err(|_| {
             HyperlaneDuskError::Other(
                 "Dusk finalized-event sequence exceeds i64 provenance range".into(),
             )
         })?;
-        validate_persisted_event(contract_id, topic, &event)?;
-        Ok(Some(event))
+        let decoded = if bytes.len() > MAX_RUES_RESPONSE_BYTES {
+            Err("it exceeds the transport bound".to_owned())
+        } else {
+            serde_json::from_slice::<FinalizedContractEvent>(&bytes)
+                .map_err(bounded_error)
+                .and_then(|mut event| {
+                    event.id = id;
+                    validate_persisted_event(contract_id, topic, &event)
+                        .map(|()| event)
+                        .map_err(|error| bounded_error(&error))
+                })
+        };
+        match decoded {
+            Ok(event) => Ok(Some(event)),
+            // Only rows that passed every check are persisted, so only a
+            // damaged store holds one that does not decode or check. It is
+            // dropped, and the lookup reads the archive again, as for a row
+            // never persisted: the row read then passes the same checks.
+            Err(why) => {
+                warn!(
+                    contract = %hex::encode(contract_id),
+                    topic,
+                    sequence,
+                    %why,
+                    "Dropping a persisted Dusk finalized event that does not decode; reading it from the archive again"
+                );
+                self.event_store()?
+                    .delete(finalized_event_row_key(contract_id, topic, sequence)?)
+                    .map_err(|error| {
+                        HyperlaneDuskError::Other(format!(
+                            "Failed to drop a persisted Dusk finalized event that does not decode: {error}"
+                        ))
+                    })?;
+                Ok(None)
+            }
+        }
     }
 
     /// Durably persist authenticated rows in one synced write.
@@ -5298,25 +5320,19 @@ mod tests {
             assert!(error.contains("[truncated, "), "{error}");
         }
 
-        // A damaged row in the local event store is reported the same way.
+        // A damaged row in the local event store is dropped, its parse
+        // error logged cut to the limit, and read from the archive again.
+        let key = finalized_event_row_key(&contract_id, "dispatch", 3).unwrap();
         client
             .event_store()
             .unwrap()
-            .put(
-                finalized_event_row_key(&contract_id, "dispatch", 3).unwrap(),
-                serde_json::json!({ "id": huge }).to_string(),
-            )
+            .put(&key, serde_json::json!({ "id": huge }).to_string())
             .unwrap();
-        let error = client
+        assert!(client
             .load_finalized_event(&contract_id, "dispatch", 3)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.len() < 2 * MAX_ERROR_BODY_BYTES,
-            "{} bytes",
-            error.len()
-        );
-        assert!(error.contains("[truncated, "), "{error}");
+            .unwrap()
+            .is_none());
+        assert!(client.event_store().unwrap().get(&key).unwrap().is_none());
     }
 
     #[test]
@@ -6191,6 +6207,36 @@ mod tests {
     /// A lookup whose block lacks a record stops before the first row of a
     /// later block, however many rows the contract has after it, instead of
     /// reading them all on every retry.
+    /// A persisted row that does not decode or check, which only a damaged
+    /// store holds, is dropped and read from the archive again, instead of
+    /// failing its sequence's lookups until the store is cleared.
+    #[tokio::test]
+    async fn a_persisted_row_that_does_not_decode_is_read_from_the_archive_again() {
+        let contract_id = [143u8; 32];
+        let archive = Archive::start(vec![archive_row(1, 7, 1, "dispatch", contract_id, &[7])]);
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(archive.url.clone(), directory.path());
+        let key = finalized_event_row_key(&contract_id, "dispatch", 0).unwrap();
+        let other_contract = archive_row(1, 7, 1, "dispatch", [144u8; 32], &[7]);
+        for damaged in [
+            b"{not json".to_vec(),
+            serde_json::to_vec(&serde_json::json!({ "id": 1 })).unwrap(),
+            serde_json::to_vec(&other_contract).unwrap(),
+            vec![b' '; MAX_RUES_RESPONSE_BYTES + 1],
+        ] {
+            client.event_store().unwrap().put(&key, &damaged).unwrap();
+            let provenance = client
+                .finalized_contract_event(&contract_id, "dispatch", 0, 7, &[7])
+                .await
+                .unwrap();
+            assert_eq!(provenance.block_height, 7);
+            // The row read again took its place.
+            let stored = client.event_store().unwrap().get(&key).unwrap().unwrap();
+            let stored: FinalizedContractEvent = serde_json::from_slice(&stored).unwrap();
+            assert_eq!(stored.source, hex::encode(contract_id));
+        }
+    }
+
     #[tokio::test]
     async fn a_lookup_reads_no_further_than_the_first_row_of_a_later_block() {
         let contract_id = [140u8; 32];
