@@ -153,3 +153,10 @@ path = "fuzz_targets/transaction_id.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ledger_lookup"
+path = "fuzz_targets/ledger_lookup.rs"
+test = false
+doc = false
+bench = false

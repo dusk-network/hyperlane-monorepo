@@ -15,10 +15,10 @@ use serde_json::{json, Value as JsonValue};
 
 use super::{
     bounded_body, bounded_text, canonical_event_cursor, decode_event_cursor, graphql_data,
-    next_tx_lookup, parse_block_heights, parse_block_pair, parse_confirmed_transaction,
-    parse_h256_hex, rkyv_deserialize, rkyv_serialize, validate_finalized_event_page,
-    validate_transaction_id, FinalizedContractEvent, FinalizedEventPage, ScanAnchor,
-    MAX_ERROR_BODY_BYTES, MAX_EVENT_TOPIC_BYTES,
+    ledger_block_height, next_tx_lookup, parse_block_heights, parse_block_pair,
+    parse_confirmed_transaction, parse_h256_hex, rkyv_deserialize, rkyv_serialize,
+    validate_finalized_event_page, validate_transaction_id, FinalizedContractEvent,
+    FinalizedEventPage, ScanAnchor, MAX_ERROR_BODY_BYTES, MAX_EVENT_TOPIC_BYTES,
 };
 use crate::checks::Input;
 
@@ -311,6 +311,44 @@ pub fn event_page(data: &[u8]) {
     );
 }
 
+/// `ledger_block_height` reads "not in a block" only from a reply whose
+/// `tx` field is present and null, reads a transaction at exactly its
+/// numeric `blockHeight`, and refuses everything else: a reply without the
+/// field, or that is not an object, says nothing about the ledger.
+pub fn ledger_lookup(data: &[u8]) {
+    let mut input = Input::new(data);
+    let height = input.edgy_u64();
+    let field = match input.u8() % 6 {
+        0 => None,
+        1 => Some(JsonValue::Null),
+        2 => Some(json!({ "blockHeight": height })),
+        3 => Some(json!({ "blockHeight": height.to_string() })),
+        4 => Some(json!({})),
+        _ => Some(json!(false)),
+    };
+    let reply = match input.u8() % 6 {
+        0 => JsonValue::Null,
+        1 => json!([]),
+        2 => json!("ok"),
+        _ => {
+            let mut map = serde_json::Map::new();
+            if let Some(field) = field {
+                map.insert("tx".into(), field);
+            }
+            JsonValue::Object(map)
+        }
+    };
+    let expected = match reply.get("tx") {
+        None => None,
+        Some(JsonValue::Null) => Some(None),
+        Some(transaction) => transaction
+            .get("blockHeight")
+            .and_then(JsonValue::as_u64)
+            .map(Some),
+    };
+    assert_eq!(ledger_block_height("ab", &reply).ok(), expected, "{reply}");
+}
+
 /// Transaction IDs go into GraphQL queries as they are, so only exactly 64
 /// hex digits are taken: nothing that could end the query's string.
 pub fn transaction_id(data: &[u8]) {
@@ -495,6 +533,8 @@ pub fn contract_reply(data: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use crate::checks::run_cases;
 
     #[test]
@@ -515,6 +555,34 @@ mod tests {
     #[test]
     fn event_pages_are_accepted_exactly_when_consistent() {
         run_cases(24, 40_000, 200, super::event_page);
+    }
+
+    /// A ledger lookup reply without the `tx` field it asked for read as
+    /// the transaction not being in a block (F-23, as F-1 for submissions).
+    #[test]
+    fn a_ledger_lookup_without_its_tx_field_is_an_error() {
+        for reply in [
+            json!(null),
+            json!({}),
+            json!([]),
+            json!("ok"),
+            json!({ "mempoolTx": null }),
+        ] {
+            assert!(super::ledger_block_height("ab", &reply).is_err(), "{reply}");
+        }
+        assert_eq!(
+            super::ledger_block_height("ab", &json!({ "tx": null })).ok(),
+            Some(None)
+        );
+        assert_eq!(
+            super::ledger_block_height("ab", &json!({ "tx": { "blockHeight": 7 } })).ok(),
+            Some(Some(7))
+        );
+    }
+
+    #[test]
+    fn ledger_lookups_read_only_what_the_reply_says() {
+        run_cases(33, 20_000, 24, super::ledger_lookup);
     }
 
     #[test]

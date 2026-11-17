@@ -2679,19 +2679,7 @@ impl RuesClient {
         validate_transaction_id(tx_id)?;
         let query = format!(r#"query {{ tx(hash: "{tx_id}") {{ blockHeight }} }}"#);
         let data = self.graphql_query(&query).await?;
-        let Some(transaction) = data.get("tx").filter(|value| !value.is_null()) else {
-            return Ok(None);
-        };
-        let height = transaction
-            .get("blockHeight")
-            .and_then(JsonValue::as_u64)
-            .ok_or_else(|| {
-                HyperlaneDuskError::Other(format!(
-                    "Ledger transaction {tx_id} is missing numeric blockHeight: {}",
-                    bounded_json(transaction)
-                ))
-            })?;
-        Ok(Some(height))
+        ledger_block_height(tx_id, &data)
     }
 
     /// Whether the node holds transaction `tx_id`, in its mempool or in a
@@ -2949,6 +2937,33 @@ fn parse_confirmed_transaction(
         }
     };
     Ok(ConfirmedTransaction { gas_spent, error })
+}
+
+/// The height of the block a `tx(hash)` lookup found transaction `tx_id`
+/// in, or `None` when the ledger does not hold it. Only the field the
+/// lookup asked for, present and null, means that: a reply without it, or
+/// that is not an object (`{}`, a null `data` from a proxy or cache in
+/// front of the node), is an error, as in a submission lookup.
+fn ledger_block_height(tx_id: &str, data: &JsonValue) -> Result<Option<u64>, HyperlaneDuskError> {
+    let Some(transaction) = data.get("tx") else {
+        return Err(HyperlaneDuskError::Other(format!(
+            "Lookup of Dusk transaction {tx_id} answered without its tx field: {}",
+            bounded_json(data)
+        )));
+    };
+    if transaction.is_null() {
+        return Ok(None);
+    }
+    let height = transaction
+        .get("blockHeight")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| {
+            HyperlaneDuskError::Other(format!(
+                "Ledger transaction {tx_id} is missing numeric blockHeight: {}",
+                bounded_json(transaction)
+            ))
+        })?;
+    Ok(Some(height))
 }
 
 fn parse_block_heights(data: &JsonValue) -> Result<(u64, u64), HyperlaneDuskError> {
