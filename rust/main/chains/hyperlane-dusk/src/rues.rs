@@ -2553,6 +2553,15 @@ impl RuesClient {
         &self,
         pair: &BlockPair,
     ) -> Result<Vec<NonFinalBlock>, HyperlaneDuskError> {
+        // The endpoint reports the heights. Hyperlane's cursors hold u32
+        // heights (`finalized_block_number`), so no honest one is larger,
+        // and within that range the arithmetic below cannot overflow.
+        let highest = pair.latest.max(pair.finalized);
+        if highest > u64::from(u32::MAX) {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Dusk block height {highest} exceeds the shared u32 cursor range"
+            )));
+        }
         let first = pair.finalized + 1;
         let last = pair.latest + 2;
         let query = format!(
@@ -3881,6 +3890,37 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    /// Heights past Hyperlane's u32 cursor range are refused before any
+    /// arithmetic on them, which overflowed near `u64::MAX`.
+    #[tokio::test]
+    async fn non_final_blocks_refuse_heights_past_the_cursor_range() {
+        let client = RuesClient::new(Url::parse("http://127.0.0.1:9").unwrap()).unwrap();
+        for (latest, finalized) in [
+            (u64::MAX, u64::MAX),
+            (u64::MAX, u64::MAX - 1),
+            (u64::MAX - 1, u64::MAX - 2),
+            (u64::from(u32::MAX) + 1, u64::from(u32::MAX)),
+        ] {
+            let pair = BlockPair {
+                latest,
+                latest_hash: H256::repeat_byte(11),
+                finalized,
+                finalized_hash: H256::repeat_byte(10),
+            };
+            let error = client
+                .non_final_blocks(&pair)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(&format!(
+                    "height {latest} exceeds the shared u32 cursor range"
+                )),
+                "{error}"
+            );
         }
     }
 
