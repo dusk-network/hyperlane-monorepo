@@ -207,6 +207,52 @@ pub(crate) enum LogLookup {
     Unknown(String),
 }
 
+/// Blocks past the tip at which a record was first missed that its log
+/// must be complete through before the archive is held to lack the
+/// record's row. A check reads the tip before contract state, which can
+/// hold a few newer blocks: more behind an endpoint that spreads requests
+/// over nodes. This many, over ten minutes of blocks, is far more.
+pub(crate) const MISSING_RECORD_MARGIN: u64 = 64;
+/// Missed records whose first sighting a `MissingRecords` keeps.
+const MAX_MISSING_RECORDS: usize = 1024;
+
+/// Records contract state holds, such as a delivery or an announcement,
+/// that their event log has not shown, with the node's tip when each was
+/// first missed.
+///
+/// A record state holds is in a block at or below the tip state was read
+/// at. When the log holds every finalized row up to its last final block
+/// without the record, and no block above that one holds it either, its
+/// block was accepted after the check read the tip, was rolled back during
+/// the check, or is final and the archive lacks its row. Once the log is
+/// complete through `MISSING_RECORD_MARGIN` blocks past the tip at which
+/// the record was first missed, and it still is missed, only the last
+/// remains. No record counts without its row either way; the checks then
+/// report the archive as critical, so that the endpoint can be fixed.
+#[derive(Debug, Default)]
+pub(crate) struct MissingRecords {
+    first_tips: HashMap<Vec<u8>, u64>,
+}
+
+impl MissingRecords {
+    /// Note that record `key` is missed by a check that read tip `tip` and
+    /// found the log complete through `final_block`. The tip at which it
+    /// was first missed, once the log is complete far enough past it to
+    /// show that the archive lacks the record's row.
+    pub(crate) fn missed(&mut self, key: &[u8], tip: u64, final_block: u64) -> Option<u64> {
+        if self.first_tips.len() >= MAX_MISSING_RECORDS && !self.first_tips.contains_key(key) {
+            self.first_tips.clear();
+        }
+        let first = *self.first_tips.entry(key.to_vec()).or_insert(tip);
+        (final_block >= first.saturating_add(MISSING_RECORD_MARGIN)).then_some(first)
+    }
+
+    /// Record `key` was found, or contract state no longer holds it.
+    pub(crate) fn settled(&mut self, key: &[u8]) {
+        self.first_tips.remove(key);
+    }
+}
+
 /// How one pass over a contract's rows for an event log ended.
 enum LogScan {
     /// It read every row up to the end of the archive or up to a row above
@@ -1783,6 +1829,41 @@ fn decode_state(bytes: &[u8], all_published: bool) -> Option<LogState> {
 mod tests {
     use super::super::tests::{archive_row, test_client_with_event_store, Archive};
     use super::*;
+
+    #[test]
+    fn a_record_counts_as_missing_from_the_archive_only_far_past_where_it_was_first_missed() {
+        let mut missing = MissingRecords::default();
+        // First missed at tip 101: blocks up to it, and a few above, may
+        // hold it without the log having read them final yet.
+        assert_eq!(missing.missed(b"a", 101, 101), None);
+        assert_eq!(missing.missed(b"a", 140, 140), None);
+        assert_eq!(
+            missing.missed(b"a", 166, 101 + MISSING_RECORD_MARGIN - 1),
+            None
+        );
+        // The log is complete far enough past the first tip.
+        assert_eq!(
+            missing.missed(b"a", 166, 101 + MISSING_RECORD_MARGIN),
+            Some(101)
+        );
+        // Another record is missed on its own; a record found starts over.
+        assert_eq!(missing.missed(b"b", 166, 166), None);
+        missing.settled(b"a");
+        assert_eq!(missing.missed(b"a", 166, 166), None);
+        // At the bound, a record missed for the first time clears the rest,
+        // which count again from the tip at which they are next missed.
+        let mut missing = MissingRecords::default();
+        for key in 0..MAX_MISSING_RECORDS {
+            missing.missed(&key.to_be_bytes(), 1_000, 1_000);
+        }
+        assert_eq!(missing.first_tips.len(), MAX_MISSING_RECORDS);
+        assert_eq!(
+            missing.missed(&MAX_MISSING_RECORDS.to_be_bytes(), 1_000, 1_000),
+            None
+        );
+        assert_eq!(missing.first_tips.len(), 1);
+        assert_eq!(missing.missed(&0usize.to_be_bytes(), 2_000, 2_000), None);
+    }
 
     /// A log of `deliver` rows of `contract_id`, keyed by their data.
     fn test_log(contract_id: [u8; 32], limits: BlockLimits) -> EventLog {

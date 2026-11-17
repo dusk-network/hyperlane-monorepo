@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use hyperlane_core::{
     Announcement, ChainResult, FixedPointNumber, HyperlaneChain, HyperlaneContract,
@@ -15,7 +15,8 @@ use hyperlane_dusk_types::message::keccak256;
 use hyperlane_dusk_types::{events, EthAddress};
 
 use crate::rues::{
-    list_reply, rkyv_deserialize, rkyv_serialize, CheckHold, EventLog, LogLookup, Read,
+    critical_report_due, list_reply, rkyv_deserialize, rkyv_serialize, BlockPair, CheckHold,
+    EventLog, LogLookup, MissingRecords, Read, MISSING_RECORD_MARGIN,
 };
 use crate::{ConnectionConf, DuskProvider, DuskSigner, HyperlaneDuskError, RuesClient};
 
@@ -54,6 +55,9 @@ struct AnnouncementReads {
     /// A validator's own startup check, by validator. A final location
     /// holds for good.
     own: HashMap<[u8; 20], (CheckHold, OwnCheck)>,
+    /// Announcements a validator's list holds that no block was found to
+    /// hold, by announcement log key.
+    missing: MissingRecords,
 }
 
 impl AnnouncementReads {
@@ -336,25 +340,30 @@ impl DuskValidatorAnnounce {
         pair: &crate::rues::BlockPair,
     ) -> ChainResult<OwnCheck> {
         let location_hash = keccak256(location.as_bytes());
+        let key = location_key(&validator, &location_hash);
         // An unannounced location reads no blocks.
         if !self
             .location_hashes(validator)
             .await?
             .contains(&location_hash)
         {
+            self.reads().missing.settled(&key);
             return Ok(OwnCheck::Known(Vec::new()));
         }
-        let key = location_key(&validator, &location_hash);
         Ok(
             match self
                 .rues
                 .finalized_event_log_lookup(log, &key, pair, ANNOUNCEMENT_LOG_PAGES)
                 .await
             {
-                Ok(LogLookup::Found(_)) => OwnCheck::Known(vec![location.to_owned()]),
-                Ok(LogLookup::Absent { final_block }) => OwnCheck::Pending(format!(
-                    "no finalized block up to block {final_block}, the last final one, holds the announcement"
-                )),
+                Ok(LogLookup::Found(_)) => {
+                    self.reads().missing.settled(&key);
+                    OwnCheck::Known(vec![location.to_owned()])
+                }
+                Ok(LogLookup::Absent { final_block }) => {
+                    self.missed_announcement(log, validator, &location_hash, pair, final_block)
+                        .await
+                }
                 Ok(LogLookup::Unknown(reason)) => {
                     debug!(%reason, "Dusk announcement log cannot show the announcement final yet");
                     OwnCheck::Unsettled(format!(
@@ -370,6 +379,71 @@ impl DuskValidatorAnnounce {
                 }
             },
         )
+    }
+}
+
+impl DuskValidatorAnnounce {
+    /// What a check of `validator`'s announcement of the location hashed
+    /// `location_hash`, which its list holds, finds when the announcement
+    /// log holds none up to `final_block`, the last final block: pending,
+    /// until the log is complete through `MISSING_RECORD_MARGIN` blocks past
+    /// the tip at which the check first missed it (`MissingRecords`). Then,
+    /// unless a block above the last final one holds it again after a
+    /// rollback, the archive lacks its row, which is reported as critical:
+    /// the contract refuses the same location again, so the validator waits
+    /// until another location is announced or the archive holds the row.
+    async fn missed_announcement(
+        &self,
+        log: &EventLog,
+        validator: [u8; 20],
+        location_hash: &[u8; 32],
+        pair: &BlockPair,
+        final_block: u64,
+    ) -> OwnCheck {
+        let pending = || {
+            OwnCheck::Pending(format!(
+                "no finalized block up to block {final_block}, the last final one, holds the announcement"
+            ))
+        };
+        let key = location_key(&validator, location_hash);
+        let Some(first_tip) = self.reads().missing.missed(&key, pair.tip().0, final_block) else {
+            return pending();
+        };
+        let pending_events = match self
+            .rues
+            .non_final_events(pair, &self.va_id, log.topic)
+            .await
+        {
+            Ok(events) => events,
+            Err(error) => {
+                return OwnCheck::Unsettled(format!(
+                    "no finalized block up to block {final_block}, the last final one, holds the announcement, and the blocks above it cannot be read: {}",
+                    crate::rues::bounded_error(&error)
+                ))
+            }
+        };
+        if pending_events.iter().any(|event| {
+            decode_announcement(&event.data).is_some_and(|announcement| {
+                announcement.validator.0 == validator
+                    && keccak256(announcement.storage_location.as_bytes()) == *location_hash
+            })
+        }) {
+            return pending();
+        }
+        let detail = format!(
+            "no block holds the announcement: no finalized block up to block {final_block}, the last final one and at least {MISSING_RECORD_MARGIN} blocks past tip {first_tip} where it was first missed, and no block above it. The node's archive lacks the announcement's finalized row, and the contract refuses the same location again: announce another storage location, or use an endpoint whose archive holds the row"
+        );
+        let what = format!("{}/{}", log.topic, hex::encode(&key));
+        if critical_report_due(&self.va_id, &what, first_tip) {
+            error!(
+                validator = %hex::encode(validator),
+                final_block,
+                first_tip,
+                %detail,
+                "CRITICAL: Dusk archive is missing a finalized announcement that contract state proves exists"
+            );
+        }
+        OwnCheck::Pending(detail)
     }
 }
 

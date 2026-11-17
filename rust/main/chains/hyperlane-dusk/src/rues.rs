@@ -35,7 +35,10 @@ pub(crate) use batch::{
 pub use endpoint::QueryRateLimit;
 use endpoint::{Endpoint, RequestClass};
 use event_log::EventLogLocks;
-pub(crate) use event_log::{CheckHold, EventLog, LogEntry, LogLookup, LogState, BLOCK_LIMITS};
+pub(crate) use event_log::{
+    CheckHold, EventLog, LogEntry, LogLookup, LogState, MissingRecords, BLOCK_LIMITS,
+    MISSING_RECORD_MARGIN,
+};
 pub(crate) use submissions::{
     Holder, PreparedDelivery, Reservation, SentDelivery, Submission, TransactionStatus,
     MAX_PREPARED_DELIVERIES, MAX_RESERVATION_TXS,
@@ -111,7 +114,7 @@ static ARCHIVE_GAP_REPORTS: OnceLock<StdMutex<HashMap<ArchiveGapKey, std::time::
 /// Whether a critical condition of a contract and topic at a block, such as
 /// a missing block or a halted event log, is due to be reported again,
 /// recording the report if so.
-fn critical_report_due(contract_id: &[u8; 32], topic: &str, block_height: u64) -> bool {
+pub(crate) fn critical_report_due(contract_id: &[u8; 32], topic: &str, block_height: u64) -> bool {
     let reports = ARCHIVE_GAP_REPORTS.get_or_init(|| StdMutex::new(HashMap::new()));
     let mut reports = reports.lock().unwrap_or_else(PoisonError::into_inner);
     let now = std::time::Instant::now();

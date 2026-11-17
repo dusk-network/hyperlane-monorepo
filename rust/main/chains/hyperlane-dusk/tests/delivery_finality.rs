@@ -848,6 +848,102 @@ async fn validator_startup_waits_until_its_announcement_is_final() {
     assert!(error.contains("no eventCursorDir"), "{error}");
 }
 
+/// Final blocks on top of the chain, through `margin` blocks past `tip`.
+fn finalize_past(node: &mut Node, tip: u64, margin: u64) {
+    while node.tip() < tip + margin {
+        node.push(vec![]);
+    }
+    node.finalized = node.tip();
+}
+
+/// An announcement the validator's list holds, in a block the archive
+/// finalized without its row, keeps startup waiting, and is reported as
+/// missing from the archive once the log is complete far past the tip at
+/// which it was first missed: the contract refuses the same location again.
+#[tokio::test]
+async fn an_announcement_the_archive_lacks_is_reported_as_missing() {
+    let mut node = Node::new(100);
+    let block = node.push(vec![]);
+    node.locations = vec![LOCATION.to_owned()];
+    node.finalized = block;
+    let fixture = Fixture::start(node);
+    let strict = fixture.announcements_with_log().with_own_location(LOCATION);
+    let error = strict
+        .get_announced_storage_locations(&[validator()])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("no finalized block up to block 101") && !error.contains("lacks"),
+        "{error}"
+    );
+
+    finalize_past(&mut fixture.node(), block, 63);
+    fixture.next_tick().await;
+    let error = strict
+        .get_announced_storage_locations(&[validator()])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(!error.contains("lacks"), "{error}");
+
+    finalize_past(&mut fixture.node(), block, 64);
+    fixture.next_tick().await;
+    let error = strict
+        .get_announced_storage_locations(&[validator()])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(LOCATION)
+            && error.contains("archive lacks the announcement's finalized row")
+            && error.contains("announce another storage location"),
+        "{error}"
+    );
+}
+
+/// An announcement rolled back and put in a later block again, which is
+/// not final yet, is only pending, however long after it was first missed.
+#[tokio::test]
+async fn an_announcement_in_a_block_above_the_last_final_one_is_not_reported_as_missing() {
+    let mut node = Node::new(100);
+    let block = node.push(vec![]);
+    node.locations = vec![LOCATION.to_owned()];
+    node.finalized = block;
+    let fixture = Fixture::start(node);
+    let strict = fixture.announcements_with_log().with_own_location(LOCATION);
+    assert!(strict
+        .get_announced_storage_locations(&[validator()])
+        .await
+        .is_err());
+
+    let again = {
+        let mut node = fixture.node();
+        finalize_past(&mut node, block, 64);
+        node.push(vec![Event::announced(VALIDATOR, LOCATION)])
+    };
+    fixture.next_tick().await;
+    let error = strict
+        .get_announced_storage_locations(&[validator()])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("no finalized block up to block 165") && !error.contains("lacks"),
+        "{error}"
+    );
+
+    fixture.node().finalized = again;
+    fixture.next_tick().await;
+    assert_eq!(
+        strict
+            .get_announced_storage_locations(&[validator()])
+            .await
+            .unwrap(),
+        vec![vec![LOCATION.to_owned()]]
+    );
+}
+
 #[tokio::test]
 async fn with_an_announcement_log_startup_counts_only_a_finalized_announcement() {
     let mut node = Node::new(100);
@@ -1007,6 +1103,45 @@ async fn a_delivery_rolled_back_within_the_check_never_counts_with_a_delivery_lo
     );
     // The relayer checks again later and relays the message again.
     assert_eq!(delivered_with_log(&fixture).await, Ok(false));
+}
+
+/// A delivery the Mailbox reports, in a block the archive finalized without
+/// its `ProcessId` row, never counts, and is reported as missing from the
+/// archive once the log is complete far past the tip at which it was first
+/// missed.
+#[tokio::test]
+async fn a_delivery_the_archive_lacks_is_reported_as_missing() {
+    let mut node = Node::new(100);
+    let block = node.push(vec![]);
+    node.delivered.insert(MESSAGE);
+    node.finalized = block;
+    let fixture = Fixture::start(node);
+    let mailbox = fixture.mailbox_with_log();
+    let delivered = || async {
+        mailbox
+            .delivered(message_id())
+            .await
+            .map_err(|error| error.to_string())
+    };
+    let error = delivered().await.unwrap_err();
+    assert!(
+        error.contains("rolled back during this check, or the node's archive skipped it"),
+        "{error}"
+    );
+
+    finalize_past(&mut fixture.node(), block, 63);
+    fixture.next_tick().await;
+    let error = delivered().await.unwrap_err();
+    assert!(!error.contains("lacks"), "{error}");
+
+    finalize_past(&mut fixture.node(), block, 64);
+    fixture.next_tick().await;
+    let error = delivered().await.unwrap_err();
+    assert!(
+        error.contains("archive lacks the delivery's finalized ProcessId row")
+            && error.contains("no finalized block up to block 165"),
+        "{error}"
+    );
 }
 
 #[tokio::test]

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use hyperlane_core::{
     accumulator::incremental::IncrementalMerkle, BatchResult, ChainResult, Checkpoint,
@@ -18,10 +18,10 @@ use hyperlane_dusk_types::merkle::{IncrementalMerkle as HookTree, TREE_DEPTH};
 
 use crate::final_records::FinalRecords;
 use crate::rues::{
-    bounded_body, bounded_error, bounded_json, bounded_text, fits_one_aggregate, list_reply,
-    rkyv_deserialize, rkyv_serialize, BlockPair, CheckHold, ConfirmedTransaction, LogLookup,
-    PreparedDelivery, Read, SentDelivery, TransactionStatus, BOOL_REPLY, ID_REPLY, U32_REPLY,
-    U64_REPLY,
+    bounded_body, bounded_error, bounded_json, bounded_text, critical_report_due,
+    fits_one_aggregate, list_reply, rkyv_deserialize, rkyv_serialize, BlockPair, CheckHold,
+    ConfirmedTransaction, LogLookup, MissingRecords, PreparedDelivery, Read, SentDelivery,
+    TransactionStatus, BOOL_REPLY, ID_REPLY, MISSING_RECORD_MARGIN, U32_REPLY, U64_REPLY,
 };
 use crate::{ConnectionConf, DuskProvider, DuskSigner, HyperlaneDuskError, RuesClient};
 
@@ -199,6 +199,8 @@ type LogProgress = crate::rues::LogState;
 #[derive(Debug, Default)]
 struct DeliveryChecks {
     checks: HashMap<H256, (CheckHold, Delivery)>,
+    /// Deliveries the Mailbox reports that no block was found to hold.
+    missing: MissingRecords,
 }
 
 impl DeliveryChecks {
@@ -1483,6 +1485,7 @@ impl DuskMailbox {
         let delivered: bool =
             rkyv_deserialize(&self.rues.tick_read(pair.finalized(), read).await?)?;
         if !delivered {
+            self.delivery_found(&id_bytes);
             return Ok(Delivery::Absent);
         }
         let lookup = self
@@ -1496,7 +1499,10 @@ impl DuskMailbox {
             .await;
         // Only a finalized delivery counts.
         let final_block = match lookup {
-            Ok(LogLookup::Found(_)) => return Ok(Delivery::Final),
+            Ok(LogLookup::Found(_)) => {
+                self.delivery_found(&id_bytes);
+                return Ok(Delivery::Final);
+            }
             Ok(LogLookup::Absent { final_block }) => final_block,
             Ok(LogLookup::Unknown(reason)) => {
                 debug!(message_id = ?id, %reason, "Dusk delivery log cannot show the delivery final yet");
@@ -1535,6 +1541,7 @@ impl DuskMailbox {
                 }
             };
             if processed.message_id == id_bytes {
+                self.delivery_found(&id_bytes);
                 return Ok(Delivery::Pending(format!(
                     "Message {id:?} is delivered in Dusk block {} ({:?}, transaction {}), which is not final yet",
                     event.block_height,
@@ -1546,7 +1553,31 @@ impl DuskMailbox {
         // In no final block and in no block above them: a block that held
         // it was rolled back during this check, and the next one reads it
         // as not delivered, or the archive skipped the final block that
-        // holds it and this stays so.
+        // holds it and this stays so. Missed while the log reads far enough
+        // past the tip at which it was first missed, only the latter
+        // remains.
+        let missed = self
+            .delivery_checks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .missing
+            .missed(&id_bytes, pair.tip().0, final_block);
+        if let Some(first_tip) = missed {
+            let detail = format!(
+                "Message {id:?} is delivered at the Dusk tip, but no block holds its delivery: no finalized block up to block {final_block}, the last final one and at least {MISSING_RECORD_MARGIN} blocks past tip {first_tip} where it was first missed, and no block above it. The node's archive lacks the delivery's finalized ProcessId row, and the delivery does not count without it: repair or rebuild the node's archive, or use another endpoint"
+            );
+            let what = format!("{}/{}", events::ProcessId::TOPIC, hex::encode(id_bytes));
+            if critical_report_due(&self.mailbox_id, &what, first_tip) {
+                error!(
+                    message_id = ?id,
+                    final_block,
+                    first_tip,
+                    %detail,
+                    "CRITICAL: Dusk archive is missing a finalized delivery that contract state proves exists"
+                );
+            }
+            return Ok(Delivery::Unsettled(detail));
+        }
         warn!(
             message_id = ?id,
             final_block,
@@ -1555,6 +1586,16 @@ impl DuskMailbox {
         Ok(Delivery::Unsettled(format!(
             "Message {id:?} is delivered at the Dusk tip, but no finalized block up to block {final_block}, the last final one, holds its delivery, and no block above it does either: the block that did was rolled back during this check, or the node's archive skipped it"
         )))
+    }
+
+    /// Message `id`'s delivery was found, or the Mailbox no longer reports
+    /// it delivered.
+    fn delivery_found(&self, id: &[u8; 32]) {
+        self.delivery_checks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .missing
+            .settled(id);
     }
 
     /// The gas limit a delivery is submitted with: the relayer's, which
