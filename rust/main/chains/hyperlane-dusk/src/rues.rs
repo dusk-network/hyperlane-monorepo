@@ -3944,6 +3944,33 @@ mod tests {
                 "{error}"
             );
         }
+        // The range's last height is read: here the node then answers that
+        // it holds no block above the last final one.
+        let pair = BlockPair {
+            latest: u64::from(u32::MAX),
+            latest_hash: H256::repeat_byte(11),
+            finalized: u64::from(u32::MAX) - 1,
+            finalized_hash: H256::repeat_byte(10),
+        };
+        let url = test_server(vec![(200, serde_json::json!({ "blocks": [] }).to_string())]);
+        let error = RuesClient::new(url)
+            .unwrap()
+            .non_final_blocks(&pair)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("it was rolled back"), "{error}");
+    }
+
+    /// A pass reads the largest block `BLOCK_LIMITS` allows whole: at full
+    /// pages from an anchor up to `SCAN_ANCHOR_SPACING` rows before it and
+    /// its fence page, and still the block's rows when pages shrink to half
+    /// size.
+    #[test]
+    fn a_scan_pass_reads_the_largest_block_whole() {
+        let page = FINALIZED_EVENT_PAGE_SIZE as u64;
+        assert!(MAX_SCAN_PAGES * page >= BLOCK_LIMITS.rows + SCAN_ANCHOR_SPACING + page);
+        assert!(MAX_SCAN_PAGES * (page / 2) >= BLOCK_LIMITS.rows);
     }
 
     #[tokio::test]
@@ -6234,6 +6261,25 @@ mod tests {
             let stored = client.event_store().unwrap().get(&key).unwrap().unwrap();
             let stored: FinalizedContractEvent = serde_json::from_slice(&stored).unwrap();
             assert_eq!(stored.source, hex::encode(contract_id));
+        }
+
+        // A well-formed row is read up to the transport bound and served
+        // from the store as it is; one byte over, it is dropped unread and
+        // replaced by the row read again.
+        let row = serde_json::to_vec(&archive_row(1, 7, 1, "dispatch", contract_id, &[7])).unwrap();
+        for (size, served) in [
+            (MAX_RUES_RESPONSE_BYTES, true),
+            (MAX_RUES_RESPONSE_BYTES + 1, false),
+        ] {
+            let mut padded = row.clone();
+            padded.resize(size, b' ');
+            client.event_store().unwrap().put(&key, &padded).unwrap();
+            client
+                .finalized_contract_event(&contract_id, "dispatch", 0, 7, &[7])
+                .await
+                .unwrap();
+            let stored = client.event_store().unwrap().get(&key).unwrap().unwrap();
+            assert_eq!(stored.len() == size, served, "{size} bytes");
         }
     }
 
