@@ -32,7 +32,7 @@ dusk-bytes = "0.1.7"
 # separately built `dusk-tx` helper. Pin the companion repository to an exact
 # reviewed commit so release/Docker builds do not depend on an adjacent checkout
 # and cannot drift with a moving branch.
-hyperlane-dusk-types = { git = "https://github.com/dusk-network/hyperlane-dusk", rev = "dcacccafe4f3016431293263f0e863fa4c7cd217", features = ["serde"] }
+hyperlane-dusk-types = { git = "https://github.com/dusk-network/hyperlane-dusk", rev = "bb10aaa749f42c5fc83e1945b2b9552c2246b0ab", features = ["serde"] }
 
 # rkyv for RUES binary serialization (matching on-chain contract serialization)
 rkyv = { version = "0.7", features = ["validation"] }
