@@ -84,6 +84,15 @@ const MAX_NON_FINAL_BLOCKS: u64 = 64;
 /// Blocks whose archived events of one contract and topic a client keeps for
 /// finality checks.
 const NON_FINAL_EVENT_CACHE_BLOCKS: usize = 256;
+/// Most `finalizedEvents` pages one pass of a record lookup reads (see
+/// `scan_from`): twice the full pages of the largest block `BLOCK_LIMITS`
+/// allows. A pass that runs out records how far it read, so the next lookup
+/// resumes there and a long history is read over several lookups. A lookup
+/// resumes at most `SCAN_ANCHOR_SPACING` rows before its block once the
+/// rows before it were read, so every block within `BLOCK_LIMITS` is read
+/// whole. An endpoint that pages without end holds a lookup for this many
+/// pages, not for good.
+const MAX_SCAN_PAGES: u64 = 2 * BLOCK_LIMITS.rows / FINALIZED_EVENT_PAGE_SIZE as u64;
 
 type SharedRuesClients = HashMap<(String, PathBuf), RuesClient>;
 static SHARED_RUES_CLIENTS: OnceLock<StdMutex<SharedRuesClients>> = OnceLock::new();
@@ -1778,11 +1787,16 @@ impl RuesClient {
     /// One pass over the contract's archive rows from `start`, or from its
     /// first row, for the rows of `block_height`. Reads to the end of that
     /// block, so the block's rows can be cached, and stops before the first
-    /// row of a later block once every wanted sequence has a row. A block
+    /// row of a later block: Rusk archives blocks in height order, so no row
+    /// of the block comes after it, and a wanted sequence without a row by
+    /// then has none in this archive, which the caller diagnoses. A block
     /// over the cache bound is read only until every wanted sequence has a
-    /// row. Without a row for every wanted sequence the scan reads to the
-    /// end of the archive. A resumed scan first checks `start`'s fence row,
-    /// as `ScanAnchor` describes.
+    /// row. A resumed scan first checks `start`'s fence row, as `ScanAnchor`
+    /// describes.
+    ///
+    /// A pass reads at most `MAX_SCAN_PAGES` pages. One that runs out
+    /// records its position, as at its end, and fails; the next lookup
+    /// resumes from there.
     ///
     /// A row the archive has not inserted yet is not an error here: the
     /// caller reports it, and the next lookup resumes from the anchors this
@@ -1812,6 +1826,7 @@ impl RuesClient {
         let mut size = PageSize::largest();
         let mut capture = BlockCapture::new(self.block_cache().limits.block_bytes);
         let mut later = None;
+        let mut pages = 0u64;
         loop {
             let cursor = previous_id.map(canonical_event_cursor);
             let (page, bytes) = self
@@ -1825,6 +1840,7 @@ impl RuesClient {
                 &page,
             )?;
             size.after_page(page.events.len(), bytes);
+            pages = pages.saturating_add(1);
             let has_next_page = page.has_next_page;
             let mut events = page.events.into_iter();
             if let Some(anchor) = fence.take() {
@@ -1847,18 +1863,14 @@ impl RuesClient {
             let mut stop = false;
             for event in events {
                 if event.block_height > block_height {
-                    // The scanned block's rows all come before this one.
+                    // The scanned block's rows all come before this one. Stop
+                    // before it: the position recorded below then ends the
+                    // scanned block, where a lookup of a later block can
+                    // start.
                     capture.complete = true;
-                    if later.is_none() {
-                        later = Some(event.clone());
-                    }
-                    if found.len() == wanted.len() {
-                        // Stop before it: the position recorded below then
-                        // ends the scanned block, where a lookup of a later
-                        // block can start.
-                        stop = true;
-                        break;
-                    }
+                    later = Some(event);
+                    stop = true;
+                    break;
                 }
                 previous_id = Some(event.id);
                 rank = rank.saturating_add(1);
@@ -1916,16 +1928,25 @@ impl RuesClient {
                 }
             }
 
-            if stop || !has_next_page {
+            let out_of_pages = !stop && has_next_page && pages >= MAX_SCAN_PAGES;
+            if stop || !has_next_page || out_of_pages {
                 if !has_next_page && capture.seen {
                     // Rusk archives a finalized block's rows together.
                     capture.complete = true;
                 }
+                let resume_after = last_row.as_ref().map(|event| event.id);
                 if let (Some(event), Some(highest)) = (last_row, highest_block) {
                     let before_block = start_before.max(highest.saturating_add(1));
                     if let Some(anchor) = ScanAnchor::after_row(&event, before_block, rank)? {
                         self.offer_scan_anchor(contract_id, anchor)?;
                     }
+                }
+                if out_of_pages {
+                    return Err(HyperlaneDuskError::Other(format!(
+                        "Dusk archive scan of contract {} read {pages} pages without reaching the end of block {block_height}; the next lookup resumes after row {}",
+                        hex::encode(contract_id),
+                        resume_after.map_or_else(|| "none".to_owned(), |id| id.to_string())
+                    )));
                 }
                 return Ok(ScanOutcome::Done(BlockScan {
                     found,
@@ -4481,6 +4502,115 @@ mod tests {
         }
     }
 
+    /// An archive endpoint that pages a contract's `finalizedEvents` one row
+    /// at a time, which a page may hold: rows `1..=filler` of block
+    /// `filler_height`, then `last`, if any, as the next row; with `filler`
+    /// `None`, filler rows without end. A row is a function of its ID, so a
+    /// scan can resume at any of them. `checkBlock` accepts `last`'s block.
+    struct RowStream {
+        url: Url,
+        address: std::net::SocketAddr,
+        pages: Arc<AtomicU64>,
+        stop: Arc<AtomicBool>,
+        worker: Option<thread::JoinHandle<()>>,
+    }
+
+    impl RowStream {
+        fn start(
+            contract_id: [u8; 32],
+            filler_height: u64,
+            filler: Option<i64>,
+            last: Option<JsonValue>,
+        ) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let url = Url::parse(&format!("http://{address}")).unwrap();
+            let pages = Arc::new(AtomicU64::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_pages = pages.clone();
+            let worker_stop = stop.clone();
+            let worker = thread::spawn(move || {
+                for stream in listener.incoming() {
+                    if worker_stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let Ok(mut stream) = stream else {
+                        continue;
+                    };
+                    let query = String::from_utf8(read_request_body(&mut stream)).unwrap();
+                    let reply = if query.contains("finalizedEvents(") {
+                        worker_pages.fetch_add(1, Ordering::SeqCst);
+                        let id = query
+                            .split_once("cursor: \"")
+                            .and_then(|(_, rest)| rest.split('"').next())
+                            .map_or(1, |cursor| decode_event_cursor(cursor).unwrap() + 1);
+                        let rows =
+                            filler.map_or(i64::MAX, |filler| filler + i64::from(last.is_some()));
+                        let row = match filler {
+                            Some(filler) if id > filler => {
+                                last.clone().filter(|_| id <= rows).map(|mut row| {
+                                    row["id"] = id.into();
+                                    row
+                                })
+                            }
+                            _ => Some(archive_row(
+                                id,
+                                filler_height,
+                                1,
+                                "dispatch",
+                                contract_id,
+                                &id.to_be_bytes(),
+                            )),
+                        };
+                        let cursor = row.as_ref().map(|_| canonical_event_cursor(id));
+                        serde_json::json!({"finalizedEvents": {"json": {
+                            "startCursor": cursor,
+                            "endCursor": cursor,
+                            "hasNextPage": row.is_some() && id < rows,
+                            "events": row.into_iter().collect::<Vec<_>>(),
+                        }}})
+                    } else if query.contains("checkBlock(") {
+                        let finalized = last.as_ref().is_some_and(|row| {
+                            query.contains(&format!("height: {}", row["block_height"]))
+                                && query.contains(row["block_hash"].as_str().unwrap())
+                        });
+                        serde_json::json!({ "checkBlock": finalized })
+                    } else {
+                        serde_json::json!({"errors": [{"message": "unexpected query"}]})
+                    };
+                    let reply = reply.to_string();
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    );
+                }
+            });
+            Self {
+                url,
+                address,
+                pages,
+                stop,
+                worker: Some(worker),
+            }
+        }
+
+        fn pages(&self) -> u64 {
+            self.pages.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for RowStream {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            // Wake the worker from its wait for a connection.
+            let _ = std::net::TcpStream::connect(self.address);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_caught_up_scan_resumes_after_its_last_row() {
         let contract_id = [7u8; 32];
@@ -6013,6 +6143,101 @@ mod tests {
                 .await,
             Err(HyperlaneDuskError::ArchiveMissingRows(_))
         ));
+    }
+
+    /// A lookup whose block lacks a record stops before the first row of a
+    /// later block, however many rows the contract has after it, instead of
+    /// reading them all on every retry.
+    #[tokio::test]
+    async fn a_lookup_reads_no_further_than_the_first_row_of_a_later_block() {
+        let contract_id = [140u8; 32];
+        let mut rows = vec![archive_row(1, 6, 1, "dispatch", contract_id, &[6])];
+        rows.extend((2..=2_001).map(|id| archive_row(id, 8, 2, "dispatch", contract_id, &[8])));
+        let archive = Archive::start(rows);
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(archive.url.clone(), directory.path());
+        let error = client
+            .finalized_contract_event(&contract_id, "dispatch", 0, 7, &[7])
+            .await
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(
+            matches!(error, HyperlaneDuskError::ArchiveMissingRows(_))
+                && text.contains("skipped finalized block 7")
+                && text.contains("finalized block 8"),
+            "{text}"
+        );
+        // The first page holds block 6's row and the first of block 8's.
+        assert_eq!(archive.pages(), [None]);
+        // The scan recorded where block 7's rows would end.
+        let anchors = client.scan_anchors_of(&contract_id);
+        assert_eq!(anchors.len(), 1);
+        assert_eq!((anchors[0].fence_id, anchors[0].before_block), (1, 7));
+    }
+
+    /// An endpoint that pages without end holds a lookup for
+    /// `MAX_SCAN_PAGES` pages, and the lookup records where it stopped.
+    #[tokio::test]
+    async fn a_lookup_reads_at_most_its_page_budget_from_an_endless_archive() {
+        let contract_id = [141u8; 32];
+        let stream = RowStream::start(contract_id, 5, None, None);
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(stream.url.clone(), directory.path());
+        let lookup = client.finalized_contract_event(&contract_id, "dispatch", 0, 6, &[6]);
+        let error = tokio::time::timeout(Duration::from_secs(300), lookup)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(&format!(
+                "read {MAX_SCAN_PAGES} pages without reaching the end of block 6; the next lookup resumes after row {MAX_SCAN_PAGES}"
+            )),
+            "{error}"
+        );
+        assert_eq!(stream.pages(), MAX_SCAN_PAGES);
+        let anchors = client.scan_anchors_of(&contract_id);
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(
+            (
+                anchors[0].fence_id,
+                anchors[0].rank,
+                anchors[0].before_block
+            ),
+            (MAX_SCAN_PAGES as i64, MAX_SCAN_PAGES, 6)
+        );
+    }
+
+    /// A history longer than one lookup's page budget is read over several
+    /// lookups, each resuming where the last one stopped.
+    #[tokio::test]
+    async fn a_history_longer_than_the_page_budget_is_read_over_several_lookups() {
+        let contract_id = [142u8; 32];
+        let filler = MAX_SCAN_PAGES as i64 + 100;
+        let last = archive_row(0, 6, 3, "dispatch", contract_id, &[6]);
+        let stream = RowStream::start(contract_id, 5, Some(filler), Some(last));
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(stream.url.clone(), directory.path());
+        let lookup = client.finalized_contract_event(&contract_id, "dispatch", 0, 6, &[6]);
+        let error = tokio::time::timeout(Duration::from_secs(300), lookup)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("pages without reaching the end of block 6"),
+            "{error}"
+        );
+        assert_eq!(stream.pages(), MAX_SCAN_PAGES);
+        // The next lookup reads the fence row, the 100 filler rows after it
+        // and the record.
+        let provenance = client
+            .finalized_contract_event(&contract_id, "dispatch", 0, 6, &[6])
+            .await
+            .unwrap();
+        assert_eq!(provenance.block_height, 6);
+        assert_eq!(provenance.transaction_id.as_bytes()[32..], [3u8; 32]);
+        assert_eq!(stream.pages(), MAX_SCAN_PAGES + 102);
     }
 
     #[tokio::test]
