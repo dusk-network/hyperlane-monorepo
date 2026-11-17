@@ -231,11 +231,11 @@ impl Fixture {
                     } else {
                         assert_eq!(
                             query,
-                            format!("query {{ tx(hash: \"{tx}\") {{ gasSpent err }} }}")
+                            format!("query {{ tx(hash: \"{tx}\") {{ id gasSpent err }} }}")
                         );
                         worker_queries.fetch_add(1, Ordering::SeqCst);
                         let reply = serde_json::to_vec(&serde_json::json!({"tx":{
-                            "gasSpent":FULL_GAS,"err":"recipient rejected"}}))
+                            "id":tx,"gasSpent":FULL_GAS,"err":"recipient rejected"}}))
                         .unwrap();
                         ("200 OK", reply)
                     }

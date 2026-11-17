@@ -293,9 +293,15 @@ impl Reservation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TransactionStatus {
     /// In a block of the node's chain at `block_height`, with its receipt.
+    /// `in_mempool`: the node still lists it in its mempool too, as it does
+    /// for a moment after accepting its block (`transaction_status`), or
+    /// after a rollback put it back while a stale read still finds the
+    /// block. A caller that would forget the transaction because of its
+    /// block waits until it has left the mempool.
     Included {
         block_height: u64,
         receipt: ConfirmedTransaction,
+        in_mempool: bool,
     },
     /// In the node's mempool.
     Pending,
@@ -739,7 +745,7 @@ impl RuesClient {
         tx_id: &str,
     ) -> Result<TransactionStatus, HyperlaneDuskError> {
         validate_transaction_id(tx_id)?;
-        let ledger = format!(r#"tx(hash: "{tx_id}") {{ blockHeight gasSpent err }}"#);
+        let ledger = format!(r#"tx(hash: "{tx_id}") {{ id blockHeight gasSpent err }}"#);
         let mempool = format!(r#"mempoolTx(hash: "{tx_id}") {{ id }}"#);
         let data = self
             .graphql_query(&format!("query {{ {mempool} {ledger} }}"))
@@ -749,8 +755,26 @@ impl RuesClient {
         }
         for (field, asked) in [(&ledger, "tx"), (&mempool, "mempoolTx"), (&ledger, "tx")] {
             let data = self.graphql_query(&format!("query {{ {field} }}")).await?;
-            if let Some(status) = found(tx_id, &data, &[asked])? {
-                return Ok(status);
+            match found(tx_id, &data, &[asked])? {
+                // A ledger read alone does not say whether the mempool still
+                // lists the transaction: a read of the mempool after it does.
+                Some(TransactionStatus::Included {
+                    block_height,
+                    receipt,
+                    ..
+                }) => {
+                    let data = self
+                        .graphql_query(&format!("query {{ {mempool} }}"))
+                        .await?;
+                    let in_mempool = found(tx_id, &data, &["mempoolTx"])?.is_some();
+                    return Ok(TransactionStatus::Included {
+                        block_height,
+                        receipt,
+                        in_mempool,
+                    });
+                }
+                Some(status) => return Ok(status),
+                None => {}
             }
         }
         Ok(TransactionStatus::Unknown)
@@ -844,8 +868,9 @@ impl RuesClient {
 const MISSING_INTERMEDIATE_NONCE: &str = "Missing intermediate nonce";
 
 /// Where a lookup of transaction `tx_id` that asked for the fields `asked`
-/// and answered `data` found it: in a block (`tx`), in the mempool
-/// (`mempoolTx`), or, `None`, in neither of them.
+/// and answered `data` found it: in a block (`tx`), with whether the
+/// mempool lists it too, in the mempool alone (`mempoolTx`), or, `None`, in
+/// neither of them.
 ///
 /// "Neither" lets the relayer forget a transaction it kept and sign its
 /// message again, so only a reply that says so stands for it: one that
@@ -853,6 +878,12 @@ const MISSING_INTERMEDIATE_NONCE: &str = "Missing intermediate nonce";
 /// does not know. A reply without one of them, or that is not an object at
 /// all, such as `{}` or a `null` data from a proxy or cache in front of the
 /// node, is an error.
+///
+/// A block or the mempool counts only for the transaction asked about: each
+/// entry found must name `tx_id` as its `id`, and a reply with an entry for
+/// another transaction, as a proxy or cache can answer with, is an error
+/// too. Read as `tx_id`'s, another transaction's failed receipt in a final
+/// block would let the relayer forget `tx_id` while it can still land.
 fn found(
     tx_id: &str,
     data: &JsonValue,
@@ -864,7 +895,12 @@ fn found(
             bounded_json(data)
         )));
     }
+    let mempool = data.get("mempoolTx").filter(|value| !value.is_null());
+    if let Some(entry) = mempool {
+        check_identity(tx_id, "mempoolTx", entry)?;
+    }
     if let Some(transaction) = data.get("tx").filter(|value| !value.is_null()) {
+        check_identity(tx_id, "tx", transaction)?;
         let block_height = transaction
             .get("blockHeight")
             .and_then(JsonValue::as_u64)
@@ -877,12 +913,41 @@ fn found(
         return Ok(Some(TransactionStatus::Included {
             block_height,
             receipt: parse_confirmed_transaction(tx_id, transaction)?,
+            in_mempool: mempool.is_some(),
         }));
     }
-    if data.get("mempoolTx").is_some_and(|value| !value.is_null()) {
-        return Ok(Some(TransactionStatus::Pending));
+    Ok(mempool.map(|_| TransactionStatus::Pending))
+}
+
+/// Whether a reply to a lookup of transaction `tx_id` in both places holds
+/// it in either. Each entry found must be of `tx_id`, as in `found`; a
+/// field missing from the reply holds nothing.
+pub(super) fn holds(tx_id: &str, data: &JsonValue) -> Result<bool, HyperlaneDuskError> {
+    let mut held = false;
+    for field in ["mempoolTx", "tx"] {
+        if let Some(entry) = data.get(field).filter(|value| !value.is_null()) {
+            check_identity(tx_id, field, entry)?;
+            held = true;
+        }
     }
-    Ok(None)
+    Ok(held)
+}
+
+/// An entry a lookup of transaction `tx_id` found, in its `field`, must
+/// name `tx_id` as its `id`: Rusk writes it as the hash's 64 hex digits.
+pub(super) fn check_identity(
+    tx_id: &str,
+    field: &str,
+    entry: &JsonValue,
+) -> Result<(), HyperlaneDuskError> {
+    let named = entry.get("id").and_then(JsonValue::as_str);
+    if named.is_some_and(|id| strip_hex_prefix(id).eq_ignore_ascii_case(tx_id)) {
+        return Ok(());
+    }
+    Err(HyperlaneDuskError::Other(format!(
+        "Lookup of Dusk transaction {tx_id} answered with a {field} entry that is not of it: {}",
+        bounded_json(entry)
+    )))
 }
 
 /// Write options that reach the disk before the write returns.
@@ -931,6 +996,70 @@ mod tests {
             found("ab", &json!({ "mempoolTx": null }), &["mempoolTx"]),
             Ok(None)
         ));
+    }
+
+    /// An entry for another transaction than the one asked about, as a
+    /// proxy or cache can answer with, is an error. Read as the asked one's,
+    /// another transaction's failed receipt in a final block let the relayer
+    /// forget a kept transaction that could still land.
+    #[test]
+    fn a_reply_for_another_transaction_is_an_error() {
+        use serde_json::json;
+
+        let both = ["mempoolTx", "tx"];
+        let receipt =
+            |id: &str| json!({ "id": id, "blockHeight": 7, "gasSpent": 1, "err": "Panic" });
+        for reply in [
+            json!({ "mempoolTx": { "id": "ab" }, "tx": receipt("cd") }),
+            json!({ "mempoolTx": null, "tx": receipt("cd") }),
+            json!({ "mempoolTx": { "id": "cd" }, "tx": null }),
+            json!({ "mempoolTx": { "id": "cd" }, "tx": receipt("ab") }),
+            json!({ "mempoolTx": null, "tx": { "blockHeight": 7, "gasSpent": 1, "err": null } }),
+            json!({ "mempoolTx": {}, "tx": null }),
+            json!({ "mempoolTx": { "id": 7 }, "tx": null }),
+        ] {
+            assert!(found("ab", &reply, &both).is_err(), "{reply}");
+        }
+        assert!(found("ab", &json!({ "tx": receipt("cd") }), &["tx"]).is_err());
+        // Its own entries, named in either case; in both places at once, as
+        // for a moment after its block is accepted.
+        assert!(matches!(
+            found(
+                "ab",
+                &json!({ "mempoolTx": { "id": "AB" }, "tx": receipt("ab") }),
+                &both
+            ),
+            Ok(Some(TransactionStatus::Included {
+                block_height: 7,
+                in_mempool: true,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            found(
+                "ab",
+                &json!({ "mempoolTx": null, "tx": receipt("ab") }),
+                &both
+            ),
+            Ok(Some(TransactionStatus::Included {
+                in_mempool: false,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            found(
+                "ab",
+                &json!({ "mempoolTx": { "id": "ab" }, "tx": null }),
+                &both
+            ),
+            Ok(Some(TransactionStatus::Pending))
+        ));
+        assert!(holds("ab", &json!({ "mempoolTx": { "id": "cd" }, "tx": null })).is_err());
+        assert!(matches!(
+            holds("ab", &json!({ "mempoolTx": null, "tx": { "id": "ab" } })),
+            Ok(true)
+        ));
+        assert!(matches!(holds("ab", &json!({})), Ok(false)));
     }
 
     #[test]

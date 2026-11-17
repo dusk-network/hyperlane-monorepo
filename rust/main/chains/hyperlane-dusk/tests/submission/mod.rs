@@ -541,6 +541,7 @@ impl Model {
         }
         self.ledger.get(hash).map_or(Value::Null, |included| {
             json!({
+                "id": hash,
                 "blockHeight": included.height,
                 "gasSpent": included.gas_spent,
                 "err": included.error,
@@ -625,6 +626,10 @@ pub enum Fault {
     /// answer is what it held when the lookup came; taken by such a lookup
     /// only.
     HoldLookupReply(Arc<Gate>),
+    /// Answer a lookup of both `tx` and `mempoolTx` with this ledger entry
+    /// and the mempool as the node holds it, as a proxy or a cache in front
+    /// of the node might; taken by such a lookup only.
+    LedgerEntry(Value),
 }
 
 /// A gate a held request waits at.
@@ -1249,7 +1254,7 @@ fn take_fault(faults: &Faults, route: Route, nonce: Option<u64>, lookup: bool) -
             && (lookup
                 || !matches!(
                     fault,
-                    Fault::BetweenFields { .. } | Fault::HoldLookupReply(_)
+                    Fault::BetweenFields { .. } | Fault::HoldLookupReply(_) | Fault::LedgerEntry(_)
                 ))
     })?;
     Some(faults.remove(position).2)
@@ -1332,6 +1337,11 @@ fn serve(
             } else {
                 (second, first)
             };
+            let answer = json!({ "mempoolTx": mempool, "tx": ledger });
+            return reply(stream, "200 OK", answer.to_string().as_bytes());
+        }
+        Some(Fault::LedgerEntry(ledger)) => {
+            let mempool = state.lock().unwrap().mempool_field(looked_up(&query));
             let answer = json!({ "mempoolTx": mempool, "tx": ledger });
             return reply(stream, "200 OK", answer.to_string().as_bytes());
         }

@@ -2740,7 +2740,9 @@ impl RuesClient {
     /// Whether the node holds transaction `tx_id`, in its mempool or in a
     /// block, within `timeout`. The node accepts a propagated transaction
     /// before its mempool stores it, and checks a transaction with a later
-    /// nonce of the same account against the mempool.
+    /// nonce of the same account against the mempool. An entry the node
+    /// answers with must be of `tx_id` (`submissions::found`): one for
+    /// another transaction is an error.
     ///
     /// Each query, with its waits for the endpoint's rate limit, ends at the
     /// deadline: an answer that would come after it does not count.
@@ -2751,7 +2753,7 @@ impl RuesClient {
     ) -> Result<bool, HyperlaneDuskError> {
         validate_transaction_id(tx_id)?;
         let query = format!(
-            r#"query {{ mempoolTx(hash: "{tx_id}") {{ id }} tx(hash: "{tx_id}") {{ blockHeight }} }}"#
+            r#"query {{ mempoolTx(hash: "{tx_id}") {{ id }} tx(hash: "{tx_id}") {{ id }} }}"#
         );
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -2760,8 +2762,7 @@ impl RuesClient {
                 return Ok(false);
             };
             let data = data?;
-            let held = |field: &str| data.get(field).is_some_and(|value| !value.is_null());
-            if held("mempoolTx") || held("tx") {
+            if submissions::holds(tx_id, &data)? {
                 return Ok(true);
             }
             if tokio::time::Instant::now() >= deadline {
@@ -2819,7 +2820,9 @@ impl RuesClient {
                         // A non-null ledger record is an authoritative
                         // observation. Missing or malformed execution fields
                         // are corruption/schema drift, not a pending state that
-                        // a later response may silently overwrite.
+                        // a later response may silently overwrite, and so is a
+                        // record of another transaction.
+                        submissions::check_identity(tx_id, "tx", tx)?;
                         return parse_confirmed_transaction(tx_id, tx);
                     } else {
                         last_observation_error = None;
@@ -3421,7 +3424,7 @@ fn truncated_text(text: &str, original_len: usize) -> String {
 }
 
 fn transaction_query(tx_id: &str) -> String {
-    format!(r#"query {{ tx(hash: "{tx_id}") {{ gasSpent err }} }}"#)
+    format!(r#"query {{ tx(hash: "{tx_id}") {{ id gasSpent err }} }}"#)
 }
 
 /// How long after a lookup made `waited` into a wait for a transaction the
@@ -3615,7 +3618,7 @@ mod tests {
                 let mut paths = Vec::new();
                 for body in [
                     vec![7],
-                    br#"{"tx":{"gasSpent":1,"err":null}}"#.to_vec(),
+                    br#"{"tx":{"id":"abababababababababababababababababababababababababababababababab","gasSpent":1,"err":null}}"#.to_vec(),
                     br#"{"contract_owner":"fixture-owner"}"#.to_vec(),
                     vec![],
                     vec![],
@@ -3801,7 +3804,7 @@ mod tests {
     fn transaction_query_uses_graphql_quotes_without_literal_backslashes() {
         assert_eq!(
             transaction_query("aabbcc"),
-            r#"query { tx(hash: "aabbcc") { gasSpent err } }"#
+            r#"query { tx(hash: "aabbcc") { id gasSpent err } }"#
         );
     }
 
@@ -4038,7 +4041,10 @@ mod tests {
         let url = test_server(vec![
             (503, "temporarily unavailable"),
             (200, r#"{"errors":[{"message":"archive catching up"}]}"#),
-            (200, r#"{"tx":{"gasSpent":42,"err":null}}"#),
+            (
+                200,
+                r#"{"tx":{"id":"abababababababababababababababababababababababababababababababab","gasSpent":42,"err":null}}"#,
+            ),
         ]);
         let client = RuesClient::new(url).unwrap();
         let tx_id = "ab".repeat(32);
@@ -4085,7 +4091,7 @@ mod tests {
         let budget = Duration::from_millis(400);
         // The node holds the transaction, but says so only after the budget:
         // that answer comes too late to count.
-        let held = r#"{"mempoolTx":{"id":"ab"},"tx":null}"#;
+        let held = r#"{"mempoolTx":{"id":"abababababababababababababababababababababababababababababababab"},"tx":null}"#;
         let client =
             RuesClient::new(slow_server(Duration::from_secs(3), "200 OK", "", held)).unwrap();
         let started = std::time::Instant::now();
@@ -4116,8 +4122,14 @@ mod tests {
     #[tokio::test]
     async fn confirmation_rejects_a_malformed_included_transaction() {
         let url = test_server(vec![
-            (200, r#"{"tx":{"gasSpent":"not-a-number","err":null}}"#),
-            (200, r#"{"tx":{"gasSpent":42,"err":null}}"#),
+            (
+                200,
+                r#"{"tx":{"id":"abababababababababababababababababababababababababababababababab","gasSpent":"not-a-number","err":null}}"#,
+            ),
+            (
+                200,
+                r#"{"tx":{"id":"abababababababababababababababababababababababababababababababab","gasSpent":42,"err":null}}"#,
+            ),
         ]);
         let client = RuesClient::new(url).unwrap();
         let tx_id = "ab".repeat(32);
@@ -4126,6 +4138,29 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("missing numeric gasSpent"));
+    }
+
+    /// A receipt of another transaction than the one waited for, as a proxy
+    /// or cache can answer with, is an error, not its outcome.
+    #[tokio::test]
+    async fn confirmation_rejects_a_receipt_of_another_transaction() {
+        let other = "cd".repeat(32);
+        let url = test_server(vec![
+            (
+                200,
+                format!(r#"{{"tx":{{"id":"{other}","gasSpent":42,"err":null}}}}"#),
+            ),
+            (200, r#"{"tx":{"gasSpent":42,"err":null}}"#.to_owned()),
+        ]);
+        let client = RuesClient::new(url).unwrap();
+        let tx_id = "ab".repeat(32);
+        for _ in 0..2 {
+            let error = client
+                .wait_for_tx_in_blocks_of(&tx_id, Duration::from_secs(2), Duration::from_millis(1))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("not of it"), "{error}");
+        }
     }
 
     /// When `wait_for_tx` looks a transaction up on a 10 s chain, from the

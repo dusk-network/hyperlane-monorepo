@@ -472,6 +472,77 @@ async fn a_delivery_whose_transaction_failed_goes_again_once_its_block_is_final(
     std::env::remove_var("DUSK_TX_BIN");
 }
 
+/// A lookup reply that carries another transaction's receipt, as a proxy
+/// or a cache in front of the node can answer with, never releases a kept
+/// transaction. Here kept transaction A failed in its block and was
+/// reported, then a rollback put it back into the mempool, where it waits.
+/// A lookup answers with B's failed receipt in a final block beside A in
+/// the mempool: read as A's, the relayer forgot A and signed the message
+/// again while A could still land. Nor does A's own failed receipt in a
+/// final block release A while the mempool still lists it.
+#[tokio::test]
+async fn a_lookup_reply_for_another_transaction_never_releases_a_kept_one() {
+    let _env = HELPER_ENV.lock().await;
+    // Finality moves only by hand.
+    let node = Node::start_with(false, None);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let mailbox = node.mailbox(false).with_submission_limits(patient(64));
+    let delivery = delivery(0);
+    let (message, metadata, gas_limit) = &delivery;
+    node.wait_until("a few blocks", |model| model.height >= 3)
+        .await;
+    // Another relayer's delivery lands first, so A fails in its block, and
+    // the relayer gets that outcome.
+    node.pause(true);
+    let first = tokio::spawn({
+        let mailbox = mailbox.clone();
+        let (message, metadata, gas_limit) = delivery.clone();
+        async move { mailbox.process(&message, &metadata, gas_limit).await }
+    });
+    node.wait_until("A is in the mempool", |model| !model.mempool.is_empty())
+        .await;
+    node.deliver_elsewhere(&delivery);
+    node.pause(false);
+    let outcome = first.await.unwrap().unwrap();
+    assert!(!outcome.executed);
+    let a = mailbox.prepared_transaction(message.id()).unwrap().unwrap();
+    // A rollback puts A back into the mempool, where it stays, and the other
+    // delivery does not count after all. The blocks below A's are final.
+    node.pause(true);
+    let height = node.model().included(&a).unwrap().height;
+    node.rollback_to(height - 1);
+    node.undeliver(&delivery);
+    node.finalize_to(height - 1);
+    node.expire_block_pair().await;
+    let calls = node.invocations().len();
+    for (ledger, said) in [
+        (
+            serde_json::json!({
+                "id": "bb".repeat(32), "blockHeight": 1, "gasSpent": 1, "err": "Panic",
+            }),
+            "not of it",
+        ),
+        (
+            serde_json::json!({ "id": a, "blockHeight": 1, "gasSpent": 1, "err": "Panic" }),
+            "still lists it in its mempool",
+        ),
+    ] {
+        node.inject(Route::Graphql, None, Fault::LedgerEntry(ledger));
+        let error = mailbox
+            .process(message, metadata, *gas_limit)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(said), "{error}");
+        assert_eq!(node.invocations().len(), calls);
+        assert_eq!(
+            mailbox.prepared_transaction(message.id()).unwrap(),
+            Some(a.clone())
+        );
+    }
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
 /// A delivery refused before propagation reached nothing: it leaves no
 /// transaction to follow, and goes again at once.
 #[tokio::test]

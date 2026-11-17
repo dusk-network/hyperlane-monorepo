@@ -1026,11 +1026,14 @@ impl DuskMailbox {
                 .await?;
             tally.0 += 1;
             match status {
+                // Kept while the node still lists it in its mempool too.
                 TransactionStatus::Included {
                     block_height,
                     receipt,
+                    in_mempool,
                 } => {
                     if block_height > finalized
+                        || in_mempool
                         || (receipt.error.is_some() && !delivery.failure_reported)
                     {
                         continue;
@@ -1304,7 +1307,8 @@ impl DuskMailbox {
     /// - In a block, failed, and reported: it spent its nonce and delivered
     ///   nothing; the delivery goes again once that block is final, at or
     ///   below the last final block read before the lookup, since until
-    ///   then a rollback can run the transaction again.
+    ///   then a rollback can run the transaction again, and once the node no
+    ///   longer lists the transaction in its mempool either.
     /// - In the mempool: it is followed to its block, as an unknown outcome
     ///   is.
     /// - In neither, prepared less than `SubmissionLimits::drop_grace` ago:
@@ -1333,6 +1337,7 @@ impl DuskMailbox {
                 TransactionStatus::Included {
                     block_height,
                     receipt,
+                    in_mempool,
                 } => {
                     if receipt.error.is_none() {
                         info!(
@@ -1356,6 +1361,12 @@ impl DuskMailbox {
                     if block_height > finalized {
                         return Err(HyperlaneDuskError::Other(format!(
                             "Dusk delivery of message {message:?}: its earlier transaction {tx_id} failed in block {block_height}, which is not final yet; it goes again once that block is final"
+                        ))
+                        .into());
+                    }
+                    if in_mempool {
+                        return Err(HyperlaneDuskError::Other(format!(
+                            "Dusk delivery of message {message:?}: its earlier transaction {tx_id} failed in final block {block_height}, but the node still lists it in its mempool; it goes again once it has left"
                         ))
                         .into());
                     }
