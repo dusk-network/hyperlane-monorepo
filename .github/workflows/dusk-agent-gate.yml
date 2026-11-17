@@ -23,7 +23,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
-      DUSK_REF: ${{ inputs.dusk_ref || 'ae77c887223bd262c109ff054d726aff21b070c7' }}
+      DUSK_REF: ${{ inputs.dusk_ref || 'dcacccafe4f3016431293263f0e863fa4c7cd217' }}
       MONOREPO_DIR: ${{ github.workspace }}/hyperlane/hyperlane-monorepo
       DUSK_DIR: ${{ github.workspace }}/hyperlane/dusk
 
