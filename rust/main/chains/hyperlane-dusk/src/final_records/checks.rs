@@ -193,4 +193,19 @@ mod tests {
     fn searches_match_a_model_of_growing_finalizing_and_rolled_back_records() {
         run_cases(51, 3_000, 400, super::search);
     }
+
+    /// One record is in one block: a height that puts a kept record in
+    /// another block contradicts what was kept and is not kept. Mutation
+    /// testing showed neither direction was checked.
+    #[test]
+    fn a_record_is_never_kept_at_two_heights() {
+        let mut known = super::super::Known::default();
+        assert!(known.keep(5, 10));
+        assert!(!known.keep(5, 11), "the same record in a later block");
+        assert!(!known.keep(5, 9), "the same record in an earlier block");
+        assert!(known.keep(5, 10), "again in its own block");
+        assert!(known.keep(6, 11));
+        assert!(!known.keep(6, 10), "a later record in an earlier block");
+        assert!(!known.keep(4, 12), "an earlier record in a later block");
+    }
 }

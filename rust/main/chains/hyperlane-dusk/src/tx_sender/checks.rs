@@ -170,7 +170,7 @@ pub fn helper_output(data: &[u8]) {
         "429 Too Many Requests",
     ][input.below(3)];
     let lower = tx_id.to_ascii_lowercase();
-    let template = input.u8() % 9;
+    let template = input.u8() % 11;
     let (error, expected) = match template {
         0 => (
             format!("Transaction {tx_id} submission failed: Preverify failed before propagation: {node}"),
@@ -209,6 +209,31 @@ pub fn helper_output(data: &[u8]) {
                 node.clone()
             };
             (text, Expected::Other)
+        }
+        8 => {
+            // A submission error of a shape the helper does not write today:
+            // not a refusal before propagation, so never "not submitted".
+            let known = ["Preverify", "Not submitted", "Propagation outcome unknown"];
+            let detail = if known.iter().any(|prefix| node.starts_with(prefix)) {
+                format!("x{node}")
+            } else {
+                node.clone()
+            };
+            (
+                format!("Transaction {tx_id} submission failed: {detail}"),
+                Expected::Other,
+            )
+        }
+        9 => {
+            // A refusal naming something that is not a transaction ID.
+            let mut bad = tx_id.clone().into_bytes();
+            let at = input.below(bad.len());
+            bad[at] = b'g';
+            let bad = String::from_utf8(bad).unwrap_or_default();
+            (
+                format!("Transaction {bad} submission failed: Preverify failed before propagation: {node}"),
+                Expected::Other,
+            )
         }
         _ => {
             success(&mut input, prepared.as_deref(), &tx_id, &other);
