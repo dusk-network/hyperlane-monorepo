@@ -689,32 +689,49 @@ impl DuskMailbox {
         }
         self.sweep_prepared(&key, signer, message).await;
         self.room_for_prepared(&key, signer, message).await?;
+        // The helper's capability probe can take seconds the first time, so
+        // it goes before the delivery's last simulation.
+        let helper = crate::tx_sender::acking_helper("process").await?;
         self.simulate_process(message, args).await?;
-        let keep = |tx_id: &str, nonce: Option<u64>| -> Result<(), HyperlaneDuskError> {
-            let tx_id = hex::decode(tx_id)
-                .ok()
-                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-                .ok_or_else(|| {
-                    HyperlaneDuskError::Other(format!(
-                        "dusk-tx named a transaction whose hash is not 32 bytes of hex: {}",
-                        bounded_text(tx_id)
-                    ))
-                })?;
-            let prepared = PreparedDelivery {
-                tx_id,
-                prepared_at: unix_millis(),
-                failure_reported: false,
-                nonce,
-            };
-            self.rues
-                .keep_prepared_delivery(&key, message, &prepared, self.limits.prepared)
-                .inspect_err(|error| {
-                    warn!(
-                        message_id = ?message,
-                        error = %bounded_error(error),
-                        "Failed to keep the transaction prepared for a Dusk delivery; the helper is not let send it"
-                    );
-                })
+        let keep = |tx_id: String, nonce: Option<u64>| -> crate::tx_sender::Kept<'_> {
+            Box::pin(async move {
+                // The helper starts, reads the account and signs after that
+                // simulation, and may take its time: a pass older than
+                // `SIMULATION_REUSE` by now is run again before the helper
+                // may send what it signed.
+                self.simulate_process(message, args)
+                    .await
+                    .map_err(|error| {
+                        HyperlaneDuskError::Other(format!(
+                            "the delivery's simulation just before sending failed: {}",
+                            bounded_error(&error)
+                        ))
+                    })?;
+                let tx_id = hex::decode(&tx_id)
+                    .ok()
+                    .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                    .ok_or_else(|| {
+                        HyperlaneDuskError::Other(format!(
+                            "dusk-tx named a transaction whose hash is not 32 bytes of hex: {}",
+                            bounded_text(&tx_id)
+                        ))
+                    })?;
+                let prepared = PreparedDelivery {
+                    tx_id,
+                    prepared_at: unix_millis(),
+                    failure_reported: false,
+                    nonce,
+                };
+                self.rues
+                    .keep_prepared_delivery(&key, message, &prepared, self.limits.prepared)
+                    .inspect_err(|error| {
+                        warn!(
+                            message_id = ?message,
+                            error = %bounded_error(error),
+                            "Failed to keep the transaction prepared for a Dusk delivery; the helper is not let send it"
+                        );
+                    })
+            })
         };
         let call_result = crate::tx_sender::dusk_tx_call_kept(
             &self.conn,
@@ -723,6 +740,7 @@ impl DuskMailbox {
             "process",
             args,
             Some(gas_limit),
+            &helper,
             &keep,
         )
         .await;

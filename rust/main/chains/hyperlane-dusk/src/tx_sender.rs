@@ -81,8 +81,9 @@ pub async fn dusk_tx_call(
 /// the word, since its end of stdin closes with it. `keep` is called at
 /// most once.
 ///
-/// Needs a helper that lists `--ack-before-send` in its `call --help`:
-/// with another, nothing is signed, and the call fails.
+/// Needs a helper that lists `--ack-before-send` in its `call --help`,
+/// probed beforehand (`acking_helper`), which nothing here waits for.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn dusk_tx_call_kept(
     conn: &ConnectionConf,
     signer: &DuskSigner,
@@ -90,21 +91,9 @@ pub(crate) async fn dusk_tx_call_kept(
     fn_name: &str,
     args_bytes: &[u8],
     gas_limit: Option<u64>,
+    _helper: &AckingHelper,
     keep: &Keep<'_>,
 ) -> Result<Value, HyperlaneDuskError> {
-    match helper_flags().await {
-        (_, Some(flags)) if flags.acks => {}
-        (bin, Some(_)) => {
-            return Err(HyperlaneDuskError::Other(format!(
-                "The dusk-tx helper at '{bin}' does not take `call {ACK_BEFORE_SEND}`, so it would send a {fn_name} transaction before the agent kept its hash; nothing was signed. Dusk deliveries need {ACK_HELPER}."
-            )))
-        }
-        (bin, None) => {
-            return Err(HyperlaneDuskError::Other(format!(
-                "Could not read `call --help` of the dusk-tx helper at '{bin}', so nothing was signed: Dusk deliveries need {ACK_HELPER}. Set DUSK_TX_BIN to its path."
-            )))
-        }
-    }
     run_dusk_tx_at(
         &conn.url,
         conn,
@@ -122,8 +111,35 @@ pub(crate) async fn dusk_tx_call_kept(
 
 /// What keeps the hash of the transaction the helper prepared, with the
 /// nonce it is signed with when the helper names it, before the helper may
-/// send it.
-pub(crate) type Keep<'a> = dyn Fn(&str, Option<u64>) -> Result<(), HyperlaneDuskError> + Sync + 'a;
+/// send it. It may check whatever else must hold when the transaction goes,
+/// such as a simulation fresh enough: it fails, and the helper sends
+/// nothing, unless all of it does.
+pub(crate) type Keep<'a> = dyn Fn(String, Option<u64>) -> Kept<'a> + Sync + 'a;
+
+/// What a `Keep` returns.
+pub(crate) type Kept<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(), HyperlaneDuskError>> + Send + 'a>,
+>;
+
+/// The configured helper, found to take `--ack-before-send` by its
+/// `call --help` (`acking_helper`): what `dusk_tx_call_kept` needs.
+pub(crate) struct AckingHelper(());
+
+/// The configured helper, once its `call --help` lists `--ack-before-send`
+/// (`helper_flags`). The probe can take up to `HELPER_PROBE_TIMEOUT` the
+/// first time a process asks about a helper, so a caller asks before its
+/// last check of what the helper is to send.
+pub(crate) async fn acking_helper(fn_name: &str) -> Result<AckingHelper, HyperlaneDuskError> {
+    match helper_flags().await {
+        (_, Some(flags)) if flags.acks => Ok(AckingHelper(())),
+        (bin, Some(_)) => Err(HyperlaneDuskError::Other(format!(
+            "The dusk-tx helper at '{bin}' does not take `call {ACK_BEFORE_SEND}`, so it would send a {fn_name} transaction before the agent kept its hash; nothing was signed. Dusk deliveries need {ACK_HELPER}."
+        ))),
+        (bin, None) => Err(HyperlaneDuskError::Other(format!(
+            "Could not read `call --help` of the dusk-tx helper at '{bin}', so nothing was signed: Dusk deliveries need {ACK_HELPER}. Set DUSK_TX_BIN to its path."
+        ))),
+    }
+}
 
 /// A transaction the helper signed, which nothing has sent yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -683,9 +699,9 @@ fn helper_result(
 /// The agent's side of `--ack-before-send`: the helper's stdin, still open
 /// after the key line, and what keeps the hash of the transaction it
 /// prepared before the word that lets it send goes there.
-struct Ack<'a> {
+struct Ack<'a, 'k> {
     stdin: tokio::process::ChildStdin,
-    keep: &'a Keep<'a>,
+    keep: &'a Keep<'k>,
 }
 
 /// Whether the helper was let send the transaction it prepared.
@@ -713,12 +729,12 @@ struct HelperRun {
 /// Keep `tx_id`, signed with `nonce` when the helper named it, with
 /// `ack`'s `keep`, and only once that succeeds write the word that lets the
 /// helper send it. What the helper was told.
-async fn answer(ack: Ack<'_>, tx_id: &str, nonce: Option<u64>) -> Word {
+async fn answer(ack: Ack<'_, '_>, tx_id: &str, nonce: Option<u64>) -> Word {
     let Ack { mut stdin, keep } = ack;
-    if let Err(error) = keep(tx_id, nonce) {
+    if let Err(error) = keep(tx_id.to_owned(), nonce).await {
         // Dropping stdin closes it: the helper sends nothing.
         return Word::Withheld(format!(
-            "its hash could not be kept: {}",
+            "it was not kept to be sent: {}",
             bounded_error(&error)
         ));
     }
@@ -742,7 +758,7 @@ async fn wait_for_child_output(
     mut child: tokio::process::Child,
     fn_name: &str,
     timeout: Duration,
-    mut ack: Option<Ack<'_>>,
+    mut ack: Option<Ack<'_, '_>>,
 ) -> Result<HelperRun, HyperlaneDuskError> {
     let stdout = child.stdout.take().ok_or_else(|| {
         HyperlaneDuskError::Other("dusk-tx stdout pipe was not configured".into())
@@ -1312,9 +1328,9 @@ mod tests {
                 prepared_line(&tx_id)
             ));
             let kept = StdMutex::new(Vec::new());
-            let keep = |tx_id: &str, _: Option<u64>| {
-                kept.lock().unwrap().push(tx_id.to_owned());
-                Ok(())
+            let keep = |tx_id: String, _: Option<u64>| -> Kept<'_> {
+                kept.lock().unwrap().push(tx_id);
+                Box::pin(async { Ok(()) })
             };
             let stdin = child.stdin.take().unwrap();
             let ack = acks.then_some(Ack { stdin, keep: &keep });
@@ -1346,11 +1362,9 @@ mod tests {
         ));
         let started = std::time::Instant::now();
         let kept = StdMutex::new(Vec::new());
-        let keep = |tx_id: &str, nonce: Option<u64>| {
-            kept.lock()
-                .unwrap()
-                .push((tx_id.to_owned(), nonce, started.elapsed()));
-            Ok(())
+        let keep = |tx_id: String, nonce: Option<u64>| -> Kept<'_> {
+            kept.lock().unwrap().push((tx_id, nonce, started.elapsed()));
+            Box::pin(async { Ok(()) })
         };
         let ack = Ack {
             stdin: child.stdin.take().unwrap(),
@@ -1387,8 +1401,8 @@ mod tests {
             prepared_line(&tx_id),
             sent.display()
         ));
-        let keep = |_: &str, _: Option<u64>| {
-            Err(HyperlaneDuskError::Other("the event store is gone".into()))
+        let keep = |_: String, _: Option<u64>| -> Kept<'_> {
+            Box::pin(async { Err(HyperlaneDuskError::Other("the event store is gone".into())) })
         };
         let ack = Ack {
             stdin: child.stdin.take().unwrap(),

@@ -472,6 +472,80 @@ async fn a_delivery_whose_transaction_failed_goes_again_once_its_block_is_final(
     std::env::remove_var("DUSK_TX_BIN");
 }
 
+/// The helper's capability probe (`call --help`), the first in a process
+/// for a helper, can take seconds. It goes before the delivery's last
+/// simulation: a delivery made elsewhere meanwhile fails that simulation,
+/// and nothing is signed.
+#[tokio::test]
+async fn a_slow_helper_probe_goes_before_the_last_simulation() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start(false);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    node.help_delay(3);
+    let mailbox = node.mailbox(false).with_submission_limits(patient(64));
+    let delivery = delivery(0);
+    let task = tokio::spawn({
+        let mailbox = mailbox.clone();
+        let (message, metadata, gas_limit) = delivery.clone();
+        async move { mailbox.process(&message, &metadata, gas_limit).await }
+    });
+    // Another relayer delivers the message while the probe runs.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !node.probing() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    node.deliver_elsewhere(&delivery);
+    let error = task.await.unwrap().unwrap_err();
+    assert!(
+        matches!(error, ChainCommunicationError::SimulationFailed(_)),
+        "{error}"
+    );
+    assert!(node.invocations().is_empty());
+    assert!(node.propagated().is_empty());
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+/// The helper reads the account and signs after the delivery's last
+/// simulation, and can take its time: here it waits at its gate while
+/// another relayer delivers the message. Before it is let send what it
+/// signed, the simulation, by then over 2 s old, is run again, fails, and
+/// the helper sends nothing.
+#[tokio::test]
+async fn a_delivery_is_simulated_again_before_a_slow_helper_may_send_it() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start(false);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let mailbox = node.mailbox(false).with_submission_limits(patient(64));
+    let delivery = delivery(0);
+    node.next_submission(1, "gate");
+    let task = tokio::spawn({
+        let mailbox = mailbox.clone();
+        let (message, metadata, gas_limit) = delivery.clone();
+        async move { mailbox.process(&message, &metadata, gas_limit).await }
+    });
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !node.helper_reached("gated", 1) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    node.deliver_elsewhere(&delivery);
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    node.open_gate(1);
+    let error = task.await.unwrap().unwrap_err().to_string();
+    assert!(
+        error.contains("simulation just before sending failed"),
+        "{error}"
+    );
+    assert_eq!(node.words(), ["1 <eof>"]);
+    assert!(node.propagated().is_empty());
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
 /// A lookup reply that carries another transaction's receipt, as a proxy
 /// or a cache in front of the node can answer with, never releases a kept
 /// transaction. Here kept transaction A failed in its block and was

@@ -722,6 +722,7 @@ type Faults = Arc<Mutex<Vec<(Route, Option<u64>, Fault)>>>;
 const HELPER: &str = r#"#!/usr/bin/env bash
 dir="$(cd "$(dirname "$0")" && pwd)"
 if [ "$1" = "call" ] && [ "$2" = "--help" ]; then
+  if [ -f "$dir/help-delay" ]; then : > "$dir/probing"; sleep "$(cat "$dir/help-delay")"; fi
   if [ ! -f "$dir/no-ack" ]; then printf '      --ack-before-send\n'; fi
   if [ -f "$dir/pipelines" ]; then printf '      --nonce <NONCE>\n      --no-wait\n'; fi
   exit 0
@@ -962,6 +963,21 @@ impl Node {
         } else {
             let _ = std::fs::remove_file(file);
         }
+    }
+
+    /// Make the stand-in's `call --help` take `seconds` to answer, as a
+    /// helper on a loaded host can; it marks `probing` when it starts.
+    pub fn help_delay(&self, seconds: u32) {
+        std::fs::write(
+            self.directory.path().join("help-delay"),
+            seconds.to_string(),
+        )
+        .unwrap();
+    }
+
+    /// Whether the stand-in has started answering a slow `call --help`.
+    pub fn probing(&self) -> bool {
+        self.directory.path().join("probing").exists()
     }
 
     /// Make the stand-in's `call --help` leave out `--ack-before-send`, as
