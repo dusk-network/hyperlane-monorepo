@@ -196,7 +196,7 @@ pub(crate) struct FinalRecords {
 
 impl FinalRecords {
     /// One that keeps the heights of at most `capacity` blocks.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzzing"))]
     fn with_capacity(capacity: usize) -> Self {
         Self {
             known: tokio::sync::Mutex::new(Known {
@@ -498,6 +498,9 @@ where
     }
     Ok(low)
 }
+
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) mod checks;
 
 #[cfg(test)]
 mod tests {

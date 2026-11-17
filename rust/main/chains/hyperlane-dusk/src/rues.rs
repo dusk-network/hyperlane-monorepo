@@ -24,6 +24,8 @@ use hyperlane_core::{ReorgPeriod, H256, H512};
 use crate::HyperlaneDuskError;
 
 mod batch;
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) mod checks;
 mod endpoint;
 mod event_log;
 mod submissions;

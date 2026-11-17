@@ -1086,6 +1086,9 @@ pub fn announce_args(
     rkyv_serialize(&(eth_addr, String::from(storage_location), signature.to_vec()))
 }
 
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) mod checks;
+
 #[cfg(test)]
 mod tests {
     use super::*;

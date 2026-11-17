@@ -41,5 +41,9 @@ rkyv = { version = "0.7", features = ["validation"] }
 hyperlane-core = { path = "../../hyperlane-core", features = ["async"] }
 hyperlane-operation-verifier = { path = "../../applications/hyperlane-operation-verifier" }
 
+[features]
+# Exposes the parser property checks to the fuzz targets in `fuzz/`.
+fuzzing = []
+
 [dev-dependencies]
 tempfile.workspace = true

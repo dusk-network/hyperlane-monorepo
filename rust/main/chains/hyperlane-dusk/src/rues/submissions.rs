@@ -892,6 +892,9 @@ fn synced() -> WriteOptions {
     options
 }
 
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) mod checks;
+
 #[cfg(test)]
 mod tests {
     use super::*;
