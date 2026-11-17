@@ -887,7 +887,17 @@ async fn an_announcement_the_archive_lacks_is_reported_as_missing() {
         .to_string();
     assert!(!error.contains("lacks"), "{error}");
 
-    finalize_past(&mut fixture.node(), block, 64);
+    // Above the last final block, another validator announces the same
+    // location, and this one another location: neither is its
+    // announcement.
+    {
+        let mut node = fixture.node();
+        finalize_past(&mut node, block, 64);
+        node.push(vec![
+            Event::announced([0x33; 20], LOCATION),
+            Event::announced(VALIDATOR, "s3://fixture/elsewhere"),
+        ]);
+    }
     fixture.next_tick().await;
     let error = strict
         .get_announced_storage_locations(&[validator()])
@@ -1140,6 +1150,54 @@ async fn a_delivery_the_archive_lacks_is_reported_as_missing() {
     assert!(
         error.contains("archive lacks the delivery's finalized ProcessId row")
             && error.contains("no finalized block up to block 165"),
+        "{error}"
+    );
+}
+
+/// A delivery the checks find again, here in a block above the last final
+/// one, counts as missed afresh if that block is rolled back: from the tip
+/// it is then missed at, not the first one.
+#[tokio::test]
+async fn a_delivery_found_again_is_missed_afresh() {
+    let mut node = Node::new(100);
+    let block = node.push(vec![]);
+    node.delivered.insert(MESSAGE);
+    node.finalized = block;
+    let fixture = Fixture::start(node);
+    let mailbox = fixture.mailbox_with_log();
+    let delivered = || async {
+        mailbox
+            .delivered(message_id())
+            .await
+            .map_err(|error| error.to_string())
+    };
+    assert!(delivered().await.is_err());
+
+    // Far past the first miss, a block above the last final one holds it.
+    let again = {
+        let mut node = fixture.node();
+        finalize_past(&mut node, block, 100);
+        node.push(vec![Event::processed(MESSAGE)])
+    };
+    fixture.next_tick().await;
+    let error = delivered().await.unwrap_err();
+    assert!(
+        error.contains(&format!("delivered in Dusk block {again}")),
+        "{error}"
+    );
+
+    // That block is rolled back: missed again, at a tip far past the first
+    // one, it is not reported until the log is far past this tip.
+    {
+        let mut node = fixture.node();
+        node.roll_back_to(again - 1);
+        node.push(vec![]);
+        node.finalized = node.tip();
+    }
+    fixture.next_tick().await;
+    let error = delivered().await.unwrap_err();
+    assert!(
+        error.contains("rolled back during this check, or the node's archive skipped it"),
         "{error}"
     );
 }
