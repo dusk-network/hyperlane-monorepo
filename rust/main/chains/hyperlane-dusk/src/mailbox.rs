@@ -43,10 +43,13 @@ const DELIVERED_LOG_PAGES: usize = 4;
 const MAX_DELIVERY_CHECKS: usize = 4096;
 /// How long a passed `process` simulation stands for the same arguments.
 /// The relayer simulates a delivery when it prepares it, again just before
-/// it submits it, and the Mailbox did a third time in `process`: when the
-/// submission follows the preparation at once, the three ran within a few
-/// hundred milliseconds of each other on the same state. A Dusk block takes
-/// about 10 s, and the transaction waits as long again for its block.
+/// it submits it, and the Mailbox did a third time in `process`, and does
+/// once more just before the helper signs a delivery sent one at a time
+/// (`process_one`): when the submission follows the preparation at once,
+/// and the delivery did not wait for the signer's earlier transactions,
+/// they ran within a few hundred milliseconds of each other on the same
+/// state. A Dusk block takes about 10 s, and the transaction waits as long
+/// again for its block.
 const SIMULATION_REUSE: Duration = Duration::from_secs(2);
 /// Simulations a Mailbox remembers.
 const MAX_REMEMBERED_SIMULATIONS: usize = 1024;
@@ -663,6 +666,12 @@ impl DuskMailbox {
     /// whole gas limit. A hash that cannot be kept leaves the helper without
     /// the word: it sends nothing, and the delivery fails `NotSubmitted`, so
     /// that the next submission goes at once.
+    ///
+    /// Following the earlier transaction, and making room to keep this
+    /// one's, can take seconds to minutes after `process` simulated the
+    /// delivery, while another relayer may deliver the message or its
+    /// recipient change. The delivery is simulated again before the helper
+    /// signs it, unless the last pass is still fresh (`SIMULATION_REUSE`).
     async fn process_one(
         &self,
         signer: &DuskSigner,
@@ -678,6 +687,7 @@ impl DuskMailbox {
         }
         self.sweep_prepared(&key, signer, message).await;
         self.room_for_prepared(&key, signer, message).await?;
+        self.simulate_process(message, args).await?;
         let keep = |tx_id: &str, nonce: Option<u64>| -> Result<(), HyperlaneDuskError> {
             let tx_id = hex::decode(tx_id)
                 .ok()

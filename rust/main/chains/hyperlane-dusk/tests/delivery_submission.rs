@@ -362,6 +362,65 @@ async fn a_delivery_whose_first_transaction_lands_during_its_retry_is_not_sent_a
     std::env::remove_var("DUSK_TX_BIN");
 }
 
+/// A delivery waits after its simulation passed, here for its earlier
+/// transaction, which never reached the node, to be missed by two lookups
+/// half a block apart, and another relayer delivers the message meanwhile.
+/// The Mailbox simulates it again before the helper signs it, and sends
+/// nothing: the transaction would fail in its block, paying its whole gas
+/// limit.
+#[tokio::test]
+async fn a_delivery_that_waited_after_its_simulation_is_simulated_again_before_it_is_signed() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start(false);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let delivery = delivery(0);
+    let (message, metadata, gas_limit) = delivery.clone();
+    // The helper prints the transaction's hash, then reports an unknown
+    // outcome without sending it.
+    node.next_submission(1, "lose");
+    let mailbox = node.mailbox(false).with_submission_limits(patient(64));
+    let error = mailbox
+        .process(&message, &metadata, gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("to be included"), "{error}");
+    assert!(node.propagated().is_empty());
+
+    // Sent again past the 2 s a passed simulation stands for, and past the
+    // drop grace, with blocks of 4.4 s: the earlier transaction is looked
+    // up twice, 2.2 s apart, before the helper may sign another.
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    let mailbox = mailbox.with_submission_limits(SubmissionLimits {
+        block: Duration::from_millis(4_400),
+        ..patient(64)
+    });
+    let gate = std::sync::Arc::new(Gate::default());
+    node.inject(Route::Simulation, None, Fault::HoldReply(gate.clone()));
+    let calls = node.invocations().len();
+    let retry = tokio::spawn({
+        let mailbox = mailbox.clone();
+        let (message, metadata) = (message.clone(), metadata.clone());
+        async move { mailbox.process(&message, &metadata, gas_limit).await }
+    });
+    // The simulation runs on the state before another relayer delivers the
+    // message, and passes.
+    node.wait_until("the simulation is answered", |_| {
+        gate.waiting.load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+    node.deliver_elsewhere(&delivery);
+    gate.open();
+    let error = retry.await.unwrap().unwrap_err();
+    assert!(
+        matches!(error, ChainCommunicationError::SimulationFailed(_)),
+        "{error}"
+    );
+    assert_eq!(node.invocations().len(), calls);
+    assert!(node.propagated().is_empty());
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
 /// A delivery whose kept transaction failed in a block spent that nonce and
 /// delivered nothing: once the block is final, it goes again; before, a
 /// rollback could still run that transaction again.
