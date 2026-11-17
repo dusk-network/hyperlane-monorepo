@@ -90,11 +90,13 @@ const NON_FINAL_EVENT_CACHE_BLOCKS: usize = 256;
 /// Most `finalizedEvents` pages one pass of a record lookup reads (see
 /// `scan_from`): twice the full pages of the largest block `BLOCK_LIMITS`
 /// allows. A pass that runs out records how far it read, so the next lookup
-/// resumes there and a long history is read over several lookups. A lookup
-/// resumes at most `SCAN_ANCHOR_SPACING` rows before its block once the
-/// rows before it were read, so every block within `BLOCK_LIMITS` is read
-/// whole. An endpoint that pages without end holds a lookup for this many
-/// pages, not for good.
+/// resumes there and a long history is read over several lookups; one that
+/// runs out inside the block it looks for keeps what it read of the block
+/// (`PartialScan`), so the next lookup of the block reads on in it, whatever
+/// the pages hold. An endpoint that pages without end holds a lookup for
+/// this many pages, not for good. At full pages, from an anchor at most
+/// `SCAN_ANCHOR_SPACING` rows before it, one pass reads a block within
+/// `BLOCK_LIMITS` whole.
 const MAX_SCAN_PAGES: u64 = 2 * BLOCK_LIMITS.rows / FINALIZED_EVENT_PAGE_SIZE as u64;
 
 type SharedRuesClients = HashMap<(String, PathBuf), RuesClient>;
@@ -469,7 +471,76 @@ enum ScanOutcome {
     WrongAnchor,
     /// The archive has not reached the anchor's fence row yet.
     ArchiveBehind(ScanAnchor),
+    /// The pass read `MAX_SCAN_PAGES` pages first; `error` says where it
+    /// stopped. Stopped inside the block it looks for, it leaves what it
+    /// read of the block to read on from (`partial`).
+    OutOfPages {
+        error: HyperlaneDuskError,
+        partial: Option<PartialScan>,
+    },
 }
+
+/// What a pass that ran out of pages inside the block it looks for read of
+/// that block: its position after the last row read, which serves only
+/// later blocks as an anchor, the block's rows it captured, and the
+/// sequences it matched for the lookup that ran it. The next lookup of the
+/// block reads on from that position instead of from before the block, as
+/// an event log reads on in a block it staged.
+#[derive(Debug)]
+struct PartialScan {
+    position: ScanAnchor,
+    capture: BlockCapture,
+    wanted: HashSet<usize>,
+    found: ScannedRows,
+}
+
+impl PartialScan {
+    /// The block's rows a lookup of `wanted` resumes with: matched again
+    /// from the captured rows, or, once those grew past the cache bound,
+    /// the ones matched before when `wanted` asks for none other. `None`
+    /// when the lookup cannot resume from here.
+    fn found_for<F>(
+        &self,
+        contract_id: &[u8; 32],
+        topic: &str,
+        block_height: u64,
+        wanted: &HashSet<usize>,
+        matching_sequences: &F,
+    ) -> Result<Option<ScannedRows>, HyperlaneDuskError>
+    where
+        F: Fn(&[u8]) -> Vec<usize>,
+    {
+        if let Some(rows) = &self.capture.rows {
+            let mut found = ScannedRows::new();
+            for row in rows {
+                assign_row(
+                    row,
+                    contract_id,
+                    topic,
+                    block_height,
+                    wanted,
+                    matching_sequences,
+                    &mut found,
+                )?;
+            }
+            return Ok(Some(found));
+        }
+        if !wanted.is_subset(&self.wanted) {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.found
+                .iter()
+                .filter(|(sequence, _)| wanted.contains(sequence))
+                .map(|(sequence, event)| (*sequence, event.clone()))
+                .collect(),
+        ))
+    }
+}
+
+/// Partial scans a client keeps, the latest first; each holds at most a
+/// block's worth of captured rows (`BlockCacheLimits::block_bytes`).
+const MAX_PARTIAL_SCANS: usize = 2;
 
 /// A row of the scanned block that can be a sequence's record: not
 /// reverted, of the scan's topic, with its provenance and event data parsed
@@ -567,6 +638,7 @@ struct CachedBlock {
 }
 
 /// The scanned block's rows that a scan collects for the block cache.
+#[derive(Debug)]
 struct BlockCapture {
     /// `None` once the rows grew past the bound, or once a row of the block
     /// that could be a record did not parse.
@@ -686,6 +758,9 @@ struct BlockCache {
     blocks: HashMap<BlockKey, (Arc<CachedBlock>, u64)>,
     bytes: usize,
     clock: u64,
+    /// Scans that ran out of pages inside the block they look for, and when
+    /// each was staged.
+    partial: HashMap<BlockKey, (PartialScan, u64)>,
 }
 
 impl BlockCache {
@@ -695,7 +770,33 @@ impl BlockCache {
             blocks: HashMap::new(),
             bytes: 0,
             clock: 0,
+            partial: HashMap::new(),
         }
+    }
+
+    /// Keep `partial`, of the scan of `key`'s block, for the next lookup of
+    /// it, at most `MAX_PARTIAL_SCANS` at once.
+    fn stage(&mut self, key: BlockKey, partial: PartialScan) {
+        self.partial.remove(&key);
+        while self.partial.len() >= MAX_PARTIAL_SCANS {
+            let Some(oldest) = self
+                .partial
+                .iter()
+                .min_by_key(|(_, (_, staged))| *staged)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.partial.remove(&oldest);
+        }
+        self.clock += 1;
+        self.partial.insert(key, (partial, self.clock));
+    }
+
+    /// The partial scan of `key`'s block, if one is staged, which is no
+    /// longer kept: a lookup that runs out again stages its own.
+    fn take_partial(&mut self, key: &BlockKey) -> Option<PartialScan> {
+        self.partial.remove(key).map(|(partial, _)| partial)
     }
 
     fn get(&mut self, key: &BlockKey) -> Option<Arc<CachedBlock>> {
@@ -744,6 +845,8 @@ impl BlockCache {
         for key in keys {
             self.remove(&key);
         }
+        self.partial
+            .retain(|key, _| key.contract_id != *contract_id);
     }
 }
 
@@ -1737,6 +1840,39 @@ impl RuesClient {
     where
         F: Fn(&[u8]) -> Vec<usize> + Sync,
     {
+        let key = BlockKey::new(contract_id, topic, block_height);
+        // A pass that ran out of pages inside this block left where it
+        // stopped and what it read of the block: read on from there.
+        let staged = self.block_cache().take_partial(&key);
+        if let Some(partial) = staged {
+            let resumed =
+                partial.found_for(contract_id, topic, block_height, wanted, matching_sequences)?;
+            if let Some(found) = resumed {
+                match self
+                    .scan_from(
+                        contract_id,
+                        topic,
+                        block_height,
+                        Some(partial.position),
+                        wanted,
+                        matching_sequences,
+                        Some((found, partial.capture)),
+                    )
+                    .await?
+                {
+                    ScanOutcome::Done(scan) => return Ok(scan),
+                    ScanOutcome::OutOfPages { error, partial } => {
+                        if let Some(partial) = partial {
+                            self.block_cache().stage(key, partial);
+                        }
+                        return Err(error);
+                    }
+                    // The archive no longer serves that position: the
+                    // lookup starts over from before the block.
+                    ScanOutcome::WrongAnchor | ScanOutcome::ArchiveBehind(_) => {}
+                }
+            }
+        }
         let start = self.scan_anchor_at_or_below(contract_id, block_height)?;
         match self
             .scan_from(
@@ -1746,10 +1882,17 @@ impl RuesClient {
                 start,
                 wanted,
                 matching_sequences,
+                None,
             )
             .await?
         {
             ScanOutcome::Done(scan) => return Ok(scan),
+            ScanOutcome::OutOfPages { error, partial } => {
+                if let Some(partial) = partial {
+                    self.block_cache().stage(key, partial);
+                }
+                return Err(error);
+            }
             // The anchors stay: the archive reaches them once it catches up.
             ScanOutcome::ArchiveBehind(anchor) => {
                 return Err(HyperlaneDuskError::Other(format!(
@@ -1775,10 +1918,17 @@ impl RuesClient {
                 None,
                 wanted,
                 matching_sequences,
+                None,
             )
             .await?
         {
             ScanOutcome::Done(scan) => Ok(scan),
+            ScanOutcome::OutOfPages { error, partial } => {
+                if let Some(partial) = partial {
+                    self.block_cache().stage(key, partial);
+                }
+                Err(error)
+            }
             ScanOutcome::WrongAnchor | ScanOutcome::ArchiveBehind(_) => {
                 Err(HyperlaneDuskError::Other(
                     "Dusk archive scan without an anchor found a stale anchor".into(),
@@ -1798,12 +1948,17 @@ impl RuesClient {
     /// describes.
     ///
     /// A pass reads at most `MAX_SCAN_PAGES` pages. One that runs out
-    /// records its position, as at its end, and fails; the next lookup
-    /// resumes from there.
+    /// records its position, as at its end, and stops (`OutOfPages`); the
+    /// next lookup resumes from there. Inside the block it looks for, that
+    /// position serves only later blocks as an anchor, so the pass also
+    /// leaves what it read of the block (`PartialScan`). `resume` is what
+    /// such a pass matched and captured, to go on with from `start`, its
+    /// position.
     ///
     /// A row the archive has not inserted yet is not an error here: the
     /// caller reports it, and the next lookup resumes from the anchors this
     /// pass records instead of from the first row.
+    #[allow(clippy::too_many_arguments)]
     async fn scan_from<F>(
         &self,
         contract_id: &[u8; 32],
@@ -1812,11 +1967,18 @@ impl RuesClient {
         start: Option<ScanAnchor>,
         wanted: &HashSet<usize>,
         matching_sequences: &F,
+        resume: Option<(ScannedRows, BlockCapture)>,
     ) -> Result<ScanOutcome, HyperlaneDuskError>
     where
         F: Fn(&[u8]) -> Vec<usize> + Sync,
     {
-        let mut found = ScannedRows::new();
+        let (mut found, mut capture) = match resume {
+            Some(resumed) => resumed,
+            None => (
+                ScannedRows::new(),
+                BlockCapture::new(self.block_cache().limits.block_bytes),
+            ),
+        };
         let start_before = start.map_or(0, |anchor| anchor.before_block);
         let mut rank = start.map_or(0, |anchor| anchor.rank);
         let mut highest_block = None;
@@ -1827,7 +1989,6 @@ impl RuesClient {
             start.and_then(|anchor| anchor.fence_id.checked_sub(1).filter(|id| *id >= 0));
         let mut fence = start;
         let mut size = PageSize::largest();
-        let mut capture = BlockCapture::new(self.block_cache().limits.block_bytes);
         let mut later = None;
         let mut pages = 0u64;
         loop {
@@ -1938,18 +2099,31 @@ impl RuesClient {
                     capture.complete = true;
                 }
                 let resume_after = last_row.as_ref().map(|event| event.id);
+                let mut position = None;
                 if let (Some(event), Some(highest)) = (last_row, highest_block) {
                     let before_block = start_before.max(highest.saturating_add(1));
                     if let Some(anchor) = ScanAnchor::after_row(&event, before_block, rank)? {
                         self.offer_scan_anchor(contract_id, anchor)?;
+                        position = Some(anchor);
                     }
                 }
                 if out_of_pages {
-                    return Err(HyperlaneDuskError::Other(format!(
+                    let error = HyperlaneDuskError::Other(format!(
                         "Dusk archive scan of contract {} read {pages} pages without reaching the end of block {block_height}; the next lookup resumes after row {}",
                         hex::encode(contract_id),
                         resume_after.map_or_else(|| "none".to_owned(), |id| id.to_string())
-                    )));
+                    ));
+                    // Stopped inside the block: what it read of the block
+                    // is kept with where it stopped.
+                    let partial = position
+                        .filter(|_| capture.seen)
+                        .map(|position| PartialScan {
+                            position,
+                            capture,
+                            wanted: wanted.clone(),
+                            found,
+                        });
+                    return Ok(ScanOutcome::OutOfPages { error, partial });
                 }
                 return Ok(ScanOutcome::Done(BlockScan {
                     found,
@@ -6269,6 +6443,118 @@ mod tests {
     /// A lookup whose block lacks a record stops before the first row of a
     /// later block, however many rows the contract has after it, instead of
     /// reading them all on every retry.
+    /// A pass that runs out of pages inside the block it looks for leaves
+    /// what it read of the block, and the next lookup reads on in it: here
+    /// block 6 alone has more rows than one pass reads, one per page, and
+    /// the record is its last. A position after a row of block 6 serves
+    /// only later blocks as an anchor, so every lookup started before the
+    /// block and ran out at the same row.
+    #[tokio::test]
+    async fn a_lookup_reads_on_in_its_block_after_running_out_of_pages_in_it() {
+        let contract_id = [145u8; 32];
+        let filler = MAX_SCAN_PAGES as i64 + 100;
+        let last = archive_row(0, 6, 3, "dispatch", contract_id, &[6]);
+        let stream = RowStream::start(contract_id, 6, Some(filler), Some(last));
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(stream.url.clone(), directory.path());
+        let lookup = client.finalized_contract_event(&contract_id, "dispatch", 0, 6, &[6]);
+        let error = tokio::time::timeout(Duration::from_secs(300), lookup)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("pages without reaching the end of block 6"),
+            "{error}"
+        );
+        assert_eq!(stream.pages(), MAX_SCAN_PAGES);
+        // The next lookup reads on from the last row read in block 6: the
+        // fence row, the 100 filler rows after it and the record.
+        let lookup = client.finalized_contract_event(&contract_id, "dispatch", 0, 6, &[6]);
+        let provenance = tokio::time::timeout(Duration::from_secs(300), lookup)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(provenance.block_height, 6);
+        assert_eq!(stream.pages(), MAX_SCAN_PAGES + 102);
+    }
+
+    /// A partial scan resumes another lookup of its block from the rows it
+    /// captured, and, once those grew past the bound, only a lookup of the
+    /// sequences it matched; a client keeps the latest few.
+    #[test]
+    fn partial_scans_resume_what_they_can_and_stay_few() {
+        let contract_id = [146u8; 32];
+        let event = |id: i64, data: &[u8]| -> FinalizedContractEvent {
+            serde_json::from_value(archive_row(id, 6, 1, "dispatch", contract_id, data)).unwrap()
+        };
+        let row = |data: &[u8]| BlockRow::parse(&event(1, data)).unwrap();
+        let matching = |data: &[u8]| vec![usize::from(data[0])];
+        let position = ScanAnchor::after_row(&event(1, &[1]), 7, 1)
+            .unwrap()
+            .unwrap();
+        let mut capture = BlockCapture::new(1 << 20);
+        capture.seen = true;
+        capture.push(row(&[1]));
+        capture.push(row(&[2]));
+        let wanted: HashSet<usize> = [1].into();
+        let partial = PartialScan {
+            position,
+            capture,
+            wanted: wanted.clone(),
+            found: [(1, event(1, &[1]))].into(),
+        };
+        let found = |partial: &PartialScan, wanted: &[usize]| {
+            partial
+                .found_for(
+                    &contract_id,
+                    "dispatch",
+                    6,
+                    &wanted.iter().copied().collect(),
+                    &matching,
+                )
+                .unwrap()
+                .map(|found| {
+                    let mut keys: Vec<usize> = found.into_keys().collect();
+                    keys.sort();
+                    keys
+                })
+        };
+        // Captured rows serve any sequence.
+        assert_eq!(found(&partial, &[2]), Some(vec![2]));
+        assert_eq!(found(&partial, &[1, 2, 3]), Some(vec![1, 2]));
+        // Past the bound, only the sequences matched before.
+        let mut overflowed = BlockCapture::new(0);
+        overflowed.push(row(&[1]));
+        let partial = PartialScan {
+            capture: overflowed,
+            ..partial
+        };
+        assert_eq!(found(&partial, &[1]), Some(vec![1]));
+        assert_eq!(found(&partial, &[2]), None);
+
+        let mut cache = BlockCache::new(BLOCK_CACHE_LIMITS);
+        let key = |height: u64| BlockKey::new(&contract_id, "dispatch", height);
+        for height in 0..=MAX_PARTIAL_SCANS as u64 {
+            cache.stage(
+                key(height),
+                PartialScan {
+                    position,
+                    capture: BlockCapture::new(0),
+                    wanted: wanted.clone(),
+                    found: ScannedRows::new(),
+                },
+            );
+        }
+        assert_eq!(cache.partial.len(), MAX_PARTIAL_SCANS);
+        assert!(cache.take_partial(&key(0)).is_none());
+        assert!(cache.take_partial(&key(MAX_PARTIAL_SCANS as u64)).is_some());
+        assert!(cache.take_partial(&key(MAX_PARTIAL_SCANS as u64)).is_none());
+        cache.forget_contract(&contract_id);
+        assert!(cache.partial.is_empty());
+    }
+
     /// A persisted row that does not decode or check, which only a damaged
     /// store holds, is dropped and read from the archive again, instead of
     /// failing its sequence's lookups until the store is cleared.
