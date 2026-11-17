@@ -386,12 +386,14 @@ impl DuskValidatorAnnounce {
     /// What a check of `validator`'s announcement of the location hashed
     /// `location_hash`, which its list holds, finds when the announcement
     /// log holds none up to `final_block`, the last final block: pending,
-    /// until the log is complete through `MISSING_RECORD_MARGIN` blocks past
-    /// the tip at which the check first missed it (`MissingRecords`). Then,
-    /// unless a block above the last final one holds it again after a
-    /// rollback, the archive lacks its row, which is reported as critical:
-    /// the contract refuses the same location again, so the validator waits
-    /// until another location is announced or the archive holds the row.
+    /// until every check has missed it while the log became complete through
+    /// `MISSING_RECORD_MARGIN` blocks past the tip at which the first did
+    /// (`MissingRecords`). Then, unless a block above the last final one
+    /// holds it, again after a rollback, which makes a later miss count
+    /// afresh, the archive is suspected of lacking its row, which is
+    /// reported as critical: the contract refuses the same location again,
+    /// so the validator waits until another location is announced or the
+    /// archive holds the row.
     async fn missed_announcement(
         &self,
         log: &EventLog,
@@ -428,10 +430,11 @@ impl DuskValidatorAnnounce {
                     && keccak256(announcement.storage_location.as_bytes()) == *location_hash
             })
         }) {
+            self.reads().missing.settled(&key);
             return pending();
         }
         let detail = format!(
-            "no block holds the announcement: no finalized block up to block {final_block}, the last final one and at least {MISSING_RECORD_MARGIN} blocks past tip {first_tip} where it was first missed, and no block above it. The node's archive lacks the announcement's finalized row, and the contract refuses the same location again: announce another storage location, or use an endpoint whose archive holds the row"
+            "no block holds the announcement: every check since tip {first_tip} found it in no finalized block, and in no block above the last final one, which is now block {final_block}, at least {MISSING_RECORD_MARGIN} blocks past that tip. The node's archive is suspected of lacking the announcement's finalized row, and the contract refuses the same location again: check the node's archive, and announce another storage location or use an endpoint whose archive holds the row"
         );
         let what = format!("{}/{}", log.topic, hex::encode(&key));
         if critical_report_due(&self.va_id, &what, first_tip) {
@@ -440,7 +443,7 @@ impl DuskValidatorAnnounce {
                 final_block,
                 first_tip,
                 %detail,
-                "CRITICAL: Dusk archive is missing a finalized announcement that contract state proves exists"
+                "CRITICAL: Dusk archive suspected of missing a finalized announcement that contract state reports"
             );
         }
         OwnCheck::Pending(detail)

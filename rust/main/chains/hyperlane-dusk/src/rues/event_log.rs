@@ -217,39 +217,52 @@ pub(crate) const MISSING_RECORD_MARGIN: u64 = 64;
 const MAX_MISSING_RECORDS: usize = 1024;
 
 /// Records contract state holds, such as a delivery or an announcement,
-/// that their event log has not shown, with the node's tip when each was
-/// first missed.
+/// that their event log has not shown: for each, the node's tip when it was
+/// first missed and the tip of the latest check that missed it.
 ///
 /// A record state holds is in a block at or below the tip state was read
 /// at. When the log holds every finalized row up to its last final block
 /// without the record, and no block above that one holds it either, its
 /// block was accepted after the check read the tip, was rolled back during
-/// the check, or is final and the archive lacks its row. Once the log is
-/// complete through `MISSING_RECORD_MARGIN` blocks past the tip at which
-/// the record was first missed, and it still is missed, only the last
-/// remains. No record counts without its row either way; the checks then
-/// report the archive as critical, so that the endpoint can be fixed.
+/// the check, or is final and the archive lacks its row. A record missed
+/// by every check, each finding the log complete no further than the tip
+/// the check before it read, until the log is complete through
+/// `MISSING_RECORD_MARGIN` blocks past the tip at which it was first
+/// missed, was very likely in a final block whose row the archive lacks.
+/// Not certainly: these checks never learn the record's block, and a
+/// record rolled back and made again between two checks looks the same. So
+/// the checks report a suspected gap. A check that finds the log complete
+/// past the latest check's tip saw blocks become final unobserved, which
+/// could have held the record, and a record missed again after that counts
+/// afresh. No record counts without its row either way.
 #[derive(Debug, Default)]
 pub(crate) struct MissingRecords {
-    first_tips: HashMap<Vec<u8>, u64>,
+    tips: HashMap<Vec<u8>, (u64, u64)>,
 }
 
 impl MissingRecords {
     /// Note that record `key` is missed by a check that read tip `tip` and
     /// found the log complete through `final_block`. The tip at which it
-    /// was first missed, once the log is complete far enough past it to
-    /// show that the archive lacks the record's row.
+    /// was first missed, once it has been missed continuously until the log
+    /// is complete `MISSING_RECORD_MARGIN` blocks past that tip.
     pub(crate) fn missed(&mut self, key: &[u8], tip: u64, final_block: u64) -> Option<u64> {
-        if self.first_tips.len() >= MAX_MISSING_RECORDS && !self.first_tips.contains_key(key) {
-            self.first_tips.clear();
+        if self.tips.len() >= MAX_MISSING_RECORDS && !self.tips.contains_key(key) {
+            self.tips.clear();
         }
-        let first = *self.first_tips.entry(key.to_vec()).or_insert(tip);
-        (final_block >= first.saturating_add(MISSING_RECORD_MARGIN)).then_some(first)
+        let (first, latest) = self.tips.entry(key.to_vec()).or_insert((tip, tip));
+        if final_block > *latest {
+            // Blocks became final since the last check that missed it.
+            (*first, *latest) = (tip, tip);
+        } else {
+            *latest = (*latest).max(tip);
+        }
+        (final_block >= first.saturating_add(MISSING_RECORD_MARGIN)).then_some(*first)
     }
 
-    /// Record `key` was found, or contract state no longer holds it.
+    /// Record `key` was found, possibly in a block that is not final yet,
+    /// or contract state no longer holds it: a later miss counts afresh.
     pub(crate) fn settled(&mut self, key: &[u8]) {
-        self.first_tips.remove(key);
+        self.tips.remove(key);
     }
 }
 
@@ -1831,37 +1844,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_record_counts_as_missing_from_the_archive_only_far_past_where_it_was_first_missed() {
+    fn a_record_counts_as_missing_only_when_missed_continuously_far_past_its_first_tip() {
         let mut missing = MissingRecords::default();
-        // First missed at tip 101: blocks up to it, and a few above, may
-        // hold it without the log having read them final yet.
-        assert_eq!(missing.missed(b"a", 101, 101), None);
-        assert_eq!(missing.missed(b"a", 140, 140), None);
+        // Missed by a check at every block from tip 101 on, finality two
+        // blocks behind: reported once the log is complete through 64
+        // blocks past the first tip, not before.
+        for tip in 101..=101 + MISSING_RECORD_MARGIN + 2 {
+            let final_block = tip - 2;
+            assert_eq!(
+                missing.missed(b"a", tip, final_block),
+                (final_block >= 101 + MISSING_RECORD_MARGIN).then_some(101),
+                "tip {tip}"
+            );
+        }
+        // Blocks became final unobserved, past the last check's tip (167):
+        // it counts afresh from the tip it is missed at now.
+        assert_eq!(missing.missed(b"a", 300, 298), None);
+        for tip in 301..300 + MISSING_RECORD_MARGIN + 2 {
+            assert_eq!(missing.missed(b"a", tip, tip - 2), None, "tip {tip}");
+        }
         assert_eq!(
-            missing.missed(b"a", 166, 101 + MISSING_RECORD_MARGIN - 1),
-            None
+            missing.missed(b"a", 366, 300 + MISSING_RECORD_MARGIN),
+            Some(300)
         );
-        // The log is complete far enough past the first tip.
-        assert_eq!(
-            missing.missed(b"a", 166, 101 + MISSING_RECORD_MARGIN),
-            Some(101)
-        );
+        // A tip that went back, after a rollback, does not narrow what the
+        // next check may find final without counting afresh.
+        assert_eq!(missing.missed(b"a", 360, 364), Some(300));
+        assert_eq!(missing.missed(b"a", 367, 366), Some(300));
         // Another record is missed on its own; a record found starts over.
-        assert_eq!(missing.missed(b"b", 166, 166), None);
+        assert_eq!(missing.missed(b"b", 400, 398), None);
         missing.settled(b"a");
-        assert_eq!(missing.missed(b"a", 166, 166), None);
+        assert_eq!(missing.missed(b"a", 400, 398), None);
         // At the bound, a record missed for the first time clears the rest,
         // which count again from the tip at which they are next missed.
         let mut missing = MissingRecords::default();
         for key in 0..MAX_MISSING_RECORDS {
             missing.missed(&key.to_be_bytes(), 1_000, 1_000);
         }
-        assert_eq!(missing.first_tips.len(), MAX_MISSING_RECORDS);
+        assert_eq!(missing.tips.len(), MAX_MISSING_RECORDS);
         assert_eq!(
             missing.missed(&MAX_MISSING_RECORDS.to_be_bytes(), 1_000, 1_000),
             None
         );
-        assert_eq!(missing.first_tips.len(), 1);
+        assert_eq!(missing.tips.len(), 1);
         assert_eq!(missing.missed(&0usize.to_be_bytes(), 2_000, 2_000), None);
     }
 

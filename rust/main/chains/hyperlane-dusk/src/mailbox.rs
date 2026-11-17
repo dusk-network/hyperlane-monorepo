@@ -1582,9 +1582,9 @@ impl DuskMailbox {
         // In no final block and in no block above them: a block that held
         // it was rolled back during this check, and the next one reads it
         // as not delivered, or the archive skipped the final block that
-        // holds it and this stays so. Missed while the log reads far enough
-        // past the tip at which it was first missed, only the latter
-        // remains.
+        // holds it and this stays so. Missed by every check until the log
+        // reads far past the tip at which it was first missed, the latter
+        // is very likely (`MissingRecords`).
         let missed = self
             .delivery_checks
             .lock()
@@ -1593,7 +1593,7 @@ impl DuskMailbox {
             .missed(&id_bytes, pair.tip().0, final_block);
         if let Some(first_tip) = missed {
             let detail = format!(
-                "Message {id:?} is delivered at the Dusk tip, but no block holds its delivery: no finalized block up to block {final_block}, the last final one and at least {MISSING_RECORD_MARGIN} blocks past tip {first_tip} where it was first missed, and no block above it. The node's archive lacks the delivery's finalized ProcessId row, and the delivery does not count without it: repair or rebuild the node's archive, or use another endpoint"
+                "Message {id:?} is delivered at the Dusk tip, but no block holds its delivery: every check since tip {first_tip} found it in no finalized block, and in no block above the last final one, which is now block {final_block}, at least {MISSING_RECORD_MARGIN} blocks past that tip. The node's archive is suspected of lacking the delivery's finalized ProcessId row, and the delivery does not count without it: check the node's archive, and repair or rebuild it, or use another endpoint"
             );
             let what = format!("{}/{}", events::ProcessId::TOPIC, hex::encode(id_bytes));
             if critical_report_due(&self.mailbox_id, &what, first_tip) {
@@ -1602,7 +1602,7 @@ impl DuskMailbox {
                     final_block,
                     first_tip,
                     %detail,
-                    "CRITICAL: Dusk archive is missing a finalized delivery that contract state proves exists"
+                    "CRITICAL: Dusk archive suspected of missing a finalized delivery that contract state reports"
                 );
             }
             return Ok(Delivery::Unsettled(detail));
