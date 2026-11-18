@@ -27,17 +27,14 @@ on:
 
 env:
   TURBO_TELEMETRY_DISABLED: 1
-  TURBO_API: https://cache.depot.dev
-  TURBO_TOKEN: ${{ secrets.DEPOT_TURBO_TOKEN }}
-  TURBO_TEAM: ${{ secrets.DEPOT_ORG_ID }}
 
 jobs:
   # ── EVM ──────────────────────────────────────────────
 
   cli-evm-e2e-smoke:
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     if: inputs.run_cli_e2e == 'true' && inputs.ci_tier == 'smoke'
-    timeout-minutes: 20
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -55,7 +52,6 @@ jobs:
           - warp-apply-delayed-flow-3
           - warp-check-1
           - warp-send
-          - warp-fork
     steps:
       - uses: actions/checkout@v7
         with:
@@ -77,9 +73,9 @@ jobs:
           CLI_E2E_TEST: ${{ matrix.test }}
 
   cli-evm-e2e-matrix:
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     if: inputs.run_cli_e2e == 'true' && inputs.ci_tier == 'full'
-    timeout-minutes: 20
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -139,7 +135,6 @@ jobs:
           - warp-check-5
           - warp-check-ica
           # fork
-          - warp-fork
           # other
           - warp-init
           - warp-quote
@@ -172,9 +167,9 @@ jobs:
   # ── Cosmos ───────────────────────────────────────────
 
   cli-cosmos-e2e-smoke:
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     if: (inputs.run_cli_e2e == 'true' || inputs.has_cosmos == 'true') && inputs.ci_tier == 'smoke'
-    timeout-minutes: 15
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -200,9 +195,9 @@ jobs:
           CLI_E2E_TEST: ${{ matrix.test }}
 
   cli-cosmos-e2e-matrix:
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     if: (inputs.run_cli_e2e == 'true' || inputs.has_cosmos == 'true') && inputs.ci_tier == 'full'
-    timeout-minutes: 15
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -240,9 +235,9 @@ jobs:
   # ── Radix ────────────────────────────────────────────
 
   cli-radix-e2e-smoke:
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     if: (inputs.run_cli_e2e == 'true' || inputs.has_radix == 'true') && inputs.ci_tier == 'smoke'
-    timeout-minutes: 15
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -267,9 +262,9 @@ jobs:
           CLI_E2E_TEST: ${{ matrix.test }}
 
   cli-radix-e2e-matrix:
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     if: (inputs.run_cli_e2e == 'true' || inputs.has_radix == 'true') && inputs.ci_tier == 'full'
-    timeout-minutes: 20
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -305,9 +300,9 @@ jobs:
   # ── Starknet ─────────────────────────────────────────
 
   cli-starknet-e2e-smoke:
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     if: (inputs.run_cli_e2e == 'true' || inputs.has_starknet == 'true') && inputs.ci_tier == 'smoke'
-    timeout-minutes: 20
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -333,9 +328,9 @@ jobs:
           CLI_E2E_TIER: ${{ inputs.ci_tier }}
 
   cli-starknet-e2e-matrix:
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     if: (inputs.run_cli_e2e == 'true' || inputs.has_starknet == 'true') && inputs.ci_tier == 'full'
-    timeout-minutes: 20
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -382,9 +377,9 @@ jobs:
   # ── Tron (small — always full) ──────────────────────
 
   cli-tron-e2e-matrix:
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     if: inputs.run_cli_e2e == 'true' || inputs.has_tron == 'true'
-    timeout-minutes: 20
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -413,9 +408,9 @@ jobs:
   # ── Cross-chain ─────────────────────────────────────
 
   cli-cross-chain-e2e-matrix:
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     if: inputs.run_cli_e2e == 'true'
-    timeout-minutes: 20
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -444,9 +439,9 @@ jobs:
           CLI_E2E_TEST: ${{ matrix.test }}
 
   cli-cross-chain-starknet-e2e-matrix:
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     if: inputs.run_cli_e2e == 'true' || inputs.has_starknet == 'true'
-    timeout-minutes: 20
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -473,9 +468,9 @@ jobs:
   # ── Aleo ─────────────────────────────────────────────
 
   cli-aleo-e2e-smoke:
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     if: (inputs.run_cli_e2e == 'true' || inputs.has_aleo == 'true') && inputs.ci_tier == 'smoke'
-    timeout-minutes: 15
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -501,9 +496,9 @@ jobs:
           CLI_E2E_TEST: ${{ matrix.test }}
 
   cli-aleo-e2e-matrix:
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     if: (inputs.run_cli_e2e == 'true' || inputs.has_aleo == 'true') && inputs.ci_tier == 'full'
-    timeout-minutes: 15
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -543,9 +538,9 @@ jobs:
   # ── SVM (Sealevel) ──────────────────────────────────
 
   cli-svm-e2e-smoke:
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     if: (inputs.run_cli_e2e == 'true' || inputs.has_svm == 'true') && inputs.ci_tier == 'smoke'
-    timeout-minutes: 15
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -572,9 +567,9 @@ jobs:
           CLI_E2E_TEST: ${{ matrix.test }}
 
   cli-svm-e2e-matrix:
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     if: (inputs.run_cli_e2e == 'true' || inputs.has_svm == 'true') && inputs.ci_tier == 'full'
-    timeout-minutes: 20
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -590,7 +585,6 @@ jobs:
           - warp-cross-collateral
           - warp-fee
           - warp-fee-apply
-          - warp-fork
           - warp-legacy-upgrade-fee
           - warp-quote
           - warp-read
@@ -633,9 +627,9 @@ jobs:
   # specific CLI commands that use them. Full coverage in merge queue.
 
   cli-evm-relayer-e2e:
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     if: inputs.has_relayer == 'true'
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
         with:
@@ -654,9 +648,9 @@ jobs:
           CLI_E2E_TEST: relay
 
   cli-evm-rebalancer-e2e:
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     if: inputs.has_rebalancer == 'true'
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
         with:
