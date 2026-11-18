@@ -465,8 +465,9 @@ impl Chain {
             // The deployment check.
             ("transfer", "chain_id") => vec![0],
             ("mailbox" | "announce", "local_domain") => ORIGIN.to_le_bytes().to_vec(),
-            ("mailbox", "state_version") => 5u32.to_le_bytes().to_vec(),
-            ("announce" | "hook", "state_version") => 2u32.to_le_bytes().to_vec(),
+            ("mailbox", "state_version") => 6u32.to_le_bytes().to_vec(),
+            ("announce", "state_version") => 3u32.to_le_bytes().to_vec(),
+            ("hook", "state_version") => 2u32.to_le_bytes().to_vec(),
             ("announce" | "hook", "mailbox") => MAILBOX.to_vec(),
             ("mailbox", "required_hook") => HOOK.to_vec(),
             ("hook", "hook_type") => vec![3],

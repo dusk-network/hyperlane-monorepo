@@ -25,8 +25,12 @@ pub use trait_builder::*;
 pub use validator_announce::*;
 
 mod application;
+#[cfg(any(test, feature = "fuzzing"))]
+mod checks;
 mod error;
 mod final_records;
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing;
 mod interchain_gas;
 mod interchain_security_module;
 mod mailbox;

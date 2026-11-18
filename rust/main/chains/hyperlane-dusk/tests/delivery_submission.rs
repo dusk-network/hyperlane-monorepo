@@ -362,6 +362,65 @@ async fn a_delivery_whose_first_transaction_lands_during_its_retry_is_not_sent_a
     std::env::remove_var("DUSK_TX_BIN");
 }
 
+/// A delivery waits after its simulation passed, here for its earlier
+/// transaction, which never reached the node, to be missed by two lookups
+/// half a block apart, and another relayer delivers the message meanwhile.
+/// The Mailbox simulates it again before the helper signs it, and sends
+/// nothing: the transaction would fail in its block, paying its whole gas
+/// limit.
+#[tokio::test]
+async fn a_delivery_that_waited_after_its_simulation_is_simulated_again_before_it_is_signed() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start(false);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let delivery = delivery(0);
+    let (message, metadata, gas_limit) = delivery.clone();
+    // The helper prints the transaction's hash, then reports an unknown
+    // outcome without sending it.
+    node.next_submission(1, "lose");
+    let mailbox = node.mailbox(false).with_submission_limits(patient(64));
+    let error = mailbox
+        .process(&message, &metadata, gas_limit)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("to be included"), "{error}");
+    assert!(node.propagated().is_empty());
+
+    // Sent again past the 2 s a passed simulation stands for, and past the
+    // drop grace, with blocks of 4.4 s: the earlier transaction is looked
+    // up twice, 2.2 s apart, before the helper may sign another.
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    let mailbox = mailbox.with_submission_limits(SubmissionLimits {
+        block: Duration::from_millis(4_400),
+        ..patient(64)
+    });
+    let gate = std::sync::Arc::new(Gate::default());
+    node.inject(Route::Simulation, None, Fault::HoldReply(gate.clone()));
+    let calls = node.invocations().len();
+    let retry = tokio::spawn({
+        let mailbox = mailbox.clone();
+        let (message, metadata) = (message.clone(), metadata.clone());
+        async move { mailbox.process(&message, &metadata, gas_limit).await }
+    });
+    // The simulation runs on the state before another relayer delivers the
+    // message, and passes.
+    node.wait_until("the simulation is answered", |_| {
+        gate.waiting.load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+    node.deliver_elsewhere(&delivery);
+    gate.open();
+    let error = retry.await.unwrap().unwrap_err();
+    assert!(
+        matches!(error, ChainCommunicationError::SimulationFailed(_)),
+        "{error}"
+    );
+    assert_eq!(node.invocations().len(), calls);
+    assert!(node.propagated().is_empty());
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
 /// A delivery whose kept transaction failed in a block spent that nonce and
 /// delivered nothing: once the block is final, it goes again; before, a
 /// rollback could still run that transaction again.
@@ -410,6 +469,151 @@ async fn a_delivery_whose_transaction_failed_goes_again_once_its_block_is_final(
         .unwrap();
     assert!(outcome.executed);
     assert_eq!(node.propagated(), [1, 2]);
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+/// The helper's capability probe (`call --help`), the first in a process
+/// for a helper, can take seconds. It goes before the delivery's last
+/// simulation: a delivery made elsewhere meanwhile fails that simulation,
+/// and nothing is signed.
+#[tokio::test]
+async fn a_slow_helper_probe_goes_before_the_last_simulation() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start(false);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    node.help_delay(3);
+    let mailbox = node.mailbox(false).with_submission_limits(patient(64));
+    let delivery = delivery(0);
+    let task = tokio::spawn({
+        let mailbox = mailbox.clone();
+        let (message, metadata, gas_limit) = delivery.clone();
+        async move { mailbox.process(&message, &metadata, gas_limit).await }
+    });
+    // Another relayer delivers the message while the probe runs.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !node.probing() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    node.deliver_elsewhere(&delivery);
+    let error = task.await.unwrap().unwrap_err();
+    assert!(
+        matches!(error, ChainCommunicationError::SimulationFailed(_)),
+        "{error}"
+    );
+    assert!(node.invocations().is_empty());
+    assert!(node.propagated().is_empty());
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+/// The helper reads the account and signs after the delivery's last
+/// simulation, and can take its time: here it waits at its gate while
+/// another relayer delivers the message. Before it is let send what it
+/// signed, the simulation, by then over 2 s old, is run again, fails, and
+/// the helper sends nothing.
+#[tokio::test]
+async fn a_delivery_is_simulated_again_before_a_slow_helper_may_send_it() {
+    let _env = HELPER_ENV.lock().await;
+    let node = Node::start(false);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let mailbox = node.mailbox(false).with_submission_limits(patient(64));
+    let delivery = delivery(0);
+    node.next_submission(1, "gate");
+    let task = tokio::spawn({
+        let mailbox = mailbox.clone();
+        let (message, metadata, gas_limit) = delivery.clone();
+        async move { mailbox.process(&message, &metadata, gas_limit).await }
+    });
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !node.helper_reached("gated", 1) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    node.deliver_elsewhere(&delivery);
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    node.open_gate(1);
+    let error = task.await.unwrap().unwrap_err().to_string();
+    assert!(
+        error.contains("simulation just before sending failed"),
+        "{error}"
+    );
+    assert_eq!(node.words(), ["1 <eof>"]);
+    assert!(node.propagated().is_empty());
+    std::env::remove_var("DUSK_TX_BIN");
+}
+
+/// A lookup reply that carries another transaction's receipt, as a proxy
+/// or a cache in front of the node can answer with, never releases a kept
+/// transaction. Here kept transaction A failed in its block and was
+/// reported, then a rollback put it back into the mempool, where it waits.
+/// A lookup answers with B's failed receipt in a final block beside A in
+/// the mempool: read as A's, the relayer forgot A and signed the message
+/// again while A could still land. Nor does A's own failed receipt in a
+/// final block release A while the mempool still lists it.
+#[tokio::test]
+async fn a_lookup_reply_for_another_transaction_never_releases_a_kept_one() {
+    let _env = HELPER_ENV.lock().await;
+    // Finality moves only by hand.
+    let node = Node::start_with(false, None);
+    std::env::set_var("DUSK_TX_BIN", node.helper());
+    let mailbox = node.mailbox(false).with_submission_limits(patient(64));
+    let delivery = delivery(0);
+    let (message, metadata, gas_limit) = &delivery;
+    node.wait_until("a few blocks", |model| model.height >= 3)
+        .await;
+    // Another relayer's delivery lands first, so A fails in its block, and
+    // the relayer gets that outcome.
+    node.pause(true);
+    let first = tokio::spawn({
+        let mailbox = mailbox.clone();
+        let (message, metadata, gas_limit) = delivery.clone();
+        async move { mailbox.process(&message, &metadata, gas_limit).await }
+    });
+    node.wait_until("A is in the mempool", |model| !model.mempool.is_empty())
+        .await;
+    node.deliver_elsewhere(&delivery);
+    node.pause(false);
+    let outcome = first.await.unwrap().unwrap();
+    assert!(!outcome.executed);
+    let a = mailbox.prepared_transaction(message.id()).unwrap().unwrap();
+    // A rollback puts A back into the mempool, where it stays, and the other
+    // delivery does not count after all. The blocks below A's are final.
+    node.pause(true);
+    let height = node.model().included(&a).unwrap().height;
+    node.rollback_to(height - 1);
+    node.undeliver(&delivery);
+    node.finalize_to(height - 1);
+    node.expire_block_pair().await;
+    let calls = node.invocations().len();
+    for (ledger, said) in [
+        (
+            serde_json::json!({
+                "id": "bb".repeat(32), "blockHeight": 1, "gasSpent": 1, "err": "Panic",
+            }),
+            "not of it",
+        ),
+        (
+            serde_json::json!({ "id": a, "blockHeight": 1, "gasSpent": 1, "err": "Panic" }),
+            "still lists it in its mempool",
+        ),
+    ] {
+        node.inject(Route::Graphql, None, Fault::LedgerEntry(ledger));
+        let error = mailbox
+            .process(message, metadata, *gas_limit)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(said), "{error}");
+        assert_eq!(node.invocations().len(), calls);
+        assert_eq!(
+            mailbox.prepared_transaction(message.id()).unwrap(),
+            Some(a.clone())
+        );
+    }
     std::env::remove_var("DUSK_TX_BIN");
 }
 
@@ -1669,9 +1873,12 @@ async fn a_signer_at_its_bound_of_kept_transactions_forgets_only_final_ones() {
 /// `NotSubmitted`. A hash the agent keeps lets dusk-tx preverify its
 /// transaction, only then; the stand-in node refuses a real Moonlight
 /// transaction there, so that delivery is not submitted either. Runs only
-/// when asked (`--ignored`), with `DUSK_TX_REAL_BIN` naming the build.
+/// when asked (`--ignored`), with `DUSK_TX_REAL_BIN` naming the build: CI
+/// can't build `dusk-tx`, which needs Dusk's private Rusk repository, so
+/// `scripts/dusk-tx-interop-check.sh` builds it at the agent gate's
+/// `DUSK_REF` and runs this as a release check (README, Testing).
 #[tokio::test]
-#[ignore = "runs a dusk-tx build: set DUSK_TX_REAL_BIN to its path"]
+#[ignore = "runs a dusk-tx build: scripts/dusk-tx-interop-check.sh builds one and runs it"]
 async fn a_dusk_tx_build_sends_only_on_the_agents_word() {
     let _env = HELPER_ENV.lock().await;
     let bin = std::env::var("DUSK_TX_REAL_BIN").expect("DUSK_TX_REAL_BIN names a dusk-tx build");

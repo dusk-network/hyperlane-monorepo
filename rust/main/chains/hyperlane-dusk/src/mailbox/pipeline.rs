@@ -794,9 +794,15 @@ impl DuskMailbox {
         for tx in reservation.txs.iter().rev() {
             let tx_id = hex::encode(tx);
             match tokio::time::timeout_at(deadline, self.rues.transaction_status(&tx_id)).await {
-                // One transaction of a nonce at most is in a block.
-                Ok(Ok(TransactionStatus::Included { block_height, .. })) => {
-                    return if block_height <= finalized {
+                // One transaction of a nonce at most is in a block. One the
+                // node still lists in its mempool too is kept until it has
+                // left.
+                Ok(Ok(TransactionStatus::Included {
+                    block_height,
+                    in_mempool,
+                    ..
+                })) => {
+                    return if block_height <= finalized && !in_mempool {
                         Standing::Final
                     } else {
                         Standing::Landed(tx_id)
@@ -851,8 +857,12 @@ impl DuskMailbox {
             None => None,
         };
         match status {
-            Some(Some(TransactionStatus::Included { block_height, .. })) => {
-                if block_height <= finalized {
+            Some(Some(TransactionStatus::Included {
+                block_height,
+                in_mempool,
+                ..
+            })) => {
+                if block_height <= finalized && !in_mempool {
                     Legacy::Gone
                 } else {
                     Legacy::Kept

@@ -848,6 +848,207 @@ async fn validator_startup_waits_until_its_announcement_is_final() {
     assert!(error.contains("no eventCursorDir"), "{error}");
 }
 
+/// One block more on the chain and one more final: a check after each step
+/// sees every block become final after it was the tip.
+fn step(node: &mut Node) -> u64 {
+    node.push(vec![]);
+    node.finalized += 1;
+    node.finalized
+}
+
+/// A chain whose blocks up to 101 are final and whose tip is 103, with
+/// finality two blocks behind: block 101 holds a record the archive holds
+/// no row of.
+fn node_missing_a_row() -> Node {
+    let mut node = Node::new(100);
+    let block = node.push(vec![]);
+    node.push(vec![]);
+    node.push(vec![]);
+    node.finalized = block;
+    node
+}
+
+/// What the agent reports at the ERROR level while this lives, on this
+/// thread: what an operator's alerting reads.
+struct Reports {
+    events: Arc<Mutex<Vec<String>>>,
+    _guard: tracing::subscriber::DefaultGuard,
+}
+
+impl Reports {
+    fn start() -> Self {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let guard = tracing::subscriber::set_default(Recorder(events.clone()));
+        Self {
+            events,
+            _guard: guard,
+        }
+    }
+
+    fn critical(&self) -> Vec<String> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.contains("CRITICAL"))
+            .cloned()
+            .collect()
+    }
+}
+
+struct Recorder(Arc<Mutex<Vec<String>>>);
+
+impl tracing::Subscriber for Recorder {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        if *event.metadata().level() == tracing::Level::ERROR {
+            let mut fields = Fields(String::new());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+struct Fields(String);
+
+impl tracing::field::Visit for Fields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.push_str(&format!("{}={value:?}; ", field.name()));
+    }
+}
+
+/// An announcement the validator's list holds, in a block the archive
+/// finalized without its row, keeps startup waiting. Missed by a check at
+/// every block until the log is complete 64 blocks past the tip at which
+/// it was first missed, it is reported, once, as a suspected archive gap:
+/// the contract refuses the same location again.
+#[tokio::test]
+async fn an_announcement_the_archive_lacks_is_reported_as_missing() {
+    let mut node = node_missing_a_row();
+    node.locations = vec![LOCATION.to_owned()];
+    let fixture = Fixture::start(node);
+    let strict = fixture.announcements_with_log().with_own_location(LOCATION);
+    let reports = Reports::start();
+    let check = || async {
+        strict
+            .get_announced_storage_locations(&[validator()])
+            .await
+            .unwrap_err()
+            .to_string()
+    };
+    // First missed at tip 103.
+    let mut final_block = 101;
+    while final_block < 103 + 63 {
+        let error = check().await;
+        assert!(
+            error.contains(&format!("no finalized block up to block {final_block}"))
+                && !error.contains("suspected"),
+            "{error}"
+        );
+        final_block = step(&mut fixture.node());
+        fixture.next_tick().await;
+    }
+    // Above the last final block, another validator announces the same
+    // location, and this one another location: neither is its
+    // announcement.
+    {
+        let mut node = fixture.node();
+        step(&mut node);
+        node.push(vec![
+            Event::announced([0x33; 20], LOCATION),
+            Event::announced(VALIDATOR, "s3://fixture/elsewhere"),
+        ]);
+    }
+    fixture.next_tick().await;
+    let error = check().await;
+    assert!(
+        error.contains(LOCATION)
+            && error.contains("every check since tip 103")
+            && error.contains("suspected of lacking the announcement's finalized row")
+            && error.contains("announce another storage location"),
+        "{error}"
+    );
+    let critical = reports.critical();
+    assert_eq!(critical.len(), 1, "{critical:?}");
+    assert!(
+        critical[0].contains("suspected of missing a finalized announcement")
+            && critical[0].contains("first_tip=103")
+            && critical[0].contains(&hex::encode(VALIDATOR)),
+        "{critical:?}"
+    );
+}
+
+/// An announcement rolled back and put in a later block again, which is
+/// not final yet, is only pending, however long after it was first missed,
+/// and a miss after that block is rolled back too counts afresh. Once a
+/// final block holds it, it counts.
+#[tokio::test]
+async fn an_announcement_in_a_block_above_the_last_final_one_is_not_reported_as_missing() {
+    let mut node = node_missing_a_row();
+    node.locations = vec![LOCATION.to_owned()];
+    let fixture = Fixture::start(node);
+    let strict = fixture.announcements_with_log().with_own_location(LOCATION);
+    let reports = Reports::start();
+    let check = || async {
+        strict
+            .get_announced_storage_locations(&[validator()])
+            .await
+            .map_err(|error| error.to_string())
+    };
+    let mut final_block = 101;
+    while final_block < 103 + 63 {
+        assert!(check().await.is_err());
+        final_block = step(&mut fixture.node());
+        fixture.next_tick().await;
+    }
+    let again = {
+        let mut node = fixture.node();
+        step(&mut node);
+        node.push(vec![Event::announced(VALIDATOR, LOCATION)])
+    };
+    fixture.next_tick().await;
+    let error = check().await.unwrap_err();
+    assert!(
+        error.contains("no finalized block up to block 167") && !error.contains("suspected"),
+        "{error}"
+    );
+    // That block is rolled back: missed again, the announcement counts from
+    // the tip it is missed at now.
+    {
+        let mut node = fixture.node();
+        node.roll_back_to(again - 1);
+        node.push(vec![]);
+        step(&mut node);
+    }
+    fixture.next_tick().await;
+    let error = check().await.unwrap_err();
+    assert!(!error.contains("suspected"), "{error}");
+    // Put in a block again, which becomes final.
+    let last = {
+        let mut node = fixture.node();
+        node.push(vec![Event::announced(VALIDATOR, LOCATION)])
+    };
+    fixture.node().finalized = last;
+    fixture.next_tick().await;
+    assert_eq!(check().await, Ok(vec![vec![LOCATION.to_owned()]]));
+    assert!(reports.critical().is_empty(), "{:?}", reports.critical());
+}
+
 #[tokio::test]
 async fn with_an_announcement_log_startup_counts_only_a_finalized_announcement() {
     let mut node = Node::new(100);
@@ -1007,6 +1208,133 @@ async fn a_delivery_rolled_back_within_the_check_never_counts_with_a_delivery_lo
     );
     // The relayer checks again later and relays the message again.
     assert_eq!(delivered_with_log(&fixture).await, Ok(false));
+}
+
+/// A delivery the Mailbox reports, in a block the archive finalized without
+/// its `ProcessId` row, never counts. Missed by a check at every block
+/// until the log is complete 64 blocks past the tip at which it was first
+/// missed, it is reported, once, as a suspected archive gap.
+#[tokio::test]
+async fn a_delivery_the_archive_lacks_is_reported_as_missing() {
+    let mut node = node_missing_a_row();
+    node.delivered.insert(MESSAGE);
+    let fixture = Fixture::start(node);
+    let mailbox = fixture.mailbox_with_log();
+    let reports = Reports::start();
+    let delivered = || async {
+        mailbox
+            .delivered(message_id())
+            .await
+            .map_err(|error| error.to_string())
+    };
+    // First missed at tip 103.
+    let mut final_block = 101;
+    while final_block < 103 + 64 {
+        let error = delivered().await.unwrap_err();
+        assert!(
+            error.contains("rolled back during this check, or the node's archive skipped it"),
+            "{error}"
+        );
+        final_block = step(&mut fixture.node());
+        fixture.next_tick().await;
+    }
+    let error = delivered().await.unwrap_err();
+    assert!(
+        error.contains("every check since tip 103")
+            && error.contains("which is now block 167")
+            && error.contains("suspected of lacking the delivery's finalized ProcessId row"),
+        "{error}"
+    );
+    // Reported once, however often the relayer asks.
+    step(&mut fixture.node());
+    fixture.next_tick().await;
+    assert!(delivered().await.unwrap_err().contains("suspected"));
+    let critical = reports.critical();
+    assert_eq!(critical.len(), 1, "{critical:?}");
+    assert!(
+        critical[0].contains("suspected of missing a finalized delivery")
+            && critical[0].contains("first_tip=103")
+            && critical[0].contains(&format!("{:?}", message_id())),
+        "{critical:?}"
+    );
+}
+
+/// Two misses of a delivery with blocks become final unobserved between
+/// them, as across an outage of the endpoint, are not one miss: each could
+/// be a block rolled back during its check. The later one counts afresh,
+/// however far past the first.
+#[tokio::test]
+async fn misses_with_blocks_final_unobserved_between_them_count_afresh() {
+    let mut node = node_missing_a_row();
+    node.delivered.insert(MESSAGE);
+    let fixture = Fixture::start(node);
+    let mailbox = fixture.mailbox_with_log();
+    let reports = Reports::start();
+    let delivered = || async {
+        mailbox
+            .delivered(message_id())
+            .await
+            .map_err(|error| error.to_string())
+    };
+    assert!(delivered().await.is_err());
+    {
+        let mut node = fixture.node();
+        for _ in 0..100 {
+            step(&mut node);
+        }
+    }
+    fixture.next_tick().await;
+    let error = delivered().await.unwrap_err();
+    assert!(!error.contains("suspected"), "{error}");
+    assert!(reports.critical().is_empty(), "{:?}", reports.critical());
+}
+
+/// A delivery the checks find again, here in a block above the last final
+/// one, counts as missed afresh if that block is rolled back: from the tip
+/// it is then missed at, not the first one.
+#[tokio::test]
+async fn a_delivery_found_again_is_missed_afresh() {
+    let mut node = node_missing_a_row();
+    node.delivered.insert(MESSAGE);
+    let fixture = Fixture::start(node);
+    let mailbox = fixture.mailbox_with_log();
+    let delivered = || async {
+        mailbox
+            .delivered(message_id())
+            .await
+            .map_err(|error| error.to_string())
+    };
+    let mut final_block = 101;
+    while final_block < 131 {
+        assert!(delivered().await.is_err());
+        final_block = step(&mut fixture.node());
+        fixture.next_tick().await;
+    }
+    // A block above the last final one holds it.
+    let again = fixture.node().push(vec![Event::processed(MESSAGE)]);
+    fixture.next_tick().await;
+    let error = delivered().await.unwrap_err();
+    assert!(
+        error.contains(&format!("delivered in Dusk block {again}")),
+        "{error}"
+    );
+    // That block is rolled back: missed again at every block, it is not
+    // reported 64 blocks past the tip at which it was first missed, only
+    // 64 past the one at which it is missed again.
+    {
+        let mut node = fixture.node();
+        node.roll_back_to(again - 1);
+        node.push(vec![]);
+    }
+    fixture.next_tick().await;
+    while final_block < 103 + 64 {
+        let error = delivered().await.unwrap_err();
+        assert!(!error.contains("suspected"), "{error}");
+        final_block = step(&mut fixture.node());
+        fixture.next_tick().await;
+    }
+    let error = delivered().await.unwrap_err();
+    assert!(!error.contains("suspected"), "{error}");
 }
 
 #[tokio::test]

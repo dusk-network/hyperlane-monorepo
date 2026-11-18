@@ -1,0 +1,162 @@
+[package]
+name = "hyperlane-dusk-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# A workspace of its own: the targets build with sanitizers and keep their own
+# lock, started from rust/main's so the crate's dependencies match.
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+hyperlane-dusk = { path = "..", features = ["fuzzing"] }
+
+# rust/main's patches, which the crate's dependencies are built with.
+[patch.crates-io.curve25519-dalek]
+branch = "v3.2.2-relax-zeroize"
+git = "https://github.com/Eclipse-Laboratories-Inc/curve25519-dalek"
+version = "3.2.2"
+
+[patch.crates-io.primitive-types]
+branch = "hyperlane"
+git = "https://github.com/hyperlane-xyz/parity-common.git"
+version = "=0.12.1"
+
+[patch.crates-io.rlp]
+branch = "hyperlane"
+git = "https://github.com/hyperlane-xyz/parity-common.git"
+version = "=0.5.2"
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "prepared_line"
+path = "fuzz_targets/prepared_line.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "helper_output"
+path = "fuzz_targets/helper_output.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tx_id"
+path = "fuzz_targets/tx_id.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_pair"
+path = "fuzz_targets/block_pair.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "confirmed_transaction"
+path = "fuzz_targets/confirmed_transaction.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "event_cursor"
+path = "fuzz_targets/event_cursor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "event_page"
+path = "fuzz_targets/event_page.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h256_hex"
+path = "fuzz_targets/h256_hex.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bounded"
+path = "fuzz_targets/bounded.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lookup_cadence"
+path = "fuzz_targets/lookup_cadence.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "graphql"
+path = "fuzz_targets/graphql.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "scan_anchor"
+path = "fuzz_targets/scan_anchor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "contract_reply"
+path = "fuzz_targets/contract_reply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lookup_reply"
+path = "fuzz_targets/lookup_reply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kept_records"
+path = "fuzz_targets/kept_records.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "final_records_search"
+path = "fuzz_targets/final_records_search.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transaction_id"
+path = "fuzz_targets/transaction_id.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ledger_lookup"
+path = "fuzz_targets/ledger_lookup.rs"
+test = false
+doc = false
+bench = false

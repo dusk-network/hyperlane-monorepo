@@ -1,0 +1,18 @@
+# Generates ../solidity_vectors.jsonl from Hyperlane's Solidity libraries;
+# see DuskVectors.s.sol.
+[profile.default]
+src = "."
+script = "."
+test = "."
+out = "../../../../../target/dusk-solidity-vectors/out"
+cache_path = "../../../../../target/dusk-solidity-vectors/cache"
+libs = []
+solc_version = "0.8.33"
+evm_version = "cancun"
+offline = true
+allow_paths = ["../../../../../../../solidity"]
+remappings = [
+    "@hyperlane/=../../../../../../../solidity/contracts/",
+    "@openzeppelin/contracts/=../../../../../../../solidity/dependencies/@openzeppelin-contracts-4.9.3/contracts/",
+]
+fs_permissions = [{ access = "read-write", path = "../" }]

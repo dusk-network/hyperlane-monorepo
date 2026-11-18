@@ -81,8 +81,9 @@ pub async fn dusk_tx_call(
 /// the word, since its end of stdin closes with it. `keep` is called at
 /// most once.
 ///
-/// Needs a helper that lists `--ack-before-send` in its `call --help`:
-/// with another, nothing is signed, and the call fails.
+/// Needs a helper that lists `--ack-before-send` in its `call --help`,
+/// probed beforehand (`acking_helper`), which nothing here waits for.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn dusk_tx_call_kept(
     conn: &ConnectionConf,
     signer: &DuskSigner,
@@ -90,21 +91,9 @@ pub(crate) async fn dusk_tx_call_kept(
     fn_name: &str,
     args_bytes: &[u8],
     gas_limit: Option<u64>,
+    _helper: &AckingHelper,
     keep: &Keep<'_>,
 ) -> Result<Value, HyperlaneDuskError> {
-    match helper_flags().await {
-        (_, Some(flags)) if flags.acks => {}
-        (bin, Some(_)) => {
-            return Err(HyperlaneDuskError::Other(format!(
-                "The dusk-tx helper at '{bin}' does not take `call {ACK_BEFORE_SEND}`, so it would send a {fn_name} transaction before the agent kept its hash; nothing was signed. Dusk deliveries need {ACK_HELPER}."
-            )))
-        }
-        (bin, None) => {
-            return Err(HyperlaneDuskError::Other(format!(
-                "Could not read `call --help` of the dusk-tx helper at '{bin}', so nothing was signed: Dusk deliveries need {ACK_HELPER}. Set DUSK_TX_BIN to its path."
-            )))
-        }
-    }
     run_dusk_tx_at(
         &conn.url,
         conn,
@@ -122,8 +111,35 @@ pub(crate) async fn dusk_tx_call_kept(
 
 /// What keeps the hash of the transaction the helper prepared, with the
 /// nonce it is signed with when the helper names it, before the helper may
-/// send it.
-pub(crate) type Keep<'a> = dyn Fn(&str, Option<u64>) -> Result<(), HyperlaneDuskError> + Sync + 'a;
+/// send it. It may check whatever else must hold when the transaction goes,
+/// such as a simulation fresh enough: it fails, and the helper sends
+/// nothing, unless all of it does.
+pub(crate) type Keep<'a> = dyn Fn(String, Option<u64>) -> Kept<'a> + Sync + 'a;
+
+/// What a `Keep` returns.
+pub(crate) type Kept<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(), HyperlaneDuskError>> + Send + 'a>,
+>;
+
+/// The configured helper, found to take `--ack-before-send` by its
+/// `call --help` (`acking_helper`): what `dusk_tx_call_kept` needs.
+pub(crate) struct AckingHelper(());
+
+/// The configured helper, once its `call --help` lists `--ack-before-send`
+/// (`helper_flags`). The probe can take up to `HELPER_PROBE_TIMEOUT` the
+/// first time a process asks about a helper, so a caller asks before its
+/// last check of what the helper is to send.
+pub(crate) async fn acking_helper(fn_name: &str) -> Result<AckingHelper, HyperlaneDuskError> {
+    match helper_flags().await {
+        (_, Some(flags)) if flags.acks => Ok(AckingHelper(())),
+        (bin, Some(_)) => Err(HyperlaneDuskError::Other(format!(
+            "The dusk-tx helper at '{bin}' does not take `call {ACK_BEFORE_SEND}`, so it would send a {fn_name} transaction before the agent kept its hash; nothing was signed. Dusk deliveries need {ACK_HELPER}."
+        ))),
+        (bin, None) => Err(HyperlaneDuskError::Other(format!(
+            "Could not read `call --help` of the dusk-tx helper at '{bin}', so nothing was signed: Dusk deliveries need {ACK_HELPER}. Set DUSK_TX_BIN to its path."
+        ))),
+    }
+}
 
 /// A transaction the helper signed, which nothing has sent yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -563,7 +579,7 @@ async fn run_dusk_tx_at(
     if let Word::Withheld(why) = &run.word {
         return Err(withheld(fn_name, &run, why));
     }
-    let json = helper_result(fn_name, &run.output, run.prepared.as_deref())?;
+    let json = helper_result(fn_name, &run.output, run.prepared.as_deref(), false)?;
 
     let tx_id = json
         .get("tx_id")
@@ -583,10 +599,17 @@ async fn run_dusk_tx_at(
 /// exit status and output describe. Stdout and stderr can each be up to
 /// `MAX_DUSK_TX_STREAM_BYTES`, so only a bounded part of either goes into an
 /// error or a log line. The helper's error text is classified whole.
+///
+/// `word_withheld`: the agent did not let the helper send. Only then does a
+/// `Not submitted:` line on its stderr show that it sent nothing: dusk-tx
+/// prints one only when it stops without the word. Once let send, or
+/// sending on its own, it may have sent whatever its stderr holds, and the
+/// outcome is unknown unless its own error says otherwise.
 fn helper_result(
     fn_name: &str,
     output: &std::process::Output,
     prepared_tx_id: Option<&str>,
+    word_withheld: bool,
 ) -> Result<Value, HyperlaneDuskError> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -629,8 +652,9 @@ fn helper_result(
                 }
                 let detail = format!("dusk-tx call {fn_name} failed: {detail}");
                 // A complete preverify diagnostic proves propagation never
-                // ran, and so does the helper's word that it sent nothing.
-                if before_propagation_error(err) || said_not_submitted(&stderr) {
+                // ran, and so does the helper's word that it sent nothing,
+                // when it was not let send.
+                if before_propagation_error(err) || (word_withheld && said_not_submitted(&stderr)) {
                     return Err(HyperlaneDuskError::NotSubmitted(detail));
                 }
                 return Err(helper_failure(prepared_tx_id, detail));
@@ -640,7 +664,7 @@ fn helper_result(
             "dusk-tx call {fn_name} failed (exit code {code}): {}",
             bounded_text(&stderr)
         );
-        if said_not_submitted(&stderr) {
+        if word_withheld && said_not_submitted(&stderr) {
             return Err(HyperlaneDuskError::NotSubmitted(detail));
         }
         return Err(helper_failure(prepared_tx_id, detail));
@@ -675,9 +699,9 @@ fn helper_result(
 /// The agent's side of `--ack-before-send`: the helper's stdin, still open
 /// after the key line, and what keeps the hash of the transaction it
 /// prepared before the word that lets it send goes there.
-struct Ack<'a> {
+struct Ack<'a, 'k> {
     stdin: tokio::process::ChildStdin,
-    keep: &'a Keep<'a>,
+    keep: &'a Keep<'k>,
 }
 
 /// Whether the helper was let send the transaction it prepared.
@@ -705,12 +729,12 @@ struct HelperRun {
 /// Keep `tx_id`, signed with `nonce` when the helper named it, with
 /// `ack`'s `keep`, and only once that succeeds write the word that lets the
 /// helper send it. What the helper was told.
-async fn answer(ack: Ack<'_>, tx_id: &str, nonce: Option<u64>) -> Word {
+async fn answer(ack: Ack<'_, '_>, tx_id: &str, nonce: Option<u64>) -> Word {
     let Ack { mut stdin, keep } = ack;
-    if let Err(error) = keep(tx_id, nonce) {
+    if let Err(error) = keep(tx_id.to_owned(), nonce).await {
         // Dropping stdin closes it: the helper sends nothing.
         return Word::Withheld(format!(
-            "its hash could not be kept: {}",
+            "it was not kept to be sent: {}",
             bounded_error(&error)
         ));
     }
@@ -734,7 +758,7 @@ async fn wait_for_child_output(
     mut child: tokio::process::Child,
     fn_name: &str,
     timeout: Duration,
-    mut ack: Option<Ack<'_>>,
+    mut ack: Option<Ack<'_, '_>>,
 ) -> Result<HelperRun, HyperlaneDuskError> {
     let stdout = child.stdout.take().ok_or_else(|| {
         HyperlaneDuskError::Other("dusk-tx stdout pipe was not configured".into())
@@ -843,7 +867,7 @@ async fn wait_for_child_output(
 /// before it signed one, and says why itself.
 fn withheld(fn_name: &str, run: &HelperRun, why: &str) -> HyperlaneDuskError {
     let Some(tx_id) = &run.prepared else {
-        return match helper_result(fn_name, &run.output, None) {
+        return match helper_result(fn_name, &run.output, None, true) {
             Err(error) => error,
             Ok(_) => HyperlaneDuskError::NotSubmitted(format!(
                 "dusk-tx call {fn_name} reported success without naming the transaction it prepared, which it was never let send"
@@ -1086,6 +1110,9 @@ pub fn announce_args(
     rkyv_serialize(&(eth_addr, String::from(storage_location), signature.to_vec()))
 }
 
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) mod checks;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1301,9 +1328,9 @@ mod tests {
                 prepared_line(&tx_id)
             ));
             let kept = StdMutex::new(Vec::new());
-            let keep = |tx_id: &str, _: Option<u64>| {
-                kept.lock().unwrap().push(tx_id.to_owned());
-                Ok(())
+            let keep = |tx_id: String, _: Option<u64>| -> Kept<'_> {
+                kept.lock().unwrap().push(tx_id);
+                Box::pin(async { Ok(()) })
             };
             let stdin = child.stdin.take().unwrap();
             let ack = acks.then_some(Ack { stdin, keep: &keep });
@@ -1335,11 +1362,9 @@ mod tests {
         ));
         let started = std::time::Instant::now();
         let kept = StdMutex::new(Vec::new());
-        let keep = |tx_id: &str, nonce: Option<u64>| {
-            kept.lock()
-                .unwrap()
-                .push((tx_id.to_owned(), nonce, started.elapsed()));
-            Ok(())
+        let keep = |tx_id: String, nonce: Option<u64>| -> Kept<'_> {
+            kept.lock().unwrap().push((tx_id, nonce, started.elapsed()));
+            Box::pin(async { Ok(()) })
         };
         let ack = Ack {
             stdin: child.stdin.take().unwrap(),
@@ -1376,8 +1401,8 @@ mod tests {
             prepared_line(&tx_id),
             sent.display()
         ));
-        let keep = |_: &str, _: Option<u64>| {
-            Err(HyperlaneDuskError::Other("the event store is gone".into()))
+        let keep = |_: String, _: Option<u64>| -> Kept<'_> {
+            Box::pin(async { Err(HyperlaneDuskError::Other("the event store is gone".into())) })
         };
         let ack = Ack {
             stdin: child.stdin.take().unwrap(),
@@ -1436,22 +1461,54 @@ mod tests {
             ),
         ] {
             assert!(matches!(
-                helper_result("process", &output(stdout, stderr), Some(&tx_id)),
+                helper_result("process", &output(stdout, stderr), Some(&tx_id), true),
                 Err(HyperlaneDuskError::NotSubmitted(_))
             ));
         }
         // Without that word, a helper that named its transaction may have
         // sent it.
         assert!(matches!(
-            helper_result("process", &output(String::new(), &prepared), Some(&tx_id)),
+            helper_result(
+                "process",
+                &output(String::new(), &prepared),
+                Some(&tx_id),
+                true
+            ),
             Err(HyperlaneDuskError::SubmissionOutcomeUnknown { .. })
         ));
+        // Once let send, a `Not submitted:` line on its stderr is not its
+        // refusal, which it prints only without the word: it may have sent
+        // the transaction. Its own error still says when it sent nothing.
+        for (stdout, outcome_unknown) in [
+            (String::new(), true),
+            (
+                serde_json::json!({ "success": false, "error": "no word" }).to_string(),
+                true,
+            ),
+            (
+                serde_json::json!({ "success": false, "error": format!(
+                    "Transaction {tx_id} submission failed: Not submitted: {reason}"
+                ) })
+                .to_string(),
+                false,
+            ),
+        ] {
+            let result = helper_result("process", &output(stdout, &said), Some(&tx_id), false);
+            assert_eq!(
+                matches!(
+                    result,
+                    Err(HyperlaneDuskError::SubmissionOutcomeUnknown { ref tx_id, .. }) if *tx_id == "ab".repeat(32)
+                ),
+                outcome_unknown,
+                "{result:?}"
+            );
+        }
         let unknown = serde_json::json!({ "success": false, "error": format!(
             "Transaction {tx_id} submission failed: Propagation outcome unknown: closed; retain tx_id={tx_id}"
         ) })
         .to_string();
         assert!(matches!(
-            helper_result("process", &output(unknown, &said), Some(&tx_id)),
+            helper_result("process", &output(unknown, &said), Some(&tx_id), true),
             Err(HyperlaneDuskError::SubmissionOutcomeUnknown { .. })
         ));
     }
@@ -1596,7 +1653,7 @@ mod tests {
             // A successful exit whose output is not JSON.
             (output(0, huge.clone(), ""), Some(tx_id.as_str())),
         ] {
-            let error = helper_result("process", &output, prepared)
+            let error = helper_result("process", &output, prepared, false)
                 .unwrap_err()
                 .to_string();
             assert!(error.len() < 3 * 1024, "{} bytes", error.len());
@@ -1607,7 +1664,8 @@ mod tests {
             helper_result(
                 "process",
                 &output(1, error_json(format!("Transaction {tx_id} failed: {huge}")), ""),
-                None
+                None,
+                false
             ),
             Err(HyperlaneDuskError::TransactionExecutionFailed { tx_id: failed, .. }) if failed == tx_id
         ));
@@ -1628,7 +1686,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(run.output.stderr.len(), 900_000);
-        let error = helper_result("process", &run.output, run.prepared.as_deref())
+        let error = helper_result("process", &run.output, run.prepared.as_deref(), false)
             .unwrap_err()
             .to_string();
         assert!(error.len() < 2 * 1024, "{} bytes", error.len());

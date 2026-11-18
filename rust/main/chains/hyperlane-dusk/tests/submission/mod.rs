@@ -541,6 +541,7 @@ impl Model {
         }
         self.ledger.get(hash).map_or(Value::Null, |included| {
             json!({
+                "id": hash,
                 "blockHeight": included.height,
                 "gasSpent": included.gas_spent,
                 "err": included.error,
@@ -625,6 +626,10 @@ pub enum Fault {
     /// answer is what it held when the lookup came; taken by such a lookup
     /// only.
     HoldLookupReply(Arc<Gate>),
+    /// Answer a lookup of both `tx` and `mempoolTx` with this ledger entry
+    /// and the mempool as the node holds it, as a proxy or a cache in front
+    /// of the node might; taken by such a lookup only.
+    LedgerEntry(Value),
 }
 
 /// A gate a held request waits at.
@@ -717,6 +722,7 @@ type Faults = Arc<Mutex<Vec<(Route, Option<u64>, Fault)>>>;
 const HELPER: &str = r#"#!/usr/bin/env bash
 dir="$(cd "$(dirname "$0")" && pwd)"
 if [ "$1" = "call" ] && [ "$2" = "--help" ]; then
+  if [ -f "$dir/help-delay" ]; then : > "$dir/probing"; sleep "$(cat "$dir/help-delay")"; fi
   if [ ! -f "$dir/no-ack" ]; then printf '      --ack-before-send\n'; fi
   if [ -f "$dir/pipelines" ]; then printf '      --nonce <NONCE>\n      --no-wait\n'; fi
   exit 0
@@ -957,6 +963,21 @@ impl Node {
         } else {
             let _ = std::fs::remove_file(file);
         }
+    }
+
+    /// Make the stand-in's `call --help` take `seconds` to answer, as a
+    /// helper on a loaded host can; it marks `probing` when it starts.
+    pub fn help_delay(&self, seconds: u32) {
+        std::fs::write(
+            self.directory.path().join("help-delay"),
+            seconds.to_string(),
+        )
+        .unwrap();
+    }
+
+    /// Whether the stand-in has started answering a slow `call --help`.
+    pub fn probing(&self) -> bool {
+        self.directory.path().join("probing").exists()
     }
 
     /// Make the stand-in's `call --help` leave out `--ack-before-send`, as
@@ -1249,7 +1270,7 @@ fn take_fault(faults: &Faults, route: Route, nonce: Option<u64>, lookup: bool) -
             && (lookup
                 || !matches!(
                     fault,
-                    Fault::BetweenFields { .. } | Fault::HoldLookupReply(_)
+                    Fault::BetweenFields { .. } | Fault::HoldLookupReply(_) | Fault::LedgerEntry(_)
                 ))
     })?;
     Some(faults.remove(position).2)
@@ -1332,6 +1353,11 @@ fn serve(
             } else {
                 (second, first)
             };
+            let answer = json!({ "mempoolTx": mempool, "tx": ledger });
+            return reply(stream, "200 OK", answer.to_string().as_bytes());
+        }
+        Some(Fault::LedgerEntry(ledger)) => {
+            let mempool = state.lock().unwrap().mempool_field(looked_up(&query));
             let answer = json!({ "mempoolTx": mempool, "tx": ledger });
             return reply(stream, "200 OK", answer.to_string().as_bytes());
         }

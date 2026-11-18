@@ -24,6 +24,8 @@ use hyperlane_core::{ReorgPeriod, H256, H512};
 use crate::HyperlaneDuskError;
 
 mod batch;
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) mod checks;
 mod endpoint;
 mod event_log;
 mod submissions;
@@ -33,7 +35,10 @@ pub(crate) use batch::{
 pub use endpoint::QueryRateLimit;
 use endpoint::{Endpoint, RequestClass};
 use event_log::EventLogLocks;
-pub(crate) use event_log::{CheckHold, EventLog, LogEntry, LogLookup, LogState, BLOCK_LIMITS};
+pub(crate) use event_log::{
+    CheckHold, EventLog, LogEntry, LogLookup, LogState, MissingRecords, BLOCK_LIMITS,
+    MISSING_RECORD_MARGIN,
+};
 pub(crate) use submissions::{
     Holder, PreparedDelivery, Reservation, SentDelivery, Submission, TransactionStatus,
     MAX_PREPARED_DELIVERIES, MAX_RESERVATION_TXS,
@@ -49,14 +54,17 @@ const SCAN_ANCHOR_SPACING: u64 = FINALIZED_EVENT_PAGE_SIZE as u64;
 /// Most bytes of a response body that go into an error or a log line.
 const MAX_ERROR_BODY_BYTES: usize = 1024;
 /// The Mailbox state version this agent reads: dispatched message IDs
-/// (`dispatched_id`), and deliveries from `ProcessId` events only.
-const MAILBOX_STATE_VERSION: u32 = 5;
+/// (`dispatched_id`), deliveries from `ProcessId` events only, and `process`
+/// only as a transaction's own call or a query, as the relayer sends and
+/// simulates it.
+const MAILBOX_STATE_VERSION: u32 = 6;
 /// The MerkleTreeHook state version this agent reads: stored message IDs,
 /// from which checkpoints compute their roots (no `root_at`).
 const MERKLE_TREE_HOOK_STATE_VERSION: u32 = 2;
 /// The ValidatorAnnounce state version this agent reads: location hashes,
-/// with the locations in `ValidatorAnnouncement` events.
-const VALIDATOR_ANNOUNCE_STATE_VERSION: u32 = 2;
+/// with the locations in `ValidatorAnnouncement` events, and `announce` only
+/// as a transaction's own call, as the validator sends it.
+const VALIDATOR_ANNOUNCE_STATE_VERSION: u32 = 3;
 /// How long a Dusk block takes: about 10 s on mainnet and testnet. The node
 /// builds a block from what its mempool holds when the block's round starts,
 /// so a transaction it admits is in a block 10 to 20 s later.
@@ -82,6 +90,17 @@ const MAX_NON_FINAL_BLOCKS: u64 = 64;
 /// Blocks whose archived events of one contract and topic a client keeps for
 /// finality checks.
 const NON_FINAL_EVENT_CACHE_BLOCKS: usize = 256;
+/// Most `finalizedEvents` pages one pass of a record lookup reads (see
+/// `scan_from`): twice the full pages of the largest block `BLOCK_LIMITS`
+/// allows. A pass that runs out records how far it read, so the next lookup
+/// resumes there and a long history is read over several lookups; one that
+/// runs out inside the block it looks for keeps what it read of the block
+/// (`PartialScan`), so the next lookup of the block reads on in it, whatever
+/// the pages hold. An endpoint that pages without end holds a lookup for
+/// this many pages, not for good. At full pages, from an anchor at most
+/// `SCAN_ANCHOR_SPACING` rows before it, one pass reads a block within
+/// `BLOCK_LIMITS` whole.
+const MAX_SCAN_PAGES: u64 = 2 * BLOCK_LIMITS.rows / FINALIZED_EVENT_PAGE_SIZE as u64;
 
 type SharedRuesClients = HashMap<(String, PathBuf), RuesClient>;
 static SHARED_RUES_CLIENTS: OnceLock<StdMutex<SharedRuesClients>> = OnceLock::new();
@@ -100,7 +119,7 @@ static ARCHIVE_GAP_REPORTS: OnceLock<StdMutex<HashMap<ArchiveGapKey, std::time::
 /// Whether a critical condition of a contract and topic at a block, such as
 /// a missing block or a halted event log, is due to be reported again,
 /// recording the report if so.
-fn critical_report_due(contract_id: &[u8; 32], topic: &str, block_height: u64) -> bool {
+pub(crate) fn critical_report_due(contract_id: &[u8; 32], topic: &str, block_height: u64) -> bool {
     let reports = ARCHIVE_GAP_REPORTS.get_or_init(|| StdMutex::new(HashMap::new()));
     let mut reports = reports.lock().unwrap_or_else(PoisonError::into_inner);
     let now = std::time::Instant::now();
@@ -455,7 +474,76 @@ enum ScanOutcome {
     WrongAnchor,
     /// The archive has not reached the anchor's fence row yet.
     ArchiveBehind(ScanAnchor),
+    /// The pass read `MAX_SCAN_PAGES` pages first; `error` says where it
+    /// stopped. Stopped inside the block it looks for, it leaves what it
+    /// read of the block to read on from (`partial`).
+    OutOfPages {
+        error: HyperlaneDuskError,
+        partial: Option<PartialScan>,
+    },
 }
+
+/// What a pass that ran out of pages inside the block it looks for read of
+/// that block: its position after the last row read, which serves only
+/// later blocks as an anchor, the block's rows it captured, and the
+/// sequences it matched for the lookup that ran it. The next lookup of the
+/// block reads on from that position instead of from before the block, as
+/// an event log reads on in a block it staged.
+#[derive(Debug)]
+struct PartialScan {
+    position: ScanAnchor,
+    capture: BlockCapture,
+    wanted: HashSet<usize>,
+    found: ScannedRows,
+}
+
+impl PartialScan {
+    /// The block's rows a lookup of `wanted` resumes with: matched again
+    /// from the captured rows, or, once those grew past the cache bound,
+    /// the ones matched before when `wanted` asks for none other. `None`
+    /// when the lookup cannot resume from here.
+    fn found_for<F>(
+        &self,
+        contract_id: &[u8; 32],
+        topic: &str,
+        block_height: u64,
+        wanted: &HashSet<usize>,
+        matching_sequences: &F,
+    ) -> Result<Option<ScannedRows>, HyperlaneDuskError>
+    where
+        F: Fn(&[u8]) -> Vec<usize>,
+    {
+        if let Some(rows) = &self.capture.rows {
+            let mut found = ScannedRows::new();
+            for row in rows {
+                assign_row(
+                    row,
+                    contract_id,
+                    topic,
+                    block_height,
+                    wanted,
+                    matching_sequences,
+                    &mut found,
+                )?;
+            }
+            return Ok(Some(found));
+        }
+        if !wanted.is_subset(&self.wanted) {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.found
+                .iter()
+                .filter(|(sequence, _)| wanted.contains(sequence))
+                .map(|(sequence, event)| (*sequence, event.clone()))
+                .collect(),
+        ))
+    }
+}
+
+/// Partial scans a client keeps, the latest first; each holds at most a
+/// block's worth of captured rows (`BlockCacheLimits::block_bytes`).
+const MAX_PARTIAL_SCANS: usize = 2;
 
 /// A row of the scanned block that can be a sequence's record: not
 /// reverted, of the scan's topic, with its provenance and event data parsed
@@ -553,6 +641,7 @@ struct CachedBlock {
 }
 
 /// The scanned block's rows that a scan collects for the block cache.
+#[derive(Debug)]
 struct BlockCapture {
     /// `None` once the rows grew past the bound, or once a row of the block
     /// that could be a record did not parse.
@@ -672,6 +761,9 @@ struct BlockCache {
     blocks: HashMap<BlockKey, (Arc<CachedBlock>, u64)>,
     bytes: usize,
     clock: u64,
+    /// Scans that ran out of pages inside the block they look for, and when
+    /// each was staged.
+    partial: HashMap<BlockKey, (PartialScan, u64)>,
 }
 
 impl BlockCache {
@@ -681,7 +773,33 @@ impl BlockCache {
             blocks: HashMap::new(),
             bytes: 0,
             clock: 0,
+            partial: HashMap::new(),
         }
+    }
+
+    /// Keep `partial`, of the scan of `key`'s block, for the next lookup of
+    /// it, at most `MAX_PARTIAL_SCANS` at once.
+    fn stage(&mut self, key: BlockKey, partial: PartialScan) {
+        self.partial.remove(&key);
+        while self.partial.len() >= MAX_PARTIAL_SCANS {
+            let Some(oldest) = self
+                .partial
+                .iter()
+                .min_by_key(|(_, (_, staged))| *staged)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.partial.remove(&oldest);
+        }
+        self.clock += 1;
+        self.partial.insert(key, (partial, self.clock));
+    }
+
+    /// The partial scan of `key`'s block, if one is staged, which is no
+    /// longer kept: a lookup that runs out again stages its own.
+    fn take_partial(&mut self, key: &BlockKey) -> Option<PartialScan> {
+        self.partial.remove(key).map(|(partial, _)| partial)
     }
 
     fn get(&mut self, key: &BlockKey) -> Option<Arc<CachedBlock>> {
@@ -730,6 +848,8 @@ impl BlockCache {
         for key in keys {
             self.remove(&key);
         }
+        self.partial
+            .retain(|key, _| key.contract_id != *contract_id);
     }
 }
 
@@ -1088,13 +1208,13 @@ impl RuesClient {
             reads.query(self, &mailbox_version).await,
             "Mailbox",
             MAILBOX_STATE_VERSION,
-            "stores dispatched message IDs (dispatched_id) and leaves deliveries to ProcessId events",
+            "stores dispatched message IDs (dispatched_id), leaves deliveries to ProcessId events and takes process only as a transaction's own call",
         )?;
         Self::validate_state_version(
             reads.query(self, &announce_version).await,
             "ValidatorAnnounce",
             VALIDATOR_ANNOUNCE_STATE_VERSION,
-            "stores location hashes (get_announced_storage_location_hashes) and leaves the locations to ValidatorAnnouncement events",
+            "stores location hashes (get_announced_storage_location_hashes), leaves the locations to ValidatorAnnouncement events and takes announce only as a transaction's own call",
         )?;
         Self::validate_mailbox_binding(
             reads.query(self, &announce_binding).await?,
@@ -1723,6 +1843,39 @@ impl RuesClient {
     where
         F: Fn(&[u8]) -> Vec<usize> + Sync,
     {
+        let key = BlockKey::new(contract_id, topic, block_height);
+        // A pass that ran out of pages inside this block left where it
+        // stopped and what it read of the block: read on from there.
+        let staged = self.block_cache().take_partial(&key);
+        if let Some(partial) = staged {
+            let resumed =
+                partial.found_for(contract_id, topic, block_height, wanted, matching_sequences)?;
+            if let Some(found) = resumed {
+                match self
+                    .scan_from(
+                        contract_id,
+                        topic,
+                        block_height,
+                        Some(partial.position),
+                        wanted,
+                        matching_sequences,
+                        Some((found, partial.capture)),
+                    )
+                    .await?
+                {
+                    ScanOutcome::Done(scan) => return Ok(scan),
+                    ScanOutcome::OutOfPages { error, partial } => {
+                        if let Some(partial) = partial {
+                            self.block_cache().stage(key, partial);
+                        }
+                        return Err(error);
+                    }
+                    // The archive no longer serves that position: the
+                    // lookup starts over from before the block.
+                    ScanOutcome::WrongAnchor | ScanOutcome::ArchiveBehind(_) => {}
+                }
+            }
+        }
         let start = self.scan_anchor_at_or_below(contract_id, block_height)?;
         match self
             .scan_from(
@@ -1732,10 +1885,17 @@ impl RuesClient {
                 start,
                 wanted,
                 matching_sequences,
+                None,
             )
             .await?
         {
             ScanOutcome::Done(scan) => return Ok(scan),
+            ScanOutcome::OutOfPages { error, partial } => {
+                if let Some(partial) = partial {
+                    self.block_cache().stage(key, partial);
+                }
+                return Err(error);
+            }
             // The anchors stay: the archive reaches them once it catches up.
             ScanOutcome::ArchiveBehind(anchor) => {
                 return Err(HyperlaneDuskError::Other(format!(
@@ -1761,10 +1921,17 @@ impl RuesClient {
                 None,
                 wanted,
                 matching_sequences,
+                None,
             )
             .await?
         {
             ScanOutcome::Done(scan) => Ok(scan),
+            ScanOutcome::OutOfPages { error, partial } => {
+                if let Some(partial) = partial {
+                    self.block_cache().stage(key, partial);
+                }
+                Err(error)
+            }
             ScanOutcome::WrongAnchor | ScanOutcome::ArchiveBehind(_) => {
                 Err(HyperlaneDuskError::Other(
                     "Dusk archive scan without an anchor found a stale anchor".into(),
@@ -1776,15 +1943,25 @@ impl RuesClient {
     /// One pass over the contract's archive rows from `start`, or from its
     /// first row, for the rows of `block_height`. Reads to the end of that
     /// block, so the block's rows can be cached, and stops before the first
-    /// row of a later block once every wanted sequence has a row. A block
+    /// row of a later block: Rusk archives blocks in height order, so no row
+    /// of the block comes after it, and a wanted sequence without a row by
+    /// then has none in this archive, which the caller diagnoses. A block
     /// over the cache bound is read only until every wanted sequence has a
-    /// row. Without a row for every wanted sequence the scan reads to the
-    /// end of the archive. A resumed scan first checks `start`'s fence row,
-    /// as `ScanAnchor` describes.
+    /// row. A resumed scan first checks `start`'s fence row, as `ScanAnchor`
+    /// describes.
+    ///
+    /// A pass reads at most `MAX_SCAN_PAGES` pages. One that runs out
+    /// records its position, as at its end, and stops (`OutOfPages`); the
+    /// next lookup resumes from there. Inside the block it looks for, that
+    /// position serves only later blocks as an anchor, so the pass also
+    /// leaves what it read of the block (`PartialScan`). `resume` is what
+    /// such a pass matched and captured, to go on with from `start`, its
+    /// position.
     ///
     /// A row the archive has not inserted yet is not an error here: the
     /// caller reports it, and the next lookup resumes from the anchors this
     /// pass records instead of from the first row.
+    #[allow(clippy::too_many_arguments)]
     async fn scan_from<F>(
         &self,
         contract_id: &[u8; 32],
@@ -1793,11 +1970,18 @@ impl RuesClient {
         start: Option<ScanAnchor>,
         wanted: &HashSet<usize>,
         matching_sequences: &F,
+        resume: Option<(ScannedRows, BlockCapture)>,
     ) -> Result<ScanOutcome, HyperlaneDuskError>
     where
         F: Fn(&[u8]) -> Vec<usize> + Sync,
     {
-        let mut found = ScannedRows::new();
+        let (mut found, mut capture) = match resume {
+            Some(resumed) => resumed,
+            None => (
+                ScannedRows::new(),
+                BlockCapture::new(self.block_cache().limits.block_bytes),
+            ),
+        };
         let start_before = start.map_or(0, |anchor| anchor.before_block);
         let mut rank = start.map_or(0, |anchor| anchor.rank);
         let mut highest_block = None;
@@ -1808,8 +1992,8 @@ impl RuesClient {
             start.and_then(|anchor| anchor.fence_id.checked_sub(1).filter(|id| *id >= 0));
         let mut fence = start;
         let mut size = PageSize::largest();
-        let mut capture = BlockCapture::new(self.block_cache().limits.block_bytes);
         let mut later = None;
+        let mut pages = 0u64;
         loop {
             let cursor = previous_id.map(canonical_event_cursor);
             let (page, bytes) = self
@@ -1823,6 +2007,7 @@ impl RuesClient {
                 &page,
             )?;
             size.after_page(page.events.len(), bytes);
+            pages = pages.saturating_add(1);
             let has_next_page = page.has_next_page;
             let mut events = page.events.into_iter();
             if let Some(anchor) = fence.take() {
@@ -1845,18 +2030,14 @@ impl RuesClient {
             let mut stop = false;
             for event in events {
                 if event.block_height > block_height {
-                    // The scanned block's rows all come before this one.
+                    // The scanned block's rows all come before this one. Stop
+                    // before it: the position recorded below then ends the
+                    // scanned block, where a lookup of a later block can
+                    // start.
                     capture.complete = true;
-                    if later.is_none() {
-                        later = Some(event.clone());
-                    }
-                    if found.len() == wanted.len() {
-                        // Stop before it: the position recorded below then
-                        // ends the scanned block, where a lookup of a later
-                        // block can start.
-                        stop = true;
-                        break;
-                    }
+                    later = Some(event);
+                    stop = true;
+                    break;
                 }
                 previous_id = Some(event.id);
                 rank = rank.saturating_add(1);
@@ -1914,16 +2095,38 @@ impl RuesClient {
                 }
             }
 
-            if stop || !has_next_page {
+            let out_of_pages = !stop && has_next_page && pages >= MAX_SCAN_PAGES;
+            if stop || !has_next_page || out_of_pages {
                 if !has_next_page && capture.seen {
                     // Rusk archives a finalized block's rows together.
                     capture.complete = true;
                 }
+                let resume_after = last_row.as_ref().map(|event| event.id);
+                let mut position = None;
                 if let (Some(event), Some(highest)) = (last_row, highest_block) {
                     let before_block = start_before.max(highest.saturating_add(1));
                     if let Some(anchor) = ScanAnchor::after_row(&event, before_block, rank)? {
                         self.offer_scan_anchor(contract_id, anchor)?;
+                        position = Some(anchor);
                     }
+                }
+                if out_of_pages {
+                    let error = HyperlaneDuskError::Other(format!(
+                        "Dusk archive scan of contract {} read {pages} pages without reaching the end of block {block_height}; the next lookup resumes after row {}",
+                        hex::encode(contract_id),
+                        resume_after.map_or_else(|| "none".to_owned(), |id| id.to_string())
+                    ));
+                    // Stopped inside the block: what it read of the block
+                    // is kept with where it stopped.
+                    let partial = position
+                        .filter(|_| capture.seen)
+                        .map(|position| PartialScan {
+                            position,
+                            capture,
+                            wanted: wanted.clone(),
+                            found,
+                        });
+                    return Ok(ScanOutcome::OutOfPages { error, partial });
                 }
                 return Ok(ScanOutcome::Done(BlockScan {
                     found,
@@ -2168,27 +2371,49 @@ impl RuesClient {
         else {
             return Ok(None);
         };
-        if bytes.len() > MAX_RUES_RESPONSE_BYTES {
-            return Err(HyperlaneDuskError::Other(
-                "Persisted Dusk finalized event exceeds the transport bound".into(),
-            ));
-        }
-        let mut event: FinalizedContractEvent =
-            serde_json::from_slice(&bytes).map_err(|error| {
-                HyperlaneDuskError::Other(format!(
-                    "Failed to decode persisted Dusk finalized event: {}",
-                    bounded_error(error)
-                ))
-            })?;
         // Archive row IDs are pagination hints, not durable provenance. Use
         // the locally owned topic sequence.
-        event.id = i64::try_from(sequence).map_err(|_| {
+        let id = i64::try_from(sequence).map_err(|_| {
             HyperlaneDuskError::Other(
                 "Dusk finalized-event sequence exceeds i64 provenance range".into(),
             )
         })?;
-        validate_persisted_event(contract_id, topic, &event)?;
-        Ok(Some(event))
+        let decoded = if bytes.len() > MAX_RUES_RESPONSE_BYTES {
+            Err("it exceeds the transport bound".to_owned())
+        } else {
+            serde_json::from_slice::<FinalizedContractEvent>(&bytes)
+                .map_err(bounded_error)
+                .and_then(|mut event| {
+                    event.id = id;
+                    validate_persisted_event(contract_id, topic, &event)
+                        .map(|()| event)
+                        .map_err(|error| bounded_error(&error))
+                })
+        };
+        match decoded {
+            Ok(event) => Ok(Some(event)),
+            // Only rows that passed every check are persisted, so only a
+            // damaged store holds one that does not decode or check. It is
+            // dropped, and the lookup reads the archive again, as for a row
+            // never persisted: the row read then passes the same checks.
+            Err(why) => {
+                warn!(
+                    contract = %hex::encode(contract_id),
+                    topic,
+                    sequence,
+                    %why,
+                    "Dropping a persisted Dusk finalized event that does not decode; reading it from the archive again"
+                );
+                self.event_store()?
+                    .delete(finalized_event_row_key(contract_id, topic, sequence)?)
+                    .map_err(|error| {
+                        HyperlaneDuskError::Other(format!(
+                            "Failed to drop a persisted Dusk finalized event that does not decode: {error}"
+                        ))
+                    })?;
+                Ok(None)
+            }
+        }
     }
 
     /// Durably persist authenticated rows in one synced write.
@@ -2527,6 +2752,15 @@ impl RuesClient {
         &self,
         pair: &BlockPair,
     ) -> Result<Vec<NonFinalBlock>, HyperlaneDuskError> {
+        // The endpoint reports the heights. Hyperlane's cursors hold u32
+        // heights (`finalized_block_number`), so no honest one is larger,
+        // and within that range the arithmetic below cannot overflow.
+        let highest = pair.latest.max(pair.finalized);
+        if highest > u64::from(u32::MAX) {
+            return Err(HyperlaneDuskError::Other(format!(
+                "Dusk block height {highest} exceeds the shared u32 cursor range"
+            )));
+        }
         let first = pair.finalized + 1;
         let last = pair.latest + 2;
         let query = format!(
@@ -2677,25 +2911,15 @@ impl RuesClient {
         validate_transaction_id(tx_id)?;
         let query = format!(r#"query {{ tx(hash: "{tx_id}") {{ blockHeight }} }}"#);
         let data = self.graphql_query(&query).await?;
-        let Some(transaction) = data.get("tx").filter(|value| !value.is_null()) else {
-            return Ok(None);
-        };
-        let height = transaction
-            .get("blockHeight")
-            .and_then(JsonValue::as_u64)
-            .ok_or_else(|| {
-                HyperlaneDuskError::Other(format!(
-                    "Ledger transaction {tx_id} is missing numeric blockHeight: {}",
-                    bounded_json(transaction)
-                ))
-            })?;
-        Ok(Some(height))
+        ledger_block_height(tx_id, &data)
     }
 
     /// Whether the node holds transaction `tx_id`, in its mempool or in a
     /// block, within `timeout`. The node accepts a propagated transaction
     /// before its mempool stores it, and checks a transaction with a later
-    /// nonce of the same account against the mempool.
+    /// nonce of the same account against the mempool. An entry the node
+    /// answers with must be of `tx_id` (`submissions::found`): one for
+    /// another transaction is an error.
     ///
     /// Each query, with its waits for the endpoint's rate limit, ends at the
     /// deadline: an answer that would come after it does not count.
@@ -2706,7 +2930,7 @@ impl RuesClient {
     ) -> Result<bool, HyperlaneDuskError> {
         validate_transaction_id(tx_id)?;
         let query = format!(
-            r#"query {{ mempoolTx(hash: "{tx_id}") {{ id }} tx(hash: "{tx_id}") {{ blockHeight }} }}"#
+            r#"query {{ mempoolTx(hash: "{tx_id}") {{ id }} tx(hash: "{tx_id}") {{ id }} }}"#
         );
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -2715,8 +2939,7 @@ impl RuesClient {
                 return Ok(false);
             };
             let data = data?;
-            let held = |field: &str| data.get(field).is_some_and(|value| !value.is_null());
-            if held("mempoolTx") || held("tx") {
+            if submissions::holds(tx_id, &data)? {
                 return Ok(true);
             }
             if tokio::time::Instant::now() >= deadline {
@@ -2774,7 +2997,9 @@ impl RuesClient {
                         // A non-null ledger record is an authoritative
                         // observation. Missing or malformed execution fields
                         // are corruption/schema drift, not a pending state that
-                        // a later response may silently overwrite.
+                        // a later response may silently overwrite, and so is a
+                        // record of another transaction.
+                        submissions::check_identity(tx_id, "tx", tx)?;
                         return parse_confirmed_transaction(tx_id, tx);
                     } else {
                         last_observation_error = None;
@@ -2947,6 +3172,33 @@ fn parse_confirmed_transaction(
         }
     };
     Ok(ConfirmedTransaction { gas_spent, error })
+}
+
+/// The height of the block a `tx(hash)` lookup found transaction `tx_id`
+/// in, or `None` when the ledger does not hold it. Only the field the
+/// lookup asked for, present and null, means that: a reply without it, or
+/// that is not an object (`{}`, a null `data` from a proxy or cache in
+/// front of the node), is an error, as in a submission lookup.
+fn ledger_block_height(tx_id: &str, data: &JsonValue) -> Result<Option<u64>, HyperlaneDuskError> {
+    let Some(transaction) = data.get("tx") else {
+        return Err(HyperlaneDuskError::Other(format!(
+            "Lookup of Dusk transaction {tx_id} answered without its tx field: {}",
+            bounded_json(data)
+        )));
+    };
+    if transaction.is_null() {
+        return Ok(None);
+    }
+    let height = transaction
+        .get("blockHeight")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| {
+            HyperlaneDuskError::Other(format!(
+                "Ledger transaction {tx_id} is missing numeric blockHeight: {}",
+                bounded_json(transaction)
+            ))
+        })?;
+    Ok(Some(height))
 }
 
 fn parse_block_heights(data: &JsonValue) -> Result<(u64, u64), HyperlaneDuskError> {
@@ -3349,7 +3601,7 @@ fn truncated_text(text: &str, original_len: usize) -> String {
 }
 
 fn transaction_query(tx_id: &str) -> String {
-    format!(r#"query {{ tx(hash: "{tx_id}") {{ gasSpent err }} }}"#)
+    format!(r#"query {{ tx(hash: "{tx_id}") {{ id gasSpent err }} }}"#)
 }
 
 /// How long after a lookup made `waited` into a wait for a transaction the
@@ -3543,7 +3795,7 @@ mod tests {
                 let mut paths = Vec::new();
                 for body in [
                     vec![7],
-                    br#"{"tx":{"gasSpent":1,"err":null}}"#.to_vec(),
+                    br#"{"tx":{"id":"abababababababababababababababababababababababababababababababab","gasSpent":1,"err":null}}"#.to_vec(),
                     br#"{"contract_owner":"fixture-owner"}"#.to_vec(),
                     vec![],
                     vec![],
@@ -3729,7 +3981,7 @@ mod tests {
     fn transaction_query_uses_graphql_quotes_without_literal_backslashes() {
         assert_eq!(
             transaction_query("aabbcc"),
-            r#"query { tx(hash: "aabbcc") { gasSpent err } }"#
+            r#"query { tx(hash: "aabbcc") { id gasSpent err } }"#
         );
     }
 
@@ -3843,6 +4095,64 @@ mod tests {
         }
     }
 
+    /// Heights past Hyperlane's u32 cursor range are refused before any
+    /// arithmetic on them, which overflowed near `u64::MAX`.
+    #[tokio::test]
+    async fn non_final_blocks_refuse_heights_past_the_cursor_range() {
+        let client = RuesClient::new(Url::parse("http://127.0.0.1:9").unwrap()).unwrap();
+        for (latest, finalized) in [
+            (u64::MAX, u64::MAX),
+            (u64::MAX, u64::MAX - 1),
+            (u64::MAX - 1, u64::MAX - 2),
+            (u64::from(u32::MAX) + 1, u64::from(u32::MAX)),
+        ] {
+            let pair = BlockPair {
+                latest,
+                latest_hash: H256::repeat_byte(11),
+                finalized,
+                finalized_hash: H256::repeat_byte(10),
+            };
+            let error = client
+                .non_final_blocks(&pair)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(&format!(
+                    "height {latest} exceeds the shared u32 cursor range"
+                )),
+                "{error}"
+            );
+        }
+        // The range's last height is read: here the node then answers that
+        // it holds no block above the last final one.
+        let pair = BlockPair {
+            latest: u64::from(u32::MAX),
+            latest_hash: H256::repeat_byte(11),
+            finalized: u64::from(u32::MAX) - 1,
+            finalized_hash: H256::repeat_byte(10),
+        };
+        let url = test_server(vec![(200, serde_json::json!({ "blocks": [] }).to_string())]);
+        let error = RuesClient::new(url)
+            .unwrap()
+            .non_final_blocks(&pair)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("it was rolled back"), "{error}");
+    }
+
+    /// A pass reads the largest block `BLOCK_LIMITS` allows whole: at full
+    /// pages from an anchor up to `SCAN_ANCHOR_SPACING` rows before it and
+    /// its fence page, and still the block's rows when pages shrink to half
+    /// size.
+    #[test]
+    fn a_scan_pass_reads_the_largest_block_whole() {
+        let page = FINALIZED_EVENT_PAGE_SIZE as u64;
+        assert!(MAX_SCAN_PAGES * page >= BLOCK_LIMITS.rows + SCAN_ANCHOR_SPACING + page);
+        assert!(MAX_SCAN_PAGES * (page / 2) >= BLOCK_LIMITS.rows);
+    }
+
     #[tokio::test]
     async fn non_final_block_events_reject_malformed_archive_replies() {
         let block = NonFinalBlock {
@@ -3908,7 +4218,10 @@ mod tests {
         let url = test_server(vec![
             (503, "temporarily unavailable"),
             (200, r#"{"errors":[{"message":"archive catching up"}]}"#),
-            (200, r#"{"tx":{"gasSpent":42,"err":null}}"#),
+            (
+                200,
+                r#"{"tx":{"id":"abababababababababababababababababababababababababababababababab","gasSpent":42,"err":null}}"#,
+            ),
         ]);
         let client = RuesClient::new(url).unwrap();
         let tx_id = "ab".repeat(32);
@@ -3955,7 +4268,7 @@ mod tests {
         let budget = Duration::from_millis(400);
         // The node holds the transaction, but says so only after the budget:
         // that answer comes too late to count.
-        let held = r#"{"mempoolTx":{"id":"ab"},"tx":null}"#;
+        let held = r#"{"mempoolTx":{"id":"abababababababababababababababababababababababababababababababab"},"tx":null}"#;
         let client =
             RuesClient::new(slow_server(Duration::from_secs(3), "200 OK", "", held)).unwrap();
         let started = std::time::Instant::now();
@@ -3986,8 +4299,14 @@ mod tests {
     #[tokio::test]
     async fn confirmation_rejects_a_malformed_included_transaction() {
         let url = test_server(vec![
-            (200, r#"{"tx":{"gasSpent":"not-a-number","err":null}}"#),
-            (200, r#"{"tx":{"gasSpent":42,"err":null}}"#),
+            (
+                200,
+                r#"{"tx":{"id":"abababababababababababababababababababababababababababababababab","gasSpent":"not-a-number","err":null}}"#,
+            ),
+            (
+                200,
+                r#"{"tx":{"id":"abababababababababababababababababababababababababababababababab","gasSpent":42,"err":null}}"#,
+            ),
         ]);
         let client = RuesClient::new(url).unwrap();
         let tx_id = "ab".repeat(32);
@@ -3996,6 +4315,29 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("missing numeric gasSpent"));
+    }
+
+    /// A receipt of another transaction than the one waited for, as a proxy
+    /// or cache can answer with, is an error, not its outcome.
+    #[tokio::test]
+    async fn confirmation_rejects_a_receipt_of_another_transaction() {
+        let other = "cd".repeat(32);
+        let url = test_server(vec![
+            (
+                200,
+                format!(r#"{{"tx":{{"id":"{other}","gasSpent":42,"err":null}}}}"#),
+            ),
+            (200, r#"{"tx":{"gasSpent":42,"err":null}}"#.to_owned()),
+        ]);
+        let client = RuesClient::new(url).unwrap();
+        let tx_id = "ab".repeat(32);
+        for _ in 0..2 {
+            let error = client
+                .wait_for_tx_in_blocks_of(&tx_id, Duration::from_secs(2), Duration::from_millis(1))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("not of it"), "{error}");
+        }
     }
 
     /// When `wait_for_tx` looks a transaction up on a 10 s chain, from the
@@ -4458,6 +4800,115 @@ mod tests {
     impl Drop for Archive {
         fn drop(&mut self) {
             self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    /// An archive endpoint that pages a contract's `finalizedEvents` one row
+    /// at a time, which a page may hold: rows `1..=filler` of block
+    /// `filler_height`, then `last`, if any, as the next row; with `filler`
+    /// `None`, filler rows without end. A row is a function of its ID, so a
+    /// scan can resume at any of them. `checkBlock` accepts `last`'s block.
+    struct RowStream {
+        url: Url,
+        address: std::net::SocketAddr,
+        pages: Arc<AtomicU64>,
+        stop: Arc<AtomicBool>,
+        worker: Option<thread::JoinHandle<()>>,
+    }
+
+    impl RowStream {
+        fn start(
+            contract_id: [u8; 32],
+            filler_height: u64,
+            filler: Option<i64>,
+            last: Option<JsonValue>,
+        ) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let url = Url::parse(&format!("http://{address}")).unwrap();
+            let pages = Arc::new(AtomicU64::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_pages = pages.clone();
+            let worker_stop = stop.clone();
+            let worker = thread::spawn(move || {
+                for stream in listener.incoming() {
+                    if worker_stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let Ok(mut stream) = stream else {
+                        continue;
+                    };
+                    let query = String::from_utf8(read_request_body(&mut stream)).unwrap();
+                    let reply = if query.contains("finalizedEvents(") {
+                        worker_pages.fetch_add(1, Ordering::SeqCst);
+                        let id = query
+                            .split_once("cursor: \"")
+                            .and_then(|(_, rest)| rest.split('"').next())
+                            .map_or(1, |cursor| decode_event_cursor(cursor).unwrap() + 1);
+                        let rows =
+                            filler.map_or(i64::MAX, |filler| filler + i64::from(last.is_some()));
+                        let row = match filler {
+                            Some(filler) if id > filler => {
+                                last.clone().filter(|_| id <= rows).map(|mut row| {
+                                    row["id"] = id.into();
+                                    row
+                                })
+                            }
+                            _ => Some(archive_row(
+                                id,
+                                filler_height,
+                                1,
+                                "dispatch",
+                                contract_id,
+                                &id.to_be_bytes(),
+                            )),
+                        };
+                        let cursor = row.as_ref().map(|_| canonical_event_cursor(id));
+                        serde_json::json!({"finalizedEvents": {"json": {
+                            "startCursor": cursor,
+                            "endCursor": cursor,
+                            "hasNextPage": row.is_some() && id < rows,
+                            "events": row.into_iter().collect::<Vec<_>>(),
+                        }}})
+                    } else if query.contains("checkBlock(") {
+                        let finalized = last.as_ref().is_some_and(|row| {
+                            query.contains(&format!("height: {}", row["block_height"]))
+                                && query.contains(row["block_hash"].as_str().unwrap())
+                        });
+                        serde_json::json!({ "checkBlock": finalized })
+                    } else {
+                        serde_json::json!({"errors": [{"message": "unexpected query"}]})
+                    };
+                    let reply = reply.to_string();
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    );
+                }
+            });
+            Self {
+                url,
+                address,
+                pages,
+                stop,
+                worker: Some(worker),
+            }
+        }
+
+        fn pages(&self) -> u64 {
+            self.pages.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for RowStream {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            // Wake the worker from its wait for a connection.
+            let _ = std::net::TcpStream::connect(self.address);
             if let Some(worker) = self.worker.take() {
                 let _ = worker.join();
             }
@@ -5108,25 +5559,19 @@ mod tests {
             assert!(error.contains("[truncated, "), "{error}");
         }
 
-        // A damaged row in the local event store is reported the same way.
+        // A damaged row in the local event store is dropped, its parse
+        // error logged cut to the limit, and read from the archive again.
+        let key = finalized_event_row_key(&contract_id, "dispatch", 3).unwrap();
         client
             .event_store()
             .unwrap()
-            .put(
-                finalized_event_row_key(&contract_id, "dispatch", 3).unwrap(),
-                serde_json::json!({ "id": huge }).to_string(),
-            )
+            .put(&key, serde_json::json!({ "id": huge }).to_string())
             .unwrap();
-        let error = client
+        assert!(client
             .load_finalized_event(&contract_id, "dispatch", 3)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.len() < 2 * MAX_ERROR_BODY_BYTES,
-            "{} bytes",
-            error.len()
-        );
-        assert!(error.contains("[truncated, "), "{error}");
+            .unwrap()
+            .is_none());
+        assert!(client.event_store().unwrap().get(&key).unwrap().is_none());
     }
 
     #[test]
@@ -5234,18 +5679,18 @@ mod tests {
         for (position, bytes, diagnostic) in [
             (
                 3,
-                rkyv_serialize(&4u32).unwrap(),
-                "Dusk Mailbox state_version 4 is not supported: this agent needs state_version 5",
+                rkyv_serialize(&5u32).unwrap(),
+                "Dusk Mailbox state_version 5 is not supported: this agent needs state_version 6",
             ),
             (
                 3,
-                rkyv_serialize(&6u32).unwrap(),
-                "Dusk Mailbox state_version 6 is not supported",
+                rkyv_serialize(&7u32).unwrap(),
+                "Dusk Mailbox state_version 7 is not supported",
             ),
             (
                 4,
-                rkyv_serialize(&1u32).unwrap(),
-                "Dusk ValidatorAnnounce state_version 1 is not supported: this agent needs state_version 2",
+                rkyv_serialize(&2u32).unwrap(),
+                "Dusk ValidatorAnnounce state_version 2 is not supported: this agent needs state_version 3",
             ),
             (
                 5,
@@ -5348,7 +5793,7 @@ mod tests {
             .unwrap();
         // The checks and their errors are those of single queries.
         let mut responses = probe();
-        responses.push(views(merkle, mailbox, 4));
+        responses.push(views(merkle, mailbox, 5));
         let error = client(responses)
             .validate_chain_identity(1, 4242, &mailbox, &announce, &merkle)
             .await
@@ -5356,7 +5801,7 @@ mod tests {
             .to_string();
         assert!(
             error.contains(
-                "Dusk Mailbox state_version 4 is not supported: this agent needs state_version 5"
+                "Dusk Mailbox state_version 5 is not supported: this agent needs state_version 6"
             ),
             "{error}"
         );
@@ -5373,7 +5818,7 @@ mod tests {
             .to_string();
         assert!(
             error.contains(
-                "Failed to query Dusk Mailbox state_version (this agent needs state_version 5)"
+                "Failed to query Dusk Mailbox state_version (this agent needs state_version 6)"
             ) && error.contains("(500)"),
             "{error}"
         );
@@ -5392,8 +5837,9 @@ mod tests {
             .unwrap()
         };
         // Version 4 stored the processed-message log and root_at that this
-        // agent no longer reads, and the Mailbox dropped them in version 5.
-        for version in [0u32, 1, 3, 4, 6] {
+        // agent no longer reads, and the Mailbox dropped them in version 5;
+        // version 5 let contracts call process. Testnet starts at 6.
+        for version in [0u32, 1, 3, 4, 5, 7] {
             let error = identity((200, rkyv_serialize(&version).unwrap()))
                 .validate_chain_identity(1, 4242, &mailbox, &[4u8; 32], &[5u8; 32])
                 .await
@@ -5401,7 +5847,7 @@ mod tests {
                 .to_string();
             assert!(
                 error.contains(&format!("state_version {version} is not supported"))
-                    && error.contains("needs state_version 5"),
+                    && error.contains("needs state_version 6"),
                 "{error}"
             );
         }
@@ -5413,7 +5859,7 @@ mod tests {
             .to_string();
         assert!(
             error.contains("Failed to query Dusk Mailbox state_version")
-                && error.contains("needs state_version 5"),
+                && error.contains("needs state_version 6"),
             "{error}"
         );
     }
@@ -5996,6 +6442,262 @@ mod tests {
                 .await,
             Err(HyperlaneDuskError::ArchiveMissingRows(_))
         ));
+    }
+
+    /// A lookup whose block lacks a record stops before the first row of a
+    /// later block, however many rows the contract has after it, instead of
+    /// reading them all on every retry.
+    /// A pass that runs out of pages inside the block it looks for leaves
+    /// what it read of the block, and the next lookup reads on in it: here
+    /// block 6 alone has more rows than one pass reads, one per page, and
+    /// the record is its last. A position after a row of block 6 serves
+    /// only later blocks as an anchor, so every lookup started before the
+    /// block and ran out at the same row.
+    #[tokio::test]
+    async fn a_lookup_reads_on_in_its_block_after_running_out_of_pages_in_it() {
+        let contract_id = [145u8; 32];
+        let filler = MAX_SCAN_PAGES as i64 + 100;
+        let last = archive_row(0, 6, 3, "dispatch", contract_id, &[6]);
+        let stream = RowStream::start(contract_id, 6, Some(filler), Some(last));
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(stream.url.clone(), directory.path());
+        let lookup = client.finalized_contract_event(&contract_id, "dispatch", 0, 6, &[6]);
+        let error = tokio::time::timeout(Duration::from_secs(300), lookup)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("pages without reaching the end of block 6"),
+            "{error}"
+        );
+        assert_eq!(stream.pages(), MAX_SCAN_PAGES);
+        // The next lookup reads on from the last row read in block 6: the
+        // fence row, the 100 filler rows after it and the record.
+        let lookup = client.finalized_contract_event(&contract_id, "dispatch", 0, 6, &[6]);
+        let provenance = tokio::time::timeout(Duration::from_secs(300), lookup)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(provenance.block_height, 6);
+        assert_eq!(stream.pages(), MAX_SCAN_PAGES + 102);
+    }
+
+    /// A partial scan resumes another lookup of its block from the rows it
+    /// captured, and, once those grew past the bound, only a lookup of the
+    /// sequences it matched; a client keeps the latest few.
+    #[test]
+    fn partial_scans_resume_what_they_can_and_stay_few() {
+        let contract_id = [146u8; 32];
+        let event = |id: i64, data: &[u8]| -> FinalizedContractEvent {
+            serde_json::from_value(archive_row(id, 6, 1, "dispatch", contract_id, data)).unwrap()
+        };
+        let row = |data: &[u8]| BlockRow::parse(&event(1, data)).unwrap();
+        let matching = |data: &[u8]| vec![usize::from(data[0])];
+        let position = ScanAnchor::after_row(&event(1, &[1]), 7, 1)
+            .unwrap()
+            .unwrap();
+        let mut capture = BlockCapture::new(1 << 20);
+        capture.seen = true;
+        capture.push(row(&[1]));
+        capture.push(row(&[2]));
+        let wanted: HashSet<usize> = [1].into();
+        let partial = PartialScan {
+            position,
+            capture,
+            wanted: wanted.clone(),
+            found: [(1, event(1, &[1]))].into(),
+        };
+        let found = |partial: &PartialScan, wanted: &[usize]| {
+            partial
+                .found_for(
+                    &contract_id,
+                    "dispatch",
+                    6,
+                    &wanted.iter().copied().collect(),
+                    &matching,
+                )
+                .unwrap()
+                .map(|found| {
+                    let mut keys: Vec<usize> = found.into_keys().collect();
+                    keys.sort();
+                    keys
+                })
+        };
+        // Captured rows serve any sequence.
+        assert_eq!(found(&partial, &[2]), Some(vec![2]));
+        assert_eq!(found(&partial, &[1, 2, 3]), Some(vec![1, 2]));
+        // Past the bound, only the sequences matched before.
+        let mut overflowed = BlockCapture::new(0);
+        overflowed.push(row(&[1]));
+        let partial = PartialScan {
+            capture: overflowed,
+            ..partial
+        };
+        assert_eq!(found(&partial, &[1]), Some(vec![1]));
+        assert_eq!(found(&partial, &[2]), None);
+
+        let mut cache = BlockCache::new(BLOCK_CACHE_LIMITS);
+        let key = |height: u64| BlockKey::new(&contract_id, "dispatch", height);
+        for height in 0..=MAX_PARTIAL_SCANS as u64 {
+            cache.stage(
+                key(height),
+                PartialScan {
+                    position,
+                    capture: BlockCapture::new(0),
+                    wanted: wanted.clone(),
+                    found: ScannedRows::new(),
+                },
+            );
+        }
+        assert_eq!(cache.partial.len(), MAX_PARTIAL_SCANS);
+        assert!(cache.take_partial(&key(0)).is_none());
+        assert!(cache.take_partial(&key(MAX_PARTIAL_SCANS as u64)).is_some());
+        assert!(cache.take_partial(&key(MAX_PARTIAL_SCANS as u64)).is_none());
+        cache.forget_contract(&contract_id);
+        assert!(cache.partial.is_empty());
+    }
+
+    /// A persisted row that does not decode or check, which only a damaged
+    /// store holds, is dropped and read from the archive again, instead of
+    /// failing its sequence's lookups until the store is cleared.
+    #[tokio::test]
+    async fn a_persisted_row_that_does_not_decode_is_read_from_the_archive_again() {
+        let contract_id = [143u8; 32];
+        let archive = Archive::start(vec![archive_row(1, 7, 1, "dispatch", contract_id, &[7])]);
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(archive.url.clone(), directory.path());
+        let key = finalized_event_row_key(&contract_id, "dispatch", 0).unwrap();
+        let other_contract = archive_row(1, 7, 1, "dispatch", [144u8; 32], &[7]);
+        for damaged in [
+            b"{not json".to_vec(),
+            serde_json::to_vec(&serde_json::json!({ "id": 1 })).unwrap(),
+            serde_json::to_vec(&other_contract).unwrap(),
+            vec![b' '; MAX_RUES_RESPONSE_BYTES + 1],
+        ] {
+            client.event_store().unwrap().put(&key, &damaged).unwrap();
+            let provenance = client
+                .finalized_contract_event(&contract_id, "dispatch", 0, 7, &[7])
+                .await
+                .unwrap();
+            assert_eq!(provenance.block_height, 7);
+            // The row read again took its place.
+            let stored = client.event_store().unwrap().get(&key).unwrap().unwrap();
+            let stored: FinalizedContractEvent = serde_json::from_slice(&stored).unwrap();
+            assert_eq!(stored.source, hex::encode(contract_id));
+        }
+
+        // A well-formed row is read up to the transport bound and served
+        // from the store as it is; one byte over, it is dropped unread and
+        // replaced by the row read again.
+        let row = serde_json::to_vec(&archive_row(1, 7, 1, "dispatch", contract_id, &[7])).unwrap();
+        for (size, served) in [
+            (MAX_RUES_RESPONSE_BYTES, true),
+            (MAX_RUES_RESPONSE_BYTES + 1, false),
+        ] {
+            let mut padded = row.clone();
+            padded.resize(size, b' ');
+            client.event_store().unwrap().put(&key, &padded).unwrap();
+            client
+                .finalized_contract_event(&contract_id, "dispatch", 0, 7, &[7])
+                .await
+                .unwrap();
+            let stored = client.event_store().unwrap().get(&key).unwrap().unwrap();
+            assert_eq!(stored.len() == size, served, "{size} bytes");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lookup_reads_no_further_than_the_first_row_of_a_later_block() {
+        let contract_id = [140u8; 32];
+        let mut rows = vec![archive_row(1, 6, 1, "dispatch", contract_id, &[6])];
+        rows.extend((2..=2_001).map(|id| archive_row(id, 8, 2, "dispatch", contract_id, &[8])));
+        let archive = Archive::start(rows);
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(archive.url.clone(), directory.path());
+        let error = client
+            .finalized_contract_event(&contract_id, "dispatch", 0, 7, &[7])
+            .await
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(
+            matches!(error, HyperlaneDuskError::ArchiveMissingRows(_))
+                && text.contains("skipped finalized block 7")
+                && text.contains("finalized block 8"),
+            "{text}"
+        );
+        // The first page holds block 6's row and the first of block 8's.
+        assert_eq!(archive.pages(), [None]);
+        // The scan recorded where block 7's rows would end.
+        let anchors = client.scan_anchors_of(&contract_id);
+        assert_eq!(anchors.len(), 1);
+        assert_eq!((anchors[0].fence_id, anchors[0].before_block), (1, 7));
+    }
+
+    /// An endpoint that pages without end holds a lookup for
+    /// `MAX_SCAN_PAGES` pages, and the lookup records where it stopped.
+    #[tokio::test]
+    async fn a_lookup_reads_at_most_its_page_budget_from_an_endless_archive() {
+        let contract_id = [141u8; 32];
+        let stream = RowStream::start(contract_id, 5, None, None);
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(stream.url.clone(), directory.path());
+        let lookup = client.finalized_contract_event(&contract_id, "dispatch", 0, 6, &[6]);
+        let error = tokio::time::timeout(Duration::from_secs(300), lookup)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(&format!(
+                "read {MAX_SCAN_PAGES} pages without reaching the end of block 6; the next lookup resumes after row {MAX_SCAN_PAGES}"
+            )),
+            "{error}"
+        );
+        assert_eq!(stream.pages(), MAX_SCAN_PAGES);
+        let anchors = client.scan_anchors_of(&contract_id);
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(
+            (
+                anchors[0].fence_id,
+                anchors[0].rank,
+                anchors[0].before_block
+            ),
+            (MAX_SCAN_PAGES as i64, MAX_SCAN_PAGES, 6)
+        );
+    }
+
+    /// A history longer than one lookup's page budget is read over several
+    /// lookups, each resuming where the last one stopped.
+    #[tokio::test]
+    async fn a_history_longer_than_the_page_budget_is_read_over_several_lookups() {
+        let contract_id = [142u8; 32];
+        let filler = MAX_SCAN_PAGES as i64 + 100;
+        let last = archive_row(0, 6, 3, "dispatch", contract_id, &[6]);
+        let stream = RowStream::start(contract_id, 5, Some(filler), Some(last));
+        let directory = tempfile::tempdir().unwrap();
+        let client = test_client_with_event_store(stream.url.clone(), directory.path());
+        let lookup = client.finalized_contract_event(&contract_id, "dispatch", 0, 6, &[6]);
+        let error = tokio::time::timeout(Duration::from_secs(300), lookup)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("pages without reaching the end of block 6"),
+            "{error}"
+        );
+        assert_eq!(stream.pages(), MAX_SCAN_PAGES);
+        // The next lookup reads the fence row, the 100 filler rows after it
+        // and the record.
+        let provenance = client
+            .finalized_contract_event(&contract_id, "dispatch", 0, 6, &[6])
+            .await
+            .unwrap();
+        assert_eq!(provenance.block_height, 6);
+        assert_eq!(provenance.transaction_id.as_bytes()[32..], [3u8; 32]);
+        assert_eq!(stream.pages(), MAX_SCAN_PAGES + 102);
     }
 
     #[tokio::test]

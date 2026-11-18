@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use hyperlane_core::{
     accumulator::incremental::IncrementalMerkle, BatchResult, ChainResult, Checkpoint,
@@ -18,10 +18,10 @@ use hyperlane_dusk_types::merkle::{IncrementalMerkle as HookTree, TREE_DEPTH};
 
 use crate::final_records::FinalRecords;
 use crate::rues::{
-    bounded_body, bounded_error, bounded_json, bounded_text, fits_one_aggregate, list_reply,
-    rkyv_deserialize, rkyv_serialize, BlockPair, CheckHold, ConfirmedTransaction, LogLookup,
-    PreparedDelivery, Read, SentDelivery, TransactionStatus, BOOL_REPLY, ID_REPLY, U32_REPLY,
-    U64_REPLY,
+    bounded_body, bounded_error, bounded_json, bounded_text, critical_report_due,
+    fits_one_aggregate, list_reply, rkyv_deserialize, rkyv_serialize, BlockPair, CheckHold,
+    ConfirmedTransaction, LogLookup, MissingRecords, PreparedDelivery, Read, SentDelivery,
+    TransactionStatus, BOOL_REPLY, ID_REPLY, MISSING_RECORD_MARGIN, U32_REPLY, U64_REPLY,
 };
 use crate::{ConnectionConf, DuskProvider, DuskSigner, HyperlaneDuskError, RuesClient};
 
@@ -43,10 +43,13 @@ const DELIVERED_LOG_PAGES: usize = 4;
 const MAX_DELIVERY_CHECKS: usize = 4096;
 /// How long a passed `process` simulation stands for the same arguments.
 /// The relayer simulates a delivery when it prepares it, again just before
-/// it submits it, and the Mailbox did a third time in `process`: when the
-/// submission follows the preparation at once, the three ran within a few
-/// hundred milliseconds of each other on the same state. A Dusk block takes
-/// about 10 s, and the transaction waits as long again for its block.
+/// it submits it, and the Mailbox did a third time in `process`, and does
+/// once more just before the helper signs a delivery sent one at a time
+/// (`process_one`): when the submission follows the preparation at once,
+/// and the delivery did not wait for the signer's earlier transactions,
+/// they ran within a few hundred milliseconds of each other on the same
+/// state. A Dusk block takes about 10 s, and the transaction waits as long
+/// again for its block.
 const SIMULATION_REUSE: Duration = Duration::from_secs(2);
 /// Simulations a Mailbox remembers.
 const MAX_REMEMBERED_SIMULATIONS: usize = 1024;
@@ -196,6 +199,8 @@ type LogProgress = crate::rues::LogState;
 #[derive(Debug, Default)]
 struct DeliveryChecks {
     checks: HashMap<H256, (CheckHold, Delivery)>,
+    /// Deliveries the Mailbox reports that no block was found to hold.
+    missing: MissingRecords,
 }
 
 impl DeliveryChecks {
@@ -663,6 +668,12 @@ impl DuskMailbox {
     /// whole gas limit. A hash that cannot be kept leaves the helper without
     /// the word: it sends nothing, and the delivery fails `NotSubmitted`, so
     /// that the next submission goes at once.
+    ///
+    /// Following the earlier transaction, and making room to keep this
+    /// one's, can take seconds to minutes after `process` simulated the
+    /// delivery, while another relayer may deliver the message or its
+    /// recipient change. The delivery is simulated again before the helper
+    /// signs it, unless the last pass is still fresh (`SIMULATION_REUSE`).
     async fn process_one(
         &self,
         signer: &DuskSigner,
@@ -678,31 +689,49 @@ impl DuskMailbox {
         }
         self.sweep_prepared(&key, signer, message).await;
         self.room_for_prepared(&key, signer, message).await?;
-        let keep = |tx_id: &str, nonce: Option<u64>| -> Result<(), HyperlaneDuskError> {
-            let tx_id = hex::decode(tx_id)
-                .ok()
-                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-                .ok_or_else(|| {
-                    HyperlaneDuskError::Other(format!(
-                        "dusk-tx named a transaction whose hash is not 32 bytes of hex: {}",
-                        bounded_text(tx_id)
-                    ))
-                })?;
-            let prepared = PreparedDelivery {
-                tx_id,
-                prepared_at: unix_millis(),
-                failure_reported: false,
-                nonce,
-            };
-            self.rues
-                .keep_prepared_delivery(&key, message, &prepared, self.limits.prepared)
-                .inspect_err(|error| {
-                    warn!(
-                        message_id = ?message,
-                        error = %bounded_error(error),
-                        "Failed to keep the transaction prepared for a Dusk delivery; the helper is not let send it"
-                    );
-                })
+        // The helper's capability probe can take seconds the first time, so
+        // it goes before the delivery's last simulation.
+        let helper = crate::tx_sender::acking_helper("process").await?;
+        self.simulate_process(message, args).await?;
+        let keep = |tx_id: String, nonce: Option<u64>| -> crate::tx_sender::Kept<'_> {
+            Box::pin(async move {
+                // The helper starts, reads the account and signs after that
+                // simulation, and may take its time: a pass older than
+                // `SIMULATION_REUSE` by now is run again before the helper
+                // may send what it signed.
+                self.simulate_process(message, args)
+                    .await
+                    .map_err(|error| {
+                        HyperlaneDuskError::Other(format!(
+                            "the delivery's simulation just before sending failed: {}",
+                            bounded_error(&error)
+                        ))
+                    })?;
+                let tx_id = hex::decode(&tx_id)
+                    .ok()
+                    .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                    .ok_or_else(|| {
+                        HyperlaneDuskError::Other(format!(
+                            "dusk-tx named a transaction whose hash is not 32 bytes of hex: {}",
+                            bounded_text(&tx_id)
+                        ))
+                    })?;
+                let prepared = PreparedDelivery {
+                    tx_id,
+                    prepared_at: unix_millis(),
+                    failure_reported: false,
+                    nonce,
+                };
+                self.rues
+                    .keep_prepared_delivery(&key, message, &prepared, self.limits.prepared)
+                    .inspect_err(|error| {
+                        warn!(
+                            message_id = ?message,
+                            error = %bounded_error(error),
+                            "Failed to keep the transaction prepared for a Dusk delivery; the helper is not let send it"
+                        );
+                    })
+            })
         };
         let call_result = crate::tx_sender::dusk_tx_call_kept(
             &self.conn,
@@ -711,6 +740,7 @@ impl DuskMailbox {
             "process",
             args,
             Some(gas_limit),
+            &helper,
             &keep,
         )
         .await;
@@ -1014,11 +1044,14 @@ impl DuskMailbox {
                 .await?;
             tally.0 += 1;
             match status {
+                // Kept while the node still lists it in its mempool too.
                 TransactionStatus::Included {
                     block_height,
                     receipt,
+                    in_mempool,
                 } => {
                     if block_height > finalized
+                        || in_mempool
                         || (receipt.error.is_some() && !delivery.failure_reported)
                     {
                         continue;
@@ -1292,7 +1325,8 @@ impl DuskMailbox {
     /// - In a block, failed, and reported: it spent its nonce and delivered
     ///   nothing; the delivery goes again once that block is final, at or
     ///   below the last final block read before the lookup, since until
-    ///   then a rollback can run the transaction again.
+    ///   then a rollback can run the transaction again, and once the node no
+    ///   longer lists the transaction in its mempool either.
     /// - In the mempool: it is followed to its block, as an unknown outcome
     ///   is.
     /// - In neither, prepared less than `SubmissionLimits::drop_grace` ago:
@@ -1321,6 +1355,7 @@ impl DuskMailbox {
                 TransactionStatus::Included {
                     block_height,
                     receipt,
+                    in_mempool,
                 } => {
                     if receipt.error.is_none() {
                         info!(
@@ -1344,6 +1379,12 @@ impl DuskMailbox {
                     if block_height > finalized {
                         return Err(HyperlaneDuskError::Other(format!(
                             "Dusk delivery of message {message:?}: its earlier transaction {tx_id} failed in block {block_height}, which is not final yet; it goes again once that block is final"
+                        ))
+                        .into());
+                    }
+                    if in_mempool {
+                        return Err(HyperlaneDuskError::Other(format!(
+                            "Dusk delivery of message {message:?}: its earlier transaction {tx_id} failed in final block {block_height}, but the node still lists it in its mempool; it goes again once it has left"
                         ))
                         .into());
                     }
@@ -1473,6 +1514,7 @@ impl DuskMailbox {
         let delivered: bool =
             rkyv_deserialize(&self.rues.tick_read(pair.finalized(), read).await?)?;
         if !delivered {
+            self.delivery_found(&id_bytes);
             return Ok(Delivery::Absent);
         }
         let lookup = self
@@ -1486,7 +1528,10 @@ impl DuskMailbox {
             .await;
         // Only a finalized delivery counts.
         let final_block = match lookup {
-            Ok(LogLookup::Found(_)) => return Ok(Delivery::Final),
+            Ok(LogLookup::Found(_)) => {
+                self.delivery_found(&id_bytes);
+                return Ok(Delivery::Final);
+            }
             Ok(LogLookup::Absent { final_block }) => final_block,
             Ok(LogLookup::Unknown(reason)) => {
                 debug!(message_id = ?id, %reason, "Dusk delivery log cannot show the delivery final yet");
@@ -1525,6 +1570,7 @@ impl DuskMailbox {
                 }
             };
             if processed.message_id == id_bytes {
+                self.delivery_found(&id_bytes);
                 return Ok(Delivery::Pending(format!(
                     "Message {id:?} is delivered in Dusk block {} ({:?}, transaction {}), which is not final yet",
                     event.block_height,
@@ -1536,7 +1582,31 @@ impl DuskMailbox {
         // In no final block and in no block above them: a block that held
         // it was rolled back during this check, and the next one reads it
         // as not delivered, or the archive skipped the final block that
-        // holds it and this stays so.
+        // holds it and this stays so. Missed by every check until the log
+        // reads far past the tip at which it was first missed, the latter
+        // is very likely (`MissingRecords`).
+        let missed = self
+            .delivery_checks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .missing
+            .missed(&id_bytes, pair.tip().0, final_block);
+        if let Some(first_tip) = missed {
+            let detail = format!(
+                "Message {id:?} is delivered at the Dusk tip, but no block holds its delivery: every check since tip {first_tip} found it in no finalized block, and in no block above the last final one, which is now block {final_block}, at least {MISSING_RECORD_MARGIN} blocks past that tip. The node's archive is suspected of lacking the delivery's finalized ProcessId row, and the delivery does not count without it: check the node's archive, and repair or rebuild it, or use another endpoint"
+            );
+            let what = format!("{}/{}", events::ProcessId::TOPIC, hex::encode(id_bytes));
+            if critical_report_due(&self.mailbox_id, &what, first_tip) {
+                error!(
+                    message_id = ?id,
+                    final_block,
+                    first_tip,
+                    %detail,
+                    "CRITICAL: Dusk archive suspected of missing a finalized delivery that contract state reports"
+                );
+            }
+            return Ok(Delivery::Unsettled(detail));
+        }
         warn!(
             message_id = ?id,
             final_block,
@@ -1545,6 +1615,16 @@ impl DuskMailbox {
         Ok(Delivery::Unsettled(format!(
             "Message {id:?} is delivered at the Dusk tip, but no finalized block up to block {final_block}, the last final one, holds its delivery, and no block above it does either: the block that did was rolled back during this check, or the node's archive skipped it"
         )))
+    }
+
+    /// Message `id`'s delivery was found, or the Mailbox no longer reports
+    /// it delivered.
+    fn delivery_found(&self, id: &[u8; 32]) {
+        self.delivery_checks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .missing
+            .settled(id);
     }
 
     /// The gas limit a delivery is submitted with: the relayer's, which
