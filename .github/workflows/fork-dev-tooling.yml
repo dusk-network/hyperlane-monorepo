@@ -3,7 +3,7 @@ name: fork-dev-tooling
 
 on:
   push:
-    branches: ['ci/npm-*']
+    branches: ['ci/npm-*', 'ci/widgets-*']
 
 permissions:
   contents: read
