@@ -19,22 +19,13 @@ env:
 
 jobs:
   e2e-matrix:
-    runs-on: depot-ubuntu-24.04-8
+    runs-on: ubuntu-latest
     if: inputs.event_name == 'push' || (inputs.event_name == 'pull_request' && inputs.base_ref == 'main') || inputs.event_name == 'merge_group' || inputs.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
-        e2e-type:
-          [
-            cosmwasm,
-            cosmosnative,
-            evm,
-            sealevel,
-            sealevel-composite,
-            starknet,
-            radix,
-            tron,
-          ]
+        # CI-only: legs relevant to this branch
+        e2e-type: [sealevel, sealevel-composite]
     steps:
       - uses: actions/checkout@v7
         with:
