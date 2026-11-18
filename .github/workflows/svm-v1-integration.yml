@@ -25,14 +25,11 @@ concurrency:
 
 env:
   TURBO_TELEMETRY_DISABLED: 1
-  TURBO_API: https://cache.depot.dev
-  TURBO_TOKEN: ${{ secrets.DEPOT_TURBO_TOKEN }}
-  TURBO_TEAM: ${{ secrets.DEPOT_ORG_ID }}
 
 jobs:
   svm-v1-integration:
-    runs-on: depot-ubuntu-24.04
-    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
         with:
