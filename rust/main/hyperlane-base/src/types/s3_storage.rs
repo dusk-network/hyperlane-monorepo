@@ -866,6 +866,8 @@ mod tests {
     /// Recent AWS SDKs add CRC checksum headers to uploads and request checksum
     /// validation on downloads by default. Some S3-compatible stores reject
     /// those headers, so requests must only carry checksums the operation requires.
+    /// The clients use the SDK's default HTTP client and credential chain, and take the
+    /// endpoint and keys from the AWS profile.
     #[tokio::test]
     async fn requests_carry_only_required_checksum_headers() {
         use hyper::{service::service_fn, Body, Response};
@@ -905,29 +907,23 @@ mod tests {
             Region::new("test-checksum-headers"),
             None,
         );
-        // Build both clients the way the storage does, pointed at the mock. FIPS and
-        // dual-stack are pinned off so a local AWS profile can't reject the endpoint.
-        let http_client = aws_smithy_http_client::hyper_014::HyperClientBuilder::new()
-            .build(hyper::client::HttpConnector::new());
-        let loader = || {
-            storage
-                .default_aws_sdk_config_loader()
-                .endpoint_url(format!("http://{address}"))
-                .use_fips(false)
-                .use_dual_stack(false)
-                .http_client(http_client.clone())
-        };
-        let authenticated = loader()
-            .credentials_provider(aws_sdk_s3::config::Credentials::for_tests())
+        let profile = format!(
+            "[default]\n\
+             endpoint_url = http://{address}\n\
+             aws_access_key_id = test-access-key\n\
+             aws_secret_access_key = test-secret\n"
+        );
+        let authenticated = loader_with_profile(&storage, &profile).load().await;
+        let anonymous = loader_with_profile(&storage, &profile)
+            .no_credentials()
             .load()
             .await;
-        let anonymous = loader().no_credentials().load().await;
         storage
             .authenticated_client
-            .set(Client::new(&authenticated))
+            .set(s3_client(&authenticated))
             .unwrap();
         anonymous_client_cell(storage.region.clone())
-            .set(Client::new(&anonymous))
+            .set(s3_client(&anonymous))
             .unwrap();
 
         storage
@@ -949,6 +945,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("no {method} request"))
         };
         let put = headers(hyper::Method::PUT);
+        assert!(put[hyper::header::AUTHORIZATION]
+            .to_str()
+            .unwrap()
+            .contains("Credential=test-access-key/"));
         for name in put.keys() {
             assert!(
                 !name.as_str().starts_with("x-amz-checksum-")
@@ -956,9 +956,9 @@ mod tests {
                 "unexpected PUT header {name}"
             );
         }
-        assert!(headers(hyper::Method::GET)
-            .get("x-amz-checksum-mode")
-            .is_none());
+        let get = headers(hyper::Method::GET);
+        assert!(get.get(hyper::header::AUTHORIZATION).is_none());
+        assert!(get.get("x-amz-checksum-mode").is_none());
     }
 
     #[tokio::test]
