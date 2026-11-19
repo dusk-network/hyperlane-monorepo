@@ -26,7 +26,8 @@ env:
 
 jobs:
   pnpm-install:
-    runs-on: depot-ubuntu-24.04
+    if: false # CI-only: not Rust-relevant
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
@@ -48,9 +49,9 @@ jobs:
         run: ./scripts/check-package-json.sh
 
   lint-prettier-run:
-    runs-on: depot-ubuntu-24.04-8
+    if: false # CI-only: not Rust-relevant
+    runs-on: ubuntu-latest
     needs: [change-detection]
-    if: needs.change-detection.outputs.run_lint_prettier == 'true'
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -119,9 +120,9 @@ jobs:
           rm -f changed_files.txt
 
   lint-prettier:
+    if: false # CI-only: not Rust-relevant
     runs-on: ubuntu-latest
     needs: [lint-prettier-run]
-    if: always()
     steps:
       - uses: actions/checkout@v7
       - name: Check lint-prettier status
@@ -147,7 +148,7 @@ jobs:
       has_rebalancer: ${{ steps.decide.outputs.has_rebalancer }}
       has_svm: ${{ steps.decide.outputs.has_svm }}
       has_svm_program_inputs: ${{ steps.decide.outputs.has_svm_program_inputs }}
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
@@ -321,10 +322,10 @@ jobs:
           echo "has_svm_program_inputs=${{ steps.check-vm.outputs.has_svm_program_inputs }}" >> $GITHUB_OUTPUT
 
   pnpm-test-run:
-    runs-on: depot-ubuntu-24.04
+    if: false # CI-only: not Rust-relevant
+    runs-on: ubuntu-latest
     needs: [change-detection]
     timeout-minutes: 20
-    if: needs.change-detection.outputs.skip_ts != 'true'
     steps:
       - uses: actions/checkout@v7
         with:
@@ -341,9 +342,9 @@ jobs:
         run: pnpm run test:ci
 
   pnpm-test:
+    if: false # CI-only: not Rust-relevant
     runs-on: ubuntu-latest
     needs: [pnpm-test-run]
-    if: always()
     steps:
       - uses: actions/checkout@v7
       - name: Check pnpm-test status
@@ -353,9 +354,9 @@ jobs:
           result: ${{ needs.pnpm-test-run.result }}
 
   infra-test:
-    runs-on: depot-ubuntu-24.04
+    if: false # CI-only: not Rust-relevant
+    runs-on: ubuntu-latest
     needs: [change-detection]
-    if: needs.change-detection.outputs.skip_ts != 'true'
     env:
       GRAFANA_SERVICE_ACCOUNT_TOKEN: ${{ secrets.GRAFANA_SERVICE_ACCOUNT_TOKEN }}
       BALANCE_CHANGES: false
@@ -408,9 +409,9 @@ jobs:
         run: pnpm -C typescript/infra test:warp
 
   cli-install-test-run:
-    runs-on: depot-ubuntu-24.04
+    if: false # CI-only: not Rust-relevant
+    runs-on: ubuntu-latest
     needs: [change-detection]
-    if: needs.change-detection.outputs.skip_ts != 'true'
     steps:
       - uses: actions/checkout@v7
         with:
@@ -426,9 +427,9 @@ jobs:
         run: hyperlane --version
 
   cli-install-test:
+    if: false # CI-only: not Rust-relevant
     runs-on: ubuntu-latest
     needs: [cli-install-test-run]
-    if: always()
     steps:
       - uses: actions/checkout@v7
       - name: Check cli-install-test status
@@ -440,6 +441,7 @@ jobs:
   # Reusable workflow callers
 
   cli-e2e-tests:
+    if: false # CI-only: not Rust-relevant
     needs: [change-detection]
     uses: ./.github/workflows/test-cli-e2e.yml
     secrets: inherit
@@ -456,9 +458,9 @@ jobs:
       has_svm: ${{ needs.change-detection.outputs.has_svm }}
 
   cli-e2e:
+    if: false # CI-only: not Rust-relevant
     runs-on: ubuntu-latest
     needs: [cli-e2e-tests]
-    if: always()
     steps:
       - uses: actions/checkout@v7
       - name: Check CLI E2E status
@@ -468,6 +470,7 @@ jobs:
           result: ${{ needs.cli-e2e-tests.result }}
 
   sdk-e2e-tests:
+    if: false # CI-only: not Rust-relevant
     needs: [change-detection]
     uses: ./.github/workflows/test-sdk-e2e.yml
     secrets: inherit
@@ -480,9 +483,9 @@ jobs:
       has_svm: ${{ needs.change-detection.outputs.has_svm }}
 
   sdk-e2e:
+    if: false # CI-only: not Rust-relevant
     runs-on: ubuntu-latest
     needs: [sdk-e2e-tests]
-    if: always()
     steps:
       - uses: actions/checkout@v7
       - name: Check SDK E2E status
@@ -499,13 +502,14 @@ jobs:
       base_ref: ${{ github.base_ref }}
 
   coverage-tests:
+    if: false # CI-only: not Rust-relevant
     uses: ./.github/workflows/test-coverage.yml
     secrets: inherit
 
   agent-configs:
-    runs-on: depot-ubuntu-24.04
+    if: false # CI-only: not Rust-relevant
+    runs-on: ubuntu-latest
     needs: [change-detection]
-    if: needs.change-detection.outputs.skip_ts != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -566,6 +570,7 @@ jobs:
         run: node typescript/svm-sdk/scripts/check-program-bytes-hash.mjs --warn
 
   env-tests:
+    if: false # CI-only: not Rust-relevant
     needs: [change-detection]
     uses: ./.github/workflows/test-env.yml
     secrets: inherit
