@@ -5,7 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use aws_config::{timeout::TimeoutConfig, BehaviorVersion, ConfigLoader, Region};
+use aws_config::{timeout::TimeoutConfig, BehaviorVersion, ConfigLoader, Region, SdkConfig};
 use aws_sdk_s3::{
     config::{RequestChecksumCalculation, ResponseChecksumValidation},
     error::SdkError,
@@ -13,6 +13,7 @@ use aws_sdk_s3::{
     primitives::ByteStream,
     Client,
 };
+use aws_types::service_config::ServiceConfigKey;
 use bytes::Bytes;
 use dashmap::DashMap;
 use derive_new::new;
@@ -58,6 +59,36 @@ pub struct S3Storage {
 /// requests when creating them. This cache allows us to reuse
 /// anonymous clients across the entire agent.
 static ANONYMOUS_CLIENT_CACHE: OnceLock<DashMap<Region, Arc<OnceCell<Client>>>> = OnceLock::new();
+
+/// Builds an S3 client from loaded SDK config.
+///
+/// aws-config leaves endpoint URLs from the environment and profile out of the shared config
+/// when `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS` (or `ignore_configured_endpoint_urls` in the
+/// profile) is set, but the S3 config builder reads them again from the same sources. In that
+/// case, use the shared endpoint, which is only set when given in code.
+fn s3_client(sdk_config: &SdkConfig) -> Client {
+    let mut config = aws_sdk_s3::config::Builder::from(sdk_config);
+    if ignores_configured_endpoint_urls(sdk_config) {
+        config.set_endpoint_url(sdk_config.endpoint_url().map(str::to_owned));
+    }
+    Client::from_conf(config.build())
+}
+
+/// Reads the endpoint URL opt-out from the environment and profile the config was loaded from.
+fn ignores_configured_endpoint_urls(sdk_config: &SdkConfig) -> bool {
+    let Ok(key) = ServiceConfigKey::builder()
+        .service_id("S3")
+        .env("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS")
+        .profile("ignore_configured_endpoint_urls")
+        .build()
+    else {
+        return false;
+    };
+    sdk_config
+        .service_config()
+        .and_then(|config| config.load_config(key))
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+}
 
 fn anonymous_client_cell(region: Region) -> Arc<OnceCell<Client>> {
     let cell = ANONYMOUS_CLIENT_CACHE
@@ -180,7 +211,7 @@ impl S3Storage {
         self.authenticated_client
             .get_or_init(|| async {
                 let config = self.default_aws_sdk_config_loader().load().await;
-                Client::new(&config)
+                s3_client(&config)
             })
             .await
     }
@@ -204,7 +235,7 @@ impl S3Storage {
                 .no_credentials()
                 .load()
                 .await;
-            Client::new(&config)
+            s3_client(&config)
         })
         .await
         .clone()
@@ -433,6 +464,15 @@ impl CheckpointSyncer for S3Storage {
 
 #[cfg(test)]
 mod tests {
+    use aws_runtime::env_config::file::{EnvConfigFileKind, EnvConfigFiles};
+    use aws_sdk_s3::{
+        config::{
+            interceptors::BeforeTransmitInterceptorContextRef, ConfigBag, Intercept,
+            RuntimeComponents,
+        },
+        error::BoxError,
+    };
+
     use super::*;
 
     #[tokio::test]
@@ -727,6 +767,99 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
             serde_json::from_slice::<serde_json::Value>(&pretty).unwrap()
+        );
+    }
+
+    /// Loads SDK config through the storage's loader, with `profile` as the AWS config file and
+    /// none of the host's environment variables or AWS config files.
+    fn loader_with_profile(storage: &S3Storage, profile: &str) -> ConfigLoader {
+        storage
+            .default_aws_sdk_config_loader()
+            .empty_test_environment()
+            .profile_files(
+                EnvConfigFiles::builder()
+                    .with_contents(EnvConfigFileKind::Config, profile)
+                    .build(),
+            )
+    }
+
+    /// Returns the host an anonymous S3 client built from `loader` sends a GetObject request
+    /// to. The request is stopped before it is sent, so a plain HTTP client is enough.
+    async fn get_object_host(loader: ConfigLoader) -> String {
+        #[derive(Debug, Clone, Default)]
+        struct CaptureUri(Arc<std::sync::Mutex<Option<String>>>);
+
+        impl Intercept for CaptureUri {
+            fn name(&self) -> &'static str {
+                "CaptureUri"
+            }
+
+            fn read_before_transmit(
+                &self,
+                context: &BeforeTransmitInterceptorContextRef<'_>,
+                _: &RuntimeComponents,
+                _: &mut ConfigBag,
+            ) -> Result<(), BoxError> {
+                *self.0.lock().unwrap() = Some(context.request().uri().to_owned());
+                Err("request captured".into())
+            }
+        }
+
+        let http_client = aws_smithy_http_client::hyper_014::HyperClientBuilder::new()
+            .build(hyper::client::HttpConnector::new());
+        let config = loader
+            .no_credentials()
+            .http_client(http_client)
+            .load()
+            .await;
+        let client = s3_client(&config);
+        let capture = CaptureUri::default();
+        let result = client
+            .get_object()
+            .bucket("test-bucket")
+            .key("key")
+            .customize()
+            .interceptor(capture.clone())
+            .send()
+            .await;
+        let uri = capture.0.lock().unwrap().take();
+        let uri = uri.unwrap_or_else(|| panic!("request not captured: {result:?}"));
+        Url::parse(&uri).unwrap().host_str().unwrap().to_owned()
+    }
+
+    /// With `ignore_configured_endpoint_urls` set, S3 uses neither the global nor the
+    /// S3-specific endpoint URL from the profile.
+    #[tokio::test]
+    async fn s3_endpoint_honours_ignore_configured_endpoint_urls() {
+        let storage = S3Storage::new("test-bucket".into(), None, Region::new("us-east-1"), None);
+        let profile = |opt_out: &str| {
+            format!(
+                "[default]\n\
+                 {opt_out}\
+                 endpoint_url = http://global.example.test\n\
+                 services = local\n\
+                 [services local]\n\
+                 s3 =\n  endpoint_url = http://s3.example.test\n"
+            )
+        };
+        let configured = profile("");
+        let opted_out = profile("ignore_configured_endpoint_urls = true\n");
+
+        assert_eq!(
+            get_object_host(loader_with_profile(&storage, &configured)).await,
+            "test-bucket.s3.example.test"
+        );
+        assert_eq!(
+            get_object_host(loader_with_profile(&storage, &opted_out)).await,
+            "test-bucket.s3.us-east-1.amazonaws.com"
+        );
+        // An endpoint set in code still applies.
+        assert_eq!(
+            get_object_host(
+                loader_with_profile(&storage, &opted_out).endpoint_url("http://code.example.test")
+            )
+            .await,
+            "test-bucket.code.example.test"
         );
     }
 
