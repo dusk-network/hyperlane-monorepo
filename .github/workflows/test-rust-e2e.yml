@@ -19,7 +19,7 @@ env:
 
 jobs:
   e2e-matrix:
-    runs-on: depot-ubuntu-24.04-8
+    runs-on: ubuntu-latest
     if: inputs.event_name == 'push' || (inputs.event_name == 'pull_request' && inputs.base_ref == 'main') || inputs.event_name == 'merge_group' || inputs.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
