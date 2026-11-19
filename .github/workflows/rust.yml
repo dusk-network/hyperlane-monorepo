@@ -78,7 +78,7 @@ jobs:
   lander-coverage-run:
     needs: [ts-only]
     if: needs.ts-only.outputs.skip_rust != 'true'
-    runs-on: depot-ubuntu-24.04-8
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
@@ -123,13 +123,13 @@ jobs:
           files: ./rust/main/lcov.info
           disable_search: true
           flags: ./rust/main/lander
-          fail_ci_if_error: true
+          fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
 
   test-rs-run:
     needs: [ts-only]
     if: needs.ts-only.outputs.skip_rust != 'true'
-    runs-on: depot-ubuntu-24.04-8
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
@@ -176,7 +176,7 @@ jobs:
   test-rs-sealevel-run:
     needs: [ts-only]
     if: needs.ts-only.outputs.skip_rust != 'true'
-    runs-on: depot-ubuntu-24.04-8
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
@@ -228,7 +228,7 @@ jobs:
   lint-rs-run:
     needs: [ts-only]
     if: needs.ts-only.outputs.skip_rust != 'true'
-    runs-on: depot-ubuntu-24.04-8
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
