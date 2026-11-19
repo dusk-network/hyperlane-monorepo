@@ -5,6 +5,7 @@ import { ProtocolType } from '@hyperlane-xyz/utils';
 
 import { getTokenGasOracleConfigs } from '../config/environments/mainnet3/tokenGasOracles.js';
 import { getIgp } from '../config/environments/mainnet3/igp.js';
+import { getIgp as getTestnet4Igp } from '../config/environments/testnet4/igp.js';
 import gasPrices from '../config/environments/mainnet3/gasPrices.json' with { type: 'json' };
 import { supportedChainNames } from '../config/environments/mainnet3/supportedChainNames.js';
 import tokenPrices from '../config/environments/mainnet3/tokenPrices.json' with { type: 'json' };
@@ -240,5 +241,21 @@ describe('mainnet3 stablecoin IGP gas oracles', () => {
     // Base's native IGP floor also applies when paying in USDC/USDT.
     expect(quote.gte(100_000)).to.equal(true);
     expect(quote.lte(100_100)).to.equal(true);
+  });
+});
+
+describe('testnet4 IGP overheads', () => {
+  it('covers two new Glamsterdam storage slots for deliveries into Sepolia', () => {
+    // Glamsterdam charges ~97,920 more gas per new slot. A first delivery writes
+    // two: the Mailbox's delivery record and the recipient's balance.
+    const newSlotGas = 97_920;
+    for (const [origin, igp] of Object.entries(getTestnet4Igp())) {
+      if (origin === 'sepolia') continue;
+      const reference =
+        origin === 'basesepolia' ? 'optimismsepolia' : 'basesepolia';
+      const additionalGas = igp.overhead.sepolia - igp.overhead[reference];
+      expect(additionalGas).to.be.at.least(2 * newSlotGas);
+      expect(additionalGas).to.be.lessThan(300_000);
+    }
   });
 });
