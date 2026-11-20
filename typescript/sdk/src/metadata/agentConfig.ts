@@ -650,6 +650,26 @@ export const RelayerAgentConfigSchema = AgentConfigSchema.extend({
     .describe(
       'If no blacklist is provided ALL will be considered to not be on the blacklist.',
     ),
+  ccipReadAllowedDomains: z
+    .string()
+    .refine(
+      (value) =>
+        value.split(',').every((entry) => {
+          const domain = entry.trim();
+          if (!domain) return true;
+          if (!z.regexes.hostname.test(domain)) return false;
+          try {
+            return !z.regexes.ipv4.test(new URL(`https://${domain}`).hostname);
+          } catch {
+            return false;
+          }
+        }),
+      'Each CCIP-read allowlist entry must be a bare DNS hostname',
+    )
+    .optional()
+    .describe(
+      'Comma-separated exact DNS names allowed for CCIP reads. Empty or omitted disables CCIP reads.',
+    ),
   addressBlacklist: z
     .string()
     .optional()
@@ -921,9 +941,21 @@ export const ValidatorAgentConfigSchema = AgentConfigSchema.extend({
     .refine((url) => WEBSOCKET_URL_PREFIX_REGEX.test(url), {
       message: 'Must use ws:// or wss://',
     })
+    .refine((value) => {
+      try {
+        const url = new URL(value);
+        // URL.search is empty for a bare '?', which Rust also rejects.
+        return (
+          url.pathname === '/validators' &&
+          !url.href.split('#', 1)[0].includes('?')
+        );
+      } catch {
+        return false;
+      }
+    }, 'Must use /validators without query parameters')
     .optional()
     .describe(
-      'Live Merkle tree insertion source. RPC indexes history and recovers gaps, then pauses once an overlapping insertion matches.',
+      'Live Merkle tree insertions from /validators without query parameters. RPC indexes history and recovers gaps before an RPC-verified live-start handoff. Checkpoint roots are verified through configured RPCs before signing.',
     ),
 });
 
