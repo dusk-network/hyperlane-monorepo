@@ -310,6 +310,12 @@ impl BaseAgent for Relayer {
     where
         Self: Sized,
     {
+        if settings.ccip_read_allowed_domains.is_empty() {
+            warn!("ccipReadAllowedDomains is empty. All CCIP-read lookups will be refused.");
+        } else {
+            info!(domains = ?settings.ccip_read_allowed_domains, "CCIP-read allowed domains");
+        }
+
         Self::reset_critical_errors(&settings, &chain_metrics);
         let critical_errors = CriticalErrorTracker::new(chain_metrics.clone());
 
@@ -346,6 +352,14 @@ impl BaseAgent for Relayer {
         )
         .await;
         debug!(elapsed = ?start_entity_init.elapsed(), event = "initialized origin chains", "Relayer startup duration measurement");
+
+        let scraper_sources = origins
+            .values()
+            .map(|origin| {
+                let confirmations = settings.scraper_confirmations(&origin.chain_conf)?;
+                Ok(ScraperSource::from_origin(origin, confirmations))
+            })
+            .collect::<Result<_>>()?;
 
         start_entity_init = Instant::now();
         let dispatcher_metrics = DispatcherMetrics::new(core_metrics.registry())
@@ -471,6 +485,7 @@ impl BaseAgent for Relayer {
                         default_ism_getter.clone(),
                         settings.ism_cache_configs.clone(),
                     ),
+                    settings.ccip_read_allowed_domains.clone(),
                     ccip_signer.clone(),
                     origin_chain_setup.ignore_reorg_reports,
                 )
@@ -501,7 +516,6 @@ impl BaseAgent for Relayer {
         }
         debug!(elapsed = ?start_entity_init.elapsed(), event = "initialized message contexts", "Relayer startup duration measurement");
 
-        let scraper_sources = origins.values().map(ScraperSource::from_origin).collect();
         let scraper_websocket_monitor = settings
             .websocket_url
             .map(|url| {

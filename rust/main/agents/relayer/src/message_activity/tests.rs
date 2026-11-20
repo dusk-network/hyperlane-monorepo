@@ -353,6 +353,122 @@ async fn signature_progress_is_published_before_quorum_in_the_existing_format() 
     assert_eq!(reporter.metrics.dropped.get(), 0);
 }
 
+#[tokio::test]
+async fn signature_wait_publishes_missing_readers_before_any_signature() {
+    let (reporter, mut receiver) = reporter(1);
+    let observer = reporter.checkpoint_observer_for_node(
+        &HyperlaneMessage::default(),
+        Some(H256::zero()),
+        2,
+        Some("root"),
+    );
+    observer.observe(CheckpointObservation::Fetching { index: 12 });
+    observer.observe(CheckpointObservation::Unavailable {
+        validator: H256::repeat_byte(1),
+        index: Some(12),
+        reason: CheckpointUnavailableReason::Missing,
+    });
+    assert!(receiver.try_recv().is_err());
+    observer.report_signature_wait();
+    let event = receiver.try_recv().expect("missing-reader progress");
+    let updates = state::ActivityState::new(None)
+        .project(&[event])
+        .await
+        .expect("project zero-signature progress");
+    let (StoredActivity::Snapshot { state } | StoredActivity::SnapshotUpdate { state }) =
+        &updates[0].activity;
+    let signatures = &state["modules"][0]["signatures"];
+    assert_eq!(signatures["collected"], 0);
+    assert_eq!(signatures["index"], 12);
+    assert_eq!(signatures["unavailable"][0]["reason"], "missing");
+}
+
+#[tokio::test]
+async fn reorg_checks_are_scoped_and_retained_through_signature_progress() {
+    let (reporter, mut receiver) = reporter(1);
+    let message = HyperlaneMessage::default();
+    let observer =
+        reporter.checkpoint_observer_for_node(&message, Some(H256::zero()), 2, Some("root"));
+    let states = state::ActivityState::new(None);
+    reporter.report_node(
+        &message,
+        "root",
+        Activity::MetadataModule {
+            ism: H256::zero(),
+            module_type: ModuleType::MessageIdMultisig,
+        },
+    );
+    let module = receiver.try_recv().expect("module activity");
+    states.project(&[module]).await.expect("project module");
+
+    let first = H160::repeat_byte(1);
+    let second = H160::repeat_byte(2);
+    let mut expected = BTreeMap::new();
+    for (validator, observation, labels) in [
+        (
+            first,
+            CheckpointObservation::ReorgNotFound { validator: first },
+            &["reorg_not_found"][..],
+        ),
+        (
+            second,
+            CheckpointObservation::ReorgReported {
+                validator: second,
+                ignored: true,
+            },
+            &["reorg_reported", "reorg_ignored"][..],
+        ),
+        (
+            first,
+            CheckpointObservation::ReorgCheckFailed { validator: first },
+            &["reorg_check_failed"][..],
+        ),
+    ] {
+        observer.observe(observation);
+        let event = receiver
+            .try_recv()
+            .expect("reorg read publishes immediately");
+        assert_eq!(event.node_id.as_deref(), Some("root"));
+        let validator = H256::from(validator);
+        expected.insert(
+            validator,
+            serde_json::json!({
+                "validator": validator,
+                "states": labels,
+            }),
+        );
+        let observed_at = event.observed_at;
+        let updates = states.project(&[event]).await.expect("project reorg read");
+        let update = updates.last().expect("reorg update before signatures");
+        assert_eq!(update.observed_at, observed_at);
+        let (StoredActivity::Snapshot { state } | StoredActivity::SnapshotUpdate { state }) =
+            &update.activity;
+        let node = &state["modules"][0];
+        assert!(node["signatures"].is_null());
+        let checks = node["reorg_checks"].as_array().expect("reorg checks");
+        assert_eq!(checks.len(), expected.len());
+        assert!(expected.values().all(|row| checks.contains(row)));
+    }
+
+    observer.observe(CheckpointObservation::Fetching { index: 12 });
+    observer.observe(CheckpointObservation::Signature {
+        index: 12,
+        root: H256::repeat_byte(2),
+        signers: vec![checkpoint_signer(1, None)],
+    });
+    let event = receiver.try_recv().expect("signature progress");
+    let updates = states.project(&[event]).await.expect("project signatures");
+    let (StoredActivity::Snapshot { state } | StoredActivity::SnapshotUpdate { state }) =
+        &updates.last().expect("signature update").activity;
+    let node = &state["modules"][0];
+    assert_eq!(node["signatures"]["collected"], 1);
+    let checks = node["reorg_checks"]
+        .as_array()
+        .expect("retained reorg checks");
+    assert_eq!(checks.len(), expected.len());
+    assert!(expected.values().all(|row| checks.contains(row)));
+}
+
 // Requires an empty disposable database and a superuser test login, to exercise
 // real restricted writer permissions via SET SESSION AUTHORIZATION.
 #[tokio::test]
@@ -413,11 +529,25 @@ async fn postgres() -> eyre::Result<()> {
         // Exercise the background writer and its success counter, not only INSERT.
         let (writer_reporter, writer_receiver) = self::reporter(1);
         let metrics = writer_reporter.metrics.clone();
-        writer_reporter.report(&message, Activity::Delivered);
+        writer_reporter.report_node(&message, "root", Activity::OffchainRead {
+            ism: H256::zero(),
+            endpoint: Some(0),
+            attempt: 1,
+            gateway: OffchainReadGateway::from_template("https://lookup.example/proof/{data}?token=private"),
+            state: OffchainReadState::DomainNotAllowed,
+            http_status: None,
+        });
         drop(writer_reporter);
         tokio::time::timeout(Duration::from_secs(5), write_events(url.clone(), writer_receiver, metrics.clone(), None)).await?;
         assert_eq!(metrics.written.get(), 1);
         assert_eq!(metrics.failed.get(), 0);
+        let latest = db.query_one(Statement::from_string(DbBackend::Postgres,
+            "SELECT activity #> '{state,modules,0,offchain_read}' AS lookup FROM public.message_activity ORDER BY id DESC LIMIT 1"))
+            .await?.ok_or_else(|| eyre::eyre!("missing CCIP observation"))?;
+        let lookup: serde_json::Value = latest.try_get("", "lookup")?;
+        assert_eq!(lookup["state"], "domain_not_allowed");
+        assert_eq!(lookup["url_template"], "https://lookup.example/proof/{data}");
+        assert!(lookup["observed_at_millis"].is_number());
         let index = db.query_one(Statement::from_string(DbBackend::Postgres,
             "SELECT indexdef FROM pg_indexes WHERE indexname = 'message_activity_received_at_idx'"))
             .await?.ok_or_else(|| eyre::eyre!("missing received-at index"))?;
