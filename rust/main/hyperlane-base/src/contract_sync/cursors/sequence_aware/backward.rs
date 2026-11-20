@@ -453,8 +453,11 @@ impl<T: Debug + Clone + Sync + Send + Indexable + 'static> BackwardSequenceAware
     async fn gap_start(&self, low: u32, sequence: u32) -> u32 {
         let mut start = sequence;
         while start > low {
-            match self.get_sequence_log_block_number(start - 1).await {
-                Ok(None) => start -= 1,
+            match self
+                .get_sequence_log_block_number(start.saturating_sub(1))
+                .await
+            {
+                Ok(None) => start = start.saturating_sub(1),
                 Ok(Some(_)) => break,
                 Err(error) => {
                     warn!(
