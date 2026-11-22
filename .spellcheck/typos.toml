@@ -106,3 +106,7 @@ leafs = "leafs"
 
 # SDK exported type (changing breaks downstream consumers)
 Lifecyle = "Lifecyle"
+
+[default.extend-identifiers]
+# Hetzner Object Storage location (Helsinki)
+hel1 = "hel1"

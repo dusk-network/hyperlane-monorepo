@@ -65,6 +65,22 @@ fn anonymous_client_cell(region: Region) -> Arc<OnceCell<Client>> {
     Arc::clone(&cell)
 }
 
+/// The endpoint of an S3-compatible provider, known from the bucket's region:
+/// Hetzner Object Storage or DigitalOcean Spaces. Any other region is left to
+/// the SDK, which uses Amazon S3, or `AWS_ENDPOINT_URL` when that is set.
+///
+/// hyperlane-dusk's `dusk-tx` (dusk-network/hyperlane-dusk,
+/// `dusk-tx/src/validators.rs`) keeps the same list. Keep the two in sync.
+fn provider_endpoint(region: &str) -> Option<String> {
+    let domain = match region {
+        "fsn1" | "nbg1" | "hel1" => "your-objectstorage.com",
+        "nyc3" | "ams3" | "sfo2" | "sfo3" | "sgp1" | "lon1" | "fra1" | "tor1" | "blr1" | "syd1"
+        | "atl1" | "ric1" | "mkc1" => "digitaloceanspaces.com",
+        _ => return None,
+    };
+    Some(format!("https://{region}.{domain}"))
+}
+
 /// Keep a single SDK chunk without copying; fragmented bodies retain the Vec collector.
 #[derive(Debug)]
 enum S3ObjectBody {
@@ -209,8 +225,13 @@ impl S3Storage {
 
     /// A default ConfigLoader with timeout, region, and behavior version.
     /// Unless overridden, credentials will be loaded from the env.
+    /// A provider's region also sets its endpoint, which wins over `AWS_ENDPOINT_URL`.
     fn default_aws_sdk_config_loader(&self) -> aws_config::ConfigLoader {
-        ConfigLoader::default()
+        let mut loader = ConfigLoader::default();
+        if let Some(endpoint) = provider_endpoint(self.region.as_ref()) {
+            loader = loader.endpoint_url(endpoint);
+        }
+        loader
             .timeout_config(
                 TimeoutConfig::builder()
                     .operation_timeout(S3_REQUEST_TIMEOUT)
@@ -373,7 +394,9 @@ impl CheckpointSyncer for S3Storage {
         } else {
             "amazonaws.com"
         };
-        let mut public = Url::parse(&format!("https://s3.{region}.{aws_domain}")).ok()?;
+        let endpoint = provider_endpoint(region)
+            .unwrap_or_else(|| format!("https://s3.{region}.{aws_domain}"));
+        let mut public = Url::parse(&endpoint).ok()?;
         public.set_path(&format!("{bucket}/{}", key.replace('%', "%25")));
         Some(public.into())
     }
@@ -505,6 +528,58 @@ mod tests {
                 "https://s3.us-east-1.amazonaws.com/test-bucket/foo%2520bar//nested/checkpoint_7_with_id.json"
             )
         );
+
+        for (region, host) in [
+            ("nbg1", "nbg1.your-objectstorage.com"),
+            ("sgp1", "sgp1.digitaloceanspaces.com"),
+        ] {
+            let storage = S3Storage::new(
+                "test-bucket".to_owned(),
+                Some("validator-1".to_owned()),
+                Region::new(region),
+                None,
+            );
+            assert_eq!(
+                storage.checkpoint_location(7),
+                Some(format!(
+                    "https://{host}/test-bucket/validator-1/checkpoint_7_with_id.json"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn provider_endpoint_follows_the_region() {
+        for (region, endpoint) in [
+            ("fsn1", "https://fsn1.your-objectstorage.com"),
+            ("nbg1", "https://nbg1.your-objectstorage.com"),
+            ("hel1", "https://hel1.your-objectstorage.com"),
+            ("nyc3", "https://nyc3.digitaloceanspaces.com"),
+            ("fra1", "https://fra1.digitaloceanspaces.com"),
+            ("mkc1", "https://mkc1.digitaloceanspaces.com"),
+        ] {
+            assert_eq!(provider_endpoint(region).as_deref(), Some(endpoint));
+        }
+        // Amazon's regions, and any region not listed, keep the SDK's resolution.
+        for region in ["us-east-1", "eu-central-1", "cn-north-1", "nyc1", "NBG1"] {
+            assert_eq!(provider_endpoint(region), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_region_sets_the_sdk_endpoint() {
+        for (region, endpoint) in [
+            ("hel1", "https://hel1.your-objectstorage.com"),
+            ("ams3", "https://ams3.digitaloceanspaces.com"),
+        ] {
+            let storage = S3Storage::new("test-bucket".into(), None, Region::new(region), None);
+            let config = storage
+                .default_aws_sdk_config_loader()
+                .no_credentials()
+                .load()
+                .await;
+            assert_eq!(config.endpoint_url(), Some(endpoint));
+        }
     }
 
     #[tokio::test]
